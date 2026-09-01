@@ -1,0 +1,21 @@
+pluginManagement {
+    includeBuild("../../node_modules/@react-native/gradle-plugin")
+}
+plugins { id("com.facebook.react.settings") }
+
+extensions.configure(com.facebook.react.ReactSettingsExtension) { extension ->
+    extension.autolinkLibrariesFromCommand(
+        ["node", file("../../node_modules/react-native/cli.js").absolutePath, "config"],
+        file(".."),
+        files(
+            "../package.json",
+            "../../package.json",
+            "../../pnpm-lock.yaml",
+            "../../pnpm-workspace.yaml",
+        ),
+    )
+}
+
+rootProject.name = "Tacendum"
+include(":app")
+includeBuild("../../node_modules/@react-native/gradle-plugin")

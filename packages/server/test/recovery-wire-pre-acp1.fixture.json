@@ -1,0 +1,26 @@
+{
+  "note": "TRANSCRIBED (not independently captured): authored against the landed previous handlers + DTOs — no committed capture harness independently attests it, and the verify response's groupId/completesAt are determined by the replay rig's own seeded constants and clock. What the replay genuinely pins: the landed {email} field set parses to the identical object under the parallel-field schemas, JSON key order, the 72h completesAt arithmetic, and the answer bytes FOR THESE CAPTURED SHAPES against the CURRENT handlers. What it deliberately cannot show: unknown-key tolerance (the .strict() narrowing has its own pinned case in accounts-phone-recovery.test.ts) or independent attestation of the previous build.",
+  "requestCode": {
+    "body": "{\"email\":\"capture.owner@example.com\"}",
+    "parsed": {
+      "email": "capture.owner@example.com"
+    },
+    "response": {
+      "statusCode": 200,
+      "body": "{}"
+    }
+  },
+  "verify": {
+    "body": "{\"email\":\"capture.owner@example.com\",\"code\":\"100001\",\"class\":\"tablet\"}",
+    "code": "100001",
+    "parsed": {
+      "email": "capture.owner@example.com",
+      "code": "100001",
+      "class": "tablet"
+    },
+    "response": {
+      "statusCode": 200,
+      "body": "{\"groupId\":\"01CAPTUREGROUP0000000000A1\",\"completesAt\":1700259200}"
+    }
+  }
+}

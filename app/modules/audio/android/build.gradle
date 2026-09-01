@@ -1,0 +1,47 @@
+apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+apply plugin: "com.facebook.react"
+
+// Codegen configuration (spec name, jsSrcsDir, javaPackageName) comes from
+// this module's package.json codegenConfig; the react plugin reads it in
+// library mode and inherits reactNativeDir/codegenDir from the app project.
+
+android {
+    namespace "com.miranatechnologies.tacendum.audio"
+    compileSdk rootProject.ext.compileSdkVersion
+    buildToolsVersion rootProject.ext.buildToolsVersion
+
+    defaultConfig {
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    testOptions {
+        unitTests.all {
+            testLogging {
+                events "failed"
+                exceptionFormat "full"
+            }
+        }
+    }
+}
+
+dependencies {
+    implementation("com.facebook.react:react-android")
+    // androidx.core (AOSP, not GMS — the same posture the attach module takes for the
+    // attach module's location call): ContextCompat gives the permission
+    // check and the API-33 `RECEIVER_NOT_EXPORTED` broadcast registration a
+    // single spelling across the minSdk-26..targetSdk-36 range this module
+    // must cover.
+    implementation("androidx.core:core:1.13.1")
+    testImplementation("junit:junit:4.13.2")
+}

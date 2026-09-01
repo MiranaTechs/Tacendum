@@ -1,0 +1,50 @@
+Additional permission under GNU AGPL version 3 section 7
+========================================================
+
+Mirana Technologies Inc. grants an additional permission, under section 7 of
+the GNU Affero General Public License version 3, for distribution of this
+program in object-code form through the Apple App Store: compliance with the
+Apple App Store terms of service is not to be considered a further restriction
+under section 7 with respect to material whose copyright is held by Mirana
+Technologies Inc., and Mirana Technologies Inc. will not treat App Store
+distribution of official builds as a violation of the license with respect to
+that material.
+
+
+WHAT THIS PERMISSION DOES NOT COVER
+-----------------------------------
+
+Read this part. It is the reason this file exists as prose rather than as a
+paragraph nobody reads.
+
+Section 7 permits an additional permission only over material for which the
+grantor can give copyright permission. **This permission therefore covers only
+material copyrighted by Mirana Technologies Inc. It does not, and cannot,
+extend to third-party components.**
+
+The most important of those is **libsignal** (Copyright Signal Messenger, LLC),
+which is licensed AGPL-3.0-only and is linked by the iOS application, the
+command-line client, and the server's authentication function. Signal granted
+an App Store additional permission once, in June 2016, for the now-archived
+`libsignal-protocol-c` under GPLv3. That grant was never carried forward to the
+current libsignal, whose README states that use outside of Signal is
+unsupported. **There is no current permission from Signal to rely on.**
+
+Consequently this file is not a complete answer to the GPL-family/App Store
+question for a binary containing libsignal. It resolves that question only for
+Mirana's own code. That residual risk was weighed deliberately and accepted
+in writing on 2026-07-27, in the project's internal licensing record, by
+Mirana Technologies Inc. — the party able to act on it.
+
+Anyone redistributing a modified version should reach their own conclusion
+rather than inheriting ours.
+
+
+CONTRIBUTIONS
+-------------
+
+This permission can only be granted over code the project holds the rights to.
+Contributions are accepted on the terms in CONTRIBUTING.md, which include the
+same grant — because a single merged contribution without it makes this
+permission unretrofittable without tracing every contributor, which is a
+multi-year problem and not a paperwork one.

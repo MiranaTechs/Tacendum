@@ -1,0 +1,37 @@
+{
+  "name": "@tacendum/server",
+  "version": "0.0.0",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/local/dev.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
+    "bundle": "node scripts/bundle-lambda.mjs",
+    "bundle:verify": "node scripts/bundle-lambda.mjs --verify"
+  },
+  "dependencies": {
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.1106.0",
+    "@aws-sdk/client-cloudwatch": "^3.1106.0",
+    "@aws-sdk/client-dynamodb": "^3.1106.0",
+    "@aws-sdk/client-lambda": "^3.1106.0",
+    "@aws-sdk/client-pinpoint-sms-voice-v2": "^3.1118.0",
+    "@aws-sdk/client-s3": "^3.1106.0",
+    "@aws-sdk/client-secrets-manager": "^3.1106.0",
+    "@aws-sdk/client-sesv2": "^3.1117.0",
+    "@aws-sdk/cloudfront-signer": "^3.1098.0",
+    "@aws-sdk/lib-dynamodb": "^3.1106.0",
+    "@aws-sdk/s3-request-presigner": "^3.1106.0",
+    "@signalapp/libsignal-client": "0.100.0",
+    "@tacendum/shared": "workspace:*",
+    "ulid": "^3.0.2",
+    "ws": "^8.21.3",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.162",
+    "@types/ws": "^8.18.1",
+    "esbuild": "0.28.1"
+  }
+}

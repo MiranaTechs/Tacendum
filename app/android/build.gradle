@@ -1,0 +1,162 @@
+buildscript {
+    ext {
+        buildToolsVersion = "36.0.0"
+        minSdkVersion = 26
+        compileSdkVersion = 36
+        targetSdkVersion = 36
+        ndkVersion = "27.1.12297006"
+        kotlinVersion = "2.1.20"
+        // libsignal-android 0.100.0 — pinned for cross-client parity with
+        // the CLI/server, sha256-verified in gradle/verification-metadata.xml.
+        //
+        // TOOLCHAIN, VERIFIED RATHER THAN PREEMPTED. The first sync did
+        // NOT demand a Kotlin 2.2.x bump: Kotlin 2.1.20 compiles
+        // against libsignal's classes unchanged, so the pin stays at 2.1.20
+        // and the build stays on Java 17. What the artifact DOES demand is a
+        // Java 21 runtime for anything that LOADS its classes — they are class
+        // file major version 65 — which is why only the host-JVM unit test
+        // task takes a JDK 21 launcher (tacendum-crypto/android/build.gradle).
+        // Compilation is unaffected: kotlinc reads major 65 at jvmTarget 17.
+        libsignalVersion = "0.100.0"
+    }
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("com.android.tools.build:gradle")
+        classpath("com.facebook.react:react-native-gradle-plugin")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin")
+        // FCM: the google-services plugin, resolved ONLY
+        // when the app module will actually apply it — the same
+        // file-presence conditional as every other piece of Firebase wiring
+        // (app/build.gradle's FCM header is the inventory). Version pinned
+        // here; bytes pinned in gradle/verification-metadata.xml (the
+        // com.google.gms group is outside the trust rule there).
+        if (file("app/google-services.json").isFile()) {
+            classpath("com.google.gms:google-services:4.4.4")
+        }
+    }
+}
+
+apply plugin: "com.facebook.react.rootproject"
+
+// ---------------------------------------------------------------------------
+// libsignal
+//
+// org.signal is NOT on Maven Central at this version — Central's newest
+// libsignal-android is 0.86.5 (checked 2026-08-18); 0.100.0 lives on Signal's
+// own artifact host. Two consequences are handled here:
+//
+//   1. CONTENT FILTER, both ways. Our repository answers for `org.signal` and
+//      nothing else, and every other repository — Maven Central, Google, and
+//      anything the React Native plugin adds later — is barred from answering
+//      for `org.signal`. Without the second half, a Central resolution could
+//      quietly satisfy the group from a different publisher, which is exactly
+//      the substitution the pin exists to prevent.
+//   2. MIRROR FIRST. build-artifacts.signal.org has no SLA, so a mirror in our
+//      own store is tried first when `tacendumLibsignalMirrorUrl` (or
+//      TACENDUM_LIBSIGNAL_MIRROR_URL) names one; upstream stays as the
+//      fallback. The mirror changes WHERE bytes come from, never WHICH bytes:
+//      gradle/verification-metadata.xml pins the sha256 of every artifact, so
+//      a mirror serving anything else fails the build rather than the review.
+// ---------------------------------------------------------------------------
+def libsignalMirrorUrl = (
+    findProperty("tacendumLibsignalMirrorUrl")
+        ?: System.getenv("TACENDUM_LIBSIGNAL_MIRROR_URL")
+        ?: ""
+).toString().trim()
+def libsignalUpstreamUrl = "https://build-artifacts.signal.org/libraries/maven"
+
+allprojects { project ->
+    project.repositories {
+        if (!libsignalMirrorUrl.isEmpty()) {
+            maven {
+                name = "libsignalMirror"
+                url = uri(libsignalMirrorUrl)
+                content { it.includeGroup("org.signal") }
+            }
+        }
+        maven {
+            name = "libsignalUpstream"
+            url = uri(libsignalUpstreamUrl)
+            content { it.includeGroup("org.signal") }
+        }
+    }
+    // `all` rather than a one-shot loop: the React Native plugin adds
+    // mavenCentral()/google() to every project after this block runs, and a
+    // repository added later must be fenced off from org.signal too.
+    project.repositories.all { repo ->
+        if (repo.name != "libsignalMirror" && repo.name != "libsignalUpstream") {
+            repo.content { it.excludeGroup("org.signal") }
+        }
+    }
+}
+
+subprojects { subproject ->
+    subproject.plugins.withId("com.android.library") {
+        subproject.android.ndkVersion = rootProject.ext.ndkVersion
+    }
+
+    subproject.plugins.withId("com.android.application") {
+        def requiredNdkVersion = rootProject.ext.ndkVersion.toString()
+        def sdkDirectory = subproject.androidComponents.sdkComponents.sdkDirectory
+        def verifyReleaseNativeStripping =
+            subproject.tasks.register("verifyReleaseNativeStripping") {
+                group = "verification"
+                description =
+                    "Fails unless the pinned NDK can strip release native libraries."
+
+                doLast {
+                    def sdkRoot = sdkDirectory.get().asFile
+                    def ndkDir = new File(sdkRoot, "ndk/${requiredNdkVersion}")
+                    def sourcePropertiesFile = new File(ndkDir, "source.properties")
+                    def installedRevision = ""
+                    if (sourcePropertiesFile.isFile()) {
+                        def sourceProperties = new Properties()
+                        sourcePropertiesFile.withInputStream { sourceProperties.load(it) }
+                        installedRevision =
+                            sourceProperties.getProperty("Pkg.Revision", "").trim()
+                    }
+
+                    def stripRoot = new File(ndkDir, "toolchains/llvm/prebuilt")
+                    def llvmStrip = subproject.fileTree(stripRoot) {
+                        include "*/bin/llvm-strip"
+                        include "*/bin/llvm-strip.exe"
+                    }.files.find { candidate ->
+                        if (!candidate.isFile() || !candidate.canExecute()) {
+                            return false
+                        }
+                        try {
+                            // Existence is not enough: a wrong-host prebuilt can
+                            // be present but unusable, which leaves AGP on the
+                            // same warn-and-package fallback this gate forbids.
+                            def process =
+                                new ProcessBuilder(candidate.absolutePath, "--version")
+                                    .redirectErrorStream(true)
+                                    .start()
+                            process.inputStream.withCloseable { it.readAllBytes() }
+                            return process.waitFor() == 0
+                        } catch (Exception ignored) {
+                            return false
+                        }
+                    }
+
+                    if (installedRevision != requiredNdkVersion || llvmStrip == null) {
+                        throw new GradleException(
+                            "Release native-symbol stripping is unavailable: Android NDK " +
+                                "${requiredNdkVersion} with a working llvm-strip is required; " +
+                                "otherwise AGP packages libsignal unstripped. Fix with: " +
+                                "sdkmanager \"ndk;${requiredNdkVersion}\""
+                        )
+                    }
+                }
+            }
+
+        // Release artifacts must never reach AGP's warn-and-copy fallback.
+        // Debug stays usable on machines that do not have the pinned NDK.
+        subproject.tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+            dependsOn(verifyReleaseNativeStripping)
+        }
+    }
+}

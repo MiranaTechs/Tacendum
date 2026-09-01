@@ -1,0 +1,41 @@
+{
+  "name": "tacendum",
+  "version": "0.0.0",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "packageManager": "pnpm@11.10.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "infra:up": "docker compose up -d",
+    "turn:up": "docker compose --profile turn up -d coturn",
+    "turn:down": "docker compose --profile turn stop coturn",
+    "infra:down": "docker compose down",
+    "tables:create": "tsx scripts/create-tables.ts",
+    "dev": "pnpm --filter @tacendum/server dev",
+    "sweep": "tsx scripts/sweep.ts",
+    "build": "pnpm -r build",
+    "test": "bash scripts/vitest-run.sh",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.18.0",
+    "@types/node": "^22.10.5",
+    "eslint": "^9.18.0",
+    "prettier": "^3.4.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.66.0",
+    "vitest": "^3.0.2"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.726.1",
+    "@aws-sdk/lib-dynamodb": "^3.726.1",
+    "@aws-sdk/client-s3": "^3.726.1",
+    "@tacendum/shared": "workspace:*"
+  }
+}

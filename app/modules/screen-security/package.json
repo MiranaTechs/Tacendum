@@ -1,0 +1,21 @@
+{
+  "name": "tacendum-screen-security",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Tacendum screen security module: capture-state and screenshot events plus a native app-switcher cover. Supported APIs only — iOS cannot block screenshots, so this observes and covers, never hooks.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "license": "AGPL-3.0-only",
+  "peerDependencies": {
+    "react": "*",
+    "react-native": "*"
+  },
+  "codegenConfig": {
+    "name": "ScreenSecuritySpec",
+    "type": "modules",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.miranatechnologies.tacendum.screensecurity"
+    }
+  }
+}

@@ -1,0 +1,12 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      The microphone, declared by the module that opens it.
+      A library manifest merges into the application's, so this is
+      the same declaration wherever it is written; keeping it here means the
+      permission travels with the code that needs it, and a build that drops
+      this module drops its permission too.
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+</manifest>

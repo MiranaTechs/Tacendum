@@ -1,0 +1,45 @@
+// Local signing configuration — copy to Tacendum.xcconfig (same directory,
+// gitignored) and fill in. The copy is the setup step; this file is the schema.
+//
+// WHY THIS FILE EXISTS. The Apple Developer Team ID used to be a literal in
+// project.pbxproj. It is not a secret, but it fails .env.example's test for
+// what may stay in the repository — "is it already public by another route?"
+// A Team ID is not: it names the legal entity behind the app and is one of
+// the two identifiers an Apple-support social-engineering attempt starts
+// from. So it lives here, next to the project, in a file git never sees.
+//
+// HOW IT IS WIRED. This file is the base configuration of the two
+// PROJECT-level build configurations. That placement is load-bearing:
+// CocoaPods owns the TARGET-level base configurations (Pods-*.xcconfig per
+// target and configuration), and attaching this file there would detach the
+// Pods ones and break the build. The project level had no base configuration
+// at all, targets inherit from it, and `pod install` never touches it. The
+// four DEVELOPMENT_TEAM settings in project.pbxproj are the reference
+// $(TACENDUM_DEVELOPMENT_TEAM), resolved from here.
+//
+// SUPERSEDED — READ THIS BEFORE TRUSTING THE FILE BESIDE IT.
+//
+// This example used to describe a scheme where Tacendum.xcconfig itself was
+// gitignored, and asserted that a missing file left Simulator builds working
+// while only device builds failed. That was false, and the way it was
+// "verified" is the lesson: `xcodebuild -showBuildSettings` tolerates a
+// missing base-configuration reference and exits 0; `xcodebuild build` does
+// not. A clean clone could not build the app or the extension at all.
+//
+// Today `Tacendum.xcconfig` is COMMITTED with an empty default and an
+// optional include, and the file you create locally is
+// `Tacendum.local.xcconfig`. Copy THAT:
+//
+//     cp app/ios/Tacendum.xcconfig.example app/ios/Tacendum.local.xcconfig
+//     # then set TACENDUM_DEVELOPMENT_TEAM to the team's ID
+//
+// The rationale for keeping the value out of git is unchanged and still
+// correct — a Team ID names the legal entity and is one of two identifiers
+// an Apple-support social-engineering attempt starts from. What changed is
+// that the FILE no longer has to be withheld to withhold the VALUE.
+
+// Apple Developer Team ID (developer.apple.com → Membership).
+// Push only works when this is the team the server's APNs key is scoped
+// to: a build signed by a different team gets tokens Apple will not
+// accept for that key.
+TACENDUM_DEVELOPMENT_TEAM =

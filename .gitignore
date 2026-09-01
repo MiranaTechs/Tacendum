@@ -1,0 +1,68 @@
+node_modules/
+dist/
+cdk.out/
+*.tsbuildinfo
+.DS_Store
+coverage/
+*.log
+
+# local runtime state
+.tacendum/
+.minio-data/
+.dynamodb-data/
+
+# React Native / iOS
+app/ios/Pods/
+app/ios/build/
+*.xcuserstate
+
+# scratch
+.remember/
+.superpowers/
+.worktrees/
+
+# stray tooling temp files
+_tmp_*
+.playwright-mcp/
+
+# Secrets must never reach the remote. None are tracked, and these patterns
+# are here so an accident stays local:
+# the APNs .p8 in particular is the kind of file that lands in a repo root.
+# .xcode.env is deliberately NOT ignored — React Native versions it on purpose
+# and it contains only a NODE_BINARY lookup.
+.env
+.env.*
+# …but the SCHEMA is committed: it is what an outsider needs to build this,
+# and what AGPL's Corresponding Source asks for. Values stay out.
+!.env.example
+!.xcode.env
+# Same policy for the Xcode side: the Apple Team ID lives in this gitignored
+# xcconfig (project-level base configuration; Tacendum.xcconfig.example is the
+# committed schema). Exact path, so the .example file is not caught by it.
+# The COMMITTED base configuration is app/ios/Tacendum.xcconfig — it must stay
+# in git or a clean clone cannot build the app at all (Xcode errors on a
+# missing base-configuration reference before compiling anything). Only the
+# machine-local file carrying the Team ID is ignored.
+app/ios/Tacendum.local.xcconfig
+*.p8
+*.pem
+*.key
+*.p12
+*.mobileprovision
+*.keystore
+# `.jks` is the same object under Android's own conventional extension. The
+# release upload keystore is the one signing key whose loss is unrecoverable
+# and whose leak is total — it is never in git, and this pattern keeps an
+# `upload.jks` in the repo root from being committed by a plain `git add .`,
+# which is exactly how a signing key gets published.
+*.jks
+
+# Per-run CDK output dirs (concurrent CLIs need their own --output).
+cdk.out.*
+
+# Python bytecode.
+__pycache__/
+*.pyc
+
+# Local-only compose deviations (port conflicts on a given machine).
+docker-compose.override.yml

@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Tacendum</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<!--
+	  EXPORT COMPLIANCE.
+
+	  TRUE, and the honest answer. Tacendum implements its own end-to-end
+	  encryption — libsignal's PQXDH and Double Ratchet, AES-256-GCM
+	  attachments, DTLS-SRTP media — far beyond the HTTPS-and-platform-crypto
+	  exemptions that would justify `false`. Answering `false` to skip the
+	  App Store Connect questions would be a false statement on a federal
+	  compliance surface, which is a worse problem than the paperwork.
+
+	  WHAT THIS KEY DOES AND DOES NOT DO. Present and true, it stops every
+	  upload sitting in "Missing Compliance" waiting for someone to answer the
+	  web form. It does NOT end the matter: `true` TRIGGERS the App Encryption
+	  Declaration, which is what produces `ITSEncryptionExportComplianceCode`
+	  — the key that actually closes it. That declaration is a release step
+	  and the classification (5D992.c mass-market, self-classified, no CCATS,
+	  no BIS submission) is the answer it is filed against.
+
+	  THE KEY IS ABSENT, NOT ANSWERED FALSE, and here is why.
+	  The paragraph above assumed `true` merely deferred the declaration.
+	  Measured otherwise on the first real upload: with `true` in the binary
+	  and NO App Encryption Declaration yet existing in App Store Connect,
+	  Apple's validator refuses the upload outright — "Invalid Export
+	  Compliance Code. The export compliance key value [] ... doesn't match
+	  the key value of the app's export compliance documentation." So the
+	  trade inverted: `true` was chosen to avoid a Missing Compliance wait,
+	  and instead it blocked upload entirely. Removing the key defers the
+	  SAME truthful answers to the App Store Connect questionnaire (uses
+	  encryption: yes; standard algorithms beyond the OS's: yes; exempt: no)
+	  — absence asks the question, it does not answer it. When ASC issues the
+	  compliance code through that flow, BOTH keys return together:
+	  ITSAppUsesNonExemptEncryption true and ITSEncryptionExportComplianceCode
+	  with the issued value. Answering `false` remains what the paragraph
+	  above says it is: a false statement on a federal compliance surface.
+	-->
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<false/>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>RCTNewArchEnabled</key>
+	<true/>
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>Tacendum uses your camera for video calls and to take photos. Both are end-to-end encrypted and never leave your device unencrypted.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Your location is read once, only when you choose to share it in a conversation, and is sent end-to-end encrypted to that person only.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Tacendum uses your microphone for calls. Audio is end-to-end encrypted and never leaves your device unencrypted.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Choose a photo to send end-to-end encrypted in your chat, or to read a Tacendum ID from a QR code.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>voip</string>
+		<string>audio</string>
+	</array>
+	<key>UIStatusBarStyle</key>
+	<string>UIStatusBarStyleDarkContent</string>
+	<key>UIUserInterfaceStyle</key>
+	<string>Light</string>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<false/>
+</dict>
+</plist>

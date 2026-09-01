@@ -1,0 +1,26 @@
+{
+  "name": "tacendum-call",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Tacendum calling module: WebRTC peer connection, CallKit, PushKit, and the audio-session handshake. Media is DTLS-SRTP keyed on the devices; the fingerprint that binds it rides inside the ratcheted envelope.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "license": "AGPL-3.0-only",
+  "peerDependencies": {
+    "react": "*",
+    "react-native": "*"
+  },
+  "codegenConfig": {
+    "name": "TacendumCallSpec",
+    "type": "all",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.miranatechnologies.tacendum.call"
+    },
+    "ios": {
+      "componentProvider": {
+        "TacendumVideoView": "TacendumVideoView"
+      }
+    }
+  }
+}

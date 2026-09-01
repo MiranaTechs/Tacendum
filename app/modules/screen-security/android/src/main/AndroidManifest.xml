@@ -1,0 +1,18 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      The permission WindowManager.addScreenRecordingCallback demands (API 35+,
+      by design). It is a normal install-time permission — no prompt,
+      nothing to ask for at runtime — and it grants only the ability to be told
+      that a recording of THIS app's windows started or stopped. It cannot read
+      the recording and does not apply to any other app.
+
+      Declared here rather than in the app manifest because this module is the
+      only caller: the module that needs the capability is the module that
+      names it, and a reader of the app manifest is never left wondering which
+      feature a stray permission belongs to. Manifest merging folds it into the
+      final app manifest either way.
+    -->
+    <uses-permission android:name="android.permission.DETECT_SCREEN_RECORDING" />
+
+</manifest>

@@ -1,0 +1,139 @@
+apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+apply plugin: "com.facebook.react"
+
+// Codegen configuration (spec name, jsSrcsDir, javaPackageName) comes from
+// this module's package.json codegenConfig; the react plugin reads it in
+// library mode and inherits reactNativeDir/codegenDir from the app project.
+
+android {
+    namespace "com.miranatechnologies.tacendum.crypto"
+    compileSdk rootProject.ext.compileSdkVersion
+    buildToolsVersion rootProject.ext.buildToolsVersion
+
+    defaultConfig {
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    testOptions {
+        unitTests.all {
+            // The host-JVM suites read packages/shared/*.json (auth vectors,
+            // blob vectors) and must not depend on the directory Gradle
+            // happens to start in.
+            systemProperty "tacendum.repoRoot", rootProject.projectDir.parentFile.parentFile.absolutePath
+            testLogging {
+                events "failed"
+                exceptionFormat "full"
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The host-JVM test runtime needs a JDK 21 — and this is a discovered fact,
+// not a preference. libsignal-client 0.100.0 ships class files at major
+// version 65: kotlinc reads them fine at jvmTarget 17 (so the SHIPPED build
+// stays on Java 17, and nothing else in this repo moves), but a Java 17 test
+// JVM cannot LOAD them, and these suites deliberately run the real cipher and
+// the real record serialization rather than a mock. Gradle's toolchain
+// auto-detection finds only the JDK it is running on here, so the launcher is
+// resolved directly, in the order a person would look:
+//
+//   1. TACENDUM_JDK21 / -PtacendumJdk21   — an explicit override, first
+//   2. the current JVM, if it is already 21+
+//   3. /usr/libexec/java_home -v 21       — the macOS registry
+//   4. the two JDK 21 installs this machine actually has
+//
+// FAIL LOUD, NEVER SKIP: with no JDK 21 the task throws with the command that
+// fixes it. A test task that silently degrades to "no libsignal" would report
+// green while executing none of the pins this task exists to run.
+// ---------------------------------------------------------------------------
+// EACH CANDIDATE IS VERSION-CHECKED, not merely existence-checked: on this
+// machine `/usr/libexec/java_home -v 21` exits 0 and prints the JDK **17**
+// home, so "it answered" is not "it is 21". The `release` file every JDK ships
+// is the authority.
+def isJdk21OrLater = { String home ->
+    if (!home || !new File(home, "bin/java").canExecute()) {
+        return false
+    }
+    def releaseFile = new File(home, "release")
+    if (!releaseFile.isFile()) {
+        return false
+    }
+    def line = releaseFile.readLines().find { it.startsWith("JAVA_VERSION=") }
+    if (!line) {
+        return false
+    }
+    def major = (line =~ /JAVA_VERSION="(\d+)/)
+    return major.find() && (major.group(1) as Integer) >= 21
+}
+
+def resolveJdk21 = {
+    def candidates = []
+    def explicit = findProperty("tacendumJdk21") ?: System.getenv("TACENDUM_JDK21")
+    if (explicit) {
+        candidates << explicit.toString()
+    }
+    candidates << System.getProperty("java.home")
+    try {
+        def out = new ByteArrayOutputStream()
+        def proc = ["/usr/libexec/java_home", "-v", "21"].execute()
+        proc.consumeProcessOutput(out, new ByteArrayOutputStream())
+        if (proc.waitFor() == 0) {
+            candidates << out.toString().trim()
+        }
+    } catch (Exception ignored) {
+        // Not macOS, or no java_home: fall through to the explicit paths.
+    }
+    candidates << "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home"
+    candidates << "/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+    return candidates.find { isJdk21OrLater(it) }
+}
+
+tasks.withType(Test).configureEach { testTask ->
+    def jdk21 = resolveJdk21()
+    if (jdk21) {
+        testTask.executable = "${jdk21}/bin/java"
+    } else {
+        // FAIL, never skip: a suite that quietly runs on 17 reports green
+        // while every libsignal-touching pin throws UnsupportedClassVersionError
+        // — which is a failure, but only if something is watching for it.
+        testTask.doFirst {
+            throw new GradleException(
+                "No JDK 21 found for the tacendum-crypto host-JVM suites (libsignal-client " +
+                "0.100.0 is class file major 65 and will not load on a 17 JVM). Install one " +
+                "— `brew install openjdk@21` — or set TACENDUM_JDK21 to its home."
+            )
+        }
+    }
+}
+
+dependencies {
+    implementation("com.facebook.react:react-android")
+    // libsignal-android: the AAR carries the JNI .so; its
+    // Java classes come from the libsignal-client jar it depends on. Both are
+    // sha256-pinned in app/android/gradle/verification-metadata.xml.
+    implementation("org.signal:libsignal-android:${rootProject.ext.libsignalVersion}")
+
+    testImplementation("junit:junit:4.13.2")
+    // The real org.json, shadowing the android.jar stub whose every method
+    // throws on the host JVM: the suites read the shared fixtures
+    // (authvectors/blobvectors/pinvectors) as JSON rather than by regex.
+    testImplementation("org.json:json:20250107")
+    // The SAME libsignal, on the host JVM: the client jar bundles desktop
+    // natives, so BlobFramingTest and the store suites exercise the real
+    // cipher and the real record serialization rather than a mock. This is
+    // what makes the framing and fail-direction pins mean anything before an
+    // emulator ever boots.
+    testImplementation("org.signal:libsignal-client:${rootProject.ext.libsignalVersion}")
+}

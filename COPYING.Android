@@ -1,0 +1,85 @@
+Additional permission under GNU AGPL version 3 section 7
+========================================================
+
+Mirana Technologies Inc. grants an additional permission, under section 7 of
+the GNU Affero General Public License version 3, for distribution of this
+program in object-code form through Google Play: compliance with the Google
+Play terms of service (including the Developer Distribution Agreement and
+the Developer Program Policies) is not to be considered a further
+restriction under section 7 with respect to (a) material whose copyright is
+held by Mirana Technologies Inc., and (b) contributions whose authors
+granted Mirana Technologies Inc. the channel-generic store permission with
+regrant authority under CONTRIBUTING.md term 2 — this file is that
+authority exercised for Google Play, as that term provides. Mirana
+Technologies Inc. will not treat Google Play distribution of official
+builds as a violation of the license with respect to that material.
+
+A note on why this file exists at all, given that the GPL-family tension
+with Play is historically weaker than with the Apple App Store — Signal,
+F-Droid projects and many GPL applications distribute on Play. Weaker is not
+absent: the Developer Distribution Agreement imposes terms a reader could
+treat as "further restrictions", and this file resolves that doubt for
+Mirana's material the same way `COPYING.iOS` resolves it for the App Store,
+rather than relying on the tension staying weak.
+
+
+WHAT THIS PERMISSION DOES NOT COVER
+-----------------------------------
+
+Read this part. It is the reason this file exists as prose rather than as a
+paragraph nobody reads.
+
+Section 7 permits an additional permission only over material for which the
+grantor can give copyright permission. **This permission therefore covers
+only material for which Mirana Technologies Inc. can give it: material
+Mirana holds copyright in, and contributions whose authors granted the
+channel-generic store permission with regrant authority under
+CONTRIBUTING.md term 2. It does not, and cannot, extend to any other
+third-party material.**
+
+The most important of those is **libsignal** (Copyright Signal Messenger,
+LLC), which is licensed AGPL-3.0-only and is linked by the iOS application,
+the Android application, the command-line client, and the server's
+authentication function. Signal granted an App Store additional permission
+once, in June 2016, for the now-archived `libsignal-protocol-c` under GPLv3.
+That grant was never carried forward to the current libsignal, whose README
+states that use outside of Signal is unsupported, and no analogous grant
+exists for Google Play or any other channel. Signal distributing its own
+Android application — with libsignal inside — on Google Play is its right as
+copyright holder and creates no permission for anyone else. **There is no
+current permission from Signal to rely on.**
+
+Consequently this file is not a complete answer to the GPL-family/store
+question for a binary containing libsignal. It resolves that question only
+for the material this permission covers — Mirana's own code, and
+contributions regranted under CONTRIBUTING.md term 2. That residual risk
+was weighed deliberately for this channel too; the fresh written
+acceptance, recorded in the project's internal licensing record by Mirana
+Technologies Inc. — the party able to act on it — reads: "I accept the
+licensing risk of distributing Tacendum through Google Play — accepted in
+writing on 2026-08-20, Natnael Mengesha, Mirana Technologies Inc."
+
+Anyone redistributing a modified version should reach their own conclusion
+rather than inheriting ours.
+
+
+CONTRIBUTIONS
+-------------
+
+This permission can only be granted over code the project holds the rights
+to. Contributions are accepted on the terms in CONTRIBUTING.md: each
+contributor grants Mirana Technologies Inc., over the contribution itself,
+a channel-generic store permission — distribution of the combined work
+through any app-store distribution channel Mirana designates, today the
+Apple App Store and Google Play — **together with the authority for Mirana
+to regrant that permission over the contribution as part of the combined
+work**, which is what this file does for Google Play. That term was
+rewritten on 2026-08-16 from an Apple-only grant incorporated by reference
+from `COPYING.iOS`; under its transitional rule, any contribution
+submitted before the term's adoption (the 2026-08-16 commit that
+introduced it) — merged or not — was assented under the Apple-only term
+and requires the submitter's re-assent before it may be merged or
+distributed under the widened grant. The stakes are the usual
+ones: a single distributed contribution without the grant makes this
+permission unretrofittable without tracing every contributor, which is a
+multi-year problem and not a paperwork one.

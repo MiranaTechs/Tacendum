@@ -1,0 +1,271 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>C617.1</string>
+				<string>3B52.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>CA92.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>35F9.1</string>
+			</array>
+		</dict>
+	</array>
+	<!--
+	  WHAT "COLLECTED" MEANS HERE, AND WHY THIS ARRAY IS NOT EMPTY.
+
+	  An empty array here would be a false declaration. Apple
+	  counts data as collected when it is transmitted off the device and kept
+	  beyond transient use. END-TO-END ENCRYPTION IS A PROTECTION, NOT AN
+	  EXEMPTION FROM DISCLOSURE: the relay stores queued ciphertext for up to
+	  30 days, attachment blobs for 30 days, and device tokens for 90 — so
+	  those are collected, whether or not anyone here can read them. Signal,
+	  WhatsApp and iMessage all declare collected data for the same reason.
+
+	  The App Store Connect questionnaire is a DIFFERENT taxonomy from this
+	  manifest (the questionnaire covers third-party partners; this manifest
+	  need not duplicate what an embedded SDK's own manifest declares), so
+	  the two will never match line for line, and a reviewer comparing them
+	  is comparing the wrong things.
+
+	  What is deliberately absent, because the server genuinely never sees it:
+	  no phone number, no display name, no avatar (UserRecord has no such
+	  field — profile data travels as ordinary encrypted messages), no contact
+	  list, no address-book upload, no location, no advertising identifier, no
+	  analytics SDK. An email address is NOT on that list: a
+	  user may link one, optionally, and it is declared below as EmailAddress.
+
+	  ONE CORRECTION: this comment used to say "no social graph"
+	  flatly. That is too strong and was always imprecise. The relay does
+	  hold two kinds of durable association between account ids — the crew
+	  edge (which human owns which integration account) and
+	  the consent edge (which human authorized which AI agent to
+	  reach them). Both are pairs of ULIDs and are declared under UserID
+	  below; neither is Apple's Contacts type, because there is no address
+	  book anywhere in this product.
+
+	  The Article 50 AI-origin marker is NOT in this array on purpose: it
+	  rides inside the E2EE envelope (shared/src/ai-origin.ts), so the relay
+	  can neither read, strip, nor inject it, and nothing about it is stored
+	  server-side. Nothing to declare, and saying so is not the same as
+	  saying it does not exist.
+	-->
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array>
+		<!--
+		  Queued messages: senderId, recipientId, timestamp and the base64
+		  ciphertext payload, held in tacendum_messages under a 30-day TTL
+		  until the recipient's device drains them. Apple's guidance names
+		  private messaging content explicitly, and ciphertext is still
+		  content.
+		-->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeEmailsOrTextMessages</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<!-- Image attachments: AES-256-GCM blobs in S3, 30-day lifecycle. -->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypePhotosorVideos</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<!-- Voice notes, same blob path and same lifecycle as images. -->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeAudioData</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<!--
+		  The account id itself (a ULID) plus the identity public key and
+		  prekey material on the user row. The account IS the keypair here —
+		  no phone number, email or username is required or stands in for it.
+		  Also under this type: the keyed scrambling (an HMAC
+		  under a server secret, never the name) of a username the user chose
+		  to claim — Apple's own examples for User ID are "screen name,
+		  handle" — with its findability switch and verification time.
+		-->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeUserID</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<!--
+		  An email address the user
+		  CHOOSES to link. Optional — registration still sends key material
+		  only, and UserRecord still carries no such field. The address is
+		  transmitted to the service for verification and recovery sends and
+		  retained as a keyed scrambling on a claim row (emailhash#v<K>#…, an
+		  HMAC under a server secret) with its verification time and the
+		  user's findability switch; the address itself is not stored. Apple
+		  counts it as collected because it leaves the device and a derived
+		  form is kept. Purpose: account recovery of the device grouping and
+		  the consent-gated find-by-identifier lookup. Linked, not tracking.
+		-->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeEmailAddress</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<!--
+		  APNs alert and VoIP device tokens (tacendum_push_tokens), bound to
+		  the account id. These are device-level identifiers.
+
+		  The deletion path removes this row (handlers/account.ts,
+		  deletePushToken in the destructive sweep), so the token goes with
+		  the account and the 90-day TTL is a liveness sweep only.
+		-->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeDeviceID</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<!--
+		  Operational logs: S3 server-access logs for the attachments bucket
+		  (which record requester IP) and CloudWatch lines carrying a userId
+		  on roughly ten event types, retained three months. Declared as
+		  diagnostics rather than analytics because nothing here is measured
+		  for product insight; it exists to debug and to answer abuse.
+		-->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeOtherDiagnosticData</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<!--
+		  Call performance. The app drains one report
+		  per call to POST /v1/call-metrics (shared/src/dto.ts CallMetricReport;
+		  no flag, no opt-out), and two of its fields are performance
+		  measurements rather than interaction facts: setupMs — published as a
+		  CloudWatch `CallSetupLatency` datum — and the technical outcomes
+		  connection_failed / media_failed / unsupported.
+
+		  WHY NOT THE OtherDiagnosticData ENTRY ABOVE: that one is Apple's
+		  RESIDUAL category, and its comment scopes it to server-side LOGS. A
+		  latency is not "other diagnostic data"; PerformanceData is the named
+		  type, and Apple's own examples — launch time, hang rate — are this
+		  exact shape. Stretching the logs entry to cover a client-submitted
+		  telemetry stream would have meant rewriting its stated reason.
+
+		  LINKED even though the published datum carries no account dimension
+		  (Scope/Media/Outcome only): the submission is authenticated, its
+		  dedupe row is keyed sha256(userId ‖ reportId), and its rate-limit
+		  counter names the userId. Same reasoning as the activity row below.
+		  Both purposes are declared because both are true — the failure
+		  outcomes exist to detect a broken calling path, the counters to
+		  measure how the feature performs in the field.
+		-->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypePerformanceData</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+				<string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+			</array>
+		</dict>
+		<!--
+		  Hourly human-activity records for DAU counting, AND the call-outcome
+		  side of the metric report described in the PerformanceData entry
+		  above (a call placed, answered, declined, and how long it ran is
+		  information about how the user interacts with the app). The activity
+		  row holds sha256(salted userId) and an hour bucket, nothing else.
+		  Declared LINKED
+		  even though it is pseudonymous: the hash is re-derivable by anyone
+		  holding the userId, so "not linked" would be a claim that depends on
+		  an attacker's ignorance rather than on the data. Declaring it linked
+		  costs nothing.
+		-->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeProductInteraction</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+			</array>
+		</dict>
+	</array>
+	<!--
+	  No advertising identifier, no data broker, no cross-app or cross-site
+	  correlation, no analytics SDK. This one is genuinely false.
+	-->
+	<key>NSPrivacyTracking</key>
+	<false/>
+</dict>
+</plist>

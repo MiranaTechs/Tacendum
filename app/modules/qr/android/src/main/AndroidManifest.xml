@@ -1,0 +1,54 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      The camera is used, but it is not required: a device with no camera at
+      all still installs and still reads a QR out of a picture in the gallery.
+      `required="false"` is what keeps that device on the store listing.
+    -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+
+    <application>
+
+        <!--
+          The live scanner. Not exported: nothing outside this app may start it,
+          because starting it means turning on the camera and handing whatever
+          it reads to a callback this process owns.
+
+          `excludeFromRecents`: a live camera screen has no business in the task
+          switcher. NOT `noHistory` — that finishes the activity the moment it
+          stops, and the runtime CAMERA prompt is what would stop it, so the
+          scanner would die answering its own permission request.
+        -->
+        <activity
+            android:name="com.miranatechnologies.tacendum.qr.QrScannerActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+            android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen" />
+
+        <!--
+          The share grant — a recorded divergence from iOS. iOS hands the
+          share sheet a file:// URL; Android cannot — a file:// URI leaving the
+          app has thrown FileUriExposedException since API 24 — so the one
+          picture goes out as a content:// URI backed by this provider, with a
+          read grant the sharing intent carries and the system revokes.
+
+          The authority is derived from the applicationId so it stays unique to
+          this app; `grantUriPermissions` is what makes the per-intent grant
+          possible at all, and `exported="false"` is what keeps it the ONLY way
+          in — no other app may query this provider on its own initiative.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.qrshare"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/tacendum_qr_paths" />
+        </provider>
+
+    </application>
+
+</manifest>

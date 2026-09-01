@@ -1,0 +1,67 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`a whole 1:1 call, traced (the group-call seam regression net) a refused outbound call and a busy inbound one leave the same trace 1`] = `[]`;
+
+exports[`a whole 1:1 call, traced (the group-call seam regression net) a refused outbound call and a busy inbound one leave the same trace 2`] = `
+[
+  "db.saveOffer({"cid":"01HQ000000000000000000000A","peerId":"01HQ0000000000000000000001","sdp":"v=0\\r\\na=fingerprint:sha-256 AA:BB\\r\\nOFFER","video":false,"exp":1800000060000,"serverTs":1800000000000})",
+  "turn.fetch()",
+  "native.configure([{"urls":["stun:turn.tacendum.com:3478"]},{"urls":["turn:turn.tacendum.com:3478?transport=udp"],"username":"u","credential":"c"}], false)",
+  "state("incoming_ringing", "01HQ000000000000000000000A")",
+  "native.reportIncomingCall("01HQ000000000000000000000A", "01HQ0000000000000000000001", "name:01HQ0000000000000000000001", "name:01HQ0000000000000000000001", false)",
+  "send("01HQ0000000000000000000001", {"tcm":"call.ringing","cid":"01HQ000000000000000000000A"}, {"urgent":false})",
+  "native.updateIncomingCallDisplay("01HQ000000000000000000000A", "name:01HQ0000000000000000000001")",
+  "db.saveOffer({"cid":"01HQ000000000000000000000C","peerId":"01HQ0000000000000000000002","sdp":"v=0\\r\\na=fingerprint:sha-256 AA:BB\\r\\nOFFER","video":false,"exp":1800000060000,"serverTs":1800000000000})",
+  "state("incoming_ringing", "01HQ000000000000000000000A")",
+  "send("01HQ0000000000000000000002", {"tcm":"call.end","cid":"01HQ000000000000000000000C","r":"busy"}, {"urgent":false})",
+  "native.dismissPendingIncomingCall("01HQ0000000000000000000002", "declined", "")",
+]
+`;
+
+exports[`a whole 1:1 call, traced (the group-call seam regression net) incoming: offer → ring → accept → ice → connected → hangup 1`] = `
+[
+  "db.saveOffer({"cid":"01HQ000000000000000000000A","peerId":"01HQ0000000000000000000001","sdp":"v=0\\r\\na=fingerprint:sha-256 AA:BB\\r\\nOFFER","video":false,"exp":1800000060000,"serverTs":1800000000000})",
+  "turn.fetch()",
+  "native.configure([{"urls":["stun:turn.tacendum.com:3478"]},{"urls":["turn:turn.tacendum.com:3478?transport=udp"],"username":"u","credential":"c"}], false)",
+  "state("incoming_ringing", "01HQ000000000000000000000A")",
+  "native.reportIncomingCall("01HQ000000000000000000000A", "01HQ0000000000000000000001", "name:01HQ0000000000000000000001", "name:01HQ0000000000000000000001", false)",
+  "send("01HQ0000000000000000000001", {"tcm":"call.ringing","cid":"01HQ000000000000000000000A"}, {"urgent":false})",
+  "native.updateIncomingCallDisplay("01HQ000000000000000000000A", "name:01HQ0000000000000000000001")",
+  "state("incoming_answering", "01HQ000000000000000000000A")",
+  "native.createAnswer("01HQ000000000000000000000A", "v=0\\r\\na=fingerprint:sha-256 AA:BB\\r\\nOFFER", false)",
+  "send("01HQ0000000000000000000001", {"tcm":"call.answer","cid":"01HQ000000000000000000000A","sdp":"v=0\\r\\na=fingerprint:sha-256 CC:DD\\r\\nANSWER","vid":false}, {"urgent":false})",
+  "state("incoming_answering", "01HQ000000000000000000000A")",
+  "native.addIceCandidates("01HQ000000000000000000000A", [{"cand":"candidate:2 1 udp 1 10.0.0.2 1 typ host","mid":"0","idx":0}])",
+  "state("connected", "01HQ000000000000000000000A")",
+  "native.reportOutgoingConnected("01HQ000000000000000000000A")",
+  "state("ending", "01HQ000000000000000000000A")",
+  "send("01HQ0000000000000000000001", {"tcm":"call.end","cid":"01HQ000000000000000000000A","r":"hangup"}, {"urgent":true})",
+  "native.close("01HQ000000000000000000000A")",
+  "native.endCall("01HQ000000000000000000000A", "hangup")",
+  "log({"cid":"01HQ000000000000000000000A","peerId":"01HQ0000000000000000000001","direction":"in","kind":"audio","reason":"hangup","startedAt":1800000000000,"connectedAt":1800000000000,"endedAt":1800000000000,"missed":false})",
+  "db.dropOffer("01HQ000000000000000000000A")",
+  "state("idle", null)",
+]
+`;
+
+exports[`a whole 1:1 call, traced (the group-call seam regression net) outgoing: place → ringing → answer → ice → connected → peer ends 1`] = `
+[
+  "turn.fetch()",
+  "native.configure([{"urls":["stun:turn.tacendum.com:3478"]},{"urls":["turn:turn.tacendum.com:3478?transport=udp"],"username":"u","credential":"c"}], false)",
+  "state("outgoing_connecting", "01HQ000000000000000000000B")",
+  "native.createOffer("01HQ000000000000000000000B", false)",
+  "native.reportOutgoingCall("01HQ000000000000000000000B", "name:01HQ0000000000000000000001", false)",
+  "send("01HQ0000000000000000000001", {"tcm":"call.offer","cid":"01HQ000000000000000000000B","sdp":"v=0\\r\\na=fingerprint:sha-256 AA:BB\\r\\nOFFER","vid":false,"exp":1800000060000}, {"urgent":true})",
+  "state("outgoing_ringing", "01HQ000000000000000000000B")",
+  "state("outgoing_connecting", "01HQ000000000000000000000B")",
+  "native.setRemoteAnswer("01HQ000000000000000000000B", "v=0\\r\\na=fingerprint:sha-256 CC:DD\\r\\nANSWER")",
+  "state("connected", "01HQ000000000000000000000B")",
+  "native.reportOutgoingConnected("01HQ000000000000000000000B")",
+  "native.dismissPendingIncomingCall("01HQ0000000000000000000001", "cancelled", "")",
+  "state("ending", "01HQ000000000000000000000B")",
+  "native.close("01HQ000000000000000000000B")",
+  "native.endCall("01HQ000000000000000000000B", "hangup")",
+  "log({"cid":"01HQ000000000000000000000B","peerId":"01HQ0000000000000000000001","direction":"out","kind":"audio","reason":"hangup","startedAt":1800000000000,"connectedAt":1800000000000,"endedAt":1800000000000,"missed":false})",
+  "state("idle", null)",
+]
+`;

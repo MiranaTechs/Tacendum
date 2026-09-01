@@ -1,0 +1,55 @@
+apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+apply plugin: "com.facebook.react"
+
+// Codegen configuration (spec name, jsSrcsDir, javaPackageName) comes from
+// this module's package.json codegenConfig; the react plugin reads it in
+// library mode and inherits reactNativeDir/codegenDir from the app project.
+
+android {
+    namespace "com.miranatechnologies.tacendum.screensecurity"
+    compileSdk rootProject.ext.compileSdkVersion
+    buildToolsVersion rootProject.ext.buildToolsVersion
+
+    defaultConfig {
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    testOptions {
+        // Robolectric reads the merged manifest and the generated
+        // com/android/tools/test_config.properties through this; without it
+        // every @Config(sdk = ...) test fails at startup rather than running.
+        unitTests.includeAndroidResources = true
+        unitTests.all {
+            testLogging {
+                events "failed"
+                exceptionFormat "full"
+            }
+        }
+    }
+}
+
+dependencies {
+    implementation("com.facebook.react:react-android")
+
+    testImplementation("junit:junit:4.13.2")
+    // Robolectric, and it is load-bearing rather than convenient: the two
+    // claims this module has to make — FLAG_SECURE is on the window before the
+    // first frame, and the API-35 recording callback both REGISTERS and, when
+    // fired, reaches onCapturedChanged — are claims about a real Window and
+    // about a specific SDK level. A plain JUnit suite can construct neither,
+    // and @Config(sdk = [34]) / @Config(sdk = [35]) is what makes the two
+    // sides of the version branch separately provable on one machine.
+    testImplementation("org.robolectric:robolectric:4.16.1")
+    testImplementation("androidx.test:core:1.6.1")
+}

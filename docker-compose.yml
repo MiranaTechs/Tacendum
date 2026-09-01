@@ -1,0 +1,145 @@
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:2.5.4
+    container_name: tacendum-dynamodb
+    command: ['-jar', 'DynamoDBLocal.jar', '-sharedDb', '-dbPath', '/data']
+    ports:
+      - '127.0.0.1:8000:8000'
+    volumes:
+      - ./.dynamodb-data:/data
+    working_dir: /home/dynamodblocal
+    user: root
+    healthcheck:
+      # DynamoDB Local answers on the port even for unauthenticated pokes.
+      test: ['CMD-SHELL', 'curl -s http://localhost:8000 >/dev/null 2>&1 || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    container_name: tacendum-minio
+    command: ['server', '/data', '--console-address', ':9001']
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - '127.0.0.1:9000:9000'
+      - '127.0.0.1:9001:9001'
+    volumes:
+      - ./.minio-data:/data
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: create the `attachments` bucket, then exit.
+  minio-bootstrap:
+    image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+    container_name: tacendum-minio-bootstrap
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/attachments &&
+      echo 'bucket attachments ready'
+      "
+
+  # Local TURN relay. Present so the credential math can be
+  # checked against the thing that actually validates it — coturn — rather
+  # than only against our own re-implementation of its HMAC. Not needed for
+  # ordinary development: two simulators on one Mac reach each other over host
+  # candidates, so nothing depends on this being up.
+  #
+  # `use-auth-secret` is the same scheme production uses; the secret here is a
+  # fixed test value and is deliberately not a secret.
+  coturn:
+    image: coturn/coturn:4.6.2
+    container_name: tacendum-coturn
+    # Opt-in: `pnpm infra:up` deliberately does NOT start this. Ordinary
+    # development never needs a relay, so nobody should pay for a container
+    # they will not use. Start it with `pnpm turn:up` when running the TURN
+    # integration tests.
+    profiles: ['turn']
+    # The relay refuses to be aimed inward, exactly as a production relay
+    # must, with ONE explicit exception for its own address.
+    #
+    # Why the deny-list is needed on a LOOPBACK-BOUND relay, which is not
+    # obvious: the static secret below is
+    # published, so any web page's JavaScript can mint a valid credential,
+    # point an RTCPeerConnection at turn:127.0.0.1:3478, and relay to
+    # 169.254.169.254 or the developer's LAN. The page cannot send those
+    # packets itself — the relay is the confused deputy that does it for it.
+    # "Only local processes can reach loopback" is not the same as "only
+    # trusted code runs locally"; a browser runs whatever it is served.
+    #
+    # Why the exception is needed: `turnutils_uclient -y` uses the relay's
+    # OWN discovered address as the peer, and on Docker that address is
+    # inside 172.16/12 — so a bare deny-list makes coturn refuse its own
+    # allocation with "channel bind: error 403 (Forbidden IP)" and
+    # turn.integration.test.ts fails against a healthy relay. A production
+    # relay has the same need and meets it through external-ip, which installs
+    # a whitelist for the relay's own address; there is no external-ip here,
+    # so the address is pinned below and allowed as a single /32.
+    #
+    # Note for anyone editing the block below: it is a FOLDED SCALAR, so
+    # every line becomes part of one command string. A '#' comment inside it
+    # is passed to coturn verbatim and it refuses to start with "invalid
+    # command line string".
+    networks:
+      default:
+        ipv4_address: 172.28.5.10
+    command: >
+      -n
+      --log-file=stdout
+      --listening-port=3478
+      --listening-ip=0.0.0.0
+      --realm=tacendum.local
+      --use-auth-secret
+      --static-auth-secret=local-development-turn-secret
+      --min-port=49160
+      --max-port=49200
+      --fingerprint
+      --no-tls
+      --no-dtls
+      --no-multicast-peers
+      --no-tcp-relay
+      --allowed-peer-ip=172.28.5.10
+      --denied-peer-ip=0.0.0.0-0.255.255.255
+      --denied-peer-ip=10.0.0.0-10.255.255.255
+      --denied-peer-ip=100.64.0.0-100.127.255.255
+      --denied-peer-ip=127.0.0.0-127.255.255.255
+      --denied-peer-ip=169.254.0.0-169.254.255.255
+      --denied-peer-ip=172.16.0.0-172.31.255.255
+      --denied-peer-ip=192.0.0.0-192.0.0.255
+      --denied-peer-ip=192.168.0.0-192.168.255.255
+      --denied-peer-ip=198.18.0.0-198.19.255.255
+      --denied-peer-ip=::1
+      --denied-peer-ip=::ffff:0.0.0.0-::ffff:255.255.255.255
+      --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+    ports:
+      # Loopback ONLY. A short 'HOST:CONTAINER' mapping binds 0.0.0.0 AND ::,
+      # which put a keyless DynamoDB, a minioadmin/minioadmin object store and
+      # a relay holding a published secret on every network this laptop joins.
+      - '127.0.0.1:3478:3478/udp'
+      - '127.0.0.1:3478:3478/tcp'
+    healthcheck:
+      test: ['CMD-SHELL', 'turnutils_stunclient 127.0.0.1 >/dev/null 2>&1 || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+# A PINNED subnet so the relay's own address is a constant the deny-list can
+# carve an exception for (see the coturn service). Docker would otherwise
+# assign a different bridge address on every recreate, and an --allowed-peer-ip
+# cannot name a moving target.
+networks:
+  default:
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.5.0/24

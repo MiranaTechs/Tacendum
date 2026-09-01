@@ -1,0 +1,74 @@
+apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+apply plugin: "com.facebook.react"
+
+// Codegen configuration (spec name, jsSrcsDir, javaPackageName) comes from
+// this module's package.json codegenConfig; the react plugin reads it in
+// library mode and inherits reactNativeDir/codegenDir from the app project.
+
+android {
+    namespace "com.miranatechnologies.tacendum.qr"
+    compileSdk rootProject.ext.compileSdkVersion
+    buildToolsVersion rootProject.ext.buildToolsVersion
+
+    defaultConfig {
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    testOptions {
+        // Robolectric reads the merged manifest and the generated
+        // com/android/tools/test_config.properties through this.
+        unitTests.includeAndroidResources = true
+        unitTests.all {
+            testLogging {
+                events "failed"
+                exceptionFormat "full"
+            }
+        }
+    }
+}
+
+dependencies {
+    implementation("com.facebook.react:react-android")
+
+    // zxing core (Apache-2.0). Encode AND decode, deliberately
+    // — NOT ML Kit and not the barcode scanner in Play Services: this app has
+    // no GMS dependency and is not acquiring one for a QR square. `core` only;
+    // `android-core`/`android-integration` add an activity-launching scanner
+    // this module replaces with its own CameraX analyzer.
+    implementation("com.google.zxing:core:3.5.4")
+
+    // CameraX for the live scan. camera-core/camera2 are the pipeline,
+    // camera-lifecycle binds it to the scanner activity's lifecycle so a
+    // backgrounded scanner releases the camera, and camera-view is PreviewView.
+    implementation("androidx.camera:camera-core:1.4.2")
+    implementation("androidx.camera:camera-camera2:1.4.2")
+    implementation("androidx.camera:camera-lifecycle:1.4.2")
+    implementation("androidx.camera:camera-view:1.4.2")
+
+    // ComponentActivity — a LifecycleOwner (which bindToLifecycle needs) and an
+    // ActivityResultCaller (which the runtime CAMERA request needs), without
+    // dragging in an AppCompat theme requirement for a full-bleed camera
+    // screen that has no action bar.
+    implementation("androidx.activity:activity:1.10.1")
+
+    // FileProvider, for the content:// share grant.
+    implementation("androidx.core:core:1.16.0")
+
+    testImplementation("junit:junit:4.13.2")
+    // Robolectric: the encode path ends in Bitmap/PNG and the decode path
+    // begins in BitmapFactory, so the determinism and bounds-refusal pins are
+    // claims about android.graphics and cannot be made on a bare JVM.
+    testImplementation("org.robolectric:robolectric:4.16.1")
+    testImplementation("androidx.test:core:1.6.1")
+}

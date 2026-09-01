@@ -1,0 +1,24 @@
+{
+  "note": "Vectors for authSignedBytes(). The Swift signer mirrors this by hand and cannot be checked at build time — verify against these on device.",
+  "domain": "tacendum-auth-v2",
+  "cases": [
+    {
+      "origin": "https://api.tacendum.com",
+      "normalizedOrigin": "https://api.tacendum.com",
+      "challengeB64": "Q0hBTExFTkdF",
+      "signedBytesHex": "746163656e64756d2d617574682d7632001868747470733a2f2f6170692e746163656e64756d2e636f6d4348414c4c454e4745"
+    },
+    {
+      "origin": "https://API.Tacendum.com:443/v1/",
+      "normalizedOrigin": "https://api.tacendum.com",
+      "challengeB64": "Q0hBTExFTkdF",
+      "signedBytesHex": "746163656e64756d2d617574682d7632001868747470733a2f2f6170692e746163656e64756d2e636f6d4348414c4c454e4745"
+    },
+    {
+      "origin": "http://localhost:8080",
+      "normalizedOrigin": "http://localhost:8080",
+      "challengeB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "signedBytesHex": "746163656e64756d2d617574682d76320015687474703a2f2f6c6f63616c686f73743a38303830000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    }
+  ]
+}

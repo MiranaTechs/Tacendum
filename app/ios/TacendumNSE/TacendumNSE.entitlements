@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Deliberately empty at this step.
+
+	  The App Group this extension will eventually need is the thing that
+	  requires a registered identifier on the developer account and a
+	  provisioning profile that carries it, and adding it here is the single
+	  most likely reason a first NSE build fails to sign. Proving the target
+	  builds, signs and embeds WITHOUT it first means a signing failure later
+	  has exactly one new cause instead of several.
+
+	  NOT `keychain-access-groups`, then or ever: this app's identity is a file
+	  in the container, not a Keychain item, and adding the extension to a
+	  Keychain access group would change the group of items that already exist
+	  — which is how the lock passcode becomes unreadable to the app that wrote
+	  it.
+	-->
+	<!--
+	  The one capability this extension does take, and the only way it can read
+	  anything the app knows.
+
+	  Byte-identical to the app's entry. A mismatch does not fail the build or
+	  the signing; it gives each target its own private container, so the
+	  extension opens an empty directory, finds no preference and no armed
+	  marker, and falls back to showing nothing. That failure looks exactly
+	  like "previews are turned off" and reports itself nowhere.
+	-->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.miranatechnologies.tacendum</string>
+	</array>
+	<!--
+	  The one way the platform lets this extension DROP a notification rather
+	  than rewrite it: with this entitlement, delivering empty content — no
+	  title, no body, no sound — presents nothing at all. It exists for
+	  exactly one branch, the blocked-sender guard in NotificationService: a
+	  blocked sender's ciphertext still earns a push (blocking is enforced on
+	  receipt, deliberately undetectable to them), and without suppression the
+	  block was audible — a generic banner and the default sound for every
+	  message they cared to fire. jest pins this key
+	  (nse.blocked.suppress.test.ts), so removing it is a conscious act.
+
+	  DISTRIBUTION NOTE, in the spirit of the App Group note above: this is
+	  an Apple-approved capability. The account holder requests it for the
+	  NSE's bundle id at developer.apple.com, and DEVICE signing fails with
+	  "provisioning profile doesn't include the … usernotifications.filtering
+	  entitlement" until the grant lands in the profile. Simulator builds are
+	  unaffected. If a device build is needed before the grant, delete this
+	  key AND amend the jest pin together; the Swift's empty delivery still
+	  kills the sound and the words on its own — only the bare app-name
+	  banner needs the entitlement to go.
+	-->
+	<!--
+	  the key is REMOVED, on the distribution note's own terms.
+	  Archiving for the App Store failed exactly as predicted above
+	  ("provisioning profile doesn't include the Notification (NSE) Filtering
+	  capability"), the capability request to Apple is filed, and shipping was
+	  chosen over waiting. Until the grant lands and this key returns, a
+	  blocked sender's message presents a bare app-name banner: the empty
+	  delivery in NotificationService still strips the sound and every word,
+	  and the sender still learns nothing. nse.blocked.suppress.test.ts pins
+	  THIS interim state now — re-adding the key must edit that pin back too,
+	  so the return is as conscious as the removal.
+	-->
+</dict>
+</plist>

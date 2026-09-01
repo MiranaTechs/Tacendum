@@ -1,0 +1,21 @@
+{
+  "name": "tacendum-attach",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Tacendum attach module: pick a document (size-capped before its bytes ever reach JS), one-shot location, and QuickLook preview of a received file. On-device only; nothing here touches the network.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "license": "AGPL-3.0-only",
+  "peerDependencies": {
+    "react": "*",
+    "react-native": "*"
+  },
+  "codegenConfig": {
+    "name": "AttachSpec",
+    "type": "modules",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.miranatechnologies.tacendum.attach"
+    }
+  }
+}

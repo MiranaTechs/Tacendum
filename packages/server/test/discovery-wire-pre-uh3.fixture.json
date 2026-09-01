@@ -1,0 +1,47 @@
+{
+  "note": "TRANSCRIBED and RE-CUT DELIBERATELY (the standing client-strict wire-compat rule: the app zod-.parse()es DTOs with no OTA, so every wire delta is server-first and the pre-change field sets are pinned by replay, never assumed). Authored against the landed previous lookup handler + DTO — no committed capture harness independently attests it, and both hit responses' member ULIDs are the replay rig's own seeded constants. What the replay genuinely pins: the landed {email} AND {phone} field sets parse to the identical objects under the one-of-THREE parallel-field schema (no `username` key materializes on either), JSON key order, the minimal-disclosure hit bytes, and the frozen collapsed-refusal miss bytes FOR THESE CAPTURED SHAPES against the CURRENT handler — with the username flag entirely ABSENT, so neither possession-class path rides a username-flag read. The RESPONSE bytes are asserted byte-identical to the earlier discovery fixture's (discovery-wire-pre-acp2.fixture.json) — the response DTO is untouched: no echo, the constant class literal unchanged. What it deliberately cannot show: unknown-key narrowing (none happened — the lookup wire was already .strict(); the {username} shapes and the two-or-three-fields malformed shapes are the NEW refinement's and have their own pinned cases in accounts-username-discovery.test.ts and packages/shared/test/username-dto.test.ts) or independent attestation of the previous build.",
+  "email": {
+    "hit": {
+      "body": "{\"email\":\"capture.owner@example.com\"}",
+      "parsed": {
+        "email": "capture.owner@example.com"
+      },
+      "response": {
+        "statusCode": 200,
+        "body": "{\"members\":[{\"userId\":\"01CAPTUREOWNER0000000000A1\",\"class\":\"phone\"}],\"rosterVersion\":1}"
+      }
+    },
+    "miss": {
+      "body": "{\"email\":\"capture.miss@example.com\"}",
+      "parsed": {
+        "email": "capture.miss@example.com"
+      },
+      "response": {
+        "statusCode": 403,
+        "body": "{\"error\":{\"code\":\"accounts_refused\",\"detail\":\"not available\"}}"
+      }
+    }
+  },
+  "phone": {
+    "hit": {
+      "body": "{\"phone\":\"+15555550100\"}",
+      "parsed": {
+        "phone": "+15555550100"
+      },
+      "response": {
+        "statusCode": 200,
+        "body": "{\"members\":[{\"userId\":\"01CAPTUREPHONEOWNER00000A1\",\"class\":\"phone\"}],\"rosterVersion\":1}"
+      }
+    },
+    "miss": {
+      "body": "{\"phone\":\"+15555550199\"}",
+      "parsed": {
+        "phone": "+15555550199"
+      },
+      "response": {
+        "statusCode": 403,
+        "body": "{\"error\":{\"code\":\"accounts_refused\",\"detail\":\"not available\"}}"
+      }
+    }
+  }
+}

@@ -1,0 +1,47 @@
+apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+apply plugin: "com.facebook.react"
+
+// Codegen configuration (spec name, jsSrcsDir, javaPackageName) comes from
+// this module's package.json codegenConfig; the react plugin reads it in
+// library mode and inherits reactNativeDir/codegenDir from the app project.
+
+android {
+    namespace "com.miranatechnologies.tacendum.attach"
+    compileSdk rootProject.ext.compileSdkVersion
+    buildToolsVersion rootProject.ext.buildToolsVersion
+
+    defaultConfig {
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    testOptions {
+        unitTests.all {
+            testLogging {
+                events "failed"
+                exceptionFormat "full"
+            }
+        }
+    }
+}
+
+dependencies {
+    implementation("com.facebook.react:react-android")
+    // androidx.core — AOSP, not GMS, which is the whole reason it is here:
+    // LocationManagerCompat.getCurrentLocation covers the minSdk-26..29 gap
+    // that the framework's own API-30 getCurrentLocation leaves open, without
+    // a hand-rolled fallback and without pulling Play Services into the tree.
+    // ContextCompat's permission check comes along in the same artifact.
+    implementation("androidx.core:core:1.13.1")
+    testImplementation("junit:junit:4.13.2")
+}

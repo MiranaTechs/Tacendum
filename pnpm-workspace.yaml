@@ -1,0 +1,31 @@
+packages:
+  - packages/*
+  - app
+  - app/modules/*
+# Metro (React Native's bundler) cannot follow pnpm's symlinked store. Hoist so
+# the app can resolve modules. NOTE: must live here, not .npmrc — pnpm 11 only
+# reads auth/registry settings from .npmrc and silently ignores node-linker.
+nodeLinker: hoisted
+allowBuilds:
+  # esbuild ships a platform binary via a postinstall; tsx and vitest need it.
+  esbuild: true
+  # libsignal's postinstall wires up its prebuilt native module (node-gyp-build).
+  '@signalapp/libsignal-client': true
+minimumReleaseAgeExclude:
+  - '@signalapp/libsignal-client@0.100.0'
+  - react-native-dotenv@4.1.1
+
+# Transitive advisories that are safe to force: every one of these is a
+# PATCH bump inside the major the tree already resolves, so nothing changes
+# API. The two remaining advisories (image-size, fast-xml-parser) need major
+# bumps into Metro's asset pipeline and the React Native CLI; they are
+# build-time only and are accepted with reasoning in SECURITY.md rather than
+# forced here, because breaking the bundler to silence a DoS advisory about
+# the developer's own files is a bad trade.
+overrides:
+  brace-expansion@<1.1.18: '1.1.18'
+  brace-expansion@>=5.0.0 <5.0.9: '5.0.9'
+  js-yaml@<3.15.1: '3.15.1'
+  js-yaml@>=4.0.0 <4.3.1: '4.3.1'
+  nanoid@<3.3.17: '3.3.17'
+  postcss@<8.5.23: '8.5.23'

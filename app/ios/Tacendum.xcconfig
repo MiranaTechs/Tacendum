@@ -1,0 +1,41 @@
+// Project-level base configuration. COMMITTED, and it must be.
+//
+// WHY THIS FILE IS IN GIT WHEN IT USED TO BE IGNORED. It was gitignored so the
+// Apple Team ID would never enter the repository. That protected the value and
+// broke the build: Xcode resolves a base-configuration reference when it
+// constructs the build description, so a MISSING FILE is a hard error before a
+// single source file compiles —
+//
+//     error: Unable to open base configuration reference file
+//            '.../app/ios/Tacendum.xcconfig'
+//
+// — twice, once per project-level configuration, exit 65. A fresh clone could
+// not build the app or the extension AT ALL, which would mean the published
+// tree was not Corresponding Source: a stranger cannot rebuild what we ship.
+// Found by building from a clean clone.
+//
+// The repo only ever needed to withhold the VALUE, not the FILE. So this file
+// ships with an empty default and pulls the real value from a gitignored
+// sibling.
+//
+// HOW THE DOCUMENTED BEHAVIOUR STAYED WRONG. Tacendum.xcconfig.example claimed
+// a missing file left Simulator builds working, citing `xcodebuild
+// -showBuildSettings` as proof. That command TOLERATES a missing
+// base-configuration reference and simply omits the setting; `xcodebuild build`
+// does not. The claim was verified with the one command incapable of detecting
+// the failure, and every local build hid it because the ignored file existed on
+// this disk.
+//
+// ORDER IS LOAD-BEARING. xcconfig is last-match-wins, so the empty default MUST
+// come first and the include second. Reversed, the empty default clobbers the
+// local team ID, `-showBuildSettings` prints nothing for DEVELOPMENT_TEAM,
+// Simulator builds still succeed, and device signing breaks invisibly — the
+// same class of silent failure this file exists to end.
+
+// Apple Developer Team ID. Empty here, on purpose: a clean clone builds to the
+// Simulator and fails a DEVICE build loudly.
+TACENDUM_DEVELOPMENT_TEAM =
+
+// The real value, if this machine has been set up. `#include?` is the optional
+// form — absent file, no error.
+#include? "Tacendum.local.xcconfig"

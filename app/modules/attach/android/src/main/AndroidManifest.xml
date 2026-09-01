@@ -1,0 +1,42 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      COARSE only. Hundred-metre accuracy is what sharing a place needs,
+      and FINE would be asking for more than the feature uses. Declared by the
+      module that reads it, so the permission travels with the code and a
+      build without this module carries neither.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <application>
+
+        <!--
+          The in-app previewer.
+
+          exported=false   nothing outside this app can launch it, so the only
+                           way to a preview is through the module.
+          configChanges    keeps the ordinary rotations from destroying and
+                           recreating the activity, which is the one lifecycle
+                           path where the delete-on-dismiss could race a
+                           reopen.
+
+          The launch mode is deliberately left at `standard` and `noHistory`
+          is deliberately absent: both would break `startActivityForResult`
+          (a singleTask activity lands in another task, and a noHistory one
+          never returns a result), and the result is how the module learns the
+          presentation ended and releases its one-at-a-time guard.
+
+          Screenshots and the recents thumbnail are handled by FLAG_SECURE,
+          set in onCreate before the first frame — there is no manifest
+          attribute for it, and `excludeFromRecents` would not help here in
+          any case because it applies to a task's root activity, which this
+          is not.
+        -->
+        <activity
+            android:name=".PreviewActivity"
+            android:exported="false"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode" />
+
+    </application>
+
+</manifest>

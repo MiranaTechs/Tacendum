@@ -1,0 +1,122 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      THE CALL MODULE'S OWN MANIFEST.
+
+      A library manifest merges into the application's, so every declaration
+      below is the same declaration wherever it is written — and keeping it
+      here means the permissions and components travel with the code that
+      needs them: a build that drops this module drops its microphone, its
+      camera, its Telecom registration and its call notifications too. The
+      audio module's RECORD_AUDIO line proved the merge.
+
+      RECORD_AUDIO is declared here as well as in the audio module. That is
+      not an oversight and not a conflict — the merger collapses duplicate
+      `uses-permission` elements — it is the same principle applied twice:
+      two modules open the microphone, so two modules say so.
+    -->
+
+    <!-- Telecom: a self-managed ConnectionService needs exactly this. -->
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+
+    <!-- The two sensors a call uses. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!--
+      libwebrtc's OWN requirement, and it is not optional: without it the
+      process ABORTS the first time a peer connection is created.
+
+      `PeerConnectionFactory` starts `NetworkMonitor` on its network thread,
+      which constructs `NetworkMonitorAutoDetect` and calls
+      `ConnectivityManager.getActiveNetworkInfo()`. Unheld, that throws
+      SecurityException — and libwebrtc's JNI helper
+      (sdk/android/src/jni/jni_generator_helper.h:105) treats a pending Java
+      exception as fatal: `Check failed: !env->ExceptionCheck()` and SIGABRT,
+      from a thread no `try` on our side can reach. Measured on the emulator
+      in the first loopback-call run: the app died ~40 ms
+      after `PeerConnectionFactory: onNetworkThreadReady`, before a single
+      line of the call module's own Kotlin ran, and it would have died
+      identically on every real call on every device.
+
+      Nothing above the `.so` could have caught it. The permission is a
+      NORMAL one (install-time, no runtime grant, no prompt), so its absence
+      costs nothing anywhere except inside libwebrtc — which is exactly why
+      it belongs beside the module that links libwebrtc rather than in the
+      application manifest, where "who needs this?" has no answer.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!--
+      The foreground service and its three types. From Android 14 a service
+      must declare the type it runs as, and the type must be declared here as
+      a permission too; `camera` is asserted at runtime only for a video call
+      (see CallForegroundService), but the manifest is a superset of what any
+      run may use.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+
+    <!--
+      The ring. A self-managed connection shows no system UI, so the
+      full-screen intent IS the incoming-call screen — without
+      USE_FULL_SCREEN_INTENT it degrades to a heads-up banner and a locked
+      phone never rings. POST_NOTIFICATIONS is the runtime half from API 33.
+    -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+      Bluetooth headsets, from API 31, for the route matrix: without it
+      `availableCommunicationDevices` cannot see a connected headset and the
+      "never yank an accessory" rule has nothing to read.
+    -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_CONNECT"
+        android:minSdkVersion="31" />
+
+    <!-- A voice call is still a call on a device with no camera. -->
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.microphone"
+        android:required="false" />
+
+    <application>
+
+        <!--
+          FULLY QUALIFIED NAMES, deliberately. A library manifest's
+          `android:name=".Foo"` resolves against the APPLICATION's package,
+          not the library's, and the failure mode is a component the system
+          cannot instantiate: a ConnectionService that never binds and a call
+          that never rings.
+        -->
+        <service
+            android:name="com.miranatechnologies.tacendum.call.TacendumConnectionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE">
+            <intent-filter>
+                <action android:name="android.telecom.ConnectionService" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name="com.miranatechnologies.tacendum.call.CallForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="phoneCall|microphone|camera" />
+
+        <!--
+          Answer and Decline from the ring's own buttons. NOT exported: an
+          exported receiver here would let any app on the device answer or
+          decline this device's calls.
+        -->
+        <receiver
+            android:name="com.miranatechnologies.tacendum.call.CallActionReceiver"
+            android:exported="false" />
+
+    </application>
+
+</manifest>

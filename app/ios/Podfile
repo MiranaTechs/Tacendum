@@ -1,0 +1,158 @@
+# Resolve react_native_pods.rb with node to allow for hoisting
+require Pod::Executable.execute_command('node', ['-p',
+  'require.resolve(
+    "react-native/scripts/react_native_pods.rb",
+    {paths: [process.argv[1]]},
+  )', __dir__]).strip
+
+platform :ios, min_ios_version_supported
+prepare_react_native_project!
+
+# LibSignalClient — Signal's official Swift client, libsignal 0.98.0.
+#
+# The server and CLI pin @signalapp/libsignal-client 0.100.0. That skew is
+# deliberate and safe, not an oversight to be "fixed" by bumping this:
+#
+#   - iOS talks to the CLI as a real Signal-protocol peer (PreKeyBundle,
+#     PreKeySignalMessage, SignalMessage). Across 0.98.0..0.100.0 the wire is
+#     unchanged — wire.proto, storage.proto and sealed_sender.proto are
+#     byte-identical, and so are the version constants that govern framing
+#     (CIPHERTEXT_MESSAGE_CURRENT_VERSION 4, PRE_KYBER 3, SENDERKEY 3).
+#   - The server is not a protocol participant at all: its only libsignal call
+#     is deserializing a 33-byte curve25519 PublicKey to check a signature.
+#
+# So the two surfaces are independent by construction. Bumping this pin would
+# be a full native rebuild of the crypto core for no behavioural gain; if you
+# ever do bump it, re-verify those protos and constants first.
+#
+# The pod's build phase downloads a prebuilt libsignal_ffi.a and verifies it
+# against this checksum (from the v0.98.0 release asset
+# libsignal-client-ios-build-v0.98.0.tar.gz.sha256). The value lives HERE, in
+# our git, not in the upstream checkout — upstream's podspec reads it via
+# ENV.fetch('LIBSIGNAL_FFI_PREBUILD_CHECKSUM', '') — and bin/fetch_archive.py
+# enforces it fail-closed with a hard assert.
+ENV['LIBSIGNAL_FFI_PREBUILD_CHECKSUM'] =
+  '97162a86c7af3f1c525ee8657284d6b78531709e19eb6ed63a40b173a70fb394'
+
+# LibSignalClient is a Swift pod and cannot build as a plain static library;
+# static linkage keeps Hermes/RN pods happy.
+use_frameworks! :linkage => :static
+
+target 'Tacendum' do
+  config = use_native_modules!
+
+  # Pinned by COMMIT, not by tag. This is v0.98.0's commit (annotated tag
+  # a64cacfa46b951b2fe75f1eca23d4756f2b33718 dereferences to it) — same bytes,
+  # different guarantee. A tag is a mutable ref: upstream can repoint it and
+  # CocoaPods will fetch whatever it now names. That would swap not only the 130+
+  # Swift binding files that marshal private keys across the FFI boundary, but
+  # bin/fetch_archive.py — the script that enforces LIBSIGNAL_FFI_PREBUILD_CHECKSUM
+  # above. A moved tag could delete that assert and void the FFI pin entirely,
+  # while leaving LibSignalClient.podspec byte-identical so SPEC CHECKSUMS in
+  # Podfile.lock never moves and `git diff` shows nothing. app/ios/Pods/ is
+  # gitignored, so a clean `pod install` re-fetches all of it.
+  #
+  # Declared again for TacendumNSE below; BOTH arms must stay on the commit.
+  pod 'LibSignalClient',
+      :git => 'https://github.com/signalapp/libsignal.git',
+      :commit => '8e49f09bbcdebc3c820bda2a788828f62db0e898'
+
+  use_react_native!(
+    :path => config[:reactNativePath],
+    # An absolute path to your application root.
+    :app_path => "#{Pod::Config.instance.installation_root}/..",
+    # Privacy-manifest aggregation is OFF, deliberately. When it is on (the RN
+    # default), every `pod install` runs add_aggregated_privacy_manifest,
+    # which round-trips ../Tacendum/PrivacyInfo.xcprivacy through
+    # Xcodeproj::Plist — a parse that cannot represent XML comments — and
+    # writes it back unconditionally. That silently deletes every rationale
+    # block in the manifest (the retention rationale, the token-TTL
+    # decision record, the per-declaration justifications): the only record of
+    # WHY each App Store declaration exists, lost as a formatting diff.
+    #
+    # Nothing is lost by turning it off: the manifest already carries the
+    # UNION of every required-reason API our pods declare (FileTimestamp
+    # C617.1 + 3B52.1, UserDefaults CA92.1, SystemBootTime 35F9.1 — verified
+    # against every pod resource-bundle manifest). With the flag off,
+    # RN's fallback only writes a manifest when none exists, so ours is never
+    # touched again. The cost: a FUTURE pod declaring a NEW required-reason
+    # API no longer auto-merges — add its reason code to PrivacyInfo.xcprivacy
+    # BY HAND. privacy.manifest.integrity.test.ts pins the exact declared set
+    # (so the drift is loud either way), and podfile.privacy.suppression.test.ts
+    # guards this flag itself.
+    :privacy_file_aggregation_enabled => false
+  )
+
+  post_install do |installer|
+    react_native_post_install(
+      installer,
+      config[:reactNativePath],
+      :mac_catalyst_enabled => false,
+      # :ccache_enabled => true
+    )
+    # LibSignalClient does not support Xcode 26 explicit modules
+    # (swift/README step 4).
+    installer.pods_project.targets.each do |target|
+      target.build_configurations.each do |config|
+        config.build_settings['SWIFT_ENABLE_EXPLICIT_MODULES'] = 'NO'
+      end
+    end
+
+    # With static frameworks, the LibSignalClient pod never runs a link step,
+    # so the prebuilt libsignal_ffi.a (extracted by its script phase into
+    # $(OBJROOT)/Pods.build/libsignal_ffi) must be linked into the app binary.
+    # Mirror the podspec's CARGO_BUILD_TARGET arch mapping at the app level and
+    # append the archive to the app's linker flags.
+    ffi_settings = <<~XCCONFIG
+
+      // Link the prebuilt libsignal FFI static library into the app
+      // (extracted by the LibSignalClient pod's script phase).
+      // NOTE: when several conditional assignments match, the LAST one wins —
+      // the wildcard arch line must come before the arm64-specific one.
+      CARGO_BUILD_TARGET[sdk=iphonesimulator*][arch=*] = x86_64-apple-ios
+      CARGO_BUILD_TARGET[sdk=iphonesimulator*][arch=arm64] = aarch64-apple-ios-sim
+      CARGO_BUILD_TARGET[sdk=iphoneos*] = aarch64-apple-ios
+      CARGO_BUILD_TARGET[sdk=iphoneos*][arch=arm64e] = arm64e-apple-ios
+      LIBSIGNAL_FFI_APP_LINK = $(OBJROOT)/Pods.build/libsignal_ffi/target/$(CARGO_BUILD_TARGET)/release/libsignal_ffi.a
+    XCCONFIG
+    installer.aggregate_targets.each do |aggregate_target|
+      aggregate_target.user_build_configurations.each_key do |config_name|
+        xcconfig_path = aggregate_target.xcconfig_path(config_name)
+        next unless File.exist?(xcconfig_path)
+        text = File.read(xcconfig_path)
+        next if text.include?('LIBSIGNAL_FFI_APP_LINK')
+        text = text.sub(/^(OTHER_LDFLAGS = .*)$/, '\1 $(LIBSIGNAL_FFI_APP_LINK)')
+        text << ffi_settings
+        File.write(xcconfig_path, text)
+      end
+    end
+  end
+end
+
+# The notification-service extension.
+#
+# A SIBLING of 'Tacendum', not a target nested inside it. A nested target
+# inherits `:complete` by default, which would pull React Native, Hermes and
+# every RN pod into an extension that must never boot a JS runtime — an
+# extension gets ~24 MB of dirty memory and is killed without ceremony when it
+# exceeds that. As a sibling it inherits nothing and takes exactly one pod.
+#
+# LibSignalClient is duplicated rather than shared because there is nothing to
+# share: two independent targets each declaring the dependency is how CocoaPods
+# expresses this, and the prebuilt libsignal_ffi.a is extracted once into
+# $(OBJROOT) and linked by both.
+#
+# The global `post_install` hook above applies to this target's aggregate
+# xcconfig too — it loops over every aggregate target — so the extension gets
+# the same LIBSIGNAL_FFI_APP_LINK wiring the app does. That is required, not
+# incidental: with static frameworks the pod never runs a link step, so
+# whichever binary uses libsignal has to link the archive itself.
+target 'TacendumNSE' do
+  # Commit pin, same commit as the app target above (v0.98.0's). Keep these two
+  # in lockstep: pinning only the app target still leaves the extension fetching
+  # from a movable ref, and the extension decrypts payloads with the same
+  # libsignal. See the app target for why a tag is not good enough here.
+  pod 'LibSignalClient',
+      :git => 'https://github.com/signalapp/libsignal.git',
+      :commit => '8e49f09bbcdebc3c820bda2a788828f62db0e898'
+end

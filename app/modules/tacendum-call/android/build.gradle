@@ -1,0 +1,72 @@
+apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+apply plugin: "com.facebook.react"
+
+// Codegen configuration (spec name, jsSrcsDir, javaPackageName) comes from
+// this module's package.json codegenConfig; the react plugin reads it in
+// library mode and inherits reactNativeDir/codegenDir from the app project.
+
+android {
+    namespace "com.miranatechnologies.tacendum.call"
+    compileSdk rootProject.ext.compileSdkVersion
+    buildToolsVersion rootProject.ext.buildToolsVersion
+
+    defaultConfig {
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+    }
+
+    // BuildConfig.DEBUG is the Kotlin stand-in for Swift's `#if DEBUG`.
+    // It is not the same guarantee — the classes
+    // still compile into a Release APK, which SyntheticVideoCapturer and
+    // FingerprintFault both say out loud — but it is what disconnects the
+    // synthetic camera and the fingerprint fault from every non-debug build.
+    // AGP 8 defaults this feature OFF, so without this line the constant does
+    // not exist and the guards would not compile.
+    buildFeatures {
+        buildConfig true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    testOptions {
+        unitTests.all {
+            testLogging {
+                events "failed"
+                exceptionFormat "full"
+            }
+        }
+    }
+}
+
+dependencies {
+    implementation("com.facebook.react:react-android")
+
+    // libwebrtc, as the Jitsi Android build of M124 — the SAME upstream this
+    // repo already pulls in for the JS side (react-native-webrtc 124.0.8
+    // declares `api 'org.jitsi:webrtc:124.+'`, and the iOS half of the call
+    // module builds against JitsiWebRTC 124.0.2). Pinned to the exact version
+    // rather than the `124.+` range that dependency carries: a range resolves
+    // differently on two machines and the codec list is the SDP, so "it
+    // negotiated a different codec on my laptop" is a debugging session nobody
+    // needs. Nothing here is a new cryptographic dependency — DTLS-SRTP is
+    // a sanctioned primitive, and the fingerprint that keys it is
+    // authenticated through libsignal before this library ever sees it.
+    implementation("org.jitsi:webrtc:124.0.0")
+
+    // androidx.core (AOSP, not GMS — the recorded posture): NotificationCompat
+    // for the full-screen-intent ring, ServiceCompat for the typed
+    // startForeground call, and ContextCompat for the permission check and the
+    // API-33 RECEIVER_NOT_EXPORTED broadcast registration, each with one
+    // spelling across the minSdk-26..targetSdk-36 range this module covers.
+    implementation("androidx.core:core:1.13.1")
+
+    testImplementation("junit:junit:4.13.2")
+}

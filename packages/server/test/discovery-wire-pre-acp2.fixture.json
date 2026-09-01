@@ -1,0 +1,23 @@
+{
+  "note": "TRANSCRIBED (the same honesty as the recovery wire fixture): authored against the landed previous lookup handler + DTO — no committed capture harness independently attests it, and the hit response's member ULID is the replay rig's own seeded constant. What the replay genuinely pins: the landed {email} field set parses to the identical object under the parallel-field schema, JSON key order, the minimal-disclosure hit bytes, and the frozen collapsed-refusal miss bytes FOR THESE CAPTURED SHAPES against the CURRENT handler — with the phone flag entirely ABSENT, so the email path demonstrably rides no phone-flag read. What it deliberately cannot show: unknown-key narrowing (none happened here — the landed lookup wire was ALREADY .strict(); the both-fields / neither-field / batch malformed shapes are the NEW refinement's and have their own pinned cases in accounts-phone-discovery.test.ts) or independent attestation of the previous build.",
+  "hit": {
+    "body": "{\"email\":\"capture.owner@example.com\"}",
+    "parsed": {
+      "email": "capture.owner@example.com"
+    },
+    "response": {
+      "statusCode": 200,
+      "body": "{\"members\":[{\"userId\":\"01CAPTUREOWNER0000000000A1\",\"class\":\"phone\"}],\"rosterVersion\":1}"
+    }
+  },
+  "miss": {
+    "body": "{\"email\":\"capture.miss@example.com\"}",
+    "parsed": {
+      "email": "capture.miss@example.com"
+    },
+    "response": {
+      "statusCode": 403,
+      "body": "{\"error\":{\"code\":\"accounts_refused\",\"detail\":\"not available\"}}"
+    }
+  }
+}

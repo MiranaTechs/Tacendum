@@ -1,0 +1,97 @@
+{
+  "note": "PinHash pin/salt\u2192accessKey parity vectors for registration-lock verification; NFKC divergence between platforms has no other detector. Layout per case: pin (JSON string, non-ASCII \\u-escaped; raw bytes pinned by pinUtf8Hex), 32-byte salt (hex + base64), accessKey exactly as the shipped iOS pinVerifier returns it (base64; hex mirrors it): NFKC via precomposedStringWithCompatibilityMapping, then libsignal PinHash(normalizedPin:salt:) [the SVR1 salt path], then .accessKey. Generated FROM THE iOS SIDE (from the proven side, never from the implementation under test \u2014 the blobvectors pattern) with the app's own pinned LibSignalClient pod sources. normalizedPinUtf8Hex records Swift's NFKC output so Android can check java.text.Normalizer NFKC string parity separately from the Argon2 result. Cases with nfkcEqualsCase MUST produce the accessKey of their named twin (same salt) \u2014 each such pair is a normalization detector, and the generator proves raw un-normalized bytes hash differently. Consumer: the Android parity suite, via org.signal.libsignal.svr2.PinHash.svr1(pin, salt).accessKey(). The suite must refuse to certify parity if provenance.iosSide is not true.",
+  "provenance": {
+    "iosSide": true,
+    "generator": "the app's pinned iOS LibSignalClient implementation",
+    "libSignalClientPod": "0.98.0"
+  },
+  "cases": [
+    {
+      "name": "ascii-4-digit",
+      "pin": "1234",
+      "pinUtf8Hex": "31323334",
+      "normalizedPinUtf8Hex": "31323334",
+      "saltHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "saltB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "accessKeyB64": "62nR7PQmoe/aUH245pXO/ooGH/5ihyy7lLBGUMB2s/Q=",
+      "accessKeyHex": "eb69d1ecf426a1efda507db8e695cefe8a061ffe62872cbb94b04650c076b3f4"
+    },
+    {
+      "name": "ascii-6-digit",
+      "pin": "092461",
+      "pinUtf8Hex": "303932343631",
+      "normalizedPinUtf8Hex": "303932343631",
+      "saltHex": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+      "saltB64": "paWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaU=",
+      "accessKeyB64": "CTPzFZx8BxF0rHblv+wPyXvlYUfcWUYlC2yQ8hcwpII=",
+      "accessKeyHex": "0933f3159c7c071174ac76e5bfec0fc97be56147dc5946250b6c90f21730a482"
+    },
+    {
+      "name": "ascii-passphrase",
+      "pin": "correct horse battery staple",
+      "pinUtf8Hex": "636f727265637420686f727365206261747465727920737461706c65",
+      "normalizedPinUtf8Hex": "636f727265637420686f727365206261747465727920737461706c65",
+      "saltHex": "fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0",
+      "saltB64": "//79/Pv6+fj39vX08/Lx8O/u7ezr6uno5+bl5OPi4eA=",
+      "accessKeyB64": "6U3RpTrjy1YB+7xFaMymh7xdlGrsBJuIoHat6PbNwYg=",
+      "accessKeyHex": "e94dd1a53ae3cb5601fbbc4568cca687bc5d946aec049b88a076ade8f6cdc188",
+      "note": "spaces and lowercase ASCII survive NFKC unchanged"
+    },
+    {
+      "name": "nfkc-fullwidth-digits",
+      "pin": "\uff11\uff12\uff13\uff14",
+      "pinUtf8Hex": "efbc91efbc92efbc93efbc94",
+      "normalizedPinUtf8Hex": "31323334",
+      "saltHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "saltB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "accessKeyB64": "62nR7PQmoe/aUH245pXO/ooGH/5ihyy7lLBGUMB2s/Q=",
+      "accessKeyHex": "eb69d1ecf426a1efda507db8e695cefe8a061ffe62872cbb94b04650c076b3f4",
+      "nfkcEqualsCase": "ascii-4-digit",
+      "note": "U+FF11..U+FF14 FULLWIDTH DIGITs; NFKC maps them to ASCII 1234, so this case MUST equal ascii-4-digit \u2014 an implementation that skips NFKC hashes the raw ef-bc-xx bytes and diverges"
+    },
+    {
+      "name": "nfkc-fi-ligature",
+      "pin": "\ufb01re1978",
+      "pinUtf8Hex": "efac81726531393738",
+      "normalizedPinUtf8Hex": "6669726531393738",
+      "saltHex": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+      "saltB64": "paWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaU=",
+      "accessKeyB64": "qUR2t2xKnGxCZlXPCxr2EoS58k4YiNa4jsrsNYah5t0=",
+      "accessKeyHex": "a94476b76c4a9c6c426655cf0b1af61284b9f24e1888d6b88ecaec3586a1e6dd",
+      "nfkcEqualsCase": "ascii-fi-expansion",
+      "note": "U+FB01 LATIN SMALL LIGATURE FI; NFKC expands it to 'fi' (a compatibility mapping NFC does NOT perform), so this MUST equal ascii-fi-expansion \u2014 an NFC-only implementation diverges here"
+    },
+    {
+      "name": "ascii-fi-expansion",
+      "pin": "fire1978",
+      "pinUtf8Hex": "6669726531393738",
+      "normalizedPinUtf8Hex": "6669726531393738",
+      "saltHex": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+      "saltB64": "paWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaU=",
+      "accessKeyB64": "qUR2t2xKnGxCZlXPCxr2EoS58k4YiNa4jsrsNYah5t0=",
+      "accessKeyHex": "a94476b76c4a9c6c426655cf0b1af61284b9f24e1888d6b88ecaec3586a1e6dd"
+    },
+    {
+      "name": "nfkc-decomposed-e-acute",
+      "pin": "cafe\u03011955",
+      "pinUtf8Hex": "63616665cc8131393535",
+      "normalizedPinUtf8Hex": "636166c3a931393535",
+      "saltHex": "fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0",
+      "saltB64": "//79/Pv6+fj39vX08/Lx8O/u7ezr6uno5+bl5OPi4eA=",
+      "accessKeyB64": "6/yAd4Tb1cprJ0I7YJlKOPpR1g39hN3fzTgVJi0tD4I=",
+      "accessKeyHex": "ebfc807784dbd5ca6b27423b60994a38fa51d60dfd84dddfcd3815262d2d0f82",
+      "nfkcEqualsCase": "nfc-precomposed-e-acute",
+      "note": "e + U+0301 COMBINING ACUTE; NFKC composes to U+00E9, so this MUST equal nfc-precomposed-e-acute \u2014 an implementation that skips normalization (or uses NFKD) diverges"
+    },
+    {
+      "name": "nfc-precomposed-e-acute",
+      "pin": "caf\u00e91955",
+      "pinUtf8Hex": "636166c3a931393535",
+      "normalizedPinUtf8Hex": "636166c3a931393535",
+      "saltHex": "fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0",
+      "saltB64": "//79/Pv6+fj39vX08/Lx8O/u7ezr6uno5+bl5OPi4eA=",
+      "accessKeyB64": "6/yAd4Tb1cprJ0I7YJlKOPpR1g39hN3fzTgVJi0tD4I=",
+      "accessKeyHex": "ebfc807784dbd5ca6b27423b60994a38fa51d60dfd84dddfcd3815262d2d0f82"
+    }
+  ]
+}

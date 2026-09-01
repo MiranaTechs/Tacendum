@@ -1,0 +1,167 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+      Runtime permissions, both dangerous, both asked for at the moment they
+      are used and never at launch:
+
+      CAMERA   the live QR scanner. Refusing it is a
+               normal outcome — the scanner settles with no id and the
+               still-image path still works — so nothing here is load-bearing
+               for the app starting.
+      RECORD_AUDIO  voice notes and calls. Declared once so the two
+               features that need it do not each have to reopen this file; a
+               declared-but-unused dangerous permission prompts nobody, because
+               Android only asks when the code asks.
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!--
+      AND THE HARDWARE THOSE PERMISSIONS OTHERWISE DEMAND.
+      Google Play reads a bare CAMERA or RECORD_AUDIO permission as "this app
+      REQUIRES that hardware" and filters the listing off every device without
+      it — so without these two lines the store quietly narrows the audience by
+      a rule nobody wrote down, which is the opposite of what either permission
+      means here. Neither is load-bearing: refusing the camera leaves the
+      still-image QR path, and a device with no microphone can still read and
+      send messages. `required="false"` says exactly that, and Android lint
+      treats the camera half as an ERROR rather than a warning
+      (PermissionImpliesUnsupportedChromeOsHardware) — found by the
+      `:app:check` leg of the release verification script.
+    -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!--
+      BACKGROUND DELIVERY. In a build without FCM wired, the websocket is the
+      delivery path, and a process is only allowed to keep one up while it is
+      away if it holds a foreground service. `remoteMessaging` is the type
+      that says which capability is being held, and from Android 14 the type
+      needs its own permission beside the general one.
+
+      POST_NOTIFICATIONS is the runtime half from API 33: refusing it costs
+      the banners and the ongoing "Connected" notification, never delivery.
+      The call module declares it too — the manifest merger collapses
+      duplicate `uses-permission` elements, and two parts of the app that put
+      something on the screen both say so.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+      android:name=".MainApplication"
+      android:label="@string/app_name"
+      android:icon="@mipmap/ic_launcher"
+      android:roundIcon="@mipmap/ic_launcher_round"
+      android:allowBackup="false"
+      android:fullBackupContent="@xml/backup_rules"
+      android:dataExtractionRules="@xml/data_extraction_rules"
+      android:theme="@style/AppTheme"
+      android:usesCleartextTraffic="${usesCleartextTraffic}"
+      android:supportsRtl="true">
+      <!--
+        `density` IS IN configChanges ON MEASURED EVIDENCE (a resizable
+        API 35 emulator, folding between panel sizes).
+        A density change is the config bit a real fold's inner↔outer panel
+        move delivers — the two panels are different densities — and without
+        the flag it RELAUNCHED this activity: the React tree remounted
+        (exactly one remount per `wm density` flip, three flips measured) and
+        the hand-rolled router's `useState` route was DROPPED mid-flow, a
+        live `calls` route reset to `chats` under a green suite. A
+        posture/display-size-only change was already absorbed by the declared
+        list. Declared here, the change reaches onConfigurationChanged and
+        React Native re-reads its dimensions in place; a fold-continuity
+        check (route asserted intact over CDP across a posture move and a
+        density flip on a fold emulator) is the standing re-demonstration.
+      -->
+      <activity
+        android:name=".MainActivity"
+        android:label="@string/app_name"
+        android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|density"
+        android:launchMode="singleTask"
+        android:windowSoftInputMode="adjustResize"
+        android:exported="true">
+        <intent-filter>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent-filter>
+      </activity>
+
+      <!--
+        The service that holds the socket. The fully qualified class name is
+        written out here rather than abbreviated so device verification can
+        assert it in `dumpsys` output: this is the string the check greps.
+
+        NOT exported: nothing outside this app may start or stop the thing
+        that decides whether this phone is reachable.
+      -->
+      <service
+        android:name="com.miranatechnologies.tacendum.messaging.MessagingForegroundService"
+        android:exported="false"
+        android:foregroundServiceType="remoteMessaging" />
+
+      <!--
+        THE FCM ENTRY POINT — declared always, ALIVE only
+        in a build with Firebase wired.
+
+        The class itself lives in `src/play/`, which app/build.gradle compiles
+        ONLY when `google-services.json` exists; `tacendumFcmEnabled` is set
+        from the same file-presence check, so in an unwired build this element
+        names a class that is both absent from the APK and disabled here —
+        nothing can instantiate it, and the only sender of MESSAGING_EVENT is
+        a firebase runtime the unwired build does not contain. Declared in
+        this manifest rather than a conditional one because a manifest that
+        appears and disappears with a file is a manifest nobody can review;
+        the placeholder is the one conditional, and build.gradle documents its
+        source of truth. `tools:ignore="MissingClass"` is for exactly the
+        unwired state: lint cannot see a source set that is not in the build.
+
+        NOT exported, no permission granted to anyone: FCM delivers through
+        Google Play services binding as this app, and nothing else may start
+        the thing that decides when this phone rings.
+      -->
+      <service
+        android:name="com.miranatechnologies.tacendum.push.TacendumFcmService"
+        android:enabled="${tacendumFcmEnabled}"
+        android:exported="false"
+        tools:ignore="MissingClass">
+        <intent-filter>
+          <action android:name="com.google.firebase.MESSAGING_EVENT" />
+        </intent-filter>
+      </service>
+
+      <!--
+        A FOREGROUND SERVICE THIS APP DOES NOT RUN, REMOVED AT MERGE TIME.
+
+        `react-native-webrtc` ships its own library manifest, and it declares
+        `com.oney.WebRTCModule.MediaProjectionService` with
+        `foregroundServiceType="mediaProjection"` — the screen-capture service
+        behind `getDisplayMedia`. The merger folds a library's components into
+        ours whether or not we call them, so that node landed in the shipped
+        manifest unasked.
+
+        Tacendum has no screen sharing and no screen capture. The library's
+        only route to that service is `getDisplayMedia`, which appears nowhere
+        in this app, and the service refuses to start unless
+        `WebRTCModuleOptions.enableMediaProjectionService` is set, which this
+        app never sets. Nothing here was ever going to run it.
+
+        Leaving it would have cost more than dead bytes. Play's
+        foreground-service declaration is answered per DECLARED type, so a
+        `mediaProjection` node in the manifest asks us to justify a
+        screen-recording feature that does not exist — either a false
+        declaration or a rejected submission. `tools:node="remove"` is the
+        merger's own instruction for this and it is checked: if the upstream
+        node ever disappears the directive simply no-ops, and if it moves the
+        build still merges. Remove the node, not the whole library — the rest
+        of `react-native-webrtc` is what carries every call.
+      -->
+      <service
+        android:name="com.oney.WebRTCModule.MediaProjectionService"
+        tools:node="remove" />
+    </application>
+</manifest>

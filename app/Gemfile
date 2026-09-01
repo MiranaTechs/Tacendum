@@ -1,0 +1,29 @@
+source 'https://rubygems.org'
+
+# You may use http://rbenv.org/ or https://rvm.io/ to install and use this version
+# Floor is set by activesupport 7.2, whose required_ruby_version is >= 3.1.0.
+ruby ">= 3.1"
+
+# Exclude problematic versions of cocoapods that cause build failures.
+gem 'cocoapods', '>= 1.13', '!= 1.15.0', '!= 1.15.1'
+# Security floors, moved together on purpose:
+# - activesupport >= 7.2.3.1 is the first version patched against its three
+#   open advisories.
+# - concurrent-ruby >= 1.3.7 is the first version patched against
+#   CVE-2026-54905 and CVE-2026-54906 (ReadWriteLock misuse/overflow).
+# The coupling: concurrent-ruby 1.3.5 stopped requiring 'logger', and
+# activesupport < 7.1 relied on that, crashing during `pod install` with
+# "uninitialized constant ActiveSupport::LoggerThreadSafeLevel::Logger".
+# activesupport >= 7.1.1 requires 'logger' itself, so these floors are only
+# safe as a pair — do not loosen concurrent-ruby without keeping activesupport
+# at 7.1.1 or later.
+gem 'activesupport', '>= 7.2.3.1'
+gem 'xcodeproj', '< 1.26.0'
+gem 'concurrent-ruby', '>= 1.3.7'
+
+# Ruby 3.4.0 has removed some libraries from the standard library.
+gem 'bigdecimal'
+gem 'logger'
+gem 'benchmark'
+gem 'mutex_m'
+gem 'nkf'

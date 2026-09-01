@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The ONE directory the share provider can reach: internal cache /
+  tacendum-qr. Not `<cache-path path="." />` and not `<files-path>` — a
+  provider that can hand out any file under cacheDir or filesDir would be a
+  general-purpose read grant over the protocol store, the message database and
+  the secret store, reachable by anything this app ever shares a URI with.
+
+  The directory is inside `getCacheDir()`, which Android excludes from backup
+  and device transfer by construction; the app's own backup rules exclude
+  every domain outright besides, so the plaintext picture of
+  the owner's only reachability address has two independent reasons never to
+  leave the device in a backup.
+-->
+<paths>
+    <cache-path name="tacendum-qr" path="tacendum-qr/" />
+</paths>

@@ -1,0 +1,39 @@
+{
+  "cases" : [
+    {
+      "acceptorUserId" : "01BX5ZZKBKACTAV9WEVGEMMVS0",
+      "class" : "tablet",
+      "expiresAt" : 1756100000,
+      "groupId" : "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "offererUserId" : "01BX5ZZKBKACTAV9WEVGEMMVRZ",
+      "offerNonce" : "01J5ZZKBKACTAV9WEVGEMMVS99",
+      "op" : "offer",
+      "preimageHex" : "746163656e64756d2d6c696e6b2d763100056f66666572001a303141525a334e44454b54535634525246465136394735464156001a30314258355a5a4b424b41435441563957455647454d4d56525a001a30314258355a5a4b424b41435441563957455647454d4d56533000210516028541b6afa1a6591b8251929347202fcd905a8d66c664ed8756370366cf5100067461626c6574000130001a30314a355a5a4b424b41435441563957455647454d4d56533939000a31373536313030303030",
+      "rosterEpoch" : 0,
+      "signatureB64" : "Hi2z86A41Hjy+4AG3X\/vTyUy\/nxcIawZq3Z6lF09nis27lvNPmijxbIzy+tq75VvMRBNhZ0E5ZbQfsOb2MsmAg==",
+      "signerIdentityKeyB64" : "BT65OcvfBrt3Gy5Kckg+Yr70QQ2QvCGJpG968p8r4qQS",
+      "subjectIdentityPubKey" : "BRYChUG2r6GmWRuCUZKTRyAvzZBajWbGZO2HVjcDZs9R"
+    },
+    {
+      "acceptorUserId" : "01BX5ZZKBKACTAV9WEVGEMMVS0",
+      "class" : "tablet",
+      "expiresAt" : 1756100000,
+      "groupId" : "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "offererUserId" : "01BX5ZZKBKACTAV9WEVGEMMVRZ",
+      "offerNonce" : "01J5ZZKBKACTAV9WEVGEMMVS99",
+      "op" : "accept",
+      "preimageHex" : "746163656e64756d2d6c696e6b2d76310006616363657074001a303141525a334e44454b54535634525246465136394735464156001a30314258355a5a4b424b41435441563957455647454d4d56525a001a30314258355a5a4b424b41435441563957455647454d4d565330002105f9fd77f9344a0150307f678ab7f429ed30b877fadd17156f45afe7d457627c3100067461626c6574000130001a30314a355a5a4b424b41435441563957455647454d4d56533939000a31373536313030303030",
+      "rosterEpoch" : 0,
+      "signatureB64" : "z\/2YAtEeR5E6Dtkl05qbVCTcAzT5Uxm7g4bgWn8bd6PXPDmjhYXsPUrcqJZMydAtyOf2roY0jE\/v+mb82Zs0AQ==",
+      "signerIdentityKeyB64" : "BW5GsDMWnKB7fJ5OWhmcsLLadXcV9rLt9Fbzm9w0tnhL",
+      "subjectIdentityPubKey" : "Bfn9d\/k0SgFQMH9nirf0Ke0wuHf63RcVb0Wv59RXYnwx"
+    }
+  ],
+  "domain" : "tacendum-link-v1",
+  "note" : "Swift-signed link-op fixtures (the authvectors pattern): the offer and accept tuples of linkvectors.json, preimage-built by the Swift signLinkOp construction and SIGNED by the pinned LibSignalClient pod under the iOS simulator runtime. app\/__tests__\/link-vectors.test.ts re-verifies every signature under the server's Node libsignal verify and re-proves the one-byte-mutation failure. Re-mint whenever the construction changes.",
+  "provenance" : {
+    "device" : "iOS simulator",
+    "iosSide" : true,
+    "libSignalClientPod" : "0.98.0"
+  }
+}

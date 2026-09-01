@@ -1,0 +1,15 @@
+{
+  "comment": "CAPTURED legacy GET /v1/keys/{userId} response. Captured by running the previous handler against DynamoDB Local with the deterministic user below (registrationId 4242, testIdentityKey(7) for every key field, empty one-time-prekey pool). accounts-roster.test.ts recreates exactly this state and compares the LIVE handler's response to these bytes — statusCode, headers, and the body STRING — so 'a solo target's bundle stays byte-identical to the legacy shape' is asserted against a capture, never by field-presence. Do not regenerate casually: a diff here IS the old-client-visible drift the assertion exists to catch.",
+  "userId": "0100000000000000000AC3TGT0",
+  "registrationId": 4242,
+  "identityKeySeed": 7,
+  "signedPrekeyKeyId": 11,
+  "kyberPrekeyKeyId": 12,
+  "result": {
+    "statusCode": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": "{\"userId\":\"0100000000000000000AC3TGT0\",\"registrationId\":4242,\"identityKey\":\"BQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH\",\"signedPrekey\":{\"pub\":\"BQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH\",\"sig\":\"BQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH\",\"keyId\":11},\"kyberPrekey\":{\"pub\":\"BQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH\",\"sig\":\"BQcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH\",\"keyId\":12},\"lowPrekeyCount\":true}"
+  }
+}
