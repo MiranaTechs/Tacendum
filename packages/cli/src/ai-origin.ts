@@ -67,8 +67,8 @@ const ENVELOPE_SENTINEL = '{"tcm":';
  * the workspaces share no module, so they share the doc instead.
  */
 export const AI_DISCLOSURE_SENTENCE =
-  'Replies you send are delivered to the AI provider running on your own machine; ' +
-  "Tacendum's servers relay ciphertext only.";
+  'Replies you send are delivered to the AI provider through a client running on your machine; ' +
+  "Tacendum's servers relay message ciphertext, not plaintext.";
 
 /**
  * The attestation's shape rule, in ONE place so the attend-side arm

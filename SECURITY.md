@@ -6,13 +6,12 @@ Please report security issues privately to **security@tacendum.com** rather
 than opening a public issue. Include what you did, what happened, and what
 you expected; a proof of concept helps but is not required to get a reply.
 
-We aim to acknowledge within 3 working days. If you do not hear back, that
-is a failure on our side — please chase it.
+We aim to acknowledge reports within 3 working days. Please follow up if you
+do not receive an acknowledgement.
 
-Please do not run denial-of-service tests, spam, or automated scans against
-`api.tacendum.com` or the TURN relay. Everything in this repository runs
-locally with no AWS account (see the README), which is a better place to
-test anyway.
+Do not run denial-of-service tests, spam, or automated scans against
+`api.tacendum.com` or the TURN relay. The repository can run locally without
+an AWS account; use a local environment for testing.
 
 ## What we consider in scope
 
@@ -26,75 +25,60 @@ please report issues in the protocol itself to Signal.
 
 ## Session revocation — what is enforced, and what a deployment must wire
 
-Revoking a session (sign-out, "sign out everywhere else", account deletion,
-or a superseding sign-in) enforces against any live WebSocket that session
-opened through two independent mechanisms:
+Revocation covers sign-out, "sign out everywhere else," account deletion, and
+a superseding sign-in. It applies to live WebSockets through two mechanisms:
 
-1. **The per-frame session guard**, entirely in this repository
-   (`packages/server/src/handlers/session-guard.ts`). Every socket is bound
-   at dial time to the session that opened it; a socket with no such binding
-   is refused outright — there are no exempt "legacy" sockets. A positive
-   ("still signed in") verdict is **never cached**: each client frame, each
-   live delivery to a connected recipient, and each queue-drain slice
-   re-reads the session with a strongly consistent read. Once a revocation
-   commits, the socket's next frame is refused, its next live delivery is
-   withheld, and its routing row is torn down; the only frames a revoked
-   session can still land are those already in flight when the revocation
-   committed (milliseconds of request overlap, irreducible under any
-   check-then-act design). The one cadenced path is a long queue drain,
-   which re-validates the session every 5 seconds mid-slice — so a socket
-   revoked mid-drain stops receiving within ~5 seconds. Negative verdicts
-   are cached (a revoked or expired session never becomes valid again), so
-   this costs one session read per guarded action, not per retry.
+1. **Per-frame session guard.**
+   `packages/server/src/handlers/session-guard.ts` binds every socket to its
+   opening session at dial time and refuses an unbound socket. A positive
+   ("still signed in") verdict is never cached: every client frame, live
+   delivery to a connected recipient, and queue-drain slice re-reads the
+   session with a strongly consistent read. After revocation commits, the
+   next frame is refused, the next live delivery is withheld, and the routing
+   row is removed. Only frames already in flight at commit time can still
+   land. A long queue drain revalidates every 5 seconds, so a socket revoked
+   mid-drain stops receiving within about 5 seconds. Negative verdicts are
+   cached because a revoked or expired session cannot become valid again.
 
-2. **A proactive transport disconnect** — hanging the socket itself up at
-   revocation time. This half is a *deployment* capability, not a code
-   default: the HTTP and Auth functions front a different API than the
-   WebSocket fleet, so they can only issue the hang-up if the deployment
-   gives them `WS_API_DOMAIN` and `WS_API_STAGE` (the WebSocket API's
-   execute-api management endpoint) **and** an IAM grant of
-   `execute-api:ManageConnections` covering `DELETE` on that API's
-   `@connections/*`. Our deployment (its infrastructure code is not part of
-   this repository) wires all
-   three onto exactly those two functions, and additionally sets
-   `WS_DISCONNECT_REQUIRED=1`, under which the server **refuses to start**
-   if the endpoint pair is missing (`packages/server/src/aws/deps.ts`) —
-   so a production deployment cannot silently lose the capability.
+2. **Proactive transport disconnect.** The HTTP and Auth functions front a
+   different API from the WebSocket fleet. To close a socket at revocation,
+   both functions need `WS_API_DOMAIN` and `WS_API_STAGE` for the WebSocket
+   execute-api management endpoint, plus an IAM
+   `execute-api:ManageConnections` grant covering `DELETE` on that API's
+   `@connections/*`. Production sets those values and
+   `WS_DISCONNECT_REQUIRED=1`; with that flag, the server refuses to start if
+   the endpoint pair is missing (`packages/server/src/aws/deps.ts`).
 
-**Degradation, stated honestly.** A deployment without the proactive wiring
-(and without `WS_DISCONNECT_REQUIRED=1`, e.g. local development) still
-enforces revocation through mechanism 1: the revoked socket's routing row is
-deleted, it receives nothing further (live delivery and drains re-validate),
-and its next frame is refused and the socket closed then. What is lost is
-only the immediate hang-up — a revoked socket that never speaks may linger
-open (deaf and mute) until it next sends or is delivered to. Any revocation
-that needed the missing hang-up logs `ws_disconnector_unwired` naming the
-absent variables, so the degraded state is visible in logs, never silent.
+Without the proactive wiring and without `WS_DISCONNECT_REQUIRED=1`, as in
+local development, mechanism 1 still deletes the routing row, blocks further
+delivery, and refuses and closes the socket on its next frame. The socket may
+remain open but unable to send or receive until then. A revocation that needed
+the unavailable disconnect logs `ws_disconnector_unwired` and names the
+missing variables.
 
 ## Signing keys
 
-`app/android/app/debug.keystore` is the conventional public Android debug
-keystore (`androiddebugkey`) that every Android SDK ships; it signs debug
-builds only and protects nothing. Release signing requires a separate upload
-keystore, which is never part of this repository.
+`app/android/app/debug.keystore` contains only the conventional public Android
+debug credential (`androiddebugkey`). It signs debug builds and protects
+nothing. Release signing requires a separate upload keystore, which is never
+part of this repository.
 
 ## Accepted dependency advisories
 
-`pnpm audit --prod` is not empty, and pretending otherwise would be worse
-than explaining why. Advisories that can be fixed by a patch-level bump are
-forced through `overrides` in `pnpm-workspace.yaml`. Two remain, both
-deliberately not forced:
+As of 2026-09-01, `pnpm audit --prod` against the checked-in lockfile reports
+three advisories across two build-only packages. Their available fixes require
+major-version changes in the surrounding toolchain. Advisories fixable with a
+patch-level bump are forced through `overrides` in `pnpm-workspace.yaml`.
 
 | Advisory | Why it is not forced |
 |---|---|
 | `image-size` (< 2.0.3) — infinite loop in the ICNS/JXL/HEIF parsers | Reached only through Metro, the React Native bundler, which calls it at BUILD time to measure image assets that are part of this repository. The malicious input would have to be an image a developer added to their own project. Fixing it means 1.x → 2.x under Metro's asset pipeline. |
 | `fast-xml-parser` (< 5.7.0) — XML comment/CDATA injection in XMLBuilder | Reached only through `@react-native-community/cli-platform-*`, which parses the developer's own Android/iOS project files during local development. Fixing it means 4.x → 5.x under the React Native CLI. |
 
-Neither package is present in a shipped artifact. They are not compiled into
-the iOS app, not bundled into the server's Lambda functions, and not included
-in the published CLI tarball — they exist only in the development and build
-toolchain, where the untrusted input they warn about does not occur.
+Neither package is present in the app, Lambda bundles, or packed CLI artifact.
+They are used only by the development and build toolchain, where the documented
+workflow gives them repository-controlled project inputs rather than remote
+user content.
 
-This position is re-derived, not inherited: if either package becomes
-reachable from shipped code, or a fix lands that does not require a major
-bump, the override goes in and this table shrinks.
+If either package becomes reachable from a packaged runtime, or a compatible
+fix is available, the package should be overridden and this table updated.

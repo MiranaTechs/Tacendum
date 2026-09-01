@@ -29,7 +29,10 @@ import ReactTestRenderer from 'react-test-renderer';
 import * as db from '../src/db';
 import { messaging } from '../src/messaging';
 import { AI_DISCLOSURE_SENTENCE } from '../src/machine';
-import { GroupProfileScreen, ROOM_COPY } from '../src/screens/GroupProfileScreen';
+import {
+  GroupProfileScreen,
+  ROOM_COPY,
+} from '../src/screens/GroupProfileScreen';
 
 interface FakeDb {
   name: string;
@@ -79,20 +82,22 @@ const chatRow = (peerId: string, displayName: string) => ({
  * detected CLAUDE by its MARKER alone (machines empty) — so the choice is
  * offered. The owner's-own-agent case (machines=[CLAUDE]) is set explicitly
  * where it is tested, because for it the choice must be ABSENT. */
-function installDb(opts: {
-  machines?: string[];
-  markerAuthors?: string[];
-  consent?: Record<string, 'consented' | 'refused'>;
-  /** The room's owner — ME by default; a FOREIGN owner makes this phone the
-   * second human's (the stranger's), the party the consent surface is FOR. */
-  ownerId?: string;
-  /** Member ids the OWNER's roster slots class 'integration' (the
-   * roster-write class). */
-  rosterAgents?: string[];
-  /** The foreign owner's stored display name ('Ana' by default) — settable
-   * so a peer self-named "You" can be shown not to forge the self signal. */
-  ownerName?: string;
-} = {}) {
+function installDb(
+  opts: {
+    machines?: string[];
+    markerAuthors?: string[];
+    consent?: Record<string, 'consented' | 'refused'>;
+    /** The room's owner — ME by default; a FOREIGN owner makes this phone the
+     * second human's (the stranger's), the party the consent surface is FOR. */
+    ownerId?: string;
+    /** Member ids the OWNER's roster slots class 'integration' (the
+     * roster-write class). */
+    rosterAgents?: string[];
+    /** The foreign owner's stored display name ('Ana' by default) — settable
+     * so a peer self-named "You" can be shown not to forge the self signal. */
+    ownerName?: string;
+  } = {},
+) {
   const machines = opts.machines ?? [];
   const markerAuthors = opts.markerAuthors ?? [CLAUDE];
   const consent = opts.consent ?? {};
@@ -244,9 +249,9 @@ test('member consent: an agent this account BOTH owns and has seen speak is stil
 test('no agent, no surface — the section never appears in an agent-free room', async () => {
   installDb({ machines: [], markerAuthors: [] });
   const tree = await mount();
-  expect(tree.root.findAllByProps({ testID: 'room-consent-section' }).length).toBe(
-    0,
-  );
+  expect(
+    tree.root.findAllByProps({ testID: 'room-consent-section' }).length,
+  ).toBe(0);
 });
 
 test('a SECOND human detects the agent by its MARKER alone (machine_peers empty) and is offered the choice', async () => {
@@ -366,9 +371,7 @@ test.each(['consented', 'undecided'] as const)(
   'a failed DELETE leaves %s state unchanged and never claims sharing or an announcement',
   async initial => {
     installDb(
-      initial === 'consented'
-        ? { consent: { [CLAUDE]: 'consented' } }
-        : {},
+      initial === 'consented' ? { consent: { [CLAUDE]: 'consented' } } : {},
     );
     setRoomConsent.mockRejectedValue(new Error('delete refused'));
     const tree = await mount();
@@ -379,7 +382,8 @@ test.each(['consented', 'undecided'] as const)(
     );
     expect(note).not.toMatch(/room was told|still sharing/i);
     expect(
-      tree.root.findByProps({ testID: `consent-state-${CLAUDE}` }).props.children,
+      tree.root.findByProps({ testID: `consent-state-${CLAUDE}` }).props
+        .children,
     ).toBe(
       initial === 'consented'
         ? ROOM_COPY.consentShared
@@ -452,7 +456,9 @@ test('a roster-classed agent this account OWNS is still never offered — owners
     rosterAgents: [CLAUDE],
   });
   const tree = await mount();
-  expect(tree.root.findAllByProps({ testID: 'room-consent-section' }).length).toBe(0);
+  expect(
+    tree.root.findAllByProps({ testID: 'room-consent-section' }).length,
+  ).toBe(0);
 });
 
 /** All Text content inside one consent row, joined. */
@@ -462,7 +468,9 @@ function consentRowText(tree: ReactTestRenderer.ReactTestRenderer): string {
     .findAllByType(Text)
     .map(n => {
       const { children } = n.props as { children: unknown };
-      return Array.isArray(children) ? (children as unknown[]).join('') : String(children ?? '');
+      return Array.isArray(children)
+        ? (children as unknown[]).join('')
+        : String(children ?? '');
     })
     .join('\n');
 }
@@ -562,6 +570,8 @@ test('5.1.2(i): the canonical sentence is on screen BEFORE consent can be given'
 test('the room surface QUOTES the constant — no per-surface variant', () => {
   // `toBe` alone would pass vacuously with both sides undefined; pin one
   // load-bearing fragment so the absence of the copy is a failure too.
-  expect(ROOM_COPY.consentDisclosure).toContain('relay ciphertext only.');
+  expect(ROOM_COPY.consentDisclosure).toContain(
+    'relay message ciphertext, not plaintext.',
+  );
   expect(ROOM_COPY.consentDisclosure).toBe(AI_DISCLOSURE_SENTENCE);
 });

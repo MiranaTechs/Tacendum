@@ -59,29 +59,27 @@ const seams = vi.hoisted(() => ({
   fanout: null as import('../src/send.js').FanoutLeg[][] | null,
 }));
 
-vi.mock('../src/attend-drivers.js', async importOriginal => {
+vi.mock('../src/attend-drivers.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../src/attend-drivers.js')>();
   return {
     ...real,
-    driverFor: (host: Parameters<typeof real.driverFor>[0]) =>
-      seams.driver ?? real.driverFor(host),
+    driverFor: (host: Parameters<typeof real.driverFor>[0]) => seams.driver ?? real.driverFor(host),
   };
 });
-vi.mock('../src/send.js', async importOriginal => {
+vi.mock('../src/send.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../src/send.js')>();
   return {
     ...real,
     sendEncryptedFanout: (async ({ legs }: { legs: import('../src/send.js').FanoutLeg[] }) => {
       if (seams.fanout === null) throw new Error('unexpected wire call (test)');
       seams.fanout.push(legs);
-      return legs.map(l => ({ to: l.to, msgId: l.msgId, state: 'delivered' as const }));
+      return legs.map((l) => ({ to: l.to, msgId: l.msgId, state: 'delivered' as const }));
     }) as typeof real.sendEncryptedFanout,
   };
 });
 
-const { AI_DISCLOSURE_SENTENCE, markAgentBody, markerAttested } = await import(
-  '../src/ai-origin.js'
-);
+const { AI_DISCLOSURE_SENTENCE, markAgentBody, markerAttested } =
+  await import('../src/ai-origin.js');
 const attendMod = await import('../src/attend.js');
 const { attendOnce, cmdAttendEnable, loadAttendConfig, realSendRoomReply, saveAttendConfig } =
   attendMod;
@@ -143,7 +141,7 @@ async function poll(cond: () => boolean, ms = 10_000): Promise<void> {
   const until = Date.now() + ms;
   while (!cond()) {
     if (Date.now() > until) throw new Error('poll timed out');
-    await new Promise(r => setTimeout(r, 5));
+    await new Promise((r) => setTimeout(r, 5));
   }
 }
 
@@ -153,7 +151,7 @@ const clockIo = () => {
     now: () => t,
     sleep: async (ms: number): Promise<void> => {
       t += ms;
-      await new Promise(r => setTimeout(r, 2));
+      await new Promise((r) => setTimeout(r, 2));
     },
   };
 };
@@ -162,12 +160,8 @@ const fakeSend = () => {
   const sends: { body: string; id: string; notify?: false }[] = [];
   return {
     sends,
-    bodies: () => sends.map(s => s.body),
-    sendReply: async (
-      b: string,
-      _sess?: OutSess,
-      opts?: { notify?: boolean },
-    ): Promise<string> => {
+    bodies: () => sends.map((s) => s.body),
+    sendReply: async (b: string, _sess?: OutSess, opts?: { notify?: boolean }): Promise<string> => {
       const id = mid();
       sends.push({ body: b, id, ...(opts?.notify === false ? { notify: false as const } : {}) });
       return id;
@@ -193,14 +187,16 @@ const typingFake = () => {
   };
 };
 
-const streamDriver = (opts: {
-  reply?: string;
-  ask?: { payload: string; ttlMs: number; pushBeforeAsk?: string };
-} = {}) => {
+const streamDriver = (
+  opts: {
+    reply?: string;
+    ask?: { payload: string; ttlMs: number; pushBeforeAsk?: string };
+  } = {},
+) => {
   let stream: ((s: string) => void) | undefined;
   let calls = 0;
   let release: (() => void) | undefined;
-  const released = new Promise<void>(r => {
+  const released = new Promise<void>((r) => {
     release = r;
   });
   const driver: HostDriver = {
@@ -252,9 +248,14 @@ beforeEach(() => {
   seams.driver = null;
   seams.fanout = null;
   saveProfile({
-    name: 'bot', identityKey: 'AAAA', userId: SELF,
-    deviceId: 1, authToken: 'tok', registrationId: 1,
-    accountClass: 'integration', ownerUserId: OWNER,
+    name: 'bot',
+    identityKey: 'AAAA',
+    userId: SELF,
+    deviceId: 1,
+    authToken: 'tok',
+    registrationId: 1,
+    accountClass: 'integration',
+    ownerUserId: OWNER,
   });
   cfg();
 });
@@ -341,14 +342,14 @@ describe('the one way out of attend is marked (the coverage pin)', () => {
       expect(env, `unmarked bare body left the funnel: ${s.body}`).not.toBeNull();
       expect(env?.ai, `a body left unmarked: ${s.body}`).toBe(true);
     }
-    const kinds = h.sends.map(s => (asEnvelope(s.body) as { tcm: string }).tcm);
+    const kinds = h.sends.map((s) => (asEnvelope(s.body) as { tcm: string }).tcm);
     expect(kinds).toContain('x.approval');
     expect(kinds).toContain('msg');
     expect(kinds).toContain('edit');
     // The anchor's words ride inside the msg wrapper, funneled and intact.
-    const anchor = h.sends
-      .map(s => asEnvelope(s.body))
-      .find(e => e?.tcm === 'msg') as { text: string };
+    const anchor = h.sends.map((s) => asEnvelope(s.body)).find((e) => e?.tcm === 'msg') as {
+      text: string;
+    };
     expect(anchor.text).toBe('early partial');
     // Every stream intermediate is marked too.
     expect(typing.edits.length).toBeGreaterThanOrEqual(1);
@@ -405,7 +406,7 @@ describe('the room wrapper (the marker rides grp.msg, and inside b iff b is an e
   function recordingDeliver(captured: FanoutLeg[][]): RoomDelivery {
     return (async ({ legs }: { legs: FanoutLeg[] }) => {
       captured.push(legs);
-      return legs.map(l => ({ to: l.to, msgId: l.msgId, state: 'delivered' as const }));
+      return legs.map((l) => ({ to: l.to, msgId: l.msgId, state: 'delivered' as const }));
     }) as RoomDelivery;
   }
 
@@ -482,7 +483,7 @@ describe('the room wrapper (the marker rides grp.msg, and inside b iff b is an e
     await realSendRoomReply('bot', GID, inner);
     expect(seams.fanout).toHaveLength(2);
     const bodies = seams.fanout.map(
-      legs => JSON.parse((legs[0] as FanoutLeg).body) as { b: string; ai?: boolean },
+      (legs) => JSON.parse((legs[0] as FanoutLeg).body) as { b: string; ai?: boolean },
     );
     expect(bodies[0]?.ai).toBe(true);
     expect(bodies[0]?.b).toBe('the room answer'); // bare text stays bare
@@ -585,11 +586,7 @@ describe('the notify lane marks through the same funnel', () => {
 
 describe('attend enable --marker (the attestation surface)', () => {
   const enable = (extra: Record<string, unknown>): void =>
-    cmdAttendEnable(
-      'bot',
-      { host: 'codex', bin: process.execPath, ...extra },
-      report(),
-    );
+    cmdAttendEnable('bot', { host: 'codex', bin: process.execPath, ...extra }, report());
 
   it('writes the attestation and arms the funnel', () => {
     enable({ markerMinAppBuild: 11 });
@@ -673,14 +670,17 @@ describe('the AI-disclosure sentence (Apple 5.1.2(i) / EU AI Act Art. 50)', () =
   const canonicalFromDoc = (): string => {
     const section = readFileSync(DOC, 'utf8')
       .split(/^## /m)
-      .find(s => s.startsWith('1. The canonical sentence'));
+      .find((s) => s.startsWith('1. The canonical sentence'));
     if (section === undefined) throw new Error('docs/AI-DISCLOSURE.md has no §1');
     const quoted = section
       .split('\n')
-      .filter(l => l.startsWith('> '))
-      .map(l => l.slice(2).trim());
+      .filter((l) => l.startsWith('> '))
+      .map((l) => l.slice(2).trim());
     if (quoted.length === 0) throw new Error('§1 carries no blockquote');
-    return quoted.join(' ').replace(/^\*\*"/, '').replace(/"\*\*$/, '');
+    return quoted
+      .join(' ')
+      .replace(/^\*\*"/, '')
+      .replace(/"\*\*$/, '');
   };
 
   const humanOf = (opts: Record<string, unknown>): string => {
@@ -693,8 +693,8 @@ describe('the AI-disclosure sentence (Apple 5.1.2(i) / EU AI Act Art. 50)', () =
 
   it('is EXACTLY these bytes', () => {
     expect(AI_DISCLOSURE_SENTENCE).toBe(
-      'Replies you send are delivered to the AI provider running on your own machine; ' +
-        "Tacendum's servers relay ciphertext only.",
+      'Replies you send are delivered to the AI provider through a client running on your machine; ' +
+        "Tacendum's servers relay message ciphertext, not plaintext.",
     );
   });
 
@@ -703,9 +703,12 @@ describe('the AI-disclosure sentence (Apple 5.1.2(i) / EU AI Act Art. 50)', () =
   });
 
   it('the comparison can actually fail — a paraphrase of the doc text is not equal', () => {
-    expect(canonicalFromDoc().replace('own machine', 'machine')).not.toBe(
-      AI_DISCLOSURE_SENTENCE,
-    );
+    expect(
+      canonicalFromDoc().replace(
+        'through a client running on your machine',
+        'through a local client',
+      ),
+    ).not.toBe(AI_DISCLOSURE_SENTENCE);
   });
 
   it('attend enable prints it, VERBATIM, on both hosts and with or without --marker', () => {
@@ -737,19 +740,33 @@ describe('the approval-card cap guard sees the FINAL marked bytes (boundary band
    * instead of spawning the turn under test. */
   const seed = (name: string): void => {
     saveProfile({
-      name, identityKey: 'AAAA', userId: SELF,
-      deviceId: 1, authToken: 'tok', registrationId: 1,
-      accountClass: 'integration', ownerUserId: OWNER,
+      name,
+      identityKey: 'AAAA',
+      userId: SELF,
+      deviceId: 1,
+      authToken: 'tok',
+      registrationId: 1,
+      accountClass: 'integration',
+      ownerUserId: OWNER,
     });
     saveAttendConfig(name, {
-      host: 'codex', bin: '/opt/codex', workdir: '/w', caps: ['-s', 'read-only'],
-      codexDriver: 'app-server', ownSession: OWN_SESSION, turnsPerHour: 10,
-      markerMinAppBuild: 11, approvalsMinAppBuild: 11,
+      host: 'codex',
+      bin: '/opt/codex',
+      workdir: '/w',
+      caps: ['-s', 'read-only'],
+      codexDriver: 'app-server',
+      ownSession: OWN_SESSION,
+      turnsPerHour: 10,
+      markerMinAppBuild: 11,
+      approvalsMinAppBuild: 11,
     });
   };
   const approvalsFile = (
     name: string,
-  ): { rows: { msgId?: string; state: string; decision?: string; via?: string }[]; overCapRefusals: number } =>
+  ): {
+    rows: { msgId?: string; state: string; decision?: string; via?: string }[];
+    overCapRefusals: number;
+  } =>
     JSON.parse(readFileSync(join(home, 'state', name, 'attend-approvals.json'), 'utf8')) as {
       rows: { msgId?: string; state: string; decision?: string; via?: string }[];
       overCapRefusals: number;
@@ -772,7 +789,7 @@ describe('the approval-card cap guard sees the FINAL marked bytes (boundary band
       (() => {
         try {
           return approvalsFile(account).rows.some(
-            r => r.state === 'pending' || r.state === 'answering',
+            (r) => r.state === 'pending' || r.state === 'answering',
           );
         } catch {
           return false;
@@ -794,10 +811,10 @@ describe('the approval-card cap guard sees the FINAL marked bytes (boundary band
     // across both accounts' asks, and the ungated marker is INSIDE it).
     const probe = 'measure me';
     const sends1 = await turnWithAsk('band-measure', probe);
-    const card = sends1.map(s => asEnvelope(s.body)).find(e => e?.tcm === 'x.approval');
+    const card = sends1.map((s) => asEnvelope(s.body)).find((e) => e?.tcm === 'x.approval');
     expect(card, 'the measuring ask must land a card').toBeDefined();
     const cardBytes = Buffer.byteLength(
-      sends1.find(s => asEnvelope(s.body)?.tcm === 'x.approval')?.body as string,
+      sends1.find((s) => asEnvelope(s.body)?.tcm === 'x.approval')?.body as string,
       'utf8',
     );
     const overhead = cardBytes - probe.length;
@@ -813,7 +830,7 @@ describe('the approval-card cap guard sees the FINAL marked bytes (boundary band
     expect(after.rows[0]).toMatchObject({ decision: 'deny', via: 'overcap' });
     expect(after.overCapRefusals).toBe(1);
     // The deny is SAID, and nothing this pass sent can out-size the wire cap.
-    expect(sends2.some(s => s.body.includes('does not fit'))).toBe(true);
+    expect(sends2.some((s) => s.body.includes('does not fit'))).toBe(true);
     for (const s of sends2) {
       expect(Buffer.byteLength(s.body, 'utf8')).toBeLessThanOrEqual(MAX_BODY_BYTES);
     }

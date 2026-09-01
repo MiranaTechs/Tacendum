@@ -1,97 +1,98 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# Tacendum mobile app
 
-# Getting Started
+This directory contains the React Native 0.86 client for iOS and Android. Set
+up the repository-root dependencies and local backend before starting the app.
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+## Local backend
 
-## Step 1: Start Metro
-
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
-
-To start the Metro dev server, run the following command from the root of your React Native project:
+From the repository root:
 
 ```sh
-# Using npm
-npm start
-
-# OR using Yarn
-yarn start
+cp .env.example .env
+pnpm install
+pnpm infra:up
+pnpm tables:create
+pnpm dev
 ```
 
-## Step 2: Build and run your app
+Debug builds read the repository `.env` at bundle time. Restart Metro after
+changing it. Release builds always use the hosted `aws` environment and ignore
+local endpoint overrides.
 
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
-
-### Android
+## Start Metro
 
 ```sh
-# Using npm
-npm run android
-
-# OR using Yarn
-yarn android
+pnpm --dir app start
 ```
 
-### iOS
+Metro listens on port 8083 because the local WebSocket adapter uses 8081.
 
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
+## iOS
 
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
+Requirements: macOS, Xcode 26+, CocoaPods 1.13+, and watchman. Install Ruby and
+pod dependencies from the repository root:
 
 ```sh
+cd app
 bundle install
-```
-
-Then, and every time you update your native dependencies, run:
-
-```sh
+cd ios
 bundle exec pod install
+cd ../..
 ```
 
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
+Simulator builds need no signing configuration. For a device build, copy the
+template and set `TACENDUM_DEVELOPMENT_TEAM` in the local file:
 
 ```sh
-# Using npm
-npm run ios
-
-# OR using Yarn
-yarn ios
+cp app/ios/Tacendum.xcconfig.example app/ios/Tacendum.local.xcconfig
 ```
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
+With Metro running, launch the app from another shell:
 
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
+```sh
+pnpm --dir app ios
+```
 
-## Step 3: Modify your app
+## Android
 
-Now that you have successfully run the app, let's make changes!
+Requirements: Android SDK platform 36, build-tools 36.0.0, NDK
+27.1.12297006, `ANDROID_HOME`, JDK 17 for Gradle, and JDK 21 for the host-JVM
+libsignal suites. `minSdk` is 26.
 
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
+With Metro running:
 
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
+```sh
+pnpm --dir app android
+```
 
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
+Run the native Android checks with:
 
-## Congratulations! :tada:
+```sh
+pnpm --dir app android:check
+```
 
-You've successfully run and modified your React Native App. :partying_face:
+## Checks
 
-### Now what?
+```sh
+pnpm --dir app test
+pnpm --dir app typecheck
+pnpm --dir app lint
+```
 
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
+Jest mocks native modules and exercises the JavaScript application. Native
+crypto and device-only behavior require their platform-specific suites.
 
-# Troubleshooting
+## Troubleshooting
 
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
+- Restart Metro after changing `.env`.
+- Confirm Metro is listening on 8083, not the WebSocket adapter's 8081.
+- A device signing error usually means
+  `app/ios/Tacendum.local.xcconfig` is absent or has no
+  `TACENDUM_DEVELOPMENT_TEAM` value. Simulator builds do not require it.
+- For toolchain setup, use React Native's
+  [environment guide](https://reactnative.dev/docs/set-up-your-environment)
+  and [troubleshooting guide](https://reactnative.dev/docs/troubleshooting).
 
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+Tacendum is independent. References to React Native, Apple, Android, and other
+products identify technical compatibility only and do not imply affiliation,
+sponsorship, or endorsement. Trademarks belong to their respective owners.

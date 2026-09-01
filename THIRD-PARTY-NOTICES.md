@@ -1,6 +1,11 @@
 # Third-Party Notices
 
-This inventory lists the direct third-party dependencies declared by the packages in this workspace (the root manifest, `app`, and `packages/*`), with the version and license as recorded in each installed package's own metadata (`package.json` `license` field). Workspace-internal packages (`@tacendum/*`, `tacendum-*`) are not third-party and are not listed. The native modules under `app/modules/*` declare only peer dependencies on `react` and `react-native`, already listed under `app`. Where a package's metadata declares no license field, it is listed as UNKNOWN; license values are reproduced verbatim from the metadata.
+This inventory covers direct third-party dependencies declared by the root,
+`app`, and `packages/*` manifests. Versions and license values reproduce each
+installed package's metadata; a missing license field is listed as `UNKNOWN`.
+Workspace packages (`@tacendum/*` and `tacendum-*`) are excluded. Native
+modules under `app/modules/*` declare only the `react` and `react-native` peer
+dependencies already listed under `app`.
 
 | Package | Version | License | Used by |
 |---|---|---|---|
@@ -66,8 +71,11 @@ This inventory lists the direct third-party dependencies declared by the package
 
 ## libsignal
 
-`@signalapp/libsignal-client` (the Signal protocol implementation) is central to this project: all end-to-end encryption in the CLI and server flows through it. Its installed metadata declares the license `AGPL-3.0-only`, matching this project's own AGPL-3.0-only license.
+`@signalapp/libsignal-client` provides the protocol implementation used for
+end-to-end encryption in the CLI and server. Its installed metadata declares
+`AGPL-3.0-only`, matching this project's license.
 
 ## License texts
 
-Full license texts ship inside each package under `node_modules/<package>/` (typically as `LICENSE`, `LICENSE.md`, or `COPYING`) after installation.
+After installation, each package's full license text is available under
+`node_modules/<package>/`, usually as `LICENSE`, `LICENSE.md`, or `COPYING`.

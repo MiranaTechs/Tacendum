@@ -31,8 +31,8 @@ import { DEVICE_NOUN } from './deviceNoun';
  * module, so they share a source of truth instead.
  */
 export const AI_DISCLOSURE_SENTENCE =
-  'Replies you send are delivered to the AI provider running on your own machine; ' +
-  "Tacendum's servers relay ciphertext only.";
+  'Replies you send are delivered to the AI provider through a client running on your machine; ' +
+  "Tacendum's servers relay message ciphertext, not plaintext.";
 
 /**
  * The machine section on a peer's profile (crew-chat spec; server contract in
@@ -168,7 +168,8 @@ export const AGENT_COPY = {
    * ROSTER-CLASSED member: the class is the owner's write, so the owner may
    * be named as the claimant. A marker-only agent gets `selfLabeled` below —
    * the owner claimed nothing about it. */
-  foreignAttributed: (name: string, owner: string) => `${name} — ${owner}’s AI agent`,
+  foreignAttributed: (name: string, owner: string) =>
+    `${name} — ${owner}’s AI agent`,
   /** "Claude · laptop — AI agent (self-labeled)": a MARKER-only agent, in
    * the set because IT sent a marker-carrying body here — no roster class exists,
    * so no owner made any claim and none is named (a remediation:
