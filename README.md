@@ -1,6 +1,6 @@
 # Tacendum
 
-A Signal-style, end-to-end-encrypted messenger — 1:1 conversations, and small
+Tacendum is an end-to-end-encrypted messenger for1:1 conversations, and small
 group rooms built on nothing but them. The backend is written as
 AWS-Lambda-shaped handlers hosted two ways — a local Node adapter and API Gateway — so
 the whole system runs **entirely on one machine** with no AWS account, and a
