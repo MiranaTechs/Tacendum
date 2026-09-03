@@ -12,7 +12,7 @@ import {
 } from '@tacendum/shared';
 import { makeDocClient, makeDynamoClient } from '../src/db/client.js';
 import { TABLES as SERVER_TABLES } from '../src/db/tables.js';
-import { makeDataLayer, type DataLayer } from '../src/db/data.js';
+import { makeTestOnlyDataLayer, type TestOnlyDataLayer } from '../src/db/data.js';
 import { activePhoneClaimKeys, activeUsernameClaimKeys } from '../src/opaque-ref.js';
 import {
   discoveryLookupRoute,
@@ -103,7 +103,7 @@ import { makeTestDeps, type TestDeps } from './helpers.js';
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
 let doc: DynamoDBDocumentClient;
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 
 // Digits only; '73' is this file's discriminator.
@@ -129,7 +129,7 @@ function post(token: string, body: unknown): HttpEvent {
 beforeAll(async () => {
   const client = makeDynamoClient();
   doc = makeDocClient(client);
-  const base = makeDataLayer(doc);
+  const base = makeTestOnlyDataLayer(doc);
   // All three flags closured ON (the accounts-phone discipline): the
   // class-flag read the phone and username classes ride is process-local
   // and identical for every branch of its class, so it cannot separate

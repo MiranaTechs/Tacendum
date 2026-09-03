@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  AppState,
   Pressable,
   StyleSheet,
   Text,
@@ -15,7 +16,10 @@ import {
   MASKED_VALUE,
   VAULT,
   VAULT_CONSEQUENCE,
+  VAULT_ENVELOPE_PREFIX,
   VAULT_LIMITS,
+  VAULT_RELOAD_DEBOUNCE_MS,
+  VAULT_REVEAL_MS,
   vaultRefusal,
   vaultStatusTone,
 } from '../vault';
@@ -137,7 +141,11 @@ async function undeliveredVaultIds(
   const rows = await db.listMessages(peerId);
   const latest = new Map<string, { status: db.MessageStatus; op: StuckOp }>();
   for (const row of rows) {
-    if (row.direction !== 'out') continue;
+    // Prefix first, parse second: a thread of photos, voice notes and text
+    // used to be fully parsed on every notification for the
+    // one-in-a-hundred vault row. The prefix is exactly the sentinel
+    // `parseEnvelope` itself requires, so nothing parseable is skipped.
+    if (row.direction !== 'out' || !row.body.startsWith(VAULT_ENVELOPE_PREFIX)) continue;
     const envelope = parseEnvelope(row.body);
     if (envelope?.tcm !== 'vault') continue;
     latest.set(envelope.id, { status: row.status, op: envelope.op });
@@ -195,6 +203,29 @@ export function VaultSection({ peerId, meUserId, who, blockedAt }: Props) {
   /** Set while this screen is mounted, so a load that resolves after a peer
    * change or an unmount cannot write a different Room's items into state. */
   const alive = useRef(true);
+  /** One re-mask timer per revealed key: cleared when the key is hidden by
+   * hand, on peer change, on backgrounding, and on unmount. */
+  const revealTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  /** The coalescing timer for messaging notifications. */
+  const reloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const hideKey = useCallback((key: string) => {
+    const timer = revealTimers.current.get(key);
+    if (timer !== undefined) clearTimeout(timer);
+    revealTimers.current.delete(key);
+    setShown(open => {
+      if (!open.has(key)) return open;
+      const next = new Set(open);
+      next.delete(key);
+      return next;
+    });
+  }, []);
+
+  const hideAll = useCallback(() => {
+    for (const timer of revealTimers.current.values()) clearTimeout(timer);
+    revealTimers.current.clear();
+    setShown(open => (open.size === 0 ? open : new Set()));
+  }, []);
 
   const load = useCallback(async () => {
     const rows = await db.listVaultItems(peerId);
@@ -215,9 +246,12 @@ export function VaultSection({ peerId, meUserId, who, blockedAt }: Props) {
 
   useEffect(() => {
     alive.current = true;
+    // The Map itself is never reassigned, so the cleanup may hold it directly
+    // (the exhaustive-deps rule's own remedy for a ref read at cleanup).
+    const timers = revealTimers.current;
     // A masked value must not survive a change of person, and neither must a
     // half-typed one: both belong to the Room that was on screen a moment ago.
-    setShown(new Set());
+    hideAll();
     setComposing(null);
     setRemoving(null);
     setCopied(null);
@@ -226,13 +260,39 @@ export function VaultSection({ peerId, meUserId, who, blockedAt }: Props) {
     setFailure(null);
     void load().catch(() => {});
     // The other phone can save, edit or remove an item while this is open, and
-    // an inbound merge notifies exactly like an outbound enqueue does.
-    const off = messaging.subscribe(() => void load().catch(() => {}));
+    // an inbound merge notifies exactly like an outbound enqueue does. The
+    // subscription is GLOBAL, though — a typing frame, a read mark, a message
+    // in some other Room all land here — so a burst is coalesced into one
+    // re-read per quiet beat. The mount read above and the post-write read in
+    // `runWrite` stay immediate: those are this screen's own acts, and their
+    // answer should not wait.
+    const off = messaging.subscribe(() => {
+      if (reloadTimer.current !== null) clearTimeout(reloadTimer.current);
+      reloadTimer.current = setTimeout(() => {
+        reloadTimer.current = null;
+        void load().catch(() => {});
+      }, VAULT_RELOAD_DEBOUNCE_MS);
+    });
     return () => {
       alive.current = false;
       off();
+      if (reloadTimer.current !== null) clearTimeout(reloadTimer.current);
+      reloadTimer.current = null;
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
     };
-  }, [load]);
+  }, [load, hideAll]);
+
+  // A revealed value must not be on glass when the app comes back from the
+  // switcher, the lock screen or a call: re-mask the moment the app leaves
+  // the foreground — 'inactive' included, which is when iOS takes the
+  // app-switcher snapshot.
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', next => {
+      if (next === 'background' || next === 'inactive') hideAll();
+    });
+    return () => subscription.remove();
+  }, [hideAll]);
 
   const blocked = blockedAt != null;
   const tone = vaultStatusTone(items.length);
@@ -359,13 +419,17 @@ export function VaultSection({ peerId, meUserId, who, blockedAt }: Props) {
       await messaging.deleteVaultItem(peerId, id);
     }, VAULT.removeFailed);
 
-  const toggleShown = (key: string) =>
-    setShown(open => {
-      const next = new Set(open);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
+  /** Reveal for `VAULT_REVEAL_MS`, then re-mask on its own; hiding by hand
+   * cancels the window, and a fresh reveal gets a fresh one. */
+  const toggleShown = (key: string) => {
+    if (shown.has(key)) {
+      hideKey(key);
+      return;
+    }
+    const timer = setTimeout(() => hideKey(key), VAULT_REVEAL_MS);
+    revealTimers.current.set(key, timer);
+    setShown(open => new Set(open).add(key));
+  };
 
   const copyValue = (item: db.VaultItemRow) => {
     copyWithExpiry(item.body);

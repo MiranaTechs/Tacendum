@@ -15,9 +15,9 @@ import { makeDocClient, makeDynamoClient } from '../src/db/client.js';
 import { TABLES as SERVER_TABLES } from '../src/db/tables.js';
 import {
   IDKEY_CLAIM_PREFIX,
-  makeDataLayer,
+  makeTestOnlyDataLayer,
   sessionTokenDigest,
-  type DataLayer,
+  type TestOnlyDataLayer,
 } from '../src/db/data.js';
 import { authenticate } from '../src/handlers/auth.js';
 import { accountsRefusal } from '../src/handlers/devices.js';
@@ -53,7 +53,7 @@ import { allQueued, makeTestDeps, type TestDeps } from './helpers.js';
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
 let doc: DynamoDBDocumentClient;
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 
 // Digits only; '32' is this FILE's discriminator — see the twin comment in
@@ -212,7 +212,7 @@ async function rawRow(table: string, key: Record<string, unknown>) {
 beforeAll(async () => {
   const client = makeDynamoClient();
   doc = makeDocClient(client);
-  const base = makeDataLayer(doc);
+  const base = makeTestOnlyDataLayer(doc);
   // Process-local flag override — same rationale as accounts-link.test.ts:
   // the real row is a store-wide singleton other suites toggle.
   db = { ...base, isAccountsFeatureEnabled: async () => true };

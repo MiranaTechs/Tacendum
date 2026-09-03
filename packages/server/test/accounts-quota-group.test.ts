@@ -7,10 +7,10 @@ import { TABLES as SERVER_TABLES } from '../src/db/tables.js';
 import {
   DEFAULT_QUEUE_QUOTA,
   groupRowKey,
-  makeDataLayer,
+  makeTestOnlyDataLayer,
   queuePairLedgerKey,
   QueuedQuotaExceededError,
-  type DataLayer,
+  type TestOnlyDataLayer,
   type DeviceClass,
   type GroupQuotaContext,
 } from '../src/db/data.js';
@@ -18,7 +18,7 @@ import { getPrekeyBundleHandler, uploadKeysHandler } from '../src/handlers/keys.
 import { deliverAccountsNotice } from '../src/handlers/devices.js';
 import { LIMITS, type RateLimiter } from '../src/ratelimit.js';
 import { wsDefaultHandler, type WsDeps } from '../src/handlers/ws.js';
-import { makeTestDeps, type TestDeps } from './helpers.js';
+import { makeTestDeps, type TestDeps, KEY_FIXTURE } from './helpers.js';
 
 /**
  * group-aware quotas, against REAL DynamoDB and the REAL
@@ -63,8 +63,8 @@ import { makeTestDeps, type TestDeps } from './helpers.js';
 
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
-let base: DataLayer;
-let db: DataLayer; // flag-overridable view over `base`
+let base: TestOnlyDataLayer;
+let db: TestOnlyDataLayer; // flag-overridable view over `base`
 let doc: DynamoDBDocumentClient;
 let available = false;
 let flagOn = false;
@@ -90,7 +90,7 @@ function runIdentityKey(n: number): string {
 beforeAll(async () => {
   const client = makeDynamoClient();
   doc = makeDocClient(client);
-  base = makeDataLayer(doc);
+  base = makeTestOnlyDataLayer(doc);
   db = { ...base, isAccountsFeatureEnabled: async () => flagOn };
   try {
     const { TableNames = [] } = await client.send(new ListTablesCommand({}));
@@ -211,7 +211,7 @@ function recordingLimiter(real: RateLimiter): {
 describe('linking never resets an established pair to stranger', () => {
   gated('the group-aware walk finds the pre-link reply; a genuine stranger still hits the unknown cap; the collapsed ledger row is real', async () => {
     // Small, exhaustible caps against the REAL store (the injection seam).
-    const dbq = makeDataLayer(doc, {
+    const dbq = makeTestOnlyDataLayer(doc, {
       items: 10,
       bytes: 1024 * 1024,
       unknownItems: 2,
@@ -281,7 +281,7 @@ describe('linking never resets an established pair to stranger', () => {
 
 describe('linking COLLAPSES existing allowances, never forks them', () => {
   gated('two standalone fills against a victim leave NO fresh #quota#<groupId> allowance after linking: the admission walk sums the per-ULID residue', async () => {
-    const dbq = makeDataLayer(doc, {
+    const dbq = makeTestOnlyDataLayer(doc, {
       items: 4,
       bytes: 1024 * 1024,
       unknownItems: 4,
@@ -451,7 +451,7 @@ describe('a 3-device recipient’s TOTAL inbound budget never exceeds the 1-devi
     // claim exact equality that production constants do not deliver. With 7,
     // the honest bound surfaces: the aggregate is 3×⌊7/3⌋ = 6 — NEVER above
     // the 1-device budget, up to N−1 items below it.
-    const dbq = makeDataLayer(doc, {
+    const dbq = makeTestOnlyDataLayer(doc, {
       items: 7,
       bytes: 1024 * 1024,
       unknownItems: 7,
@@ -778,8 +778,8 @@ describe('the 3×3 prekey mesh under the pinned group-pair ceiling', () => {
           body: JSON.stringify({
             registrationId: 7,
             identityKey: key,
-            signedPrekey: { keyId: 1, pub: key, sig: key },
-            kyberPrekey: { keyId: 2, pub: key, sig: key },
+            signedPrekey: { keyId: 1, pub: KEY_FIXTURE.curvePub, sig: KEY_FIXTURE.sig },
+            kyberPrekey: { keyId: 2, pub: KEY_FIXTURE.kyberPub, sig: KEY_FIXTURE.sig },
             oneTimePrekeys: [],
           }),
         },
@@ -874,8 +874,8 @@ describe('the 3×3 prekey mesh under the pinned group-pair ceiling', () => {
           body: JSON.stringify({
             registrationId: 7,
             identityKey: key,
-            signedPrekey: { keyId: 1, pub: key, sig: key },
-            kyberPrekey: { keyId: 2, pub: key, sig: key },
+            signedPrekey: { keyId: 1, pub: KEY_FIXTURE.curvePub, sig: KEY_FIXTURE.sig },
+            kyberPrekey: { keyId: 2, pub: KEY_FIXTURE.kyberPub, sig: KEY_FIXTURE.sig },
             oneTimePrekeys: [],
           }),
         },

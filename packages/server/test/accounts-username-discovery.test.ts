@@ -19,8 +19,8 @@ import { TABLES as SERVER_TABLES } from '../src/db/tables.js';
 import {
   EMAIL_CLAIM_KEY_PREFIX,
   USERNAME_CLAIM_KEY_PREFIX,
-  makeDataLayer,
-  type DataLayer,
+  makeTestOnlyDataLayer,
+  type TestOnlyDataLayer,
   type IdentifierClaimRecord,
 } from '../src/db/data.js';
 import {
@@ -53,7 +53,7 @@ import { makeMemoryDb, makeTestDeps, type LogEntry, type TestDeps } from './help
 /**
  * Discovery-by-USERNAME: the three-way-oracle
  * discipline applied to the THIRD identifier class, over the memory twin
- * AND DynamoDB Local (the two-DataLayer shape: one scenario list, two
+ * AND DynamoDB Local (the two-TestOnlyDataLayer shape: one scenario list, two
  * stores, so the twin can never drift more permissive than the store), with
  * the own edges driven by name:
  *
@@ -133,7 +133,7 @@ const allLogs: LogEntry[][] = [];
 const refusals: HttpResult[] = [];
 
 interface Store {
-  db: DataLayer;
+  db: TestOnlyDataLayer;
   setMaster(on: boolean): void;
   setPhone(on: boolean): void;
   setUsername(on: boolean): void;
@@ -148,7 +148,7 @@ interface Acct {
  * every take's bucket key is recorded, and `refuse` forces one bucket's
  * refusal without spending 2,000 takes. */
 type SuiteDeps = TestDeps & { takes: string[]; refuse: Set<string> };
-function freshDeps(db: DataLayer): SuiteDeps {
+function freshDeps(db: TestOnlyDataLayer): SuiteDeps {
   const deps = makeTestDeps(db) as SuiteDeps;
   allLogs.push(deps.logs);
   const inner: RateLimiter = deps.rateLimit;
@@ -174,7 +174,7 @@ function post(token: string | undefined, body: unknown): HttpEvent {
   };
 }
 
-async function mkAcct(db: DataLayer, deps: TestDeps): Promise<Acct> {
+async function mkAcct(db: TestOnlyDataLayer, deps: TestDeps): Promise<Acct> {
   const userId = uid();
   canaries.add(userId);
   const res = await db.getOrCreateUserByIdentityKey(`idkey-ud-${userId}`, userId, deps.now());
@@ -190,7 +190,7 @@ async function mkAcct(db: DataLayer, deps: TestDeps): Promise<Acct> {
   return { userId, token };
 }
 
-async function attachEmail(db: DataLayer, deps: TestDeps, acct: Acct, email: string): Promise<string> {
+async function attachEmail(db: TestOnlyDataLayer, deps: TestDeps, acct: Acct, email: string): Promise<string> {
   expect(
     (await emailRequestCodeRoute(post(acct.token, { email, class: 'phone' }), deps)).statusCode,
   ).toBe(200);
@@ -201,7 +201,7 @@ async function attachEmail(db: DataLayer, deps: TestDeps, acct: Acct, email: str
   return activeEmailClaimKeys(V1, email)[0]!;
 }
 
-async function attachPhone(db: DataLayer, deps: TestDeps, acct: Acct, number: string): Promise<string> {
+async function attachPhone(db: TestOnlyDataLayer, deps: TestDeps, acct: Acct, number: string): Promise<string> {
   canaries.add(number);
   expect(
     (await phoneRequestCodeRoute(post(acct.token, { phone: number, class: 'phone' }), deps))
@@ -218,7 +218,7 @@ async function attachPhone(db: DataLayer, deps: TestDeps, acct: Acct, number: st
 
 /** A grouped, email-verified account — a claimant and, once aged, a
  * gate-passing lookup caller. */
-async function verifiedAcct(db: DataLayer, deps: TestDeps): Promise<Acct & { groupId: string }> {
+async function verifiedAcct(db: TestOnlyDataLayer, deps: TestDeps): Promise<Acct & { groupId: string }> {
   const acct = await mkAcct(db, deps);
   await attachEmail(db, deps, acct, `${acct.userId}@example.test`);
   const groupId = (await db.getUserById(acct.userId))!.groupId!;
@@ -272,7 +272,7 @@ const takesOf = (deps: SuiteDeps, prefix: string): string[] =>
   deps.takes.filter((b) => b.startsWith(prefix));
 
 /**
- * THE SCENARIO LIST, over either DataLayer.
+ * THE SCENARIO LIST, over either TestOnlyDataLayer.
  */
 function discoverySuite(
   label: string,
@@ -289,7 +289,7 @@ function discoverySuite(
     };
 
     /** A gate-passing caller: verified email + ≥72 h (its own clock move). */
-    const mkCaller = async (db: DataLayer, deps: TestDeps): Promise<Acct & { groupId: string }> => {
+    const mkCaller = async (db: TestOnlyDataLayer, deps: TestDeps): Promise<Acct & { groupId: string }> => {
       const caller = await verifiedAcct(db, deps);
       deps.advanceMs(DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000);
       return caller;
@@ -847,7 +847,7 @@ discoverySuite(
 
 // --- DynamoDB Local: gated exactly as the accounts-* suites gate. ---
 let doc: DynamoDBDocumentClient;
-let ddb: DataLayer;
+let ddb: TestOnlyDataLayer;
 let available = false;
 let flagOn = true;
 let phoneFlagOn = true;
@@ -856,7 +856,7 @@ let usernameFlagOn = true;
 beforeAll(async () => {
   const client = makeDynamoClient();
   doc = makeDocClient(client);
-  const base = makeDataLayer(doc);
+  const base = makeTestOnlyDataLayer(doc);
   ddb = {
     ...base,
     isAccountsFeatureEnabled: async () => flagOn,
@@ -947,7 +947,7 @@ describe('THE PARALLEL-FIELD WIRE, third field (the previous replay fixture RE-C
     mem.setAccountsPhoneFeatureEnabled(true);
     mem.setAccountsUsernameFeatureEnabled(false); // ABSENT: neither possession path may consult it
     let usernameFlagReads = 0;
-    const db: DataLayer = {
+    const db: TestOnlyDataLayer = {
       ...mem,
       isAccountsUsernameFeatureEnabled: async () => {
         usernameFlagReads++;

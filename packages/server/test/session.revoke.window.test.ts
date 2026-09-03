@@ -4,7 +4,7 @@ import type { ServerFrame } from '@tacendum/shared';
 import { wsTicketHandler } from '../src/handlers/ws-ticket.js';
 import { wsConnectHandler, wsDefaultHandler, type WsDeps } from '../src/handlers/ws.js';
 import { makeSessionGuard } from '../src/handlers/session-guard.js';
-import { sessionTokenDigest, type DataLayer } from '../src/db/data.js';
+import { sessionTokenDigest, type TestOnlyDataLayer } from '../src/db/data.js';
 import {
   makeMemoryDb,
   makeTestDeps,
@@ -30,7 +30,7 @@ import {
 
 const B64 = 'Y2lwaGVydGV4dA==';
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: TestDeps;
 let wsDeps: WsDeps;
 let sender: {

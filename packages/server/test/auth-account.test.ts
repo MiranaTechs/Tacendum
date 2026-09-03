@@ -22,11 +22,20 @@ import {
 } from '../src/handlers/auth-account.js';
 import { deleteAccountHandler } from '../src/handlers/account.js';
 import { uploadKeysHandler } from '../src/handlers/keys.js';
+import { authenticate, requireAuth } from '../src/handlers/auth.js';
 import { IDKEY_CLAIM_PREFIX, makeDataLayer } from '../src/db/data.js';
 import { makeDocClient, makeDynamoClient } from '../src/db/client.js';
 import { TABLES } from '../src/db/tables.js';
-import type { HttpEvent } from '../src/handlers/http.js';
-import { makeMemoryDb, makeTestDeps, parseBody, type TestDeps } from './helpers.js';
+import { json, type HttpEvent } from '../src/handlers/http.js';
+import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import {
+  authedGet,
+  makeMemoryDb,
+  makeTestDeps,
+  parseBody,
+  type TestDeps,
+  KEY_FIXTURE,
+} from './helpers.js';
 
 /**
  * Keypair-only account auth (/).
@@ -154,6 +163,19 @@ const SALT = 'auth-test-user-ref-salt';
 
 beforeEach(() => {
   deps = { ...makeTestDeps(makeMemoryDb()), userRefSalt: SALT };
+});
+
+describe('the server still emits the fields the client no longer requires', () => {
+  it('a challenge response carries a numeric expiresAt in the future', async () => {
+    const res = await authChallengeHandler(
+      post('/v1/auth/challenge', { identityKey: newIdentity().publicB64 }),
+      deps,
+    );
+    expect(res.statusCode).toBe(200);
+    const body = parseBody<{ challenge: string; expiresAt?: unknown }>(res.body);
+    expect(typeof body.expiresAt).toBe('number');
+    expect(body.expiresAt as number).toBeGreaterThan(Math.floor(deps.now() / 1000));
+  });
 });
 
 describe('proving the key', () => {
@@ -423,8 +445,8 @@ describe('the identity key is immutable', () => {
       {
         registrationId: 42,
         identityKeyPub: attacker.publicB64,
-        signedPrekey: { keyId: 1, pub: 'QUJD', sig: 'QUJD' },
-        kyberPrekey: { keyId: 1, pub: 'QUJD', sig: 'QUJD' },
+        signedPrekey: { keyId: 1, pub: KEY_FIXTURE.curvePub, sig: KEY_FIXTURE.sig },
+        kyberPrekey: { keyId: 1, pub: KEY_FIXTURE.kyberPub, sig: KEY_FIXTURE.sig },
       },
       [],
     );
@@ -450,8 +472,8 @@ describe('the identity key is immutable', () => {
       post('/v1/keys', {
         registrationId: 42,
         identityKey: attacker.publicB64,
-        signedPrekey: { keyId: 1, pub: 'QUJD', sig: 'QUJD' },
-        kyberPrekey: { keyId: 1, pub: 'QUJD', sig: 'QUJD' },
+        signedPrekey: { keyId: 1, pub: KEY_FIXTURE.curvePub, sig: KEY_FIXTURE.sig },
+        kyberPrekey: { keyId: 1, pub: KEY_FIXTURE.kyberPub, sig: KEY_FIXTURE.sig },
         oneTimePrekeys: [],
       }),
       deps,
@@ -476,9 +498,9 @@ describe('the identity key is immutable', () => {
       post('/v1/keys', {
         registrationId: 42,
         identityKey: me.publicB64,
-        signedPrekey: { keyId: 1, pub: 'QUJD', sig: 'QUJD' },
-        kyberPrekey: { keyId: 1, pub: 'QUJD', sig: 'QUJD' },
-        oneTimePrekeys: [{ keyId: 9, pub: 'QUJD' }],
+        signedPrekey: { keyId: 1, pub: KEY_FIXTURE.curvePub, sig: KEY_FIXTURE.sig },
+        kyberPrekey: { keyId: 1, pub: KEY_FIXTURE.kyberPub, sig: KEY_FIXTURE.sig },
+        oneTimePrekeys: [{ keyId: 9, pub: KEY_FIXTURE.curvePub }],
       }),
       deps,
       { userId },
@@ -497,8 +519,8 @@ describe('the identity key is immutable', () => {
       {
         registrationId: 42,
         identityKeyPub: me.publicB64,
-        signedPrekey: { keyId: 1, pub: 'QUJD', sig: 'QUJD' },
-        kyberPrekey: { keyId: 1, pub: 'QUJD', sig: 'QUJD' },
+        signedPrekey: { keyId: 1, pub: KEY_FIXTURE.curvePub, sig: KEY_FIXTURE.sig },
+        kyberPrekey: { keyId: 1, pub: KEY_FIXTURE.kyberPub, sig: KEY_FIXTURE.sig },
       },
       [],
     );
@@ -1046,5 +1068,126 @@ describe('the AGPL source offer', () => {
 
     const result = await signIn(newIdentity());
     expect(result.authToken).toEqual(expect.any(String));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The two reads behind every HTTP
+// bearer validation. Eventual consistency is not something DynamoDB Local
+// simulates, so the consistency property is pinned on the SDK command itself
+// (the queue.consistency.test.ts discipline); the absent-row refusal is driven
+// through the real `authenticate` against the memory store AND pinned on the
+// wire shape of the real layer's read.
+// ---------------------------------------------------------------------------
+
+/** A recording doc stub: every command is captured; `reply` scripts the
+ * response by command instance. */
+function recordingDoc(reply: (cmd: unknown) => unknown): {
+  commands: unknown[];
+  doc: DynamoDBDocumentClient;
+} {
+  const commands: unknown[] = [];
+  const send = async (cmd: unknown): Promise<unknown> => {
+    commands.push(cmd);
+    return reply(cmd);
+  };
+  return { commands, doc: { send } as unknown as DynamoDBDocumentClient };
+}
+
+describe('the bearer session read is strongly consistent', () => {
+  it('getSession issues one GetItem on the sessions table with ConsistentRead', async () => {
+    const { commands, doc } = recordingDoc((cmd) =>
+      cmd instanceof GetCommand
+        ? { Item: { kind: 'session', userId: 'U', createdAt: 1, expiresAt: 4_000_000_000 } }
+        : {},
+    );
+    const db = makeDataLayer(doc);
+    const session = await db.getSession('a-presented-token');
+    expect(session?.userId).toBe('U');
+    const gets = commands.filter((c) => c instanceof GetCommand) as GetCommand[];
+    expect(gets).toHaveLength(1);
+    expect(gets[0]!.input.TableName).toBe(TABLES.sessions);
+    // A token revoked by sign-out, sign-out-others, account deletion or a
+    // superseding sign-in must be UNSEEN the moment the revoke answers 200 —
+    // the same read the WebSocket recheck (getSessionByDigest) always made.
+    expect(gets[0]!.input.ConsistentRead).toBe(true);
+  });
+});
+
+describe('a session whose account row is gone no longer authenticates', () => {
+  it('a freshly registered account authenticates on its very first request, and stops the moment its row is deleted — even with the session row still present', async () => {
+    const identity = newIdentity();
+    const { userId, authToken } = await signIn(identity);
+    // First request after registration: the user row was written before the
+    // session was minted, so the read sees it.
+    expect(await authenticate(authedGet(authToken), deps)).toEqual({ userId });
+
+    // The racy-deletion / revoked-integration shape: the user row is gone,
+    // the session row was NOT swept (a crash between the two, or a revoke
+    // that only deletes the row). Before the fix this session kept working
+    // on every route that never read the user row.
+    expect(await deps.db.deleteUser(userId, { identityKeyPub: identity.publicB64 })).toBe('deleted');
+    expect(await deps.db.getSession(authToken)).toBeDefined();
+    expect(await deps.db.userAccountState(userId)).toBe('absent');
+
+    expect(await authenticate(authedGet(authToken), deps)).toBeNull();
+    // And through the wrapper every authenticated route uses (the /v1/me
+    // shape): the ordinary 401, indistinguishable from any other.
+    const res = await requireAuth(async (_e, _d, auth) => json(200, auth))(
+      authedGet(authToken),
+      deps,
+    );
+    expect(res.statusCode).toBe(401);
+    expect(parseBody<{ error: { code: string } }>(res.body).error.code).toBe('unauthorized');
+  });
+
+  it('the ONE exception: `allowAbsentRow` admits a live session whose row is GONE — the deletion route needs it to finish a crashed sweep — while a tombstoned row refuses either way', async () => {
+    const identity = newIdentity();
+    const { userId, authToken } = await signIn(identity);
+    expect(await deps.db.deleteUser(userId, { identityKeyPub: identity.publicB64 })).toBe('deleted');
+    // The default stands: absent refuses.
+    expect(await authenticate(authedGet(authToken), deps)).toBeNull();
+    // The opt-in admits it — and resolves to the session's own userId, the
+    // only thing a userId-keyed sweep can reach.
+    expect(await authenticate(authedGet(authToken), deps, { allowAbsentRow: true })).toEqual({
+      userId,
+    });
+    const res = await requireAuth(async (_e, _d, auth) => json(200, auth), {
+      allowAbsentRow: true,
+    })(authedGet(authToken), deps);
+    expect(res.statusCode).toBe(200);
+    expect(parseBody<{ userId: string }>(res.body).userId).toBe(userId);
+
+    // A revoked device's row is TOMBSTONED, not gone: the record is the
+    // enforcement, and no option may reopen it.
+    const revoked = newIdentity();
+    const second = await signIn(revoked);
+    const row = await deps.db.getUserById(second.userId);
+    expect(row).toBeDefined();
+    row!.tombstoned = true;
+    expect(await deps.db.userAccountState(second.userId)).toBe('tombstoned');
+    expect(await authenticate(authedGet(second.authToken), deps)).toBeNull();
+    expect(
+      await authenticate(authedGet(second.authToken), deps, { allowAbsentRow: true }),
+    ).toBeNull();
+  });
+
+  it('userAccountState is one strongly consistent, key-projecting GetItem: absent, tombstoned, live', async () => {
+    for (const [reply, expected] of [
+      [{}, 'absent'],
+      [{ Item: { userId: 'U', tombstoned: true } }, 'tombstoned'],
+      [{ Item: { userId: 'U' } }, 'live'],
+    ] as const) {
+      const { commands, doc } = recordingDoc(() => reply);
+      expect(await makeDataLayer(doc).userAccountState('U')).toBe(expected);
+      const get = commands[0] as GetCommand;
+      expect(get).toBeInstanceOf(GetCommand);
+      expect(get.input.TableName).toBe(TABLES.users);
+      expect(get.input.ConsistentRead).toBe(true);
+      // The key is projected so a present row ALWAYS comes back as an item
+      // — a projection of `tombstoned` alone would return an empty item for
+      // a live row and make "live" and "absent" indistinguishable.
+      expect(get.input.ProjectionExpression).toMatch(/\buserId\b/);
+    }
   });
 });

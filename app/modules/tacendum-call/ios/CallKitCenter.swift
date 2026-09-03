@@ -283,7 +283,10 @@ public final class CallKitCenter: NSObject {
    * (the app deletes the mirror), and for unknown callers. Every nil shows
    * the placeholder — never the raw ULID, which means nothing to anyone.
    */
-  private func mirroredName(for peerId: String) -> String? {
+  // Internal, not private: the missed-call notice (`TacendumCallImpl
+  // .postMissedCall`) reads the same mirror when the JS side knows no name —
+  // the locked phone's case, the one a missed call most often lands on.
+  func mirroredName(for peerId: String) -> String? {
     guard !peerId.isEmpty,
           let container = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: "group.com.miranatechnologies.tacendum"),

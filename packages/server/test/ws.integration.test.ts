@@ -6,7 +6,7 @@ import WebSocket from 'ws';
 import { QueryCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { TABLES, type ServerFrame } from '@tacendum/shared';
 import { makeDocClient } from '../src/db/client.js';
-import { makeDataLayer, sessionTokenDigest, type DataLayer } from '../src/db/data.js';
+import { makeTestOnlyDataLayer, sessionTokenDigest, type TestOnlyDataLayer } from '../src/db/data.js';
 import { makeDeps } from '../src/local/http.js';
 import { startWsServer } from '../src/local/ws.js';
 import type { Deps } from '../src/handlers/http.js';
@@ -23,7 +23,7 @@ const ulid = monotonicFactory();
 const B64 = 'Y2lwaGVydGV4dA==';
 
 let doc: DynamoDBDocumentClient;
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: Deps;
 let server: Server;
 let wsUrl: string;
@@ -119,7 +119,7 @@ class TestClient {
 
 beforeAll(async () => {
   doc = makeDocClient();
-  db = makeDataLayer(doc);
+  db = makeTestOnlyDataLayer(doc);
   try {
     await doc.send(
       new QueryCommand({

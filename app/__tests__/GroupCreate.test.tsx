@@ -101,7 +101,6 @@ interface Engine {
   prepare(sql: string): { all(...args: unknown[]): Row[] };
   close(): void;
 }
-// eslint-disable-next-line @typescript-eslint/no-var-requires
 const { DatabaseSync } = require('node:sqlite') as {
   DatabaseSync: new (p: string) => Engine;
 };
@@ -570,6 +569,219 @@ describe('GroupCreateScreen — the composer', () => {
     expect(texts).toContain('hides its name, its member list');
     expect(texts).toContain('does not hide the sending');
     expect(texts).toContain('wants the member list gets it');
+
+    await ReactTestRenderer.act(() => {
+      tree.unmount();
+    });
+  });
+
+  test('the header previews the room as a RoomMark whose monogram follows the name field', async () => {
+    await db.upsertChat(BEN, 'Ben');
+    const { StyleSheet, Text } = require('react-native') as typeof import('react-native');
+    const { themeTokens } = require('../src/theme') as typeof import('../src/theme');
+    const theme = themeTokens();
+    const tree = await render(
+      <GroupCreateScreen
+        profile={PROFILE}
+        onBack={jest.fn()}
+        onOpenRoom={jest.fn()}
+      />,
+    );
+
+    // The room's own shape at hero size, from the first paint: a walled
+    // square, never a person's disc — the NamingScreen's live preview, for
+    // a room.
+    // The host View: RoomMark carries the testID on itself and on the View
+    // it draws, and the styles land on the View.
+    const mark = () =>
+      tree.root.findAll(
+        n => n.props.testID === 'room-preview-mark' && typeof n.type === 'string',
+      )[0]!;
+    expect(mark()).toBeDefined();
+    expect(StyleSheet.flatten(mark().props.style).width).toBe(
+      theme.layout.avatar.hero,
+    );
+    const monogram = () => mark().findByType(Text).props.children as string;
+
+    await ReactTestRenderer.act(async () => {
+      byId(tree, 'room-name-input')[0].props.onChangeText('Kitchen Table');
+    });
+    expect(monogram()).toBe('KT');
+    await ReactTestRenderer.act(async () => {
+      byId(tree, 'room-name-input')[0].props.onChangeText('Book club');
+    });
+    expect(monogram()).toBe('BC');
+
+    await ReactTestRenderer.act(() => {
+      tree.unmount();
+    });
+  });
+});
+
+/**
+ * The composer's three quiet gaps: the picks lived only as dots down a list
+ * that scrolls, a disabled Create button said nothing about why, an
+ * identity-changed row sat wherever the sort put it, and people this iPhone
+ * blocks vanished from the list without a word. */
+describe('GroupCreateScreen — the picks, the disabled button, the review group', () => {
+  const DAN = pad('DAN');
+  const { Text } = require('react-native') as typeof import('react-native');
+
+  function texts(tree: ReactTestRenderer.ReactTestRenderer): string {
+    return tree.root
+      .findAllByType(Text)
+      .map(n => {
+        const kids = n.props.children;
+        return Array.isArray(kids) ? kids.join('') : String(kids ?? '');
+      })
+      .join('\n');
+  }
+
+  /** testIDs in tree order, deduplicated — a testID lands on a Pressable
+   * and on the host View it draws. */
+  function idsInOrder(
+    tree: ReactTestRenderer.ReactTestRenderer,
+    match: (id: string) => boolean,
+  ): string[] {
+    const seen: string[] = [];
+    for (const n of tree.root.findAll(
+      node => typeof node.props.testID === 'string' && match(node.props.testID),
+    )) {
+      const id = n.props.testID as string;
+      if (!seen.includes(id)) seen.push(id);
+    }
+    return seen;
+  }
+
+  async function mount(): Promise<ReactTestRenderer.ReactTestRenderer> {
+    return render(
+      <GroupCreateScreen
+        profile={PROFILE}
+        onBack={jest.fn()}
+        onOpenRoom={jest.fn()}
+      />,
+    );
+  }
+
+  test('picked people show as a chip strip under the counter, and a chip un-picks', async () => {
+    await db.upsertChat(BEN, 'Ben');
+    await db.upsertChat(CARA, 'Cara');
+    const tree = await mount();
+
+    // Nothing picked: no strip, and nobody blocked: no omission line.
+    expect(byId(tree, 'room-picks').length).toBe(0);
+    expect(byId(tree, 'room-blocked-note').length).toBe(0);
+
+    await ReactTestRenderer.act(async () => {
+      byId(tree, `room-pick-${BEN}`)[0].props.onPress();
+    });
+    await ReactTestRenderer.act(async () => {
+      byId(tree, `room-pick-${CARA}`)[0].props.onPress();
+    });
+    expect(byId(tree, 'room-picks').length).toBeGreaterThan(0);
+    expect(byId(tree, `room-chip-${BEN}`).length).toBeGreaterThan(0);
+    expect(byId(tree, `room-chip-${CARA}`).length).toBeGreaterThan(0);
+    expect(texts(tree)).toContain('Ben');
+    expect(texts(tree)).toContain('Cara');
+
+    // The chip is the removal affordance: Ben leaves the picks, his row's
+    // seat empties, the strip keeps Cara.
+    await ReactTestRenderer.act(async () => {
+      byId(tree, `room-chip-${BEN}`)[0].props.onPress();
+    });
+    expect(byId(tree, `room-chip-${BEN}`).length).toBe(0);
+    expect(byId(tree, `room-picked-${BEN}`).length).toBe(0);
+    expect(byId(tree, `room-chip-${CARA}`).length).toBeGreaterThan(0);
+    expect(byId(tree, `room-picked-${CARA}`).length).toBeGreaterThan(0);
+
+    await ReactTestRenderer.act(() => {
+      tree.unmount();
+    });
+  });
+
+  test('the disabled Create button says why, and the line leaves once it is enabled', async () => {
+    await db.upsertChat(BEN, 'Ben');
+    const tree = await mount();
+    const hint = () => {
+      const nodes = byId(tree, 'room-create-hint');
+      return nodes.length === 0 ? null : (nodes[0].props.children as string);
+    };
+
+    // Both missing.
+    expect(hint()).toBe('Name the room and pick at least one person.');
+
+    // A name, nobody picked.
+    await ReactTestRenderer.act(async () => {
+      byId(tree, 'room-name-input')[0].props.onChangeText('Kitchen');
+    });
+    expect(hint()).toBe('Pick at least one person.');
+
+    // Somebody picked, no name.
+    await ReactTestRenderer.act(async () => {
+      byId(tree, 'room-name-input')[0].props.onChangeText('');
+    });
+    await ReactTestRenderer.act(async () => {
+      byId(tree, `room-pick-${BEN}`)[0].props.onPress();
+    });
+    expect(hint()).toBe('Give the room a name first.');
+
+    // Both present: the button is live and the line is gone.
+    await ReactTestRenderer.act(async () => {
+      byId(tree, 'room-name-input')[0].props.onChangeText('Kitchen');
+    });
+    expect(hint()).toBeNull();
+
+    await ReactTestRenderer.act(() => {
+      tree.unmount();
+    });
+  });
+
+  test('identity-changed rows sit last, under a "Needs review" label that exists only for them', async () => {
+    await db.upsertChat(BEN, 'Ben');
+    await db.upsertChat(CARA, 'Cara');
+    await db.upsertChat(DAN, 'Dan');
+    // Ben's safety number changed; he would otherwise sort wherever his last
+    // message put him — here, first.
+    await db.setIdentityChanged(BEN, Date.now());
+    const tree = await mount();
+
+    const order = idsInOrder(
+      tree,
+      id => id === 'room-needs-review' || id.startsWith('room-pick-'),
+    );
+    expect(order).toEqual([
+      `room-pick-${CARA}`,
+      `room-pick-${DAN}`,
+      'room-needs-review',
+      `room-pick-${BEN}`,
+    ]);
+    // Still closed, still explained.
+    expect(byId(tree, `room-pick-${BEN}`)[0].props.accessibilityState.disabled).toBe(true);
+    expect(texts(tree)).toContain('Safety number changed');
+
+    await ReactTestRenderer.act(() => {
+      tree.unmount();
+    });
+
+    // Nobody to review: no label.
+    await db.setIdentityChanged(BEN, null);
+    const clean = await mount();
+    expect(byId(clean, 'room-needs-review').length).toBe(0);
+    await ReactTestRenderer.act(() => {
+      clean.unmount();
+    });
+  });
+
+  test('someone this iPhone blocks is left off the list, and one line says so', async () => {
+    await db.upsertChat(BEN, 'Ben');
+    await db.upsertChat(EVE, 'Eve');
+    await db.blockPeer(EVE, Date.now());
+    const tree = await mount();
+
+    expect(byId(tree, `room-pick-${EVE}`).length).toBe(0);
+    expect(byId(tree, `room-pick-${BEN}`).length).toBeGreaterThan(0);
+    expect(byId(tree, 'room-blocked-note').length).toBeGreaterThan(0);
+    expect(texts(tree)).toContain('blocked');
 
     await ReactTestRenderer.act(() => {
       tree.unmount();

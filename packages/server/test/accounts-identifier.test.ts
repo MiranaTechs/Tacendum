@@ -13,7 +13,7 @@ import {
 } from '@tacendum/shared';
 import { makeDocClient, makeDynamoClient } from '../src/db/client.js';
 import { TABLES as SERVER_TABLES } from '../src/db/tables.js';
-import { EMAIL_CODE_KEY_PREFIX, makeDataLayer, type DataLayer } from '../src/db/data.js';
+import { EMAIL_CODE_KEY_PREFIX, makeTestOnlyDataLayer, type TestOnlyDataLayer } from '../src/db/data.js';
 import {
   activeEmailClaimKeys,
   emailClaimKey,
@@ -51,7 +51,7 @@ import { makeTestDeps, type LogEntry, type TestDeps } from './helpers.js';
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
 let doc: DynamoDBDocumentClient;
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 let flagOn = true;
 
@@ -154,7 +154,7 @@ async function linkPair(
 
 beforeAll(async () => {
   const client = makeDynamoClient();
-  const base = makeDataLayer(makeDocClient(client));
+  const base = makeTestOnlyDataLayer(makeDocClient(client));
   doc = makeDocClient(client);
   db = { ...base, isAccountsFeatureEnabled: async () => flagOn };
   try {
@@ -460,7 +460,7 @@ describe('attach against real DynamoDB', () => {
     expect(deps.emailsSent).toHaveLength(IDENTIFIER_SENDS_PER_RECIPIENT_PER_DAY);
   });
 
-  gated('one group per identifier, ever: a SECOND account verifying an already-claimed address is refused at the claim-uniqueness condition (claim_exists), collapsed (gate fix — the invariant was untested)', async () => {
+  gated('one group per identifier, ever: a SECOND account verifying an already-claimed address is refused at the claim-uniqueness condition (claim_exists), collapsed (fix — the invariant was untested)', async () => {
     const deps = freshDeps();
     const email = `oneowner-${RUN}@example.com`;
     const first = await mkAcct(deps);
@@ -515,6 +515,89 @@ describe('attach against real DynamoDB', () => {
   });
 });
 
+/**
+ * The identifier-keyed budgets as a denial lever. The email leg charged the
+ * per-address daily window AND the fleet ceiling on recovery MISSES: five
+ * stranger requests naming an unclaimed address locked its eventual owner
+ * out of attaching it for the day, and a hundred pristine accounts could
+ * spend the whole 1 000/day email lane at zero SES cost. Misses now spend a
+ * MISS window of the same size (the anti-probing bound is unchanged, and
+ * still identifier-keyed and uniform) and never the send window or the
+ * fleet. */
+describe('identifier-keyed budgets are not a denial lever', () => {
+  function recordingDeps(): TestDeps & { takes: string[] } {
+    const deps = freshDeps() as TestDeps & { takes: string[] };
+    const inner = deps.rateLimit;
+    deps.takes = [];
+    deps.rateLimit = {
+      take: async (bucket, opts, count) => {
+        deps.takes.push(bucket);
+        return inner.take(bucket, opts, count);
+      },
+    };
+    return deps;
+  }
+
+  gated('five stranger recovery MISSES naming an unclaimed address do not lock its owner out: the owner\'s attach still sends', async () => {
+    const deps = recordingDeps();
+    const email = `victim-${RUN}@example.com`;
+    for (let n = 1; n <= IDENTIFIER_SENDS_PER_RECIPIENT_PER_DAY; n++) {
+      const stranger = await mkAcct(deps);
+      deps.advanceMs((EMAIL_CODE_RESEND_COOLDOWN_SECONDS + 1) * 1000);
+      expect((await recoveryRequestCodeRoute(post(stranger.token, { email }), deps)).statusCode).toBe(200);
+    }
+    expect(deps.emailsSent).toHaveLength(0);
+    // The misses spent the address's MISS window, never its SEND window.
+    expect(deps.takes.filter((k) => k.startsWith('emailmiss:'))).toHaveLength(
+      IDENTIFIER_SENDS_PER_RECIPIENT_PER_DAY,
+    );
+    expect(deps.takes.filter((k) => k.startsWith('emailsend:'))).toHaveLength(0);
+    // The owner attaches the address the same day: the code goes out.
+    const owner = await mkAcct(deps);
+    deps.advanceMs((EMAIL_CODE_RESEND_COOLDOWN_SECONDS + 1) * 1000);
+    expect(
+      (await emailRequestCodeRoute(post(owner.token, { email, class: 'phone' }), deps)).statusCode,
+    ).toBe(200);
+    expect(deps.emailsSent).toHaveLength(1);
+    expect(deps.emailsSent[0]!.address).toBe(email);
+    expect(deps.takes.filter((k) => k.startsWith('emailsend:'))).toHaveLength(1);
+  });
+
+  gated('the email fleet ceiling is never spent on a MISS: twenty misses take `emailsend-fleet` zero times; a real send takes it once', async () => {
+    const deps = recordingDeps();
+    // Four pristine callers × five never-attached addresses: twenty misses,
+    // no per-caller (10/day) or per-address (60 s) window in the way.
+    for (let c = 0; c < 4; c++) {
+      const prober = await mkAcct(deps);
+      for (let a = 0; a < 5; a++) {
+        const res = await recoveryRequestCodeRoute(
+          post(prober.token, { email: `nobody-${RUN}-${c}-${a}@example.com` }),
+          deps,
+        );
+        expect(res.statusCode).toBe(200);
+      }
+    }
+    expect(deps.emailsSent).toHaveLength(0);
+    expect(deps.takes.filter((k) => k === 'emailsend-fleet')).toHaveLength(0);
+    // The identifier-keyed and caller-keyed budgets DID spend on the misses.
+    expect(deps.takes.filter((k) => k.startsWith('emailmiss:'))).toHaveLength(20);
+    expect(deps.takes.some((k) => k.startsWith('emailattach:'))).toBe(true);
+    // A real send charges the fleet exactly once.
+    const owner = await mkAcct(deps);
+    deps.takes.length = 0;
+    expect(
+      (
+        await emailRequestCodeRoute(
+          post(owner.token, { email: `fleet-${RUN}@example.com`, class: 'phone' }),
+          deps,
+        )
+      ).statusCode,
+    ).toBe(200);
+    expect(deps.emailsSent).toHaveLength(1);
+    expect(deps.takes.filter((k) => k === 'emailsend-fleet')).toHaveLength(1);
+  });
+});
+
 describe('refusal-uniformity and log-canary sweeps (the error paths, then the sinks)', () => {
   gated('recovery request-code answers IDENTICAL bytes for a linked and an unknown identifier, and only the linked one produces a send', async () => {
     const deps = freshDeps();
@@ -556,7 +639,7 @@ describe('refusal-uniformity and log-canary sweeps (the error paths, then the si
     );
   });
 
-  gated('a recovery request-code NEVER clobbers the caller\'s own pending ATTACH code — the registered-vs-not oracle is closed for a HIT and a MISS alike (gate fix)', async () => {
+  gated('a recovery request-code NEVER clobbers the caller\'s own pending ATTACH code — the registered-vs-not oracle is closed for a HIT and a MISS alike (fix)', async () => {
     const deps = freshDeps();
     // A registered address to probe (the HIT), stood up by its owner.
     const registered = `probed-${RUN}@example.com`;
@@ -599,7 +682,7 @@ describe('refusal-uniformity and log-canary sweeps (the error paths, then the si
     }
   });
 
-  gated('the recovery leg carries a PER-ACCOUNT daily send ceiling: one pristine account cycling distinct addresses is 429\'d past the pinned budget, so it cannot drain the fleet ceiling alone (gate fix)', async () => {
+  gated('the recovery leg carries a PER-ACCOUNT daily send ceiling: one pristine account cycling distinct addresses is 429\'d past the pinned budget, so it cannot drain the fleet ceiling alone (fix)', async () => {
     const deps = freshDeps();
     const drainer = await mkAcct(deps);
     // Distinct never-registered addresses (each miss answers uniform 200), each
@@ -623,7 +706,7 @@ describe('refusal-uniformity and log-canary sweeps (the error paths, then the si
     expect(over.statusCode).toBe(429);
   });
 
-  gated('K_id rotation is REAL: a claim resolved under a retiring version migrates forward to the newest, and a completed rotation orphans only what never resolved (gate fix)', async () => {
+  gated('K_id rotation is REAL: a claim resolved under a retiring version migrates forward to the newest, and a completed rotation orphans only what never resolved (fix)', async () => {
     const deps = freshDeps();
     const email = `rotate-${RUN}@example.com`;
     const acct = await mkAcct(deps);

@@ -1,5 +1,7 @@
+import { AppState, type AppStateStatus } from 'react-native';
 import * as native from 'tacendum-call';
 import * as calling from '../src/call';
+import * as db from '../src/db';
 import { messaging } from '../src/messaging';
 
 /**
@@ -406,5 +408,387 @@ describe('the quality indicator is fed a real number', () => {
     await inCall(true);
     await calling.callController().onIceStateChanged(CID, 'connected');
     expect(native.getStats).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The local mirror versus what the tracks actually do.
+// ---------------------------------------------------------------------------
+
+const CID_IN = '01J0000000000000000000000R';
+const OFFER_SDP = 'v=0\r\na=fingerprint:sha-256 AA:BB\r\nOFFER';
+
+async function flush(): Promise<void> {
+  for (let i = 0; i < 60; i++) await Promise.resolve();
+}
+
+/**
+ * Ring this phone with a 1:1 offer, through messaging's envelope listener —
+ * the seam production delivers on — and settle the controller.
+ */
+async function ringing(video: boolean, chat: Partial<db.ChatRow> = {}): Promise<void> {
+  jest.spyOn(messaging, 'onEnvelope');
+  jest.spyOn(messaging, 'sendCallEnvelope').mockResolvedValue(undefined);
+  // Someone this phone has HISTORY with (§10.6): the ring rule silences an
+  // unknown caller, and this file has no database to hold a chat row.
+  jest
+    .spyOn(db, 'getChat')
+    .mockResolvedValue({ peerId: PEER, lastMessageAt: Date.now(), ...chat } as db.ChatRow);
+  teardown = await calling.startCalling();
+  const listener = (messaging.onEnvelope as jest.Mock).mock.calls.at(-1)![0] as (
+    peerId: string,
+    envelope: unknown,
+    meta: { msgId: string; ts: number },
+  ) => void;
+  listener(
+    PEER,
+    { tcm: 'call.offer', cid: CID_IN, sdp: OFFER_SDP, vid: video, exp: Date.now() + 60_000 },
+    { msgId: '01HQMSG000000000000000000B', ts: Date.now() },
+  );
+  await flush();
+  await calling.callController().whenIdle();
+  expect(calling.currentStateForTests().name).toBe('incoming_ringing');
+}
+
+/**
+ * An offer from someone this phone has NO history with (§10.6, the default
+ * ON): the controller silences it and writes the missed row on the person's
+ * behalf. The row write fails here exactly as in `ringing` — no database —
+ * which is the locked phone's own case.
+ */
+async function silencedOffer(): Promise<void> {
+  jest.spyOn(messaging, 'onEnvelope');
+  jest.spyOn(messaging, 'sendCallEnvelope').mockResolvedValue(undefined);
+  jest.spyOn(db, 'getChat').mockResolvedValue(null);
+  teardown = await calling.startCalling();
+  const listener = (messaging.onEnvelope as jest.Mock).mock.calls.at(-1)![0] as (
+    peerId: string,
+    envelope: unknown,
+    meta: { msgId: string; ts: number },
+  ) => void;
+  listener(
+    PEER,
+    { tcm: 'call.offer', cid: CID_IN, sdp: OFFER_SDP, vid: false, exp: Date.now() + 60_000 },
+    { msgId: '01HQMSG000000000000000000C', ts: Date.now() },
+  );
+  await flush();
+  await calling.callController().whenIdle();
+}
+
+describe('the camera toggle honours the native verdict', () => {
+  it('does not claim a camera the call never negotiated', async () => {
+    // An audio call has no video m-line and no local video track;
+    // `setVideoEnabled` answers `false`. The flag used to flip anyway: a
+    // black preview here, and `call.media{v:true}` to a peer whose whole
+    // screen then became a black video surface.
+    await inCall(false);
+    const sent = messaging.sendCallEnvelope as jest.Mock;
+    sent.mockClear();
+    (native.setVideoEnabled as jest.Mock).mockResolvedValueOnce(false);
+
+    await calling.toggleVideo();
+
+    expect(calling.localMediaState().videoEnabled).toBe(false);
+    expect(sent.mock.calls.some(c => c[1]?.tcm === 'call.media')).toBe(false);
+  });
+
+  it('still turns a negotiated camera off and on', async () => {
+    await inCall(true);
+    await calling.toggleVideo();
+    expect(calling.localMediaState().videoEnabled).toBe(false);
+    await calling.toggleVideo();
+    expect(calling.localMediaState().videoEnabled).toBe(true);
+  });
+});
+
+describe('"Answer without video" re-derives the mirror', () => {
+  it('says the camera is off for a video invite answered as audio', async () => {
+    // The reset is keyed on the cid, and the cid does not change between the
+    // ring and the answer — so the mirror kept saying "camera on" for a call
+    // whose answer never started it: "Turn camera off" over a black preview,
+    // Flip enabled, and a tap straight into a black far end.
+    await ringing(true);
+    expect(calling.localMediaState().videoEnabled).toBe(true);
+    (native.setSpeaker as jest.Mock).mockClear();
+
+    await calling.callController().accept({ video: false });
+    await flush();
+
+    expect(calling.callController().state.call?.video).toBe(false);
+    expect(calling.localMediaState().videoEnabled).toBe(false);
+    // The route follows: an audio answer is heard at the ear.
+    expect(native.setSpeaker).toHaveBeenCalledWith(CID_IN, false);
+    expect(calling.localMediaState().speakerOn).toBe(false);
+  });
+
+  it('keeps the camera on for a video invite answered with video', async () => {
+    await ringing(true);
+    await calling.callController().accept();
+    await flush();
+    expect(calling.callController().state.call?.video).toBe(true);
+    expect(calling.localMediaState().videoEnabled).toBe(true);
+  });
+});
+
+describe('backgrounding a video call tells the peer (§6.6)', () => {
+  let onAppState: ((next: AppStateStatus) => void) | null = null;
+  let remove: jest.Mock;
+  let restore: () => void = () => undefined;
+
+  beforeEach(() => {
+    onAppState = null;
+    remove = jest.fn();
+    const capture = ((type: string, handler: (next: AppStateStatus) => void) => {
+      if (type === 'change') onAppState = handler;
+      return { remove };
+    }) as unknown as typeof AppState.addEventListener;
+    // The preset already mocks `addEventListener`; a `mockRestore` on an
+    // existing jest.fn would wipe its implementation for every later test
+    // in this file, so the original implementation is put back by hand.
+    const add = AppState.addEventListener as unknown as jest.Mock;
+    if (jest.isMockFunction(add)) {
+      const original = add.getMockImplementation();
+      add.mockImplementation(capture);
+      restore = () => void add.mockImplementation(original);
+    } else {
+      const spy = jest.spyOn(AppState, 'addEventListener').mockImplementation(capture);
+      restore = () => spy.mockRestore();
+    }
+  });
+
+  afterEach(() => {
+    restore();
+  });
+
+  it('disables the camera and announces v:false on background, restores it on return', async () => {
+    // iOS interrupts the capture session in the background; nothing told the
+    // peer, who watched a frozen frame under "Connected".
+    await inCall(true);
+    expect(onAppState).not.toBeNull();
+    const sent = messaging.sendCallEnvelope as jest.Mock;
+    sent.mockClear();
+    (native.setVideoEnabled as jest.Mock).mockClear();
+
+    onAppState!('background');
+    await flush();
+
+    expect(native.setVideoEnabled).toHaveBeenCalledWith(CID, false);
+    expect(calling.localMediaState().videoEnabled).toBe(false);
+    let media = sent.mock.calls.find(c => c[1]?.tcm === 'call.media');
+    expect(media?.[1]).toMatchObject({ cid: CID, v: false });
+
+    sent.mockClear();
+    onAppState!('active');
+    await flush();
+
+    expect(native.setVideoEnabled).toHaveBeenCalledWith(CID, true);
+    expect(calling.localMediaState().videoEnabled).toBe(true);
+    media = sent.mock.calls.find(c => c[1]?.tcm === 'call.media');
+    expect(media?.[1]).toMatchObject({ cid: CID, v: true });
+  });
+
+  it('leaves a camera the person turned off alone, and restores nothing', async () => {
+    await inCall(true);
+    await calling.toggleVideo();
+    expect(calling.localMediaState().videoEnabled).toBe(false);
+    (native.setVideoEnabled as jest.Mock).mockClear();
+
+    onAppState!('background');
+    await flush();
+    onAppState!('active');
+    await flush();
+
+    expect(native.setVideoEnabled).not.toHaveBeenCalled();
+    expect(calling.localMediaState().videoEnabled).toBe(false);
+  });
+
+  it('restores only the call that was paused, never the next one', async () => {
+    await inCall(true);
+    onAppState!('background');
+    await flush();
+    await calling.callController().hangup();
+    const CID2 = '01J0000000000000000000000S';
+    await calling.callController().placeCall(PEER, CID2, false);
+    (native.setVideoEnabled as jest.Mock).mockClear();
+
+    onAppState!('active');
+    await flush();
+
+    expect(native.setVideoEnabled).not.toHaveBeenCalled();
+    expect(calling.localMediaState().videoEnabled).toBe(false);
+  });
+
+  it('is a no-op with no call up', async () => {
+    jest.spyOn(messaging, 'sendCallEnvelope').mockResolvedValue(undefined);
+    teardown = await calling.startCalling();
+    onAppState!('background');
+    await flush();
+    expect(native.setVideoEnabled).not.toHaveBeenCalled();
+  });
+
+  it('removes its listener when calling stops', async () => {
+    await inCall(true);
+    teardown?.();
+    teardown = undefined;
+    expect(remove).toHaveBeenCalled();
+  });
+});
+
+describe('mute honours the native verdict', () => {
+  it('a connected call whose track refused the change claims nothing', async () => {
+    await inCall(true);
+    await calling.callController().onIceStateChanged(CID, 'connected');
+    const sent = messaging.sendCallEnvelope as jest.Mock;
+    sent.mockClear();
+    (native.setAudioEnabled as jest.Mock).mockResolvedValueOnce(false);
+
+    await calling.toggleMute();
+
+    expect(calling.localMediaState().muted).toBe(false);
+    expect(sent.mock.calls.some(c => c[1]?.tcm === 'call.media')).toBe(false);
+  });
+
+  it('a mute before the track exists is kept as intent and landed when the track is born', async () => {
+    // The CallKit Mute tapped right after answering a video call lands
+    // inside the camera-enumeration window, before `addLocalMedia` has
+    // installed the audio track: native answers `false`. The flag used to
+    // flip and the announce go out, and the track installed a moment later
+    // came up ENABLED — a muted UI over a live microphone.
+    let release: (sdp: string) => void = () => undefined;
+    (native.createOffer as jest.Mock).mockImplementationOnce(
+      () =>
+        new Promise<string>(resolve => {
+          release = resolve;
+        }),
+    );
+    jest.spyOn(messaging, 'sendCallEnvelope').mockResolvedValue(undefined);
+    teardown = await calling.startCalling();
+    const placing = calling.callController().placeCall(PEER, CID, true);
+    await flush();
+    expect(calling.currentStateForTests().name).toBe('outgoing_connecting');
+
+    (native.setAudioEnabled as jest.Mock).mockResolvedValueOnce(false);
+    await calling.toggleMute();
+    // The intent is kept — CallKit and the button agree with what was asked…
+    expect(calling.localMediaState().muted).toBe(true);
+    (native.setAudioEnabled as jest.Mock).mockClear();
+
+    // …and the moment the track exists, it is landed on it.
+    release(OFFER_SDP);
+    await placing;
+    await flush();
+    expect(native.setAudioEnabled).toHaveBeenCalledWith(CID, false);
+  });
+
+  it('the CallKit mute button goes through the same verdict', async () => {
+    await inCall(true);
+    await calling.callController().onIceStateChanged(CID, 'connected');
+    (native.setAudioEnabled as jest.Mock).mockResolvedValueOnce(false);
+
+    (native as unknown as { __call: { emit: (n: string, p: unknown) => void } }).__call.emit(
+      'callKitMute',
+      { cid: CID, muted: true },
+    );
+    await flush();
+
+    expect(calling.localMediaState().muted).toBe(false);
+  });
+
+  it('a camera intent is landed on the born track as well', async () => {
+    let release: (sdp: string) => void = () => undefined;
+    (native.createOffer as jest.Mock).mockImplementationOnce(
+      () =>
+        new Promise<string>(resolve => {
+          release = resolve;
+        }),
+    );
+    jest.spyOn(messaging, 'sendCallEnvelope').mockResolvedValue(undefined);
+    teardown = await calling.startCalling();
+    const placing = calling.callController().placeCall(PEER, CID, true);
+    await flush();
+    // The camera turned off while the track was still being built: the
+    // verdict is `true` here (the mock's default) but the point is the
+    // re-apply — the same level-triggered rule `applyPressure` follows.
+    await calling.toggleVideo();
+    expect(calling.localMediaState().videoEnabled).toBe(false);
+    (native.setVideoEnabled as jest.Mock).mockClear();
+
+    release(OFFER_SDP);
+    await placing;
+    await flush();
+    expect(native.setVideoEnabled).toHaveBeenCalledWith(CID, false);
+  });
+});
+
+describe('a missed call posts a notice', () => {
+  let post: jest.SpyInstance;
+
+  beforeEach(() => {
+    // Through the seam: the module mock predates the method, and a copy of
+    // the namespace is what this file holds.
+    post = jest.spyOn(calling.missedCallBridge, 'post').mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    post.mockRestore();
+    jest.useRealTimers();
+  });
+
+  it('posts "Missed call" with the name this device holds when the ring runs out — with or without a row', async () => {
+    // No database here, so the row write fails; the notice must not.
+    jest.useFakeTimers();
+    await ringing(false, { displayName: 'Dana', localName: '' });
+
+    await jest.advanceTimersByTimeAsync(61_000);
+    await flush();
+    await calling.callController().whenIdle();
+
+    expect(calling.currentStateForTests().name).toBe('idle');
+    expect(post).toHaveBeenCalledWith(PEER, 'Dana');
+  });
+
+  it('sends an EMPTY name when it knows none — never a raw id fragment', async () => {
+    // '' lets native fall back to the name mirror the ring itself paints
+    // from; a short id on the lock screen would name nobody the owner
+    // recognises and identify them to anyone else.
+    jest.useFakeTimers();
+    await ringing(false);
+
+    await jest.advanceTimersByTimeAsync(61_000);
+    await flush();
+    await calling.callController().whenIdle();
+
+    expect(post).toHaveBeenCalledWith(PEER, '');
+  });
+
+  it('posts nothing for a call the person declined', async () => {
+    await ringing(false);
+    await calling.callController().decline();
+    await flush();
+    await calling.callController().whenIdle();
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it('posts NOTHING for a silenced stranger — the row is the evidence, the phone stays quiet', async () => {
+    // The notice is audible and lock-screen visible (`content.sound =
+    // .default`, IMPORTANCE_DEFAULT). Keyed on `missed` alone it fired for
+    // the row the silence policy writes on a stranger's behalf — the exact
+    // interrupt §10.6 closes, once per offer, for anyone holding the id.
+    await silencedOffer();
+
+    expect(calling.currentStateForTests().name).toBe('idle');
+    expect(native.reportIncomingCall).not.toHaveBeenCalled();
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it('posts nothing for an outgoing call nobody answered', async () => {
+    jest.useFakeTimers();
+    jest.spyOn(messaging, 'sendCallEnvelope').mockResolvedValue(undefined);
+    teardown = await calling.startCalling();
+    await calling.callController().placeCall(PEER, CID, false);
+    await jest.advanceTimersByTimeAsync(61_000);
+    await flush();
+    await calling.callController().whenIdle();
+    expect(post).not.toHaveBeenCalled();
   });
 });

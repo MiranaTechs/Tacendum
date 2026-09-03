@@ -81,9 +81,26 @@ internal object CallAudioGate {
     context = appContext.applicationContext
     connections = liveConnections
     emit = sink
+    ProximityGuard.attach(appContext)
   }
 
   fun isActive(): Boolean = synchronized(lock) { isAudioEnabled }
+
+  /**
+   * Re-derive the proximity wake lock from the three facts it hangs on: the
+   * audio unit running, the active connection's route on the earpiece, and
+   * no live connection carrying video. Called from every path that can
+   * change one of them — the activation site, the deactivation, the route
+   * callback, and the module after a negotiation births a track or a close
+   * drops one. Idempotent, so an extra call is free. */
+  fun refreshProximity() {
+    val (active, connection) = synchronized(lock) { Pair(isAudioEnabled, activeConnection) }
+    val earpiece = connection?.route() == "earpiece"
+    // `usesVideo`: the call took the camera, so it is a call the person looks
+    // at whatever the camera is doing right now.
+    val video = connections().any { it.usesVideo }
+    ProximityGuard.refresh(active, earpiece, video)
+  }
 
   /**
    * THE ONLY PLACE THE AUDIO UNIT STARTS.
@@ -113,6 +130,8 @@ internal object CallAudioGate {
     // audio unit was already running comes up manual and would otherwise stay
     // silent for the rest of the call.
     for (pc in connections()) pc.applyAudioUnit(true)
+    // The unit is up and the route applied: the proximity rule can read both.
+    refreshProximity()
     if (!first) return
     // Carries no cid: there is one audio path per DEVICE, not per call — the
     // same contract the iOS event has, which is why the JS reducer needs no
@@ -136,6 +155,9 @@ internal object CallAudioGate {
           if (stop) isAudioEnabled = false
           stop
         }
+    // Whatever else is live, the lock is re-derived: a leg ending changes
+    // nothing for the others, the last one ending releases it.
+    refreshProximity()
     if (!wasEnabled) return
     for (pc in connections()) pc.applyAudioUnit(false)
     emit(EVENT_AUDIO_DEACTIVATED, "{}")
@@ -148,6 +170,9 @@ internal object CallAudioGate {
 
   fun onRouteChanged(state: CallAudioState) {
     emitRoute(routeName(state.route))
+    // The speaker button, a headset, Bluetooth: the route is the proximity
+    // rule's input that moves on its own clock.
+    refreshProximity()
   }
 
   /**

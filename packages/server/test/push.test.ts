@@ -4,7 +4,7 @@ import {
   registerPushTokenHandler,
 } from '../src/handlers/push.js';
 import type { AuthContext, HttpEvent } from '../src/handlers/http.js';
-import type { DataLayer } from '../src/db/data.js';
+import type { TestOnlyDataLayer } from '../src/db/data.js';
 import { makeMemoryDb, makeTestDeps, parseBody, type TestDeps } from './helpers.js';
 
 /**
@@ -40,7 +40,7 @@ const VALID = {
   bundleId: 'com.miranatechnologies.tacendum',
 };
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: TestDeps;
 beforeEach(() => {
   db = makeMemoryDb();

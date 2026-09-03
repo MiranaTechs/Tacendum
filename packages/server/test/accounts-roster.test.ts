@@ -5,11 +5,11 @@ import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { ListTablesCommand } from '@aws-sdk/client-dynamodb';
 import { PrekeyBundle, RevokedKeysHint, TABLES } from '@tacendum/shared';
 import { makeDocClient, makeDynamoClient } from '../src/db/client.js';
-import { makeDataLayer, type DataLayer } from '../src/db/data.js';
+import { makeTestOnlyDataLayer, type TestOnlyDataLayer } from '../src/db/data.js';
 import { getPrekeyBundleHandler, uploadKeysHandler } from '../src/handlers/keys.js';
 import { errorResult, type HttpEvent } from '../src/handlers/http.js';
 import { wsDefaultHandler, type WsDeps } from '../src/handlers/ws.js';
-import { makeTestDeps, testIdentityKey, type TestDeps } from './helpers.js';
+import { makeTestDeps, testIdentityKey, type TestDeps, KEY_FIXTURE } from './helpers.js';
 
 /**
  * the roster in the bundle response, against REAL
@@ -51,7 +51,7 @@ const FIXTURE = JSON.parse(
   result: { statusCode: number; headers: Record<string, string>; body: string };
 };
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 let flagOn = false;
 let deps: TestDeps;
@@ -79,7 +79,7 @@ function runIdentityKey(n: number): string {
 
 beforeAll(async () => {
   const client = makeDynamoClient();
-  const base = makeDataLayer(makeDocClient(client));
+  const base = makeTestOnlyDataLayer(makeDocClient(client));
   db = { ...base, isAccountsFeatureEnabled: async () => flagOn };
   try {
     const { TableNames = [] } = await client.send(new ListTablesCommand({}));
@@ -115,8 +115,8 @@ async function mkKeyedUser(seed: number, userId = uid()): Promise<string> {
   const upload = {
     registrationId: 1000 + seed,
     identityKey: idKey,
-    signedPrekey: { keyId: 1, pub: idKey, sig: idKey },
-    kyberPrekey: { keyId: 2, pub: idKey, sig: idKey },
+    signedPrekey: { keyId: 1, pub: KEY_FIXTURE.curvePub, sig: KEY_FIXTURE.sig },
+    kyberPrekey: { keyId: 2, pub: KEY_FIXTURE.kyberPub, sig: KEY_FIXTURE.sig },
     oneTimePrekeys: [],
   };
   const up = await uploadKeysHandler(
@@ -193,23 +193,23 @@ describe('solo target: byte-identical to the CAPTURED legacy fixture', () => {
     expect(res.kind).toBe('ok');
     const target = res.kind === 'ok' ? res.user.userId : FIXTURE.userId;
     expect(target).toBe(FIXTURE.userId);
-    const up = await uploadKeysHandler(
-      {
-        method: 'PUT',
-        path: '/',
-        headers: {},
-        body: JSON.stringify({
+    // Seeded through the data layer, not PUT /v1/keys: the capture's key
+    // material is the identity key reused as prekey AND signature — 33 bytes
+    // where the upload schema now demands 64 and 1569 — and the bytes under
+    // test are the SERVED ones, which storeKeys seeds exactly as the earlier
+    // handler stored them.
+    expect(
+      await db.storeKeys(
+        FIXTURE.userId,
+        {
           registrationId: FIXTURE.registrationId,
-          identityKey: idKey,
+          identityKeyPub: idKey,
           signedPrekey: { keyId: FIXTURE.signedPrekeyKeyId, pub: idKey, sig: idKey },
           kyberPrekey: { keyId: FIXTURE.kyberPrekeyKeyId, pub: idKey, sig: idKey },
-          oneTimePrekeys: [],
-        }),
-      },
-      deps,
-      { userId: FIXTURE.userId },
-    );
-    expect(up.statusCode).toBe(204);
+        },
+        [],
+      ),
+    ).toBe(true);
 
     for (const on of [false, true]) {
       flagOn = on;

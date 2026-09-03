@@ -1,5 +1,5 @@
 import React from 'react';
-import Svg, { Path } from 'react-native-svg';
+import Svg, { Circle, Path } from 'react-native-svg';
 
 /**
  * Delivery status on an outgoing message: one tick sent, two delivered, two
@@ -13,10 +13,13 @@ import Svg, { Path } from 'react-native-svg';
  * than adding a third tick keeps the difference legible at a glance without
  * teaching anyone a new vocabulary.
  *
- * Nothing is drawn while a message is still pending. A tick that appears
- * before the message has left the device would be the one lie this indicator
- * must not tell.
- */
+ * A pending message draws a small hollow ring in the muted ink — never a
+ * tick. A tick that appears before the message has left the device would be
+ * the one lie this indicator must not tell; but drawing NOTHING (as this did
+ * earlier) made "still in the outbox" and "routed, no word back"
+ * the same empty space, and a queued message under a dead socket looked
+ * exactly like a sent one. The ring is the outline of the place a tick will
+ * land: a claim about this phone, not about the server. */
 
 export type TickStatus = 'pending' | 'sent' | 'delivered' | 'read';
 
@@ -36,8 +39,29 @@ export function TickGlyph({
   color,
   readColor,
   size = 14,
-}: Props): React.JSX.Element | null {
-  if (status === 'pending') return null;
+}: Props): React.JSX.Element {
+  if (status === 'pending') {
+    return (
+      <Svg
+        width={size}
+        height={size}
+        viewBox="0 0 16 16"
+        accessibilityElementsHidden
+        importantForAccessibility="no-hide-descendants"
+      >
+        {/* Centred, and about the single tick's own span, so the row's
+            metadata does not shift when the ring becomes a tick. */}
+        <Circle
+          cx={8}
+          cy={8}
+          r={4.5}
+          stroke={color}
+          strokeWidth={STROKE}
+          fill="none"
+        />
+      </Svg>
+    );
+  }
 
   const double = status !== 'sent';
   const stroke = status === 'read' ? readColor : color;

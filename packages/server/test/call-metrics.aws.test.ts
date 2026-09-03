@@ -2,11 +2,35 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { GetCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { PutMetricDataCommand } from '@aws-sdk/client-cloudwatch';
 import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { CALL_METRIC_DEDUPE_TABLE, TABLES, TABLE_ENV_VARS } from '@tacendum/shared';
 import {
+  CALL_METRIC_DEDUPE_TABLE_ENV,
   makeAwsCallMetricPublisher,
   makeAwsCallMetricStore,
   makeAwsCallMetrics,
 } from '../src/aws/call-metrics.js';
+
+/**
+ * The dedupe table existed only in CDK, under an env name hard-coded in three
+ * places; the local table script did not create it. It now has one home in the
+ * shared contract — deliberately BESIDE `TABLES`/`TABLE_ENV_VARS` rather than
+ * inside them, because those name the tables EVERY application function
+ * receives (the infra suite pins that) and this one is injected into HttpFn
+ * alone (pinned too). The env name is the one the stack already hard-codes, so
+ * no CDK change was needed. */
+describe('the call-metric dedupe table is part of the shared table contract', () => {
+  it('the adapter reads the env name the stack sets, through the contract', () => {
+    expect(CALL_METRIC_DEDUPE_TABLE_ENV).toBe(CALL_METRIC_DEDUPE_TABLE.envVar);
+    expect(CALL_METRIC_DEDUPE_TABLE.envVar).toBe('TACENDUM_TABLE_CALL_METRIC_DEDUPE');
+  });
+
+  it('is named and TTL\'d like its siblings, outside the every-function set', () => {
+    expect(CALL_METRIC_DEDUPE_TABLE.name).toMatch(/^tacendum_/);
+    expect(Object.values(TABLES)).not.toContain(CALL_METRIC_DEDUPE_TABLE.name);
+    expect(Object.values(TABLE_ENV_VARS)).not.toContain(CALL_METRIC_DEDUPE_TABLE.envVar);
+    expect(CALL_METRIC_DEDUPE_TABLE.ttlAttribute).toBe('expiresAt');
+  });
+});
 
 const cloudWatch = vi.hoisted(() => ({
   client: { send: vi.fn() },

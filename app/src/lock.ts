@@ -40,6 +40,39 @@ const FREE_ATTEMPTS = 5;
 const BASE_COOLDOWN_MS = 30_000;
 const MAX_COOLDOWN_MS = 15 * 60_000;
 
+/**
+ * The in-process half of the cooldown deadline, on the MONOTONIC clock.
+ * `lock.lockedUntil` is wall-clock so a relaunch resumes the cooldown, but a
+ * wall clock can be moved: a forward jump — a network time correction, a
+ * manual change — would end the cooldown early. Inside one process the
+ * monotonic clock cannot be moved, so the cooldown holds for its full length
+ * on whichever of the two is later. The shadow is bound to the exact
+ * Keychain deadline it was minted for: a deadline that was rewritten, reset
+ * or cleared invalidates it, so the Keychain stays the one source a relaunch
+ * reads (that a relaunch trusts the wall clock is the platform's limit — no
+ * monotonic clock survives a process — not a choice). A backward jump needs
+ * no help: it only ever lengthens the wall-clock hold, which is the
+ * fail-closed direction. */
+let cooldownShadow: { wallUntil: number; monoUntil: number } | null = null;
+
+function monotonicNow(): number | null {
+  const perf = (globalThis as { performance?: { now?: () => number } }).performance;
+  return typeof perf?.now === 'function' ? perf.now() : null;
+}
+
+/** How long the cooldown bound to `wallUntil` still has on the monotonic
+ * clock — 0 when no shadow is bound to it, or this runtime has no such clock. */
+function shadowRemainingMs(wallUntil: number): number {
+  if (cooldownShadow === null || cooldownShadow.wallUntil !== wallUntil) return 0;
+  const mono = monotonicNow();
+  return mono === null ? 0 : Math.max(0, cooldownShadow.monoUntil - mono);
+}
+
+function bindCooldownShadow(wallUntil: number, cooldownMs: number): void {
+  const mono = monotonicNow();
+  cooldownShadow = mono === null ? null : { wallUntil, monoUntil: mono + cooldownMs };
+}
+
 export const COPY = {
   badLength: 'Use 4 to 10 digits.',
   palindrome: "This code reads the same backwards — pick one that doesn't.",
@@ -72,6 +105,7 @@ export async function setup(code: string): Promise<void> {
   await setSecret(KEY_ENABLED, '1');
   await deleteSecret(KEY_FAILS);
   await deleteSecret(KEY_LOCKED_UNTIL);
+  cooldownShadow = null;
 }
 
 export async function setAutolock(sec: number): Promise<void> {
@@ -87,13 +121,17 @@ export async function disable(): Promise<void> {
 /** Unconditional wipe of lock state — the real sign-out path only. */
 export async function clearAll(): Promise<void> {
   for (const key of ALL_KEYS) await deleteSecret(key);
+  cooldownShadow = null;
 }
 
 export async function verify(entered: string): Promise<LockVerdict> {
   const now = Date.now();
   const lockedUntil = Number((await getSecret(KEY_LOCKED_UNTIL)) ?? '0');
-  if (lockedUntil > now) {
-    return { verdict: 'cooldown', retryInMs: lockedUntil - now };
+  // The later of the two clocks holds: the Keychain's wall-clock deadline,
+  // or its monotonic shadow when the wall clock jumped past it.
+  const retryInMs = Math.max(lockedUntil - now, shadowRemainingMs(lockedUntil));
+  if (retryInMs > 0) {
+    return { verdict: 'cooldown', retryInMs };
   }
   const stored = await getSecret(KEY_CODE);
   // Enabled-with-no-code is a corrupt half-state; never brick the user.
@@ -117,7 +155,9 @@ export async function verify(entered: string): Promise<LockVerdict> {
       BASE_COOLDOWN_MS * 2 ** (fails - FREE_ATTEMPTS),
       MAX_COOLDOWN_MS,
     );
-    await setSecret(KEY_LOCKED_UNTIL, String(now + cooldown));
+    const wallUntil = now + cooldown;
+    await setSecret(KEY_LOCKED_UNTIL, String(wallUntil));
+    bindCooldownShadow(wallUntil, cooldown);
     return { verdict: 'cooldown', retryInMs: cooldown };
   }
   return { verdict: 'fail', attemptsLeft: FREE_ATTEMPTS - fails };
@@ -126,11 +166,12 @@ export async function verify(entered: string): Promise<LockVerdict> {
 async function resetFailures(): Promise<void> {
   await deleteSecret(KEY_FAILS);
   await deleteSecret(KEY_LOCKED_UNTIL);
+  cooldownShadow = null;
 }
 
 /** Active cooldown remaining, without consuming an attempt (lock-screen
- * countdown on mount/relaunch). */
+ * countdown on mount/relaunch). The later of the two clocks, as `verify`. */
 export async function cooldownRemainingMs(): Promise<number> {
   const lockedUntil = Number((await getSecret(KEY_LOCKED_UNTIL)) ?? '0');
-  return Math.max(0, lockedUntil - Date.now());
+  return Math.max(0, lockedUntil - Date.now(), shadowRemainingMs(lockedUntil));
 }

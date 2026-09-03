@@ -10,6 +10,7 @@ import {
   AccessibilityInfo,
   AppState,
   ActivityIndicator,
+  BackHandler,
   Clipboard,
   findNodeHandle,
   FlatList,
@@ -88,6 +89,7 @@ import {
   type PickSource,
 } from '../media';
 import { useKeyboardInset } from '../keyboardInset';
+import { linkRuns } from '../linkRuns';
 import { groupDeliveryNotice, messaging } from '../messaging';
 import { personName, personRef, sanitizeDisplayName, shortId } from '../person';
 import {
@@ -112,6 +114,7 @@ import { useReduceMotion } from '../useReduceMotion';
 import { usePaneWidth } from '../windowClass';
 import { Avatar } from '../ui/Avatar';
 import { PhoneGlyph, VideoGlyph } from '../ui/CallGlyph';
+import { InfoDisclosure } from '../ui/InfoDisclosure';
 // `tickLabel` is deliberately NOT imported: this screen announces delivery
 // state through STATUS_WORD, which is folded into the whole bubble's
 // accessibility label, and the glyph itself is hidden from VoiceOver so the
@@ -212,6 +215,9 @@ const RAIL_DISMISS_SCROLL = 24;
  */
 const BOTTOM_SLACK = 24;
 
+/** How long the row a tapped quote led to stays washed pine. */
+const QUOTE_FLASH_MS = 600;
+
 /** Trailing debounce on draft writes — one row per pause, not per keystroke. */
 const DRAFT_SAVE_MS = 400;
 
@@ -243,8 +249,22 @@ const MENTION_QUERY_MAX = 32;
  */
 const MENTION_PICKER_MAX_HEIGHT = 216;
 
+/** Behind the attach drawer's ⓘ: the two
+ * promises the tiles could be read as making, stated where they are asked
+ * for rather than printed under the grid on every open. */
+const ATTACH_ABOUT = [
+  'Photos you take here aren’t saved to your Photos.',
+  'Your location is read once, only when you tap Location.',
+] as const;
+
 /** People-facing copy. A raw exception must never reach the screen. */
 const COPY = {
+  /** The composer's "+" opens photos, the camera, documents and location —
+   * it is not a photo button. */
+  attach: 'Attach',
+  attachHint: 'Photos, camera, a file, or your location',
+  /** The unread divider. */
+  newMessages: (n: number) => `${n} new ${n === 1 ? 'message' : 'messages'}`,
   sendFailed: 'Your message wasn’t sent. Check your connection and try again.',
   tooLong: 'That message is too long to send.',
   photoUnreadable: 'Tacendum couldn’t read that photo. Choose another one.',
@@ -814,6 +834,7 @@ function VoiceContent({
   onToggle(): void;
   onRetry(): void;
 }): React.JSX.Element {
+  const styles = stylesFor(t);
   const state = attachment?.state ?? 'pending';
   const ink = out ? t.color.onBubbleOut : t.color.inkStrong;
   const sub = out ? t.color.onBubbleOut : t.color.inkMuted;
@@ -1001,6 +1022,115 @@ function quiet<T>(work: Promise<T>, then?: (value: T) => void): void {
   work.then(value => then?.(value)).catch(() => {});
 }
 
+/**
+ * A message's words with every declared web address made tappable.
+ * Plain words come back as the string itself, so a bubble without an
+ * address renders exactly as before; an address becomes a nested link —
+ * underlined AND coloured, never colour alone — that opens through
+ * Linking when tapped. Nothing is fetched or previewed: the address
+ * leaves this phone only on that tap. */
+function linkedText(
+  text: string,
+  linkColor: string,
+  keyPrefix: string,
+  theme: Theme,
+): React.ReactNode {
+  const runs = linkRuns(text);
+  if (!runs.some(run => run.kind === 'link')) return text;
+  const styles = stylesFor(theme);
+  return runs.map((run, i) =>
+    run.kind === 'text' ? (
+      run.text
+    ) : (
+      <Text
+        key={`${keyPrefix}-${i}`}
+        accessibilityRole="link"
+        onPress={() => {
+          // A scheme this device cannot open rejects; that is not an error
+          // the person can act on from a bubble.
+          void Linking.openURL(run.url).catch(() => undefined);
+        }}
+        style={[styles.linkSpan, { color: linkColor }]}
+      >
+        {run.text}
+      </Text>
+    ),
+  );
+}
+
+/**
+ * The delivery state a tick can draw. `received` is an inbound state and
+ * `error` renders the failed bubble, so neither reaches a tick; they map to
+ * the state that draws nothing rather than being cast past the type — a new
+ * MessageStatus fails here at compile time instead of on glass. */
+function tickStatusOf(status: db.MessageStatus): TickStatus {
+  return status === 'received' || status === 'error' ? 'pending' : status;
+}
+
+/** The identity of the newest inbound row: the "New messages" register
+ * compares this, never a row count. */
+interface InboundMark {
+  ts: number;
+  msgId: string;
+}
+
+/** `a` is a later arrival than `b` — by the sender's clock, then by id, the
+ * same order the list itself is sorted in. */
+function laterArrival(a: InboundMark, b: InboundMark): boolean {
+  return a.ts > b.ts || (a.ts === b.ts && a.msgId > b.msgId);
+}
+
+/** The newest inbound row on glass, or null when there is none. */
+function newestInboundOf(rows: db.MessageRow[]): InboundMark | null {
+  let newest: InboundMark | null = null;
+  for (const row of rows) {
+    if (row.direction !== 'in') continue;
+    if (newest === null || laterArrival(row, newest)) {
+      newest = { ts: row.ts, msgId: row.msgId };
+    }
+  }
+  return newest;
+}
+
+/**
+ * One emoji as the eye counts it: a pictographic base with any skin tone,
+ * presentation selector or keycap, joined to further bases by ZWJ — or a
+ * flag, which is two regional indicators. Built once and guarded: a JS
+ * engine without Unicode property escapes simply never draws jumbo emoji,
+ * it does not fail to draw the thread.
+ */
+const EMOJI_UNIT = (() => {
+  try {
+    const base =
+      '\\p{Extended_Pictographic}(?:\\p{Emoji_Modifier}|\\uFE0F|\\u20E3)*';
+    return new RegExp(
+      `(?:${base}(?:\\u200D${base})*|\\p{Regional_Indicator}{2})`,
+      'gu',
+    );
+  } catch {
+    return null;
+  }
+})();
+
+/** At most this many emoji, and nothing else, draw at display size. */
+const JUMBO_EMOJI_MAX = 3;
+
+/**
+ * Whether a message is one to three emoji and nothing else. Spaces between
+ * them are allowed; any letter, digit or mark that is not part of an emoji
+ * is a sentence, and a sentence keeps its bubble. */
+function isEmojiOnly(text: string): boolean {
+  if (EMOJI_UNIT === null) return false;
+  const packed = text.replace(/\s+/g, '');
+  if (packed === '') return false;
+  const units = packed.match(EMOJI_UNIT);
+  return (
+    units !== null &&
+    units.length <= JUMBO_EMOJI_MAX &&
+    units.join('') === packed
+  );
+}
+
 /** What VoiceOver says for a delivery state — never punctuation names. */
 const STATUS_WORD: Record<string, string> = {
   pending: 'Sending',
@@ -1057,11 +1187,35 @@ interface ThreadItem {
    * `approvals` table (an approval never becomes a
    * message row — the body would hold a command line at rest). */
   approval?: db.ApprovalRow;
+  /**
+   * The unread divider: how many messages arrived since the thread was last
+   * open. Set on exactly one item, placed above the first of them; `row` is
+   * then a placeholder carrying that row's ts. */
+  divider?: number;
+  /** The row's body, parsed ONCE per data change and carried here so the
+   * grouping pass, the quote resolver and the mounted row all read the
+   * same answer (each used to parse it again). Null for plain text and
+   * for the placeholder rows. */
+  envelope: Envelope | null;
   firstInGroup: boolean;
   lastInGroup: boolean;
   newDay: boolean;
   /** Last in group AND the next message shows a different clock label. */
   showClock: boolean;
+}
+
+/** The list key. Distinct namespaces for chips and the divider: a peer
+ * controls their own msgIds and could reuse a cid (or a q) as one,
+ * colliding two list keys. Module-level, so the list's key function never
+ * re-identifies. */
+function threadKey(item: ThreadItem): string {
+  return item.divider != null
+    ? 'unread-divider'
+    : item.approval
+      ? `approval:${item.approval.q}`
+      : item.call
+        ? `call:${item.call.cid}`
+        : `${item.row.msgId}:${item.row.direction}`;
 }
 
 /** The placeholder behind a call item. Empty body: every envelope parse on it
@@ -1092,10 +1246,60 @@ function approvalPlaceholderRow(a: db.ApprovalRow): db.MessageRow {
   };
 }
 
+/** The placeholder behind the unread divider — the same scheme: empty body,
+ * the first unread row's ts so the day label above it stays truthful. */
+function dividerPlaceholderRow(first: db.MessageRow): db.MessageRow {
+  return {
+    msgId: 'unread-divider',
+    peerId: first.peerId,
+    direction: 'in',
+    body: '',
+    ts: first.ts,
+    status: 'received' as db.MessageStatus,
+    deletedAt: null,
+  };
+}
+
+/**
+ * Whether a row arrived after the thread was last open — the chat list's
+ * unread rule (db.ts, `arrivedAt`), applied per row: THIS phone's arrival
+ * clock, never the sender's `ts`; my own sends, relayed history and
+ * retracted rows are never new. A row that predates the arrivedAt column
+ * falls back to its ts in a 1:1 and to "never" in a room, exactly as the
+ * count query does. */
+function isUnreadRow(row: db.MessageRow, window: UnreadWindow): boolean {
+  if (row.direction !== 'in' || row.sharedBy || row.deletedAt) return false;
+  const arrived = row.arrivedAt ?? (row.authorId != null ? 0 : row.ts);
+  return arrived > window.since && arrived <= window.until;
+}
+
+/**
+ * What the unread divider stands against: the window between the previous
+ * open and THIS one, both on this phone's clock.
+ *
+ * The upper bound is the whole point. Without it the divider was recomputed
+ * from the current rows on every requery, so a message arriving WHILE the
+ * thread was open — the person sitting at the bottom, reading — counted as
+ * unread, grew the line, and made the landing block hand the anchor over and
+ * scroll away from the message being read. The divider marks what
+ * was unread at open, and nothing that has landed since. */
+interface UnreadWindow {
+  /** The chat's `lastOpenedAt` as it stood BEFORE this open; 0 for never. */
+  since: number;
+  /** The moment this open stamped the chat — the same `Date.now()` that went
+   * to `markChatOpened`. */
+  until: number;
+}
+
 function buildItems(
   rows: db.MessageRow[],
   callAt: (db.CallLogRow | undefined)[],
   approvalAt: (db.ApprovalRow | undefined)[],
+  /** `rows[i]`'s parsed body — the caller's once-per-row parse. */
+  envelopes: (Envelope | null)[],
+  /** The open's unread window, or null while unknown — no divider is drawn
+   * against a guess. */
+  unreadWindow: UnreadWindow | null,
 ): ThreadItem[] {
     // Screenshot notices render as full-width system rows that ignore every
     // grouping flag — so they must be transparent to direction runs, like the
@@ -1123,7 +1327,7 @@ function buildItems(
       // flag governs GROUPING, so listing it would only make it transparent
       // to direction runs. Left out because the claim it makes would be
       // untrue, not because the alternative breaks anything.
-      const tcm = parseEnvelope(r.body)?.tcm;
+      const tcm = envelopes[i]?.tcm;
       // All of these render through the full-width ruled line below, so all
       // of them must be listed here. A timer notice missing from this list
       // would have swallowed a neighbouring bubble's clock label — the same
@@ -1148,7 +1352,24 @@ function buildItems(
         tcm === 'grp.consent'
       );
     });
-    return rows.map((row, i) => {
+    // The unread divider: above the first inbound MESSAGE that arrived
+    // after the previous open AND BEFORE THIS ONE, counting every such row
+    // — a message that lands while the thread is up is being read, not
+    // waiting to be read. Events (the system rows above), calls and
+    // approval cards are not messages a person has yet to read, so they
+    // neither count nor carry the line.
+    const unread = rows.map(
+      (r, i) =>
+        unreadWindow !== null &&
+        !system[i] &&
+        !callAt[i] &&
+        !approvalAt[i] &&
+        isUnreadRow(r, unreadWindow),
+    );
+    const firstUnread = unread.indexOf(true);
+    const unreadCount = unread.filter(Boolean).length;
+    const items: ThreadItem[] = [];
+    rows.forEach((row, i) => {
       const prev = rows[i - 1];
       const next = rows[i + 1];
       // A non-negative delta is required as well as a small one: two devices
@@ -1179,13 +1400,30 @@ function buildItems(
         after < GROUP_WINDOW_MS &&
         sameDay(next.ts, row.ts);
       const lastInGroup = !groupedAfter;
-      return {
+      const newDay = !prev || !sameDay(prev.ts, row.ts);
+      if (i === firstUnread) {
+        // The divider takes the day label with it, so the eye reads the
+        // date, then "N new messages", then the message — never the line
+        // wedged between a date and its first row. Grouping is untouched:
+        // the flags below were computed from the rows, not from the items.
+        items.push({
+          row: dividerPlaceholderRow(row),
+          envelope: null,
+          divider: unreadCount,
+          firstInGroup: true,
+          lastInGroup: true,
+          newDay,
+          showClock: false,
+        });
+      }
+      items.push({
         row,
         call: callAt[i],
         approval: approvalAt[i],
+        envelope: envelopes[i] ?? null,
         firstInGroup: !groupedBefore,
         lastInGroup,
-        newDay: !prev || !sameDay(prev.ts, row.ts),
+        newDay: i === firstUnread ? false : newDay,
         // Groups end at every direction change, so a quick exchange inside
         // one minute otherwise prints the same clock label four times. A
         // system row prints no clock, so it never suppresses a neighbor's.
@@ -1194,8 +1432,9 @@ function buildItems(
           (!next ||
             system[i + 1] ||
             clockLabel(next.ts) !== clockLabel(row.ts)),
-      };
+      });
     });
+    return items;
   }
 
 type Drawer = 'none' | 'attach' | 'emoji';
@@ -1228,6 +1467,7 @@ export function ChatThreadScreen({
   onStartRoomCall,
 }: Props) {
   const t = useTheme();
+  const styles = stylesFor(t);
   // The window's HEIGHT is still the right vertical bound for the panels'
   // maxHeight caps below: every pane spans the window's full height under
   // this shell, so "a banner may take a third of the glass" is a fact about
@@ -1254,6 +1494,26 @@ export function ChatThreadScreen({
   const [chat, setChat] = useState<db.ChatRow | null>(null);
   const [me, setMe] = useState<db.ProfileRow | null>(null);
   const [rows, setRows] = useState<db.MessageRow[]>([]);
+  /** Whether the list query has answered at least once for THIS peer. The
+   * empty room is drawn only once the thread knows it is empty — before the
+   * first answer `rows` is `` for every conversation, and drawing the
+   * QuietRoom then flashed it (and announced its header) on every open of a
+   * populated thread. */
+  const [rowsLoaded, setRowsLoaded] = useState(false);
+  /** The window the unread divider stands against: the chat's `lastOpenedAt`
+   * as it stood BEFORE this open — read once, ahead of the stamp this thread
+   * writes — up to the moment of this open. Null until the read answers, or
+   * when there is no chat row. */
+  const [unreadWindow, setUnreadWindow] = useState<UnreadWindow | null>(null);
+  /** `${msgId}:${direction}` of the row a tapped quote just revealed, held
+   * for QUOTE_FLASH_MS so its bubble washes pine. */
+  const [flashKey, setFlashKey] = useState<string | null>(null);
+  /** Foreground, as STATE fed by an AppState listener rather than a one-time
+   * read, so the effects that must not act on a pocketed phone re-run when
+   * it comes forward. */
+  const [appActive, setAppActive] = useState(
+    () => AppState.currentState === 'active',
+  );
   /**
    * The room's anchor when `peerId` names a room, null for a 1:1 — and
    * `groupKnown` says whether that question has been ANSWERED yet, because
@@ -1410,8 +1670,32 @@ export function ChatThreadScreen({
    * re-pins. Their first drag is the only thing that hands control over.
    */
   const anchoredToEnd = useRef(true);
+  /** Whether this open has already landed on the unread divider — once per
+   * peer, on the first resize that has it on glass. */
+  const dividerScrolled = useRef(false);
+  /** The divider's list index, mirrored for the resize handler; -1 for none. */
+  const dividerIndexRef = useRef(-1);
+  /** Where the last programmatic scroll wanted to land, for the one retry
+   * a far-off, unmeasured index needs (onScrollToIndexFailed). */
+  const scrollWant = useRef<{ index: number; viewPosition: number } | null>(
+    null,
+  );
+  /** The index that retry already ran for, so a row the list cannot measure
+   * never loops. */
+  const scrollRetried = useRef<number | null>(null);
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reactionsRef = useRef<Map<string, db.ReactionRow[]>>(new Map());
-  const seenInboundCount = useRef(0);
+  /** The newest inbound row the last requery saw. A COUNT stood here, and a
+   * row deleted and a row arrived inside one debounce window left the count
+   * unchanged — so the arrival never raised "New messages". Null until the
+   * first answer for this peer. */
+  const seenNewestInbound = useRef<InboundMark | null>(null);
+  /** Whether the list query has ANSWERED for this peer. `seenNewestInbound`
+   * cannot say: an answer with no inbound rows stores the same `null` that
+   * means "not answered yet", and that swallowed the FIRST arrival into a
+   * thread of only my own sends, or a fresh room. Reset per peer
+   * beside the mark itself. */
+  const inboundAnswered = useRef(false);
   /** Failed outgoing rows VoiceOver has already been told about. Null until
    * the first requery answers: what was already failed when the thread opened
    * is seeded silently — those bubbles are read in place — and only a row seen
@@ -1429,11 +1713,19 @@ export function ChatThreadScreen({
   /** Read by the pick/remove callbacks, which must not re-arm per keystroke. */
   const mentionChipsRef = useRef<MentionChip[]>([]);
   const mentionCaretRef = useRef<number | null>(null);
+  /** Read by the system-back handler, which is registered once and must see
+   * what is open at the moment of the press, not at subscription. */
+  const callPickerRef = useRef<'audio' | 'video' | null>(null);
+  const safetyOpenRef = useRef(false);
+  const drawerRef = useRef<Drawer>('none');
 
   draftRef.current = draft;
   pendingRef.current = pending;
   mentionChipsRef.current = mentionChips;
   mentionCaretRef.current = mentionCaret;
+  callPickerRef.current = callPicker;
+  safetyOpenRef.current = safetyOpen;
+  drawerRef.current = drawer;
 
   useEffect(() => {
     railForRef.current = railFor;
@@ -1454,7 +1746,7 @@ export function ChatThreadScreen({
    * throws, so there is nothing to catch here.
    */
   useEffect(() => {
-    if (AppState.currentState !== 'active') return;
+    if (!appActive) return;
     // Rooms send no read receipts. The RULE lives in
     // `sendReadReceipt` itself — the seam consults the same anchor and
     // refuses a room id no matter who calls it — so this gate is
@@ -1466,7 +1758,7 @@ export function ChatThreadScreen({
     // which runs for rooms unchanged.
     if (!groupKnown || group !== null) return;
     void messaging.sendReadReceipt(peerId);
-  }, [peerId, rows, groupKnown, group]);
+  }, [peerId, rows, groupKnown, group, appActive]);
 
   const liveCallName = liveCall.name;
   useEffect(() => {
@@ -1476,7 +1768,14 @@ export function ChatThreadScreen({
   }, [liveCallName]);
 
   const refresh = useCallback(() => {
-    quiet(db.getChat(peerId), setChat);
+    // Guarded by the peer the query was asked about, like every per-peer
+    // read below (five of these callbacks had no guard, so a slow read
+    // racing a thread switch could paint the previous conversation into
+    // this one).
+    quiet(db.getChat(peerId), row => {
+      if (peerIdRef.current !== peerId) return;
+      setChat(row);
+    });
     // ONE profile read per refresh — the room branch below reuses this same
     // promise for its selfId (a remediation: it used to issue a
     // second db.loadProfile on every debounced refresh).
@@ -1603,17 +1902,30 @@ export function ChatThreadScreen({
       });
     });
     quiet(db.listMessages(peerId), all => {
+      if (peerIdRef.current !== peerId) return;
       // Reaction and profile carriers are transport, not conversation.
       const visible = all.filter(r => !isCarrierEnvelope(r.body));
-      const inbound = visible.reduce(
-        (n, r) => (r.direction === 'in' ? n + 1 : n),
-        0,
-      );
-      if (inbound > seenInboundCount.current && !atBottom.current) {
+      // An ARRIVAL is a newer newest-inbound row than the last answer had —
+      // a deletion moves the mark back and claims nothing, and a repaint of
+      // the same rows leaves it where it was.
+      const newest = newestInboundOf(visible);
+      const priorNewest = seenNewestInbound.current;
+      const answered = inboundAnswered.current;
+      inboundAnswered.current = true;
+      if (
+        answered &&
+        newest !== null &&
+        // No inbound row before this answer is still an arrival — it is the
+        // FIRST one, and the thread was answered, so the two nulls are told
+        // apart by `answered`, never by the mark.
+        (priorNewest === null || laterArrival(newest, priorNewest)) &&
+        !atBottom.current
+      ) {
         setHasNew(true);
       }
-      seenInboundCount.current = inbound;
+      seenNewestInbound.current = newest;
       setRows(visible);
+      setRowsLoaded(true);
       // Exhaustion fires from messaging's silent retry timer: the row
       // repaints as failed, and on iOS a repaint says nothing. One
       // announcement per message that newly failed — every later requery
@@ -1636,11 +1948,13 @@ export function ChatThreadScreen({
     // notification is tens of megabytes of JS strings per receipt. Each bubble
     // loads its own bytes while it is mounted.
     quiet(db.listAttachmentMeta(peerId), list => {
+      if (peerIdRef.current !== peerId) return;
       // Keyed by the message composite identity: ids are sender-chosen, so
       // msgId alone can collide across directions.
       setAttachments(new Map(list.map(a => [`${a.msgId}:${a.direction}`, a])));
     });
     quiet(db.listReactions(peerId), list => {
+      if (peerIdRef.current !== peerId) return;
       const byTarget = new Map<string, db.ReactionRow[]>();
       for (const r of list) {
         const key = `${r.targetMsgId}:${r.targetDirection}`;
@@ -1681,6 +1995,7 @@ export function ChatThreadScreen({
     // empty in a duress session, where the decoy workspace's own rows are the
     // truth this screen must render.
     quiet(db.getBlockedAt(peerId), at => {
+      if (peerIdRef.current !== peerId) return;
       setPeerBlocked(at != null);
       // And now the same line for an actual block. A reaction is outbound, and
       // nothing outbound reaches someone this device blocks.
@@ -1696,6 +2011,60 @@ export function ChatThreadScreen({
   useEffect(() => {
     void messaging.sweepDisappearing(peerId);
   }, [peerId]);
+
+  // Foreground as state: the read-receipt effect above keys on `appActive`,
+  // so a message that arrived while the phone was pocketed — correctly not
+  // receipted then — is receipted when the thread comes back on glass.
+  // Coming forward is also the other moment a person is actually looking, so
+  // it sweeps the disappearing rows again: the timer below may never fire
+  // while the app is suspended.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', next => {
+      const active = next === 'active';
+      setAppActive(active);
+      if (!active) return;
+      quiet(
+        messaging.sweepDisappearing(peerId).then(() => {
+          if (peerIdRef.current === peerId) refresh();
+        }),
+      );
+    });
+    return () => sub.remove();
+  }, [peerId, refresh]);
+
+  /** The soonest expiry among the rows on glass, or Infinity for none. A
+   * number, so an unchanged deadline across a requery is not a new one. */
+  const nextExpiry = useMemo(() => {
+    let soonest = Infinity;
+    for (const row of rows) {
+      if (row.expiresAt != null && row.expiresAt < soonest) {
+        soonest = row.expiresAt;
+      }
+    }
+    return soonest;
+  }, [rows]);
+
+  useEffect(() => {
+    // A disappearing message disappears WHILE the thread is open: one timer
+    // at the soonest deadline — the typists-expiry pattern — runs the same
+    // sweep the mount runs and requeries, so the row leaves the glass
+    // without a remount. The sweep keeps its own predicates (messaging's
+    // sibling purge relies on them); this only decides WHEN it runs. A sweep that
+    // removes nothing does not re-arm: `nextExpiry` is the same number after
+    // the requery.
+    if (!Number.isFinite(nextExpiry)) return;
+    const timer = setTimeout(
+      () => {
+        quiet(
+          messaging.sweepDisappearing(peerId).then(() => {
+            if (peerIdRef.current === peerId) refresh();
+          }),
+        );
+      },
+      Math.max(0, nextExpiry - Date.now()) + 50,
+    );
+    return () => clearTimeout(timer);
+  }, [nextExpiry, peerId, refresh]);
 
   useEffect(() => {
     refresh();
@@ -1816,12 +2185,22 @@ export function ChatThreadScreen({
   useEffect(() => {
     anchoredToEnd.current = true;
     atBottom.current = true;
-    seenInboundCount.current = 0;
+    seenNewestInbound.current = null;
+    inboundAnswered.current = false;
     // Back to "not seeded": the other conversation's failures must neither be
     // announced here nor suppress this one's.
     announcedFailed.current = null;
     setShowJump(false);
     setHasNew(false);
+    // Back to "not answered": this conversation's emptiness is not known
+    // until its own list query lands.
+    setRowsLoaded(false);
+    // And its unread window: the previous thread's stamp says nothing about
+    // this one, and this one's divider has not been landed on yet.
+    setUnreadWindow(null);
+    dividerScrolled.current = false;
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+    setFlashKey(null);
     // Back to "not answered": the previous thread's roomness must not gate —
     // or ungate — this one's receipts for even one render.
     setGroup(null);
@@ -1842,7 +2221,27 @@ export function ChatThreadScreen({
   // What is new in the chat list is measured against this stamp; the thread is
   // the only place that can honestly write it.
   useEffect(() => {
-    quiet(db.markChatOpened(peerId, Date.now()));
+    // The stamp this open OVERWRITES is read first, once: the unread divider
+    // stands against it, and every later read of the chat row — the
+    // debounced refresh on each receipt — answers with this open's own
+    // stamp, which would make the divider vanish on the first tick. Chained,
+    // so the read is issued before the write. One reading of the clock for
+    // both halves of the same fact: what this open stamps on the chat is
+    // exactly the divider's upper bound, so a message that arrives a moment
+    // later is on the far side of the line.
+    const openedAt = Date.now();
+    quiet(
+      db.getChat(peerId).then(chatRow => {
+        if (peerIdRef.current === peerId) {
+          setUnreadWindow(
+            chatRow
+              ? { since: chatRow.lastOpenedAt ?? 0, until: openedAt }
+              : null,
+          );
+        }
+        return db.markChatOpened(peerId, openedAt);
+      }),
+    );
     // Sibling sync 'read': siblings clear their badge for this thread too —
     // once per open, not on unmount (the close writes the stamp for THIS
     // device's list; the account-level fact is "it was read", already sent).
@@ -2115,8 +2514,8 @@ export function ChatThreadScreen({
       const at = mentionQueryAt(prev, mentionCaretRef.current, live);
       if (at === null) return;
       const caret = Math.min(mentionCaretRef.current ?? prev.length, prev.length);
-      const name = nameFor(id);
-      const token = `@${name} `;
+      const picked = nameFor(id);
+      const token = `@${picked} `;
       const delta = token.length - (caret - at.at);
       const shifted = live.map(chip =>
         chip.start >= caret
@@ -2125,7 +2524,7 @@ export function ChatThreadScreen({
       );
       setMentionChips([
         ...shifted,
-        { id, name, start: at.at, end: at.at + 1 + name.length },
+        { id, name: picked, start: at.at, end: at.at + 1 + picked.length },
       ]);
       setDraft(prev.slice(0, at.at) + token + prev.slice(caret));
       setMentionCaret(at.at + token.length);
@@ -2206,8 +2605,7 @@ export function ChatThreadScreen({
   }, [rows]);
 
   const quotedFor = useCallback(
-    (row: db.MessageRow): db.MessageRow | undefined => {
-      const envelope = parseEnvelope(row.body);
+    ({ row, envelope }: ThreadItem): db.MessageRow | undefined => {
       if (envelope?.tcm !== 'reply') return undefined;
       // `ofs` is the REPLIER's authorship claim: what they wrote is my 'in'
       // row when the reply came from them, and my 'out' row when it is mine.
@@ -2238,6 +2636,12 @@ export function ChatThreadScreen({
     }
   }, [pending, byKey]);
 
+  /** (msgId:direction) → the body it was parsed from and the result; see the
+   * parse-once note inside `items`. */
+  const envelopeCache = useRef<
+    Map<string, { body: string; envelope: Envelope | null }>
+  >(new Map());
+
   const items = useMemo<ThreadItem[]>(() => {
     // Calls take their place in the timeline by start time. They are SYSTEM
     // rows in the grouping sense — full-width, no clock, transparent to
@@ -2256,12 +2660,129 @@ export function ChatThreadScreen({
     const mergedRows = merged.map(
       e => e.m ?? (e.c ? callPlaceholderRow(e.c) : approvalPlaceholderRow(e.a!)),
     );
+    // Parse ONCE per row per data change. Keyed by the row's identity and
+    // checked against its body: a requery returns fresh row objects with
+    // the same words, and those are not parsed again. Rebuilt from the
+    // current rows on every pass, so it holds nothing for rows that have
+    // gone.
+    const prior = envelopeCache.current;
+    const next = new Map<string, { body: string; envelope: Envelope | null }>();
+    const envelopes = mergedRows.map(row => {
+      const key = `${row.msgId}:${row.direction}`;
+      const hit = next.get(key) ?? prior.get(key);
+      if (hit && hit.body === row.body) {
+        next.set(key, hit);
+        return hit.envelope;
+      }
+      const envelope = parseEnvelope(row.body);
+      next.set(key, { body: row.body, envelope });
+      return envelope;
+    });
+    envelopeCache.current = next;
     return buildItems(
       mergedRows,
       merged.map(e => e.c),
       merged.map(e => e.a),
+      envelopes,
+      unreadWindow,
     );
-  }, [rows, calls, approvals]);
+  }, [rows, calls, approvals, unreadWindow]);
+
+  /** The items as of this render, for handlers that must not re-identify on
+   * every requery (a tapped quote resolves its index at tap time). */
+  const itemsRef = useRef<ThreadItem[]>([]);
+  itemsRef.current = items;
+  dividerIndexRef.current = useMemo(
+    () => items.findIndex(it => it.divider != null),
+    [items],
+  );
+
+  // The landing is a ONE-SHOT for the state the thread opened in. Once the
+  // unread window is known and the list has answered, "no divider" is the
+  // final answer for this open — spend the flag, so nothing arriving later
+  // can take the anchor away from someone reading at the end.
+  useEffect(() => {
+    if (dividerScrolled.current) return;
+    if (unreadWindow === null || !rowsLoaded) return;
+    if (dividerIndexRef.current < 0) dividerScrolled.current = true;
+  }, [unreadWindow, rowsLoaded, items]);
+
+  useEffect(
+    () => () => {
+      if (flashTimer.current) clearTimeout(flashTimer.current);
+    },
+    [],
+  );
+
+  /** A programmatic scroll to a row, remembered so a far-off index the list
+   * has not measured can be retried once from onScrollToIndexFailed. */
+  const scrollToRow = useCallback(
+    (index: number, viewPosition: number, animated: boolean) => {
+      scrollWant.current = { index, viewPosition };
+      scrollRetried.current = null;
+      listRef.current?.scrollToIndex({ index, viewPosition, animated });
+    },
+    [],
+  );
+
+  /**
+   * A tapped quote goes to the message it quotes: scroll it to the middle of
+   * the view and wash it pine for a moment. Resolved by the row's composite
+   * key, so a peer's reply pointing at MY row lands on my row and never on
+   * an inbound row sharing the id. */
+  const revealQuoted = useCallback(
+    (target: db.MessageRow) => {
+      const key = `${target.msgId}:${target.direction}`;
+      const index = itemsRef.current.findIndex(
+        it =>
+          it.divider == null &&
+          !it.call &&
+          !it.approval &&
+          it.row.msgId === target.msgId &&
+          it.row.direction === target.direction,
+      );
+      if (index < 0) return;
+      // Going back up the thread is leaving the end: the anchor must not
+      // pull the view straight back down on the next resize.
+      anchoredToEnd.current = false;
+      scrollToRow(index, 0.5, !reduceMotion);
+      setFlashKey(key);
+      if (flashTimer.current) clearTimeout(flashTimer.current);
+      flashTimer.current = setTimeout(() => {
+        flashTimer.current = null;
+        setFlashKey(current => (current === key ? null : current));
+      }, QUOTE_FLASH_MS);
+    },
+    [reduceMotion, scrollToRow],
+  );
+
+  /**
+   * Without getItemLayout the list cannot reach a row it has not measured in
+   * one step — a quoted message far up, the unread divider in a long
+   * thread. Land near it by the average row height, then ask once more when
+   * that region has rendered; once only, so an index the list can never
+   * measure does not loop. The rail's own scroll is to a cell just pressed,
+   * so it never arrives here.
+   */
+  const onScrollToIndexFailed = useCallback(
+    (info: { index: number; averageItemLength: number }) => {
+      if (scrollRetried.current === info.index) return;
+      scrollRetried.current = info.index;
+      const want = scrollWant.current;
+      listRef.current?.scrollToOffset({
+        offset: Math.max(0, info.averageItemLength * info.index),
+        animated: false,
+      });
+      setTimeout(() => {
+        listRef.current?.scrollToIndex({
+          index: info.index,
+          viewPosition: want?.index === info.index ? want.viewPosition : 0.5,
+          animated: false,
+        });
+      }, 100);
+    },
+    [],
+  );
 
   // The countdown tick: once a second, only while a stored-pending approval
   // is on screen. The tick updates a CLOCK READING the cards derive from —
@@ -2419,37 +2940,84 @@ export function ChatThreadScreen({
     listRef.current?.scrollToEnd({ animated: !reduceMotion });
   }, [reduceMotion]);
 
-  const onScroll = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
-    const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
-    scrollOffset.current = contentOffset.y;
-    const nearBottom =
-      contentSize.height - (contentOffset.y + layoutMeasurement.height) <=
-      BOTTOM_SLACK;
-    // While anchored, a mid-load measurement says nothing about intent — the
-    // list is still growing under a scroll the app itself performed. Reading
-    // it as "the person scrolled away" is what put the jump control on
-    // screen the moment a conversation opened.
-    if (anchoredToEnd.current) {
-      atBottom.current = true;
-      if (showJump) setShowJump(false);
-      return;
-    }
-    atBottom.current = nearBottom;
-    if (showJump === nearBottom) setShowJump(!nearBottom);
-    if (nearBottom && hasNew) setHasNew(false);
-    if (
-      dragging.current &&
-      railFor &&
-      Math.abs(contentOffset.y - railScrollOrigin.current) > RAIL_DISMISS_SCROLL
-    ) {
-      setRailFor(null);
-    }
-  };
+  // The list's handlers hold their identity across keystrokes and ticks:
+  // VirtualizedList is a PureComponent, and an inline handler was a new
+  // prop on every render of this screen — every character typed
+  // re-rendered the whole list. These read refs, and `onScroll`
+  // re-identifies only when the two states it reads change.
+  const onScroll = useCallback(
+    (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
+      scrollOffset.current = contentOffset.y;
+      const nearBottom =
+        contentSize.height - (contentOffset.y + layoutMeasurement.height) <=
+        BOTTOM_SLACK;
+      // While anchored, a mid-load measurement says nothing about intent —
+      // the list is still growing under a scroll the app itself performed.
+      // Reading it as "the person scrolled away" is what put the jump
+      // control on screen the moment a conversation opened.
+      if (anchoredToEnd.current) {
+        atBottom.current = true;
+        if (showJump) setShowJump(false);
+        return;
+      }
+      atBottom.current = nearBottom;
+      if (showJump === nearBottom) setShowJump(!nearBottom);
+      if (nearBottom && hasNew) setHasNew(false);
+      if (
+        dragging.current &&
+        railForRef.current &&
+        Math.abs(contentOffset.y - railScrollOrigin.current) >
+          RAIL_DISMISS_SCROLL
+      ) {
+        setRailFor(null);
+      }
+    },
+    [showJump, hasNew],
+  );
 
-  const onContentSizeChange = () => {
+  const onScrollBeginDrag = useCallback(() => {
+    // The person taking hold of the list is the ONLY thing that hands
+    // control over. Everything before this — staged content loads, a
+    // keyboard opening, the app's own scrollToEnd — leaves the thread
+    // anchored to its newest message.
+    anchoredToEnd.current = false;
+    dragging.current = true;
+  }, []);
+
+  const onDragEnd = useCallback(() => {
+    dragging.current = false;
+  }, []);
+
+  // The keyboard, the error strip and the jump bar all change the list's
+  // height; re-anchor instead of pushing the newest message out of view.
+  const onListLayout = useCallback(() => {
+    if (atBottom.current && !railOpenRef.current) {
+      listRef.current?.scrollToEnd({ animated: false });
+    }
+  }, []);
+
+  const onContentSizeChange = useCallback(() => {
     // An open rail is 92pt of content the person is reading: growing the list
     // must not yank it out from under them.
     if (railOpenRef.current) return;
+    // The unread divider's one landing: the first resize that has it on
+    // glass opens the thread THERE rather than at the end, and hands the
+    // anchor over — from here the person reads down, and the jump bar offers
+    // the newest. Skipped, and spent, if they already took hold of the list
+    // before the divider arrived: their scroll wins.
+    const divider = dividerIndexRef.current;
+    if (divider >= 0 && !dividerScrolled.current) {
+      dividerScrolled.current = true;
+      if (anchoredToEnd.current) {
+        anchoredToEnd.current = false;
+        atBottom.current = false;
+        setShowJump(true);
+        setHasNew(true);
+        scrollToRow(divider, 0, false);
+        return;
+      }
+    }
     // A resize born of a CLOCK — the approval countdown tick, a stream
     // overlay repaint — never scrolls, pinned or not: a tick mid-long-press
     // was cancelling the gesture (the attribution block above holds the
@@ -2462,7 +3030,7 @@ export function ChatThreadScreen({
     if (anchoredToEnd.current || atBottom.current) {
       listRef.current?.scrollToEnd({ animated: false });
     }
-  };
+  }, [scrollToRow]);
 
   const send = async () => {
     // Composing ends the moment the person taps send, success or failure —
@@ -2713,7 +3281,11 @@ export function ChatThreadScreen({
   const removeRow = useCallback(
     (row: db.MessageRow) => {
       setRailFor(null);
-      quiet(db.deleteMessage(row.msgId, row.direction), refresh);
+      // Through messaging, not straight to the store: `refresh` repaints THIS
+      // thread, and under the wide shell the chat list is live beside it and
+      // repaints on messaging.notify() alone. A bare db.deleteMessage left
+      // that row previewing the deleted words.
+      quiet(messaging.deleteForMe(row.msgId, row.direction), refresh);
     },
     [refresh],
   );
@@ -2872,7 +3444,10 @@ export function ChatThreadScreen({
         // hiccup here (a relock closing the connection mid-tap) must not
         // report 'wasn't sent' about a message that was.
         try {
-          await db.deleteMessage(row.msgId, 'out');
+          // Same funnel as Delete for me: the failed row leaving changes the
+          // chat's line, and the live list hears about it only through
+          // notify().
+          await messaging.deleteForMe(row.msgId, 'out');
         } catch {
           // The stale failed row is residue for the next requery or restart.
         }
@@ -2901,6 +3476,13 @@ export function ChatThreadScreen({
   const [recordLevel, setRecordLevel] = useState(0);
   const [recordSeconds, setRecordSeconds] = useState(0);
   const [voiceDraft, setVoiceDraft] = useState<RecordingResult | null>(null);
+  /** The recorder is spoken for — a take in progress, one waiting to be sent,
+   * or the permission dialog up. SYNCHRONOUS: re-derived on every render and
+   * set eagerly by the tap itself, so a second tap inside one frame, or a mic
+   * that outlived its gate, can never start a take over the one already
+   * there. */
+  const voiceBusyRef = useRef(false);
+  voiceBusyRef.current = recording || recordingIntent || voiceDraft !== null;
 
   useEffect(() => {
     const level = onLevel(v => setRecordLevel(v));
@@ -2957,6 +3539,9 @@ export function ChatThreadScreen({
   }, [recordingIntent]);
 
   const startVoice = useCallback(() => {
+    // A finished take is never overwritten, and a take never starts twice.
+    if (voiceBusyRef.current) return;
+    voiceBusyRef.current = true;
     void (async () => {
       setSendError(null);
       // A playing note yields to the recorder; the native side does this too.
@@ -3208,6 +3793,65 @@ export function ChatThreadScreen({
     setDrawer(current => (current === next ? 'none' : next));
   }, []);
 
+  /** The composer taking focus: the drawers close (the keyboard takes their
+   * place) and so does an open reaction rail. The rail is revealed at the
+   * BOTTOM of the viewport — exactly the edge the keyboard then covers — and
+   * the re-anchor is deliberately skipped while a rail is open, so it sat
+   * open off glass. The person has moved on to typing; a selection they
+   * cannot see is not a selection. */
+  const focusComposer = useCallback(() => {
+    setDrawer('none');
+    setRailFor(null);
+  }, []);
+
+  useEffect(() => {
+    // ANDROID SYSTEM BACK closes what is open before it leaves the thread.
+    // The router's handler (App.tsx) pops through `backDestination` on
+    // every press; with nothing here to answer first, a person who had just
+    // opened the call picker, the safety panel, a rail, a drawer or a reply
+    // chip and pressed Back — the
+    // reflex that dismisses an overlay in every Android app — was thrown
+    // out of the conversation instead. RN asks the most recent subscriber
+    // first and stops at the first `true`. The router subscribed ONCE, at
+    // app mount (`goBack` has no dependencies, so its effect never re-runs);
+    // this thread mounts in a later commit, so it is the newer subscriber
+    // and is asked first. That is the whole ordering guarantee — a
+    // dependency added to the router's `goBack` would re-subscribe it after
+    // the thread and silently win every press again. Outermost first: the
+    // picker and the panel hang under the header, the rail sits on a row,
+    // the drawers and the chip are seamed to the composer. One thing per
+    // press, the way each one's own ✕ works — the chip through
+    // `cancelPending`, so an edit hands the shelved draft back. With
+    // nothing open it yields (`false`) and the router pops as it always
+    // did; the thread never navigates itself. Refs, not state: the handler
+    // is registered once, and a press can land before a state has flushed.
+    // On iOS `BackHandler` is inert (RegisterScreen's precedent).
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (callPickerRef.current !== null) {
+        setCallPicker(null);
+        return true;
+      }
+      if (safetyOpenRef.current) {
+        setSafetyOpen(false);
+        return true;
+      }
+      if (railForRef.current !== null) {
+        setRailFor(null);
+        return true;
+      }
+      if (drawerRef.current !== 'none') {
+        setDrawer('none');
+        return true;
+      }
+      if (pendingRef.current !== null) {
+        cancelPending();
+        return true;
+      }
+      return false;
+    });
+    return () => subscription.remove();
+  }, [cancelPending]);
+
   /**
    * Through messaging, so the enforcement Set, the chat list and this thread
    * agree. A failure leaves the banner up, which is still the truth — there is
@@ -3233,8 +3877,99 @@ export function ChatThreadScreen({
     refresh();
   }, [peerId, refresh]);
 
+  /** The list's header: one element identity per change of what it shows,
+   * so a keystroke in the composer does not hand the list a new header to
+   * reconcile. */
+  const threadEmpty = rowsLoaded && rows.length === 0;
+  const meUserId = me?.userId;
+  const meDisplayName = me?.displayName;
+  const meAvatar = me?.avatarB64;
+  const listHeader = useMemo(
+    () => (
+      <View>
+        <RuledLabel
+          label="End-to-end encrypted"
+          minHeight={31}
+          marginTop={8}
+          marginBottom={12}
+        />
+        {threadEmpty ? (
+          <View style={styles.emptyThread}>
+            <QuietRoom
+              {...(meUserId
+                ? {
+                    you: {
+                      peerId: meUserId,
+                      displayName: meDisplayName,
+                      photoB64: meAvatar,
+                    },
+                  }
+                : {})}
+              them={{
+                peerId,
+                displayName:
+                  sanitizeDisplayName(chat?.localName) ||
+                  sanitizeDisplayName(chat?.displayName),
+                photoB64: chat?.avatarB64,
+              }}
+              accessibilityLabel={`A private chat between you and ${peerRef}`}
+            />
+            <Text
+              accessibilityRole="header"
+              style={[
+                t.type.sectionTitle,
+                styles.emptyTitle,
+                { color: t.color.inkStrong },
+              ]}
+            >
+              This room is ready.
+            </Text>
+            <Text
+              style={[
+                t.type.compactBody,
+                styles.emptyBody,
+                { color: t.color.inkMuted },
+              ]}
+            >
+              {named
+                ? `Write the first message to ${name}.`
+                : 'Write the first message.'}
+            </Text>
+          </View>
+        ) : null}
+      </View>
+    ),
+    [
+      threadEmpty,
+      meUserId,
+      meDisplayName,
+      meAvatar,
+      peerId,
+      chat?.localName,
+      chat?.displayName,
+      chat?.avatarB64,
+      peerRef,
+      named,
+      name,
+      t,
+      styles,
+    ],
+  );
+
   const renderItem = useCallback(
-    ({ item, index }: { item: ThreadItem; index: number }) => (
+    ({ item, index }: { item: ThreadItem; index: number }) => {
+      const quoted = quotedFor(item);
+      // "You", or my name for them: the quoted ROW's authorship, resolved as
+      // every author label is — in a room the authenticated author, in a 1:1
+      // the thread's peer — never anything the reply's envelope says.
+      const quotedAuthor = quoted
+        ? quoted.direction === 'out'
+          ? 'You'
+          : quoted.authorId
+            ? nameFor(quoted.authorId)
+            : name
+        : undefined;
+      return (
       <View>
         {item.newDay ? (
           <RuledLabel
@@ -3244,7 +3979,24 @@ export function ChatThreadScreen({
             marginBottom={8}
           />
         ) : null}
-        {item.approval ? (
+        {item.divider != null ? (
+          // The unread divider: the date divider's ruled line, spoken as
+          // one header so a screen reader can jump to where the new
+          // messages start.
+          <View
+            testID="unread-divider"
+            accessible
+            accessibilityRole="header"
+            accessibilityLabel={COPY.newMessages(item.divider)}
+          >
+            <RuledLabel
+              label={COPY.newMessages(item.divider)}
+              minHeight={31}
+              marginTop={8}
+              marginBottom={8}
+            />
+          </View>
+        ) : item.approval ? (
           // Ahead of every bubble path, like the call chip: an approval row
           // must never reach MessageRow, whose fallback prints row.body.
           <ApprovalCard
@@ -3307,21 +4059,35 @@ export function ChatThreadScreen({
           onRetryPhoto={retryPhotoDownload}
           playingVoice={playingVoice}
           trueDurations={trueDurations}
-          voiceElapsed={voiceElapsed}
+          // The play head reaches ONLY the row whose note is playing; every
+          // other row sees a constant 0 and its memo holds, so a 4 Hz
+          // progress tick repaints one bubble, not every bubble on glass.
+          voiceElapsed={
+            playingVoice === `${item.row.msgId}:${item.row.direction}`
+              ? voiceElapsed
+              : 0
+          }
           onToggleVoice={onToggleVoice}
           onRetrySend={onRetrySend}
           onRemove={removeRow}
           onRemoveEverywhere={removeEverywhere}
           onReply={startReply}
           onEdit={startEdit}
-          quoted={quotedFor(item.row)}
+          quoted={quoted}
+          quotedAuthor={quotedAuthor}
+          onReveal={revealQuoted}
+          flashed={flashKey === `${item.row.msgId}:${item.row.direction}`}
           overlay={overlays.get(item.row.msgId)}
         />
         )}
       </View>
-    ),
+      );
+    },
     [
       t,
+      name,
+      revealQuoted,
+      flashKey,
       paneWidth,
       reduceMotion,
       peerRef,
@@ -3599,107 +4365,27 @@ export function ChatThreadScreen({
         ref={listRef}
         testID="thread-list"
         data={items}
-        keyExtractor={item =>
-          // Distinct namespace for chips: a peer controls their own msgIds
-          // and could reuse a cid (or a q) as one, colliding two list keys.
-          item.approval
-            ? `approval:${item.approval.q}`
-            : item.call
-              ? `call:${item.call.cid}`
-              : `${item.row.msgId}:${item.row.direction}`
-        }
+        keyExtractor={threadKey}
         onScroll={onScroll}
-        onScrollBeginDrag={() => {
-          // The person taking hold of the list is the ONLY thing that hands
-          // control over. Everything before this — staged content loads, a
-          // keyboard opening, the app's own scrollToEnd — leaves the thread
-          // anchored to its newest message.
-          anchoredToEnd.current = false;
-          dragging.current = true;
-        }}
-        onScrollEndDrag={() => {
-          dragging.current = false;
-        }}
-        onMomentumScrollEnd={() => {
-          dragging.current = false;
-        }}
+        onScrollBeginDrag={onScrollBeginDrag}
+        onScrollEndDrag={onDragEnd}
+        onMomentumScrollEnd={onDragEnd}
         scrollEventThrottle={16}
         // Without this the first tap on any message with the keyboard up is
         // swallowed by the dismissal; interactive restores the standard iOS
         // drag-down-to-dismiss the thread had no way to do at all.
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="interactive"
-        // scrollToIndex has no getItemLayout to work from, so a far-offscreen
-        // index can fail. Harmless: the rail is on a cell just pressed.
-        onScrollToIndexFailed={() => {}}
+        onScrollToIndexFailed={onScrollToIndexFailed}
         initialNumToRender={20}
         maxToRenderPerBatch={12}
         updateCellsBatchingPeriod={50}
         windowSize={9}
-        ListHeaderComponent={
-          <View>
-            <RuledLabel
-              label="End-to-end encrypted"
-              minHeight={31}
-              marginTop={8}
-              marginBottom={12}
-            />
-            {rows.length === 0 ? (
-              <View style={styles.emptyThread}>
-                <QuietRoom
-                  {...(me
-                    ? {
-                        you: {
-                          peerId: me.userId,
-                          displayName: me.displayName,
-                          photoB64: me.avatarB64,
-                        },
-                      }
-                    : {})}
-                  them={{
-                    peerId,
-                    displayName:
-                      sanitizeDisplayName(chat?.localName) ||
-                      sanitizeDisplayName(chat?.displayName),
-                    photoB64: chat?.avatarB64,
-                  }}
-                  accessibilityLabel={`A private chat between you and ${peerRef}`}
-                />
-                <Text
-                  accessibilityRole="header"
-                  style={[
-                    t.type.sectionTitle,
-                    styles.emptyTitle,
-                    { color: t.color.inkStrong },
-                  ]}
-                >
-                  This room is ready.
-                </Text>
-                <Text
-                  style={[
-                    t.type.compactBody,
-                    styles.emptyBody,
-                    { color: t.color.inkMuted },
-                  ]}
-                >
-                  {named
-                    ? `Write the first message to ${name}.`
-                    : 'Write the first message.'}
-                </Text>
-              </View>
-            ) : null}
-          </View>
-        }
+        ListHeaderComponent={listHeader}
         renderItem={renderItem}
         contentContainerStyle={styles.listContent}
         onContentSizeChange={onContentSizeChange}
-        // The keyboard, the error strip and the jump bar all change the list's
-        // height; re-anchor instead of pushing the newest message out of view.
-        onLayout={() => {
-          if (atBottom.current && !railOpenRef.current) {
-            listRef.current?.scrollToEnd({ animated: false });
-          }
-        }}
+        onLayout={onListLayout}
       />
 
       {/* The jump bar stands down while a message is selected.
@@ -4087,6 +4773,7 @@ export function ChatThreadScreen({
             onRemoveChip: removeMention,
           }}
           onOpenDrawer={openDrawer}
+          onFocusInput={focusComposer}
           onSend={() => void send()}
           onAttach={source => void attachPhoto(source)}
           onAttachDocument={() => void attachDocument()}
@@ -4163,8 +4850,8 @@ function SafetyPanel({
   onMatch: () => void;
   onMismatch: () => void;
 }) {
+  const styles = stylesFor(t);
   const [confirming, setConfirming] = useState(false);
-  const [explaining, setExplaining] = useState(false);
   const copy = SAFETY_COPY[state];
   // Token keys resolved against the live theme — safety.ts names colours,
   // theme.ts owns their values.
@@ -4360,38 +5047,19 @@ function SafetyPanel({
                 </Text>
               </Pressable>
             ) : null}
-            <Pressable
-              onPress={() => setExplaining(v => !v)}
-              accessibilityRole="button"
-              accessibilityState={{ expanded: explaining }}
-              testID="safety-explain"
-              style={({ pressed }) => [
-                styles.textAction,
-                { borderRadius: t.radius.button },
-                pressed && { backgroundColor: t.color.pineWash },
-              ]}
-            >
-              <Text style={[t.type.buttonCompact, { color: t.color.pine }]}>
-                What this is
-              </Text>
-            </Pressable>
           </View>
         )}
 
-        {explaining
-          ? SAFETY_EXPLAINER.map(line => (
-              <Text
-                key={line}
-                style={[
-                  t.type.compactBody,
-                  styles.safetyHint,
-                  { color: t.color.inkMuted },
-                ]}
-              >
-                {line}
-              </Text>
-            ))
-          : null}
+        {/* Teaching copy behind the house ⓘ, as ApprovalCard and the
+            account screens do it — this
+            was a bare "What this is" button that unfolded the same lines. */}
+        <View style={styles.safetyAbout}>
+          <InfoDisclosure
+            label="What this is"
+            lines={SAFETY_EXPLAINER}
+            testID="safety-explain"
+          />
+        </View>
       </ScrollView>
     </View>
   );
@@ -4412,6 +5080,7 @@ function BlockedBanner({
   maxHeight: number;
   onUnblock: () => void;
 }) {
+  const styles = stylesFor(t);
   const rootRef = useRef<View>(null);
 
   // The composer a person was about to type into has just disappeared. On iOS
@@ -4513,6 +5182,7 @@ function IdentityBanner({
   onReview: () => void;
   onAccept: () => void;
 }) {
+  const styles = stylesFor(t);
   const rootRef = useRef<View>(null);
 
   // The composer a person was about to type into has just disappeared. On iOS
@@ -4637,6 +5307,7 @@ function Composer({
   onSelectionChange,
   mention,
   onOpenDrawer,
+  onFocusInput,
   onSend,
   onAttach,
   onAttachDocument,
@@ -4668,6 +5339,9 @@ function Composer({
     onRemoveChip: (chip: MentionChip) => void;
   };
   onOpenDrawer: (d: Drawer) => void;
+  /** The input taking (or being pressed into while holding) focus: the
+   * parent closes whatever the keyboard is about to cover. */
+  onFocusInput: () => void;
   onSend: () => void;
   onAttach: (source: PickSource) => void;
   onAttachDocument: () => void | Promise<void>;
@@ -4693,6 +5367,7 @@ function Composer({
   chip: { kind: 'reply' | 'edit'; label: string; text: string } | null;
   onCancelChip: () => void;
 }) {
+  const styles = stylesFor(t);
   const canSend = draft.trim().length > 0;
   // The chip is attached to the composer exactly like a drawer, so it flattens
   // the same seam: two stacked slabs with rounded corners between them would
@@ -4704,6 +5379,21 @@ function Composer({
   // A ref, not state: the input stays uncontrolled with respect to selection,
   // so a programmatic cursor can never fight the person typing.
   const selection = useRef({ start: 0, end: 0 });
+
+  // The chip speaks when it appears or changes: "Replying to Dawit. dinner
+  // at eight?" — who, then what, the bubble's own order. Keyed on the chip's
+  // WORDS, not the object: the parent builds a fresh chip each render, and a
+  // keystroke must not read the chip out again. Queued, so it lands after
+  // the rail's own dismissal rather than cutting it off.
+  const chipLabel = chip?.label ?? null;
+  const chipText = chip?.text ?? null;
+  useEffect(() => {
+    if (chipLabel === null) return;
+    AccessibilityInfo.announceForAccessibilityWithOptions(
+      chipText ? `${chipLabel}. ${chipText}` : chipLabel,
+      { queue: true },
+    );
+  }, [chipLabel, chipText]);
 
   const insertEmoji = (emoji: string) => {
     const start = Math.min(selection.current.start, draft.length);
@@ -4729,6 +5419,9 @@ function Composer({
       {chip ? (
         <View
           testID="composer-chip"
+          // TalkBack reads a change to this region in place; VoiceOver has
+          // no live regions, so the effect above speaks the chip outright.
+          accessibilityLiveRegion="polite"
           style={[
             styles.chip,
             {
@@ -4841,18 +5534,17 @@ function Composer({
               testID="attach-location"
             />
           </View>
-          {/* The one promise the icons could be read as making and the app
-              does not keep: a photo taken here never reaches the camera roll.
-              Said once, under the grid, rather than four times inside it. */}
-          <Text
-            style={[
-              t.type.utilityLabel,
-              styles.drawerFootnote,
-              { color: t.color.inkMuted },
-            ]}
-          >
-            Photos you take here aren’t saved to your Photos.
-          </Text>
+          {/* The promises the icons could be read as making — a photo taken
+              here never reaches the camera roll, a location is read only on
+              the tap — behind the house ⓘ
+              rather than printed under the grid on every open. */}
+          <View style={styles.drawerAbout}>
+            <InfoDisclosure
+              label="About attachments"
+              lines={ATTACH_ABOUT}
+              testID="attach-about"
+            />
+          </View>
         </View>
       ) : null}
 
@@ -5110,7 +5802,8 @@ function Composer({
         <Pressable
           onPress={() => onOpenDrawer('attach')}
           accessibilityRole="button"
-          accessibilityLabel="Add a photo"
+          accessibilityLabel={COPY.attach}
+          accessibilityHint={COPY.attachHint}
           accessibilityState={{ expanded: drawer === 'attach' }}
           testID="composer-attach"
           style={({ pressed }) => [
@@ -5135,16 +5828,22 @@ function Composer({
           ]}
           placeholder={name ? `Message ${name}` : 'Message'}
           placeholderTextColor={t.color.inkMuted}
+          // The system keyboard follows the palette: with nothing said here
+          // iOS raised a light keyboard over the dark thread. `scheme` is
+          // the token set's own name for itself — the one place a platform
+          // appearance must be named.
+          keyboardAppearance={t.scheme}
+          selectionColor={t.color.pine}
           value={draft}
           onChangeText={onChangeDraft}
           onSelectionChange={e => {
             selection.current = e.nativeEvent.selection;
             onSelectionChange(e.nativeEvent.selection);
           }}
-          onFocus={() => onOpenDrawer('none')}
+          onFocus={onFocusInput}
           // Pressing into an already-focused field fires no onFocus, so a
           // drawer would sit open occupying the keyboard's place.
-          onPressIn={() => onOpenDrawer('none')}
+          onPressIn={onFocusInput}
           multiline
           testID="composer-input"
         />
@@ -5171,8 +5870,11 @@ function Composer({
 
         {/* The mic takes this slot only when the send control would be
             disabled anyway AND nothing is being answered or rewritten —
-            a reply chip means the person is mid-sentence, not mid-thought. */}
-        {!canSend && !chip ? (
+            a reply chip means the person is mid-sentence, not mid-thought —
+            AND the recorder is free: while a take is in progress or waiting
+            in the bar above, a live mic here would start a second take over
+            it. */}
+        {!canSend && !chip && !voice.recording && !voice.hasDraft ? (
           <Pressable
             onPress={voice.onStart}
             accessibilityRole="button"
@@ -5268,6 +5970,7 @@ function DrawerAction({
   onPress: () => void;
   testID: string;
 }) {
+  const styles = stylesFor(t);
   return (
     <Pressable
       onPress={onPress}
@@ -5347,7 +6050,8 @@ interface MessageRowProps {
   playingVoice: string | null;
   /** Decoded lengths that disagreed with a sender's claim. */
   trueDurations: Map<string, number>;
-  /** Play head of whichever note is playing, in seconds. */
+  /** Play head of THIS row's note while it is the one playing, in seconds;
+   * 0 for every other row. */
   voiceElapsed: number;
   onToggleVoice: (row: db.MessageRow) => void;
   onRetrySend: (row: db.MessageRow) => void;
@@ -5358,6 +6062,13 @@ interface MessageRowProps {
   /** The message this one answers, already resolved — undefined when it is
    * not on this device (deleted here, or older than this install). */
   quoted: db.MessageRow | undefined;
+  /** Who wrote `quoted`, resolved by the parent the way every author label
+   * is — "You", or my name for them. Undefined with no `quoted`. */
+  quotedAuthor: string | undefined;
+  /** Tapping the quote: scroll to and flash the quoted row. */
+  onReveal: (row: db.MessageRow) => void;
+  /** This row was just revealed by a tapped quote: wash it pine. */
+  flashed: boolean;
   /** The stream snapshot painted over this inbound bubble while the
    * reply is still being written — undefined when the bubble shows durable
    * truth (no stream, faded, or closed by the final edit). */
@@ -5423,7 +6134,10 @@ function sameRowProps(a: MessageRowProps, b: MessageRowProps): boolean {
   if (
     a.quoted?.msgId !== b.quoted?.msgId ||
     a.quoted?.body !== b.quoted?.body ||
-    a.quoted?.deletedAt !== b.quoted?.deletedAt
+    a.quoted?.deletedAt !== b.quoted?.deletedAt ||
+    a.quotedAuthor !== b.quotedAuthor ||
+    a.onReveal !== b.onReveal ||
+    a.flashed !== b.flashed
   ) {
     return false;
   }
@@ -5487,13 +6201,16 @@ function sameRowProps(a: MessageRowProps, b: MessageRowProps): boolean {
  * rooms already rely on — and provenance is stated above it. The relay does
  * not degrade the message; it annotates it.
  */
-const MessageRow = memo(function MessageRow(props: MessageRowProps) {
+const MessageRow = memo(function MessageRowWithProvenance(
+  props: MessageRowProps,
+) {
   const { row } = props.item;
   const inner = <MessageRowInner {...props} />;
   // Outgoing rows are never relayed to me: `sharedBy` marks what SOMEONE ELSE
   // handed me, and my own sends are first-hand by construction.
   if (!row.sharedBy || row.direction === 'out') return inner;
   const t = props.theme;
+  const styles = stylesFor(t);
   const relayer = props.nameFor(row.sharedBy);
   const author = row.authorId ? props.nameFor(row.authorId) : 'Someone';
   return (
@@ -5551,11 +6268,14 @@ function MessageRowInner({
   onReply,
   onEdit,
   quoted,
+  quotedAuthor,
+  onReveal,
+  flashed,
   overlay,
 }: MessageRowProps) {
-  const { row } = item;
+  const styles = stylesFor(t);
+  const { row, envelope } = item;
   const out = row.direction === 'out';
-  const envelope = parseEnvelope(row.body);
   const inRoom = room !== null;
   /**
    * The AI marker: marker-OR-record (the Art. 50
@@ -5598,7 +6318,11 @@ function MessageRowInner({
     return (
       <View
         style={{
-          marginTop: item.newDay ? 0 : item.firstInGroup ? 14 : 3,
+          marginTop: item.newDay
+            ? 0
+            : item.firstInGroup
+              ? t.space.s5
+              : t.space.s2,
           alignItems: out ? 'flex-end' : 'flex-start',
         }}
       >
@@ -6130,6 +6854,12 @@ function MessageRowInner({
     envelope?.tcm === 'file' ||
     envelope?.tcm === 'loc' ||
     envelope?.tcm === 'voice';
+  /** A gesture, not a sentence: plain words that are one to three emoji
+   * draw at display size with no bubble. Plain words ONLY — a reply keeps
+   * its quote box, a mention its marks, a streamed overlay its cursor, and
+   * each of those needs the surface. */
+  const jumbo =
+    envelope === null && overlay === undefined && isEmojiOnly(displayText(row.body));
   const bubbleMax = Math.min(
     t.layout.bubbleMaxWidth,
     viewportWidth * t.layout.bubbleMaxRatio,
@@ -6238,6 +6968,17 @@ function MessageRowInner({
     spokenWords || previewFor(row.body)
   }`;
 
+  /**
+   * The addresses in this row's words. The bubble is one
+   * accessible element, which flattens the nested link's own `onPress` out
+   * of the tree — exactly the reason the quote needs an action of its own.
+   * Without a matching one per address a screen-reader user could hear the
+   * link read out and had no way to open it. Taken from `spokenWords`, so a
+   * mention row's names are already resolved and nothing is parsed twice. */
+  const bodyLinks = isStructured
+    ? []
+    : linkRuns(spokenWords).flatMap(run => (run.kind === 'link' ? [run] : []));
+
   const a11yActions = interactionsOff
     ? undefined
     : [
@@ -6245,10 +6986,27 @@ function MessageRowInner({
         // every member, addressed by the row's own the design key.
         { name: 'react', label: 'React' },
         ...(isStructured ? [] : [{ name: 'copy', label: 'Copy' }]),
+        // One per address, for the same reason the quote gets one below.
+        ...bodyLinks.map((run, i) => ({
+          name: `link:${i}`,
+          label: `Open ${run.text}`,
+        })),
+        // The bubble is ONE element to a screen reader, so the quote's own
+        // tap is not reachable that way; the rotor offers it instead.
+        ...(quoted && !quoted.deletedAt
+          ? [{ name: 'reveal', label: 'Go to the quoted message' }]
+          : []),
         { name: 'delete', label: 'Delete for me' },
       ];
   const onA11yAction = (name: string) => {
     if (name === 'react') onLongPress(row, index);
+    if (name === 'reveal' && quoted && !quoted.deletedAt) onReveal(quoted);
+    if (name.startsWith('link:')) {
+      const link = bodyLinks[Number(name.slice('link:'.length))];
+      // Same rejection discipline as the tap: a scheme this device cannot
+      // open is not an error the person can act on from a bubble.
+      if (link) void Linking.openURL(link.url).catch(() => undefined);
+    }
     if (name === 'copy') {
       // spokenWords, not displayText: a copied mention should read as the
       // names this phone shows, never as bare U+FFFC marks.
@@ -6365,6 +7123,15 @@ function MessageRowInner({
                   ? t.color.lineStrong
                   : t.color.lineSoft,
           },
+          // No surface under jumbo emoji: the glyphs are the message. The
+          // press wash survives, so a long-press still shows it took.
+          jumbo && {
+            backgroundColor: pressed ? t.color.pineWash : 'transparent',
+            borderColor: 'transparent',
+          },
+          // The row a tapped quote just led here: a pine wash for a
+          // moment, so the eye finds it after the scroll.
+          flashed && { backgroundColor: t.color.pineWash },
         ]}
       >
         {isPhoto && envelope?.tcm === 'image' ? (
@@ -6425,8 +7192,26 @@ function MessageRowInner({
           // answer need this column of their own.
           <View style={styles.bubbleBody}>
             {envelope?.tcm === 'reply' ? (
-              <View
+              // The quote goes to the message it quotes when tapped — the
+              // messenger convention. Inert when the original is gone: there
+              // is nowhere to go, and a button that does nothing is worse
+              // than a box.
+              <Pressable
                 testID={`quote-${row.msgId}`}
+                onPress={
+                  quoted && !quoted.deletedAt
+                    ? () => onReveal(quoted)
+                    : undefined
+                }
+                disabled={!quoted || !!quoted.deletedAt}
+                accessibilityRole={
+                  quoted && !quoted.deletedAt ? 'button' : undefined
+                }
+                accessibilityLabel={
+                  quoted && !quoted.deletedAt && quotedAuthor
+                    ? `Go to the quoted message from ${quotedAuthor}`
+                    : undefined
+                }
                 style={[
                   styles.quote,
                   {
@@ -6438,6 +7223,22 @@ function MessageRowInner({
                   },
                 ]}
               >
+                {quotedAuthor ? (
+                  // Who is being answered, over their words: resolved by the
+                  // parent from the quoted ROW's authorship, never from the
+                  // reply's envelope — a peer cannot name the author.
+                  <Text
+                    testID={`quote-author-${row.msgId}`}
+                    numberOfLines={1}
+                    style={[
+                      t.type.utilityLabel,
+                      styles.quoteAuthor,
+                      { color: out ? t.color.onBubbleOut : t.color.pine },
+                    ]}
+                  >
+                    {quotedAuthor}
+                  </Text>
+                ) : null}
                 <Text
                   numberOfLines={2}
                   style={[
@@ -6456,11 +7257,11 @@ function MessageRowInner({
                       : previewFor(quoted.body, mentionLabelFor)
                     : COPY.quoteMissing}
                 </Text>
-              </View>
+              </Pressable>
             ) : null}
             <Text
               style={[
-                t.type.message,
+                jumbo ? t.type.display : t.type.message,
                 styles.messageText,
                 { color: out ? t.color.onBubbleOut : t.color.inkStrong },
               ]}
@@ -6493,7 +7294,12 @@ function MessageRowInner({
                     mentionEnvelope.who,
                   ).map((segment, i) =>
                     segment.kind === 'text' ? (
-                      segment.text
+                      linkedText(
+                        segment.text,
+                        out ? t.color.onBubbleOut : t.color.pine,
+                        `l-${row.msgId}-${i}`,
+                        t,
+                      )
                     ) : (
                       <Text
                         key={`m-${i}`}
@@ -6533,7 +7339,12 @@ function MessageRowInner({
                         {'▍'}
                       </Text>,
                     ]
-                  : displayText(row.body)}
+                  : linkedText(
+                      displayText(row.body),
+                      out ? t.color.onBubbleOut : t.color.pine,
+                      `l-${row.msgId}`,
+                      t,
+                    )}
             </Text>
             {row.editedAt ? (
               // Never silent: an edit that leaves no trace is a rewrite of
@@ -6544,7 +7355,14 @@ function MessageRowInner({
                 style={[
                   t.type.timeStatus,
                   styles.editedMark,
-                  { color: out ? t.color.onBubbleOut : t.color.inkMuted },
+                  {
+                    // Same switch as the tick below: on the transparent
+                    // jumbo surface the on-pine ink is near-white on an
+                    // off-white ground, so a jumbo row takes the paper
+                    // ink.
+                    color:
+                      out && !jumbo ? t.color.onBubbleOut : t.color.inkMuted,
+                  },
                 ]}
               >
                 {COPY.edited}
@@ -6563,11 +7381,17 @@ function MessageRowInner({
             {/* On a pine bubble the accent cannot be pine — it would vanish.
                 Read is the BRIGHT ink and the other states are the muted one,
                 which is the same "this one is different" the light-bubble
-                convention gets from turning blue. */}
+                convention gets from turning blue.
+
+                A JUMBO row has no pine under it: the surface went
+                transparent, so the on-pine pair would be near-white on the
+                off-white thread ground, and the read tick invisible in both
+                themes. It takes the same paper pair the photo status below
+                already uses, for the same reason. */}
             <TickGlyph
-              status={row.status as TickStatus}
-              color={t.color.onBubbleOut}
-              readColor={t.color.onPine}
+              status={tickStatusOf(row.status)}
+              color={jumbo ? t.color.inkMuted : t.color.onBubbleOut}
+              readColor={jumbo ? t.color.pine : t.color.onPine}
               size={13}
             />
           </View>
@@ -6603,7 +7427,7 @@ function MessageRowInner({
           style={styles.photoStatus}
         >
           <TickGlyph
-            status={row.status as TickStatus}
+            status={tickStatusOf(row.status)}
             color={t.color.inkMuted}
             readColor={t.color.pine}
           />
@@ -6804,6 +7628,7 @@ function MessageActions({
   onReply: () => void;
   onEdit: () => void;
 }) {
+  const styles = stylesFor(t);
   const [confirming, setConfirming] = useState(startConfirm);
   const [copied, setCopied] = useState(false);
   /** Only my own message can be rewritten or taken off the other phone. */
@@ -6837,8 +7662,11 @@ function MessageActions({
         },
       ]}
     >
+      {/* Free to wrap: clamped to one line, "Delete this message?" ellipsised
+          at large text sizes. The strip
+          wraps too, so at those sizes the buttons take a line of their own
+          under the question instead of squeezing it. */}
       <Text
-        numberOfLines={1}
         style={[
           t.type.timeStatus,
           styles.actionDetail,
@@ -6862,6 +7690,7 @@ function MessageActions({
             accessibilityLabel="Delete for me"
             testID={`delete-mine-${row.msgId}`}
             hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+            style={styles.actionButton}
           >
             <Text style={[t.type.compactStrong, { color: t.color.danger }]}>
               For me
@@ -6876,6 +7705,7 @@ function MessageActions({
               accessibilityLabel="Delete for everyone"
               testID={`delete-everyone-${row.msgId}`}
               hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+              style={styles.actionButton}
             >
               <Text style={[t.type.compactStrong, { color: t.color.danger }]}>
                 For everyone
@@ -6887,6 +7717,7 @@ function MessageActions({
             accessibilityRole="button"
             testID={`delete-keep-${row.msgId}`}
             hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+            style={styles.actionButton}
           >
             <Text style={[t.type.compactStrong, { color: t.color.pine }]}>
               Keep
@@ -6900,6 +7731,7 @@ function MessageActions({
             accessibilityRole="button"
             testID={`reply-${row.msgId}`}
             hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+            style={styles.actionButton}
           >
             <Text style={[t.type.compactStrong, { color: t.color.pine }]}>
               Reply
@@ -6914,6 +7746,7 @@ function MessageActions({
               accessibilityRole="button"
               testID={`copy-${row.msgId}`}
               hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+              style={styles.actionButton}
             >
               <Text style={[t.type.compactStrong, { color: t.color.pine }]}>
                 Copy
@@ -6931,6 +7764,7 @@ function MessageActions({
               accessibilityRole="button"
               testID={`edit-${row.msgId}`}
               hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+              style={styles.actionButton}
             >
               <Text style={[t.type.compactStrong, { color: t.color.pine }]}>
                 Edit
@@ -6943,6 +7777,7 @@ function MessageActions({
             accessibilityLabel="Delete"
             testID={`delete-${row.msgId}`}
             hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
+            style={styles.actionButton}
           >
             <Text style={[t.type.compactStrong, { color: t.color.danger }]}>
               Delete
@@ -6995,6 +7830,7 @@ function PhotoContent({
   onOpen: () => void;
   onRetry: () => void;
 }) {
+  const styles = stylesFor(t);
   const [data, setData] = useState<string | null>(null);
 
   // The bytes live here, for as long as this bubble is mounted, instead of in
@@ -7166,395 +8002,466 @@ function PhotoContent({
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1 },
-  peerControl: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    minHeight: 44,
-    flex: 1,
-  },
-  peerText: { flex: 1 },
-  safetyControl: {
-    width: 60,
-    // 48 rather than the 44pt floor: the glyphs grew to 24, and a control
-    // sized exactly at the minimum leaves a larger mark crowding its own
-    // edges. Still a floor, not a fixed height, so Dynamic Type can push it
-    // taller without clipping.
-    minHeight: 48,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  safetyPanel: { paddingVertical: 14, borderBottomWidth: 1 },
-  safetyTop: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  safetyClose: {
-    minWidth: 44,
-    minHeight: 44,
-    alignItems: 'flex-end',
-    justifyContent: 'center',
-  },
-  safetyStatusRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginTop: 10,
-  },
-  safetyStatusRule: {
-    width: 3,
-    alignSelf: 'stretch',
-    minHeight: 15,
-    marginRight: 12,
-  },
-  safetyGrid: { flexDirection: 'row', flexWrap: 'wrap', marginTop: 8 },
-  // A third of the row at default size; the group text is free to wrap
-  // within it rather than being shrunk to fit.
-  safetyCell: { width: '33.333%' },
-  safetyHint: { marginTop: 8 },
-  safetyActions: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    alignItems: 'center',
-    gap: 16,
-  },
-  textAction: {
-    minHeight: 44,
-    justifyContent: 'center',
-    paddingHorizontal: 8,
-    marginHorizontal: -8,
-  },
-  listContent: { paddingHorizontal: 16, paddingBottom: 20 },
-  emptyThread: { alignItems: 'center', marginTop: 20, marginBottom: 24 },
-  emptyTitle: { marginTop: 20, textAlign: 'center' },
-  emptyBody: { marginTop: 8, textAlign: 'center', maxWidth: 280 },
-  bubble: {
-    borderWidth: 1,
-    flexDirection: 'row',
-    alignItems: 'flex-end',
-    justifyContent: 'center',
-    gap: 6,
-  },
-  messageText: { flexShrink: 1 },
-  /** An inbound content row: the bubble and its reply arrow on one line.
-   * `alignItems: 'flex-end'` seats the arrow by the bubble's tail corner,
-   * where the eye already reads "this message ends here". */
-  replyRow: { flexDirection: 'row', alignItems: 'flex-end' },
-  /** The bubble yields, the arrow never does: Yoga's flexShrink defaults to
-   * 0, so without this a maximal bubble would push the fixed arrow box
-   * toward the edge instead of letting its own text reflow. */
-  bubbleShrink: { flexShrink: 1 },
-  replyArrow: {
-    width: 32,
-    height: 32,
-    marginLeft: 6,
-    marginBottom: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    flexShrink: 0,
-  },
-  /** The bubble is a row so the delivery tick sits beside the last line; a
-   * quote, its answer and the edited mark stack inside this column. */
-  bubbleBody: { flexShrink: 1 },
-  quote: {
-    borderLeftWidth: 2,
-    paddingHorizontal: 8,
-    paddingVertical: 5,
-    marginBottom: 5,
-  },
-  /** Secondary text on a pine fill: onPine dimmed, so the palette owns the
-   * colour and this owns only the emphasis. */
-  quoteText: { opacity: 0.75 },
-  editedMark: { marginTop: 2, opacity: 0.75 },
-  chip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    borderWidth: StyleSheet.hairlineWidth,
-    borderBottomWidth: 0,
-    paddingLeft: 0,
-    paddingRight: 4,
-    paddingVertical: 8,
-    overflow: 'hidden',
-  },
-  chipBar: { width: 3, alignSelf: 'stretch', marginRight: 10 },
-  chipBody: { flex: 1, flexShrink: 1 },
-  chipText: { marginTop: 1 },
-  chipCancel: {
-    width: 36,
-    height: 36,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  tombstone: {
-    borderWidth: StyleSheet.hairlineWidth,
-    paddingHorizontal: 12,
-    paddingVertical: 9,
-  },
-  tombstoneText: { flexShrink: 1, fontStyle: 'italic' },
-  failedOut: { marginTop: 14 },
-  failedBubble: { alignSelf: 'flex-end' },
-  failedActions: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    alignItems: 'center',
-    gap: 16,
-  },
-  statusGlyph: { marginBottom: 1 },
-  photoStatus: { alignSelf: 'flex-end', marginTop: 3, marginRight: 4 },
-  metaLeft: { alignSelf: 'flex-start', marginTop: 3, marginLeft: 4 },
-  metaRight: { alignSelf: 'flex-end', marginTop: 3, marginRight: 4 },
-  photoFallback: { alignItems: 'center', justifyContent: 'center' },
-  photoFallbackText: { marginTop: 8 },
-  photoRetry: {
-    minHeight: 44,
-    justifyContent: 'center',
-    paddingHorizontal: 12,
-  },
-  reactionRow: { flexDirection: 'row', gap: 4, marginTop: 6 },
-  reactionChip: {
-    minHeight: 26,
-    minWidth: 30,
-    borderWidth: 1,
-    paddingHorizontal: 6,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  rail: {
-    marginTop: 6,
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 10,
-    borderTopWidth: StyleSheet.hairlineWidth,
-  },
-  railChoice: {
-    width: 44,
-    minHeight: 44,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  actionStrip: {
-    minHeight: 40,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-  },
-  actionDetail: { flexShrink: 1, marginRight: 8 },
-  actionButtons: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    flexWrap: 'wrap',
-    gap: 16,
-  },
-  corruptRow: {
-    marginVertical: 6,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    alignItems: 'center',
-  },
-  corruptAction: { alignSelf: 'flex-end' },
-  /** The event-row delivery notice: a breath under the event
-   * sentence, centered with it by the corruptRow container. */
-  eventNotice: { marginTop: 3 },
-  /** The provenance line above a relayed row. Indented to the bubble it
-   * annotates, so it reads as belonging to that message and not as a
-   * standalone system notice. */
-  sharedTag: { marginTop: 8, marginBottom: 2, marginHorizontal: 16 },
-  /** An outsider's message: full width with a slate
-   * accent bar — deliberately NOT the bubble shape, so it cannot be read as
-   * a member speaking even with the tag line cropped. */
-  outsiderRow: {
-    marginVertical: 6,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    borderLeftWidth: 3,
-    alignSelf: 'stretch',
-  },
-  outsiderText: { marginTop: 4 },
-  /** The authenticated author over an inbound run's first bubble. */
-  /** The line above a bubble: author label and/or the AI marker. A row so
-   * the badge sits beside the name when both render; flex-start so an
-   * unlabelled agent bubble's lone badge hugs the bubble's edge. */
-  authorLine: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    alignSelf: 'flex-start',
-    marginBottom: 2,
-  },
-  authorLabel: { marginLeft: 4, flexShrink: 1 },
-  mismatchRow: {
-    paddingVertical: 8,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    alignItems: 'flex-start',
-  },
-  jumpRow: {
-    minHeight: 40,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 8,
-  },
-  errorActions: {
-    borderLeftWidth: 2,
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    alignItems: 'center',
-    gap: 16,
-  },
-  progressRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingVertical: 8,
-  },
-  offlineRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    paddingVertical: 8,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-  },
-  offlineMark: { width: 6, height: 6 },
-  offlineText: { flex: 1 },
-  banner: {
-    borderTopWidth: 2,
-    borderLeftWidth: 3,
-    paddingVertical: 12,
-  },
-  bannerTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  bannerTitle: { flex: 1 },
-  bannerBody: { marginTop: 6 },
-  bannerActions: { flexDirection: 'row', gap: 12, marginTop: 10 },
-  bannerButton: {
-    minHeight: 44,
-    borderWidth: 1,
-    paddingHorizontal: 14,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  alertSquare: {
-    width: 24,
-    height: 24,
-    borderWidth: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  composerWrap: {
-    paddingTop: 8,
-    paddingHorizontal: 12,
-    paddingBottom: 8,
-    borderTopWidth: StyleSheet.hairlineWidth,
-  },
-  counter: { textAlign: 'right', marginBottom: 4, marginRight: 4 },
-  drawer: {
-    borderWidth: 1,
-    borderBottomWidth: 0,
-    overflow: 'hidden',
-    paddingTop: 14,
-    paddingBottom: 10,
-  },
-  drawerSeam: { width: StyleSheet.hairlineWidth, height: '100%' },
-  drawerGrid: { flexDirection: 'row', paddingHorizontal: 8 },
-  drawerAction: { flex: 1, alignItems: 'center', paddingVertical: 2, gap: 6 },
-  drawerDisc: {
-    width: 46,
-    height: 46,
-    borderRadius: 23,
-    borderWidth: StyleSheet.hairlineWidth,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  drawerLabel: { textAlign: 'center' },
-  drawerFootnote: { textAlign: 'center', marginTop: 10, paddingHorizontal: 16 },
-  voiceBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    paddingHorizontal: 10,
-    paddingBottom: 6,
-  },
-  voiceLevelTrack: { flex: 1, height: 4, borderRadius: 2, overflow: 'hidden' },
-  voiceTrack: { height: 3, borderRadius: 2, overflow: 'hidden' },
-  voiceTrackFill: { height: 3, borderRadius: 2 },
-  voiceMetaRow: {
-    flexDirection: 'row',
-    alignItems: 'baseline',
-    justifyContent: 'space-between',
-    gap: 8,
-  },
-  voiceLevelFill: { height: 4, borderRadius: 2 },
-  emojiRow: { paddingHorizontal: 8, alignItems: 'center' },
-  emojiChoice: {
-    width: 44,
-    minHeight: 44,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  /** The member picker: list padding replaces the drawer's grid padding. */
-  mentionDrawer: { paddingTop: 6, paddingBottom: 4 },
-  /** One person: a circle and a name. minHeight (never height) so scaled
-   * text grows the row — the no-clipping rule the room header tests pin. */
-  mentionRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 4,
-  },
-  mentionName: { flexShrink: 1 },
-  mentionChipRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-    paddingHorizontal: 4,
-    paddingBottom: 6,
-  },
-  mentionChip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    borderWidth: 1,
-    paddingLeft: 10,
-    minHeight: 32,
-  },
-  mentionChipCancel: {
-    minWidth: 32,
-    minHeight: 32,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  /** A mention in a bubble: weight beside the '@' glyph — the ink is the
-   * theme's, applied inline, and never the only signal. */
-  mentionSpan: { fontWeight: '600' },
-  composer: {
-    flexDirection: 'row',
-    alignItems: 'flex-end',
-    borderWidth: 1,
-    minHeight: 52,
-    paddingHorizontal: 4,
-  },
-  composerIcon: {
-    width: 44,
-    height: 44,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  composerInput: {
-    flex: 1,
-    minHeight: 44,
-    maxHeight: 110,
-    paddingVertical: 11,
-  },
-  sendDisc: {
-    borderWidth: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-});
+/**
+ * The thread's styles, per theme: spacing from `t.space`, floors from
+ * `t.layout`, built once per token set and shared by every component in
+ * this file. A WeakMap rather than a per-component useMemo because
+ * MessageRowInner mounts by the dozen — one StyleSheet per theme, never
+ * one per row. The token sets are module constants in theme.ts, so the map
+ * holds at most two entries.
+ *
+ * Values that are SIZES — a 44pt floor, a 32pt arrow box, a 3pt rule — are
+ * sizes, not spacing, and stay as they were (the floor is `t.layout`'s).
+ * The 1pt optical nudges under a tick and a chip line stay literal too:
+ * the scale has no 1, and 2 is not what the eye wanted there. */
+const stylesByTheme = new WeakMap<Theme, ReturnType<typeof makeStyles>>();
+function stylesFor(t: Theme): ReturnType<typeof makeStyles> {
+  let s = stylesByTheme.get(t);
+  if (!s) {
+    s = makeStyles(t);
+    stylesByTheme.set(t, s);
+  }
+  return s;
+}
+
+function makeStyles(t: Theme) {
+  const { space, layout } = t;
+  return StyleSheet.create({
+    root: { flex: 1 },
+    peerControl: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: space.s5,
+      minHeight: layout.touchTarget,
+      flex: 1,
+    },
+    peerText: { flex: 1 },
+    safetyControl: {
+      width: 60,
+      // 48 rather than the 44pt floor: the glyphs grew to 24, and a control
+      // sized exactly at the minimum leaves a larger mark crowding its own
+      // edges. Still a floor, not a fixed height, so Dynamic Type can push it
+      // taller without clipping.
+      minHeight: 48,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    safetyPanel: { paddingVertical: space.s6, borderBottomWidth: 1 },
+    safetyTop: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+    },
+    safetyClose: {
+      minWidth: layout.touchTarget,
+      minHeight: layout.touchTarget,
+      alignItems: 'flex-end',
+      justifyContent: 'center',
+    },
+    safetyStatusRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      marginTop: space.s5,
+    },
+    safetyStatusRule: {
+      width: 3,
+      alignSelf: 'stretch',
+      minHeight: 15,
+      marginRight: space.s5,
+    },
+    safetyGrid: { flexDirection: 'row', flexWrap: 'wrap', marginTop: space.s4 },
+    // A third of the row at default size; the group text is free to wrap
+    // within it rather than being shrunk to fit.
+    safetyCell: { width: '33.333%' },
+    safetyHint: { marginTop: space.s4 },
+    /** The panel's ⓘ, under the action row. */
+    safetyAbout: { marginTop: space.s2 },
+    safetyActions: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      alignItems: 'center',
+      gap: space.s6,
+    },
+    textAction: {
+      minHeight: layout.touchTarget,
+      justifyContent: 'center',
+      paddingHorizontal: space.s4,
+      marginHorizontal: -space.s4,
+    },
+    listContent: { paddingHorizontal: layout.gutter, paddingBottom: space.s7 },
+    emptyThread: {
+      alignItems: 'center',
+      marginTop: space.s7,
+      marginBottom: space.s8,
+    },
+    emptyTitle: { marginTop: space.s7, textAlign: 'center' },
+    emptyBody: { marginTop: space.s4, textAlign: 'center', maxWidth: 280 },
+    bubble: {
+      borderWidth: 1,
+      flexDirection: 'row',
+      alignItems: 'flex-end',
+      justifyContent: 'center',
+      gap: space.s3,
+    },
+    messageText: { flexShrink: 1 },
+    /** A web address inside a bubble: underlined as well as inked, so the
+     * affordance never rests on colour alone. */
+    linkSpan: { textDecorationLine: 'underline' },
+    /** An inbound content row: the bubble and its reply arrow on one line.
+     * `alignItems: 'flex-end'` seats the arrow by the bubble's tail corner,
+     * where the eye already reads "this message ends here". */
+    replyRow: { flexDirection: 'row', alignItems: 'flex-end' },
+    /** The bubble yields, the arrow never does: Yoga's flexShrink defaults to
+     * 0, so without this a maximal bubble would push the fixed arrow box
+     * toward the edge instead of letting its own text reflow. */
+    bubbleShrink: { flexShrink: 1 },
+    replyArrow: {
+      width: 32,
+      height: 32,
+      marginLeft: space.s3,
+      marginBottom: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      flexShrink: 0,
+    },
+    /** The bubble is a row so the delivery tick sits beside the last line; a
+     * quote, its answer and the edited mark stack inside this column. */
+    bubbleBody: { flexShrink: 1 },
+    quote: {
+      borderLeftWidth: 2,
+      paddingHorizontal: space.s4,
+      paddingVertical: space.s3,
+      marginBottom: space.s3,
+    },
+    /** Secondary text at FULL alpha: the palette owns the colour (inkMuted on
+     * paper, onBubbleOut on pine) and the type role owns the emphasis. The 0.75
+     * opacity these carried put the inbound quote at ≈3.1:1 and the edited mark at
+     * ≈3.7:1, under the 4.5:1 AA floor. */
+    quoteText: {},
+    /** The quoted author's name over their words. */
+    quoteAuthor: { marginBottom: space.s1 },
+    editedMark: { marginTop: space.s1 },
+    chip: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      borderWidth: StyleSheet.hairlineWidth,
+      borderBottomWidth: 0,
+      paddingLeft: 0,
+      paddingRight: space.s2,
+      paddingVertical: space.s4,
+      overflow: 'hidden',
+    },
+    chipBar: { width: 3, alignSelf: 'stretch', marginRight: space.s5 },
+    chipBody: { flex: 1, flexShrink: 1 },
+    chipText: { marginTop: 1 },
+    chipCancel: {
+      width: 36,
+      height: 36,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    tombstone: {
+      borderWidth: StyleSheet.hairlineWidth,
+      paddingHorizontal: space.s5,
+      // 9, not a step: the bubble's own vertical padding, set inline where
+      // the bubble is drawn — a tombstone stands in a bubble's place and
+      // must be its height.
+      paddingVertical: 9,
+    },
+    tombstoneText: { flexShrink: 1, fontStyle: 'italic' },
+    /** The group gap — the same step a bubble opens a run with. */
+    failedOut: { marginTop: space.s5 },
+    failedBubble: { alignSelf: 'flex-end' },
+    failedActions: {
+      flexDirection: 'row',
+      justifyContent: 'flex-end',
+      alignItems: 'center',
+      gap: space.s6,
+    },
+    statusGlyph: { marginBottom: 1 },
+    photoStatus: {
+      alignSelf: 'flex-end',
+      marginTop: space.s2,
+      marginRight: space.s2,
+    },
+    metaLeft: {
+      alignSelf: 'flex-start',
+      marginTop: space.s2,
+      marginLeft: space.s2,
+    },
+    metaRight: {
+      alignSelf: 'flex-end',
+      marginTop: space.s2,
+      marginRight: space.s2,
+    },
+    photoFallback: { alignItems: 'center', justifyContent: 'center' },
+    photoFallbackText: { marginTop: space.s4 },
+    photoRetry: {
+      minHeight: layout.touchTarget,
+      justifyContent: 'center',
+      paddingHorizontal: space.s5,
+    },
+    reactionRow: { flexDirection: 'row', gap: space.s2, marginTop: space.s3 },
+    reactionChip: {
+      minHeight: 26,
+      minWidth: 30,
+      borderWidth: 1,
+      paddingHorizontal: space.s3,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    rail: {
+      marginTop: space.s3,
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingHorizontal: space.s5,
+      borderTopWidth: StyleSheet.hairlineWidth,
+    },
+    railChoice: {
+      width: layout.touchTarget,
+      minHeight: layout.touchTarget,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    actionStrip: {
+      minHeight: 40,
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      paddingHorizontal: space.s5,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+    },
+    actionDetail: { flexShrink: 1, marginRight: space.s4 },
+    actionButtons: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      flexWrap: 'wrap',
+      gap: space.s6,
+    },
+    /** One strip action: the 44pt floor the system wants, with the word
+     * centred in it. The line stayed an 18pt line with 8pt of slop — a ~34pt
+     * target — until this floor was applied. */
+    actionButton: { minHeight: layout.touchTarget, justifyContent: 'center' },
+    corruptRow: {
+      marginVertical: space.s3,
+      paddingHorizontal: space.s5,
+      paddingVertical: space.s4,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      alignItems: 'center',
+    },
+    corruptAction: { alignSelf: 'flex-end' },
+    /** The event-row delivery notice: a breath under the event
+     * sentence, centered with it by the corruptRow container. */
+    eventNotice: { marginTop: space.s2 },
+    /** The provenance line above a relayed row. Indented to the bubble it
+     * annotates, so it reads as belonging to that message and not as a
+     * standalone system notice. */
+    sharedTag: {
+      marginTop: space.s4,
+      marginBottom: space.s1,
+      marginHorizontal: space.s6,
+    },
+    /** An outsider's message: full width with a slate
+     * accent bar — deliberately NOT the bubble shape, so it cannot be read as
+     * a member speaking even with the tag line cropped. */
+    outsiderRow: {
+      marginVertical: space.s3,
+      paddingHorizontal: space.s5,
+      paddingVertical: space.s4,
+      borderLeftWidth: 3,
+      alignSelf: 'stretch',
+    },
+    outsiderText: { marginTop: space.s2 },
+    /** The authenticated author over an inbound run's first bubble. */
+    /** The line above a bubble: author label and/or the AI marker. A row so
+     * the badge sits beside the name when both render; flex-start so an
+     * unlabelled agent bubble's lone badge hugs the bubble's edge. */
+    authorLine: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: space.s3,
+      alignSelf: 'flex-start',
+      marginBottom: space.s1,
+    },
+    authorLabel: { marginLeft: space.s2, flexShrink: 1 },
+    mismatchRow: {
+      paddingVertical: space.s4,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      alignItems: 'flex-start',
+    },
+    jumpRow: {
+      minHeight: 40,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: space.s4,
+    },
+    errorActions: {
+      borderLeftWidth: 2,
+      flexDirection: 'row',
+      justifyContent: 'flex-end',
+      alignItems: 'center',
+      gap: space.s6,
+    },
+    progressRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: space.s4,
+      paddingVertical: space.s4,
+    },
+    offlineRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: space.s3,
+      paddingVertical: space.s4,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+    },
+    offlineMark: { width: 6, height: 6 },
+    offlineText: { flex: 1 },
+    banner: {
+      borderTopWidth: 2,
+      borderLeftWidth: 3,
+      paddingVertical: space.s5,
+    },
+    bannerTitleRow: { flexDirection: 'row', alignItems: 'center', gap: space.s5 },
+    bannerTitle: { flex: 1 },
+    bannerBody: { marginTop: space.s3 },
+    bannerActions: { flexDirection: 'row', gap: space.s5, marginTop: space.s5 },
+    bannerButton: {
+      minHeight: layout.touchTarget,
+      borderWidth: 1,
+      paddingHorizontal: space.s6,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    alertSquare: {
+      width: 24,
+      height: 24,
+      borderWidth: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    composerWrap: {
+      paddingTop: space.s4,
+      paddingHorizontal: space.s5,
+      paddingBottom: space.s4,
+      borderTopWidth: StyleSheet.hairlineWidth,
+    },
+    counter: { textAlign: 'right', marginBottom: space.s2, marginRight: space.s2 },
+    drawer: {
+      borderWidth: 1,
+      borderBottomWidth: 0,
+      overflow: 'hidden',
+      paddingTop: space.s6,
+      paddingBottom: space.s5,
+    },
+    drawerSeam: { width: StyleSheet.hairlineWidth, height: '100%' },
+    drawerGrid: { flexDirection: 'row', paddingHorizontal: space.s4 },
+    drawerAction: {
+      flex: 1,
+      alignItems: 'center',
+      paddingVertical: space.s1,
+      gap: space.s3,
+    },
+    drawerDisc: {
+      width: 46,
+      height: 46,
+      borderRadius: 23,
+      borderWidth: StyleSheet.hairlineWidth,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    drawerLabel: { textAlign: 'center' },
+    /** The drawer's ⓘ, aligned with the grid's own gutter. */
+    drawerAbout: { paddingHorizontal: space.s6, marginTop: space.s2 },
+    voiceBar: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: space.s5,
+      paddingHorizontal: space.s5,
+      paddingBottom: space.s3,
+    },
+    voiceLevelTrack: { flex: 1, height: 4, borderRadius: 2, overflow: 'hidden' },
+    voiceTrack: { height: 3, borderRadius: 2, overflow: 'hidden' },
+    voiceTrackFill: { height: 3, borderRadius: 2 },
+    voiceMetaRow: {
+      flexDirection: 'row',
+      alignItems: 'baseline',
+      justifyContent: 'space-between',
+      gap: space.s4,
+    },
+    voiceLevelFill: { height: 4, borderRadius: 2 },
+    emojiRow: { paddingHorizontal: space.s4, alignItems: 'center' },
+    emojiChoice: {
+      width: layout.touchTarget,
+      minHeight: layout.touchTarget,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    /** The member picker: list padding replaces the drawer's grid padding. */
+    mentionDrawer: { paddingTop: space.s3, paddingBottom: space.s2 },
+    /** One person: a circle and a name. minHeight (never height) so scaled
+     * text grows the row — the no-clipping rule the room header tests pin. */
+    mentionRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: space.s5,
+      paddingHorizontal: space.s6,
+      paddingVertical: space.s2,
+    },
+    mentionName: { flexShrink: 1 },
+    mentionChipRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: space.s3,
+      paddingHorizontal: space.s2,
+      paddingBottom: space.s3,
+    },
+    mentionChip: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      borderWidth: 1,
+      paddingLeft: space.s5,
+      minHeight: 32,
+    },
+    mentionChipCancel: {
+      minWidth: 32,
+      minHeight: 32,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    /** A mention in a bubble: weight beside the '@' glyph — the ink is the
+     * theme's, applied inline, and never the only signal. */
+    mentionSpan: { fontWeight: '600' },
+    composer: {
+      flexDirection: 'row',
+      alignItems: 'flex-end',
+      borderWidth: 1,
+      minHeight: layout.buttonHeight,
+      paddingHorizontal: space.s2,
+    },
+    composerIcon: {
+      width: layout.touchTarget,
+      height: layout.touchTarget,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    composerInput: {
+      flex: 1,
+      minHeight: layout.touchTarget,
+      maxHeight: 110,
+      // 11: tuned with the input's 21pt line to meet the 44pt floor exactly
+      // — sizing, not spacing.
+      paddingVertical: 11,
+    },
+    sendDisc: {
+      borderWidth: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+  });
+}

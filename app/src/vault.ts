@@ -46,6 +46,29 @@ export type VaultTone = 'warningMark' | 'warningInk' | 'lineStrong' | 'inkMuted'
 export const MASKED_VALUE = '••••••••';
 
 /**
+ * How long a revealed value stays on glass before it re-masks on its own:
+ * long enough to read a Wi-Fi key aloud or type a door code into a keypad,
+ * short enough that a phone put down mid-visit is not still showing it.
+ * Backgrounding re-masks at once, whatever the clock says. */
+export const VAULT_REVEAL_MS = 45_000;
+
+/**
+ * How long a burst of messaging notifications is coalesced before the vault
+ * section re-reads the Room. Every notification — a typing frame, a read
+ * mark, a message in some other Room — used to re-read and re-parse the
+ * whole thread; one read per quiet beat is the same answer, later by a beat
+ * nobody can see. */
+export const VAULT_RELOAD_DEBOUNCE_MS = 250;
+
+/**
+ * What a vault announcement's body BEGINS with — envelope.ts's sentinel plus
+ * the kind, exactly as `encodeEnvelope` writes it (`tcm` is the schema's
+ * first key) and exactly as strict as `parseEnvelope`'s own sentinel. The
+ * undelivered-item read filters on it BEFORE parsing, so a thread of photos
+ * and text costs a prefix compare per row, not a parse. */
+export const VAULT_ENVELOPE_PREFIX = '{"tcm":"vault"';
+
+/**
  * The status rule's colour and its label ink, as TOKEN KEYS. Slate once the
  * Room is holding something, the neutral rule when it is not — the same shape
  * `blockStatusTone` and `SAFETY_STATUS` use, so a screen resolves all three
@@ -97,7 +120,9 @@ export const VAULT = {
   cancel: 'Cancel',
 
   /* ── a row ────────────────────────────────────────────── */
-  show: 'Show',
+  /** The action says how long: a reveal is a window, not
+   * a switch, and the person should know that before tapping. */
+  show: `Show for ${VAULT_REVEAL_MS / 1000} s`,
   hide: 'Hide',
   /**
    * What VoiceOver reads in place of a masked value. The bullets themselves

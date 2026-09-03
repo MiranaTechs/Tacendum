@@ -1,6 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { makeUserRefSaltLoader, readIdentifierHmacKeys } from '../src/aws/deps.js';
-import { emailRequestCodeRoute, emailVerifyRoute } from '../src/handlers/identifiers.js';
+import {
+  emailRequestCodeRoute,
+  emailVerifyRoute,
+  hmacKeys,
+  IDENTIFIER_KEY_WAIT_MS,
+} from '../src/handlers/identifiers.js';
 import { usernameClaimRoute, usernameRefusal } from '../src/handlers/username.js';
 import type { Deps, HttpEvent } from '../src/handlers/http.js';
 import { makeMemoryDb, makeTestDeps } from './helpers.js';
@@ -195,5 +200,54 @@ describe('the username claim on a COLD container (field report: first tap refuse
     // retried inside the wait, and no handler event fired.
     expect(attempts).toBe(1);
     expect(base.logs.filter((l) => l.event === 'username_claim_admitted')).toEqual([]);
+  });
+});
+
+describe('the in-flight K_id wait is BOUNDED', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('a fetch that never settles answers the collapsed refusal at the wait bound — never the Lambda timeout', async () => {
+    vi.useFakeTimers();
+    // A pending promise that never settles: the hung Secrets Manager
+    // connection, as the lane sees it.
+    const deps = { identifierHmac: { pending: new Promise<void>(() => {}) } } as unknown as Deps;
+    let settled: 'no' | 'undefined' | 'keys' = 'no';
+    const wait = hmacKeys(deps).then((keys) => {
+      settled = keys === undefined ? 'undefined' : 'keys';
+    });
+    // Just short of the bound: still waiting (a slow-but-live fetch is not
+    // abandoned early).
+    await vi.advanceTimersByTimeAsync(IDENTIFIER_KEY_WAIT_MS - 1);
+    expect(settled).toBe('no');
+    await vi.advanceTimersByTimeAsync(1);
+    await wait;
+    expect(settled).toBe('undefined');
+  });
+
+  it('a fetch that lands inside the bound is served, and the bound is a small fraction of a Lambda timeout', async () => {
+    vi.useFakeTimers();
+    let resolvePending!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      resolvePending = resolve;
+    });
+    // The production shape: the getter answers `{ pending }` until the fetch
+    // lands, then `{ keys }` (aws/deps.ts readIdentifierHmacKeys).
+    let landed = false;
+    const deps = {
+      get identifierHmac() {
+        return landed ? { keys: [{ version: 1, key: 'k1' }] } : { pending };
+      },
+    } as unknown as Deps;
+    const wait = hmacKeys(deps);
+    await vi.advanceTimersByTimeAsync(100);
+    landed = true;
+    resolvePending();
+    expect(await wait).toEqual([{ version: 1, key: 'k1' }]);
+    // The bound: enough for a Secrets Manager round trip through the SDK's
+    // own (now pinned) timeouts, and far below any function's timeout.
+    expect(IDENTIFIER_KEY_WAIT_MS).toBeGreaterThanOrEqual(2_000);
+    expect(IDENTIFIER_KEY_WAIT_MS).toBeLessThanOrEqual(5_000);
   });
 });

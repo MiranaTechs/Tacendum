@@ -31,8 +31,8 @@ import { DEVICE_NOUN } from './deviceNoun';
  * module, so they share a source of truth instead.
  */
 export const AI_DISCLOSURE_SENTENCE =
-  'Replies you send are delivered to the AI provider through a client running on your machine; ' +
-  "Tacendum's servers relay message ciphertext, not plaintext.";
+  'Replies you send are delivered to the AI provider running on your own machine; ' +
+  "Tacendum's servers relay ciphertext only.";
 
 /**
  * The machine section on a peer's profile (crew-chat spec; server contract in

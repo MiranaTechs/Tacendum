@@ -146,3 +146,92 @@ test("the disc gets the RAW stored name — a nameless caller's monogram comes f
   // the resolved "…"-prefixed label.
   expect(byPeer.get('peer-2')?.displayName ?? null).toBeNull();
 });
+
+test('opening the tab clears the missed-call notices for every peer', async () => {
+  // The rows on this screen are what the notices pointed at; showing them
+  // answers them.
+  const facade = require('../src/call') as { clearMissedCallNotices(peerId: string | null): Promise<void> };
+  const spy = jest.spyOn(facade, 'clearMissedCallNotices').mockResolvedValue(undefined);
+  try {
+    await renderCalls();
+    expect(spy).toHaveBeenCalledWith(null);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The frame and the rows.
+// ---------------------------------------------------------------------------
+
+test('the Calls header is the same HomeHeader as Chats, with the profile door when the shell hands one over', async () => {
+  const { HomeHeader } = require('../src/ui/primitives') as typeof import('../src/ui/primitives');
+  const theme = (require('../src/theme') as typeof import('../src/theme')).themeTokens();
+  const { StyleSheet, Text } = require('react-native') as typeof import('react-native');
+  const onOpenProfile = jest.fn();
+  let tree!: ReactTestRenderer.ReactTestRenderer;
+  await ReactTestRenderer.act(() => {
+    tree = ReactTestRenderer.create(
+      <CallsScreen
+        onOpenChat={jest.fn()}
+        onCall={jest.fn()}
+        profile={{ userId: 'me', displayName: 'Nat', avatarB64: '' }}
+        onOpenProfile={onOpenProfile}
+      />,
+    );
+  });
+  await ReactTestRenderer.act(async () => {});
+
+  const header = tree.root.findByType(HomeHeader);
+  expect(header.props.title).toBe('Calls');
+  // No bespoke 28/700 title any more: the one header role, screenTitle size.
+  const title = header.findAll(
+    n => n.props.accessibilityRole === 'header' && n.props.children === 'Calls',
+  )[0]!;
+  expect(StyleSheet.flatten(title.props.style).fontSize).toBe(theme.type.screenTitle.fontSize);
+  for (const node of tree.root.findAllByType(Text)) {
+    expect(StyleSheet.flatten(node.props.style)?.fontSize).not.toBe(28);
+  }
+  const door = tree.root.find(
+    n => n.props.testID === 'home-profile-door' && typeof n.props.onPress === 'function',
+  );
+  await ReactTestRenderer.act(async () => {
+    door.props.onPress();
+  });
+  expect(onOpenProfile).toHaveBeenCalledTimes(1);
+});
+
+test('rows take the glyph kit, the row disc and a 44pt redial — no typographic stand-ins', async () => {
+  const { Avatar } = require('../src/ui/Avatar') as typeof import('../src/ui/Avatar');
+  const { PhoneGlyph, VideoGlyph } = require('../src/ui/CallGlyph') as typeof import('../src/ui/CallGlyph');
+  const theme = (require('../src/theme') as typeof import('../src/theme')).themeTokens();
+  const { StyleSheet, Text } = require('react-native') as typeof import('react-native');
+  const tree = await renderCalls();
+
+  // The audio row redials with the handset, the video row with the camera.
+  expect(tree.root.findAllByType(PhoneGlyph).length).toBe(1);
+  expect(tree.root.findAllByType(VideoGlyph).length).toBe(1);
+  expect(renderedText(tree)).not.toMatch(/[⧉✆]/);
+
+  // The disc is the list row size, not a one-off 44.
+  for (const disc of tree.root.findAllByType(Avatar)) {
+    expect(disc.props.size).toBe(theme.layout.avatar.row);
+  }
+
+  // The redial disc is a full touch target.
+  const redial = tree.root.find(
+    n => n.props.accessibilityLabel === 'Video call Dawit' && typeof n.props.onPress === 'function',
+  );
+  const host = redial.findAll(
+    n => typeof n.type === 'string' && typeof n.props.style !== 'function',
+  )[0]!;
+  const style = StyleSheet.flatten(host.props.style) as { width?: number; height?: number };
+  expect(style.width).toBe(theme.layout.touchTarget);
+  expect(style.height).toBe(theme.layout.touchTarget);
+
+  // Type comes off the scale: the name is rowTitle, the time is timeStatus.
+  const name = tree.root.findAll(
+    n => n.type === Text && n.props.children === 'Dawit',
+  )[0]!;
+  expect(StyleSheet.flatten(name.props.style).fontSize).toBe(theme.type.rowTitle.fontSize);
+});

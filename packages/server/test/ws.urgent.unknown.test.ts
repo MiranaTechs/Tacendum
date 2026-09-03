@@ -3,7 +3,7 @@ import { monotonicFactory } from 'ulid';
 import { wsDefaultHandler, type WsDeps } from '../src/handlers/ws.js';
 import { deliverPushWake } from '../src/handlers/push-worker.js';
 import { LIMITS } from '../src/ratelimit.js';
-import type { DataLayer } from '../src/db/data.js';
+import type { TestOnlyDataLayer } from '../src/db/data.js';
 import { makeMemoryDb, makeTestDeps, type TestDeps } from './helpers.js';
 
 /**
@@ -32,7 +32,7 @@ import { makeMemoryDb, makeTestDeps, type TestDeps } from './helpers.js';
 const ulid = monotonicFactory();
 const VICTIM = '0000000000000000000VCTM005';
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: TestDeps;
 let wsDeps: WsDeps;
 

@@ -141,6 +141,7 @@ class Dev {
       case 'startReofferTimer':
         this.reoffers.set(e.peerId, this.world.now + e.ms);
         break;
+      case 'persistOffer':
       case 'writeSessionRow':
       case 'closeSessionRow':
       case 'legUnreachable':
@@ -186,6 +187,10 @@ class Dev {
                 sdp: env.sdp,
                 vid: env.vid,
                 exp: env.exp,
+                // The epoch this device holds, exactly as `legSend` composes
+                // it: a member added mid-call must start where the starter
+                // is, not at 0.
+                se: this.session.se,
               },
             });
           } else {
@@ -210,6 +215,13 @@ class Dev {
         cid,
         name: step.state.name,
         reason: endReason,
+        // The peer's answer, as the coordinator's `onLegState` reports it:
+        // the 1:1 machine latches `answeredAt` when their `call.answer` lands
+        // and keeps it through `ending`, which is what lets the session count
+        // an answered-then-failed leg as proof of presence.
+        ...(step.state.call?.answeredAt != null
+          ? { answeredAt: step.state.call.answeredAt }
+          : {}),
       });
       if (step.state.name === 'ending') {
         this.leg(cid, { type: 'teardownComplete' });
@@ -493,10 +505,17 @@ describe('3-way full join', () => {
     expect(world.dev(S).session?.legs[B]?.direction).toBe('out');
     expect(world.dev(B).session?.legs[A]?.direction).toBe('out');
     expect(world.dev(A).session?.legs[B]?.direction).toBe('in');
-    // §4.3 on every device: ONE report, ONE connect, ZERO releases so far.
+    // §4.3 on every device: ONE report, ZERO releases so far — and the
+    // CONNECT report is the starter's alone: it is
+    // `reportOutgoingCall(with:connectedAt:)`, and an incoming session's
+    // CXCall was connected by its answer (the callee counts here were 1
+    // and were rewritten deliberately).
     expect(world.dev(S).counts).toEqual({ incoming: 0, outgoing: 1, connected: 1, released: 0 });
-    expect(world.dev(A).counts).toEqual({ incoming: 1, outgoing: 0, connected: 1, released: 0 });
-    expect(world.dev(B).counts).toEqual({ incoming: 1, outgoing: 0, connected: 1, released: 0 });
+    expect(world.dev(A).counts).toEqual({ incoming: 1, outgoing: 0, connected: 0, released: 0 });
+    expect(world.dev(B).counts).toEqual({ incoming: 1, outgoing: 0, connected: 0, released: 0 });
+    // The aggregate's own connect latch is what the callees keep.
+    expect(world.dev(A).session?.connectedAt).not.toBeNull();
+    expect(world.dev(B).session?.connectedAt).not.toBeNull();
   });
 
   it('the ring ack reaches the starter tile: legs show "ringing" before anyone answers', () => {
@@ -541,8 +560,10 @@ describe('late join and the cross-pair race', () => {
       expect(world.dev(id).session?.roster).toEqual([S, A, B, C]);
       expect(world.dev(id).session?.legs[C]?.phase).toBe('connected');
     }
-    // C was rung once and connected once, like anybody (§4.3).
-    expect(world.dev(C).counts).toEqual({ incoming: 1, outgoing: 0, connected: 1, released: 0 });
+    // C was rung once, like anybody (§4.3); the connect report is the
+    // starter's, and C's aggregate latched its own connect.
+    expect(world.dev(C).counts).toEqual({ incoming: 1, outgoing: 0, connected: 0, released: 0 });
+    expect(world.dev(C).session?.connectedAt).not.toBeNull();
     // C's legs: starter offered to C; C offers to both non-starter incumbents.
     expect(world.dev(C).session?.legs[S]?.direction).toBe('in');
     expect(world.dev(C).session?.legs[A]?.direction).toBe('out');
@@ -727,9 +748,133 @@ describe('one flapping pair repairs itself without touching the rest of the mesh
     // The untouched pairs never noticed, and nobody's CXCall moved.
     expect(world.dev(S).session?.legs[A]?.phase).toBe('connected');
     expect(world.dev(S).session?.legs[B]?.phase).toBe('connected');
+    expect(world.dev(S).counts.connected).toBe(1); // the starter's ONE connect
     for (const id of [S, A, B]) {
-      expect(world.dev(id).counts.connected).toBe(1);
       expect(world.dev(id).counts.released).toBe(0);
     }
+  });
+});
+
+/* ========================================================================== *
+ *  Composed scenarios for the behaviours the pure tests cannot show alone.  *
+ *  Each went red against the modules that preceded them.                     *
+ * ========================================================================== */
+describe('a late-added member follows the roster from the epoch they joined at', () => {
+  it('late join → a SECOND Add → the starter hangs up: every device applies every delta and releases', () => {
+    // Before the epoch rode the ginvite, C seeded 0 while S was at 1: the Add
+    // of D (se 2) was held forever on C, D's leg offer to C was refused busy
+    // (D was not in C's roster), and S's starter-out (se 3) never ended C's
+    // call. This test is that repro, composed.
+    const D = '01BX5ZZKBKACTAV9WEVGEMMVS4';
+    const world = threeWay();
+    world.dev(C);
+    world.dev(D);
+    world.dev(S).input({ type: 'addParticipant', peerId: C, cid: world.mint() });
+    world.flush();
+    answer(world, C);
+    world.connect(S, C);
+    world.connect(C, A);
+    world.connect(C, B);
+    expect(world.dev(C).session?.se).toBe(1);
+
+    world.dev(S).input({ type: 'addParticipant', peerId: D, cid: world.mint() });
+    world.flush();
+    // C, added at epoch 1, applies the epoch-2 Add instead of holding it.
+    expect(world.dev(C).session?.held).toBeNull();
+    expect(world.dev(C).session?.roster).toEqual([S, A, B, C, D]);
+    answer(world, D);
+    world.connect(S, D);
+    world.connect(D, A);
+    world.connect(D, B);
+    world.connect(D, C); // D (index 4) offers to C (index 3); C admits a rostered joiner
+    for (const id of [S, A, B, C]) {
+      expect(world.dev(id).session?.roster).toEqual([S, A, B, C, D]);
+      expect(world.dev(id).session?.legs[D]?.phase).toBe('connected');
+    }
+    expect(world.dev(D).session?.se).toBe(2);
+    expect(world.dev(C).session?.se).toBe(2);
+
+    // The starter hangs up: the authority starter-out at se 3 ends it for
+    // EVERYONE, the late joiners included.
+    world.dev(S).input({ type: 'localHangup' });
+    world.flush();
+    for (const id of [S, A, B, C, D]) {
+      expect(world.dev(id).session).toBeNull();
+      expect(world.dev(id).counts.released).toBe(1);
+      expect(world.dev(id).released).toEqual(['hangup']);
+    }
+  });
+
+  it("the starter's Remove of a member applies on a late-added member instead of being held", () => {
+    // The reducer has no starter-side Remove input — the authority delta is
+    // composed on the wire, and `applyAuthority`'s remove arm is its remote
+    // half — so it is composed here exactly as the starter's device would
+    // send it: `call.gleave{m: B}` at the next epoch, to every other member.
+    // Before the epoch rode the ginvite, C (seeded 0 while S was at 1) held
+    // it forever: B stayed on C's call after the starter removed them.
+    const world = threeWay();
+    world.dev(C);
+    world.dev(S).input({ type: 'addParticipant', peerId: C, cid: world.mint() });
+    world.flush();
+    answer(world, C);
+    world.connect(S, C);
+    world.connect(C, A);
+    world.connect(C, B);
+    expect(world.dev(C).session?.se).toBe(1);
+    expect(world.dev(C).session?.legs[B]?.phase).toBe('connected');
+
+    const remove = { tcm: 'call.gleave' as const, sid: SID, m: B, se: 2 };
+    for (const to of [A, B, C]) {
+      world.queue.push({ lane: 'group', from: S, to, env: remove });
+    }
+    world.flush();
+
+    // C applied the epoch-2 Remove instead of holding it: B's leg is closed
+    // (folded to its departed phase once the teardown ran), nothing is held.
+    expect(world.dev(C).session?.se).toBe(2);
+    expect(world.dev(C).session?.held).toBeNull();
+    expect(['left', 'gone']).toContain(world.dev(C).session?.legs[B]?.phase);
+    expect(['left', 'gone']).toContain(world.dev(A).session?.legs[B]?.phase);
+    // B, removed by the starter, released; the call goes on for the rest.
+    expect(world.dev(B).session).toBeNull();
+    expect(world.dev(B).counts.released).toBe(1);
+    for (const id of [A, C]) expect(world.dev(id).session).not.toBeNull();
+  });
+});
+
+describe('a joiner↔incumbent leg that fails before its first connect is repaired', () => {
+  it("the joiner's connect timeout toward an incumbent who ANSWERED arms R6, and the re-offer forms the leg", () => {
+    // A answered C's offer (call.answer landed on C's leg) but never sent C a
+    // gjoin — incumbents announce once, at their own answer, before C
+    // existed. ICE then fails to connect: the 45 s connect timeout ends the
+    // leg `failed_ice`. Before this rule the leg was not `revivable` (A was
+    // never `announced` on C) and stayed "Couldn't connect" for the call.
+    const world = threeWay();
+    world.dev(C);
+    world.dev(S).input({ type: 'addParticipant', peerId: C, cid: world.mint() });
+    world.flush();
+    answer(world, C);
+    world.connect(S, C);
+    world.connect(C, B);
+    const cLeg = world.dev(C).legTo(A)!;
+    expect(cLeg.box.state.name).toBe('outgoing_connecting'); // answered, ICE in flight
+    expect(world.dev(C).session?.announced).not.toContain(A);
+
+    world.dev(C).leg(cLeg.cid, { type: 'connectTimeout' });
+    world.flush();
+    expect(world.dev(C).session?.legs[A]?.phase).toBe('failed');
+    expect(world.dev(A).session?.legs[C]?.phase).toBe('failed');
+    // THE REPAIR ARMS — on the offerer, and only there.
+    expect(world.dev(C).reoffers.has(A)).toBe(true);
+    expect(world.dev(A).reoffers.size).toBe(0);
+
+    world.advance(2_000);
+    world.connect(C, A);
+    expect(world.dev(C).session?.legs[A]?.phase).toBe('connected');
+    expect(world.dev(A).session?.legs[C]?.phase).toBe('connected');
+    expect(world.dev(C).session?.legs[A]?.cid).not.toBe(cLeg.cid);
+    // Still one CXCall each throughout.
+    expect(world.dev(C).counts.incoming).toBe(1);
+    expect(world.dev(A).counts.released).toBe(0);
   });
 });

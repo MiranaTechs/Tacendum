@@ -34,7 +34,7 @@ export function makeDdbRateLimiter(
   now: () => number = () => Date.now(),
 ): RateLimiter {
   return {
-    async take(bucket: string, opts: RateLimitOpts): Promise<number> {
+    async take(bucket: string, opts: RateLimitOpts, count = 1): Promise<number> {
       const windowMs = Math.max(1000, Math.round((opts.capacity / opts.refillPerSec) * 1000));
       const t = now();
       const windowStart = t - (t % windowMs);
@@ -46,18 +46,22 @@ export function makeDdbRateLimiter(
           TableName: tableName(),
           Key: { bucket: key },
           // One atomic write, no prior read. The TTL is set once per row and
-          // gives DynamoDB an hour's grace past the window to reap it.
+          // gives DynamoDB an hour's grace past the window to reap it. A
+          // multi-token take ADDs its whole count; a refused one has still
+          // counted — the window never un-adds, and every multi-token bucket
+          // is the caller's own, so the over-charge only ever tightens the
+          // caller who asked for more than fit.
           UpdateExpression: 'ADD n :one SET expiresAt = if_not_exists(expiresAt, :exp)',
           ExpressionAttributeValues: {
-            ':one': 1,
+            ':one': count,
             ':exp': Math.floor(windowEnd / 1000) + 3600,
           },
           ReturnValues: 'UPDATED_NEW',
         }),
       );
 
-      const count = (res.Attributes as WindowRow | undefined)?.n ?? 1;
-      if (count <= opts.capacity) return 0;
+      const total = (res.Attributes as WindowRow | undefined)?.n ?? count;
+      if (total <= opts.capacity) return 0;
       // Over budget: the honest retry-after is the start of the next window.
       return Math.max(1, Math.ceil((windowEnd - t) / 1000));
     },

@@ -11,6 +11,7 @@ import {
   type ViewStyle,
 } from 'react-native';
 import { useTheme } from '../theme';
+import { Avatar } from './Avatar';
 
 /**
  * The small set of controls every screen shares, so a button, a header, and a
@@ -86,6 +87,84 @@ export function ScreenHeader({
         )}
       </View>
       <View style={styles.headerSide}>{right}</View>
+    </View>
+  );
+}
+
+/**
+ * The home tabs' header — Chats and Calls share it, so switching tabs changes
+ * the word and nothing else: one title role, one height, and the same profile
+ * door in the same corner (the two tabs drew three different headers, and
+ * Profile/Settings were unreachable from Calls). Left-aligned, unlike the
+ * pushed surfaces' centred ScreenHeader, because a root has no back control
+ * to balance.
+ *
+ * `statusLine` is the optional second line under the title (the chat list's
+ * connection state); it rides inside the same minHeight rather than adding to
+ * it. The profile door renders only when both the person and the handler are
+ * given — a surface that omits them must offer the door elsewhere. */
+export function HomeHeader({
+  title,
+  statusLine,
+  profile,
+  onOpenProfile,
+  profileLabel = 'Open your profile',
+  testID,
+}: {
+  title: string;
+  statusLine?: React.ReactNode;
+  profile?: {
+    userId: string;
+    displayName?: string | null;
+    avatarB64?: string | null;
+  } | null;
+  onOpenProfile?: () => void;
+  profileLabel?: string;
+  testID?: string;
+}) {
+  const t = useTheme();
+  return (
+    <View
+      style={[
+        styles.homeHeader,
+        { minHeight: t.layout.headerHeight, paddingHorizontal: t.layout.gutter },
+      ]}
+      {...(testID ? { testID } : {})}
+    >
+      <View style={styles.homeHeaderTitles}>
+        <Text
+          style={[t.type.screenTitle, { color: t.color.inkStrong }]}
+          accessibilityRole="header"
+          numberOfLines={2}
+          maxFontSizeMultiplier={1.8}
+        >
+          {title}
+        </Text>
+        {statusLine ?? null}
+      </View>
+      {profile && onOpenProfile ? (
+        <Pressable
+          onPress={onOpenProfile}
+          accessibilityRole="button"
+          accessibilityLabel={profileLabel}
+          testID="home-profile-door"
+          style={({ pressed }) => [
+            styles.iconTarget,
+            {
+              width: t.layout.touchTarget,
+              height: t.layout.touchTarget,
+              backgroundColor: pressed ? t.color.pineWash : 'transparent',
+            },
+          ]}
+        >
+          <Avatar
+            peerId={profile.userId}
+            displayName={profile.displayName}
+            photoB64={profile.avatarB64}
+            size={t.layout.avatar.header}
+          />
+        </Pressable>
+      ) : null}
     </View>
   );
 }
@@ -250,6 +329,94 @@ export const TextAction = React.forwardRef<
     </Pressable>
   );
 });
+
+/**
+ * The outlined action: a considered step, never a filled button. One shape
+ * in three tones — danger for the irreversible (accepting an identity
+ * change, recording a mismatch, a delete), warning for a person's own
+ * settled decision (a block, a revoke — slate, never red, because safety.ts
+ * already assigns warningMark to "a thing to do, not a thing gone wrong"),
+ * pine for a plain secondary step — and two sizes: the 52pt button, and the
+ * 44pt compact one a row's inline confirm uses beside a TextAction.
+ *
+ * The peer profile, the room profile and the chat list each drew this
+ * button privately, with different paddings and different disabled logic,
+ * each comment insisting locality would stop a third screen using it for
+ * something alarming — by which point three screens already had. Disabled
+ * is a recessed surface with muted ink (the house rule, never opacity), and
+ * the pressed wash never paints on a disabled control. */
+export function OutlineButton({
+  label,
+  tone = 'pine',
+  size = 'regular',
+  onPress,
+  disabled,
+  testID,
+  style,
+}: {
+  label: string;
+  tone?: 'pine' | 'danger' | 'warning';
+  size?: 'regular' | 'compact';
+  onPress: () => void;
+  disabled?: boolean;
+  testID?: string;
+  style?: StyleProp<ViewStyle>;
+}) {
+  const t = useTheme();
+  const line =
+    tone === 'danger'
+      ? t.color.danger
+      : tone === 'warning'
+        ? t.color.warningMark
+        : t.color.pineLine;
+  const ink =
+    tone === 'danger'
+      ? t.color.danger
+      : tone === 'warning'
+        ? t.color.warningInk
+        : t.color.pine;
+  const wash =
+    tone === 'danger'
+      ? t.color.dangerWash
+      : tone === 'warning'
+        ? t.color.paperInset
+        : t.color.pineWash;
+  const compact = size === 'compact';
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={disabled}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      accessibilityState={{ disabled: !!disabled }}
+      {...(testID ? { testID } : {})}
+      style={({ pressed }) => [
+        compact ? styles.outlineButtonCompact : styles.outlineButton,
+        {
+          minHeight: compact ? t.layout.touchTarget : t.layout.buttonHeight,
+          borderRadius: t.radius.button,
+          borderWidth: 1,
+          borderColor: disabled ? t.color.lineSoft : line,
+          backgroundColor: disabled
+            ? t.color.paperInset
+            : pressed && !disabled
+              ? wash
+              : 'transparent',
+        },
+        style,
+      ]}
+    >
+      <Text
+        style={[
+          compact ? t.type.buttonCompact : t.type.button,
+          { color: disabled ? t.color.inkMuted : ink },
+        ]}
+      >
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
 
 /** Inline error that occupies layout space and is announced. Never a toast. */
 export function InlineError({
@@ -497,6 +664,13 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
   },
   headerSide: { minWidth: 44, flexDirection: 'row', alignItems: 'center' },
+  homeHeader: {
+    paddingVertical: 4,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  homeHeaderTitles: { flex: 1 },
   headerCenter: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   iconTarget: {
     width: 44,
@@ -548,4 +722,14 @@ const styles = StyleSheet.create({
   identityValue: { flex: 1 },
   identityValueStacked: { alignSelf: 'stretch' },
   textAction: { justifyContent: 'center', paddingHorizontal: 8 },
+  outlineButton: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 20,
+  },
+  outlineButtonCompact: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 12,
+  },
 });

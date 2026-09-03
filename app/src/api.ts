@@ -19,11 +19,150 @@ import {
   WsTicketResponse,
   type CallMetricReport,
 } from '@tacendum/shared';
+import { MAX_ATTACHMENT_BYTES } from '@tacendum/shared';
 import { API_BASE } from './config';
 import { currentToken, reauthenticate } from './reauth';
 import { session } from './session';
 
 /** Thin REST client for the endpoints (mirrors the CLI's). */
+
+/**
+ * EVERY FETCH HAS A DEADLINE.
+ *
+ * `fetch` in React Native has no timeout of its own — `ws.ts` measured that
+ * on the device and gave the ticket mint a watchdog; every other request in
+ * the app was unbounded. The costs were concrete: a first message to a new
+ * contact blocked in the prekey fetch forever on a stalled link (the
+ * composer saw neither success nor error), and two hung blob downloads held
+ * both `MAX_CONCURRENT_DOWNLOADS` slots for the rest of the session, every
+ * later photo and avatar stuck 'pending' behind them.
+ *
+ * REST calls get a fixed deadline: a healthy round trip is tens to a few
+ * thousand milliseconds, so twenty seconds aborts nothing that was going to
+ * succeed and bounds the one failure mode with no other exit. Blob
+ * transfers get a size-scaled one — base plus a per-MiB allowance — because
+ * a 10 MiB photo over a bad cell link legitimately takes longer than any
+ * fixed REST budget. */
+export const REQUEST_TIMEOUT_MS = 20_000;
+const BLOB_TIMEOUT_BASE_MS = 30_000;
+const BLOB_TIMEOUT_PER_MIB_MS = 10_000;
+/** The base64 text of a maximum-size blob: what `downloadBlob` budgets for
+ * when the caller cannot say how big the object is (a pointer carries no
+ * size — messaging.ts, `noteAutoFetched`). */
+const MAX_BLOB_B64_LENGTH = Math.ceil((MAX_ATTACHMENT_BYTES * 4) / 3);
+
+/** Deadline for one blob transfer of `bytes` (base64 characters count as
+ * bytes: they are what actually crosses the network). */
+export function blobTimeoutMs(bytes: number): number {
+  const mib = Math.ceil(Math.max(0, bytes) / (1024 * 1024));
+  return BLOB_TIMEOUT_BASE_MS + BLOB_TIMEOUT_PER_MIB_MS * mib;
+}
+
+/**
+ * A request that reached its deadline. Its own class rather than RN's
+ * `TypeError('Network request failed')` so a caller CAN tell "no answer in
+ * time" from "no network at all" — and deliberately not an `ApiRequestError`,
+ * which carries an HTTP status this never had (`apiProbeSession` turns those
+ * into a verdict about the credential; a timeout is no verdict).
+ */
+export class ApiTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`request timed out after ${timeoutMs} ms`);
+    this.name = 'ApiTimeoutError';
+  }
+}
+
+/**
+ * Run `work` with an AbortSignal that fires at the deadline; the timer is
+ * cleared the moment the work settles, so a request that answers leaves no
+ * handle behind. Abort surfaces as `ApiTimeoutError` whatever the platform's
+ * own abort error looks like (RN throws a DOMException-shaped `AbortError`;
+ * the whatwg polyfill under jest throws a plain Error).
+ */
+async function withDeadline<T>(
+  timeoutMs: number,
+  work: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // A deadline must never be what keeps a process alive: on Node (jest)
+  // `setTimeout` returns a handle that holds the event loop open, and a
+  // request some test abandoned mid-flight would then hold the whole run
+  // open for the length of its deadline (the "Jest did not exit" tail).
+  // React Native's timers are plain numbers — no `unref` — so this is a
+  // no-op on the device, where the deadline fires exactly as before.
+  (timer as unknown as { unref?: () => void }).unref?.();
+  try {
+    return await work(controller.signal);
+  } catch (err) {
+    if (controller.signal.aborted) throw new ApiTimeoutError(timeoutMs);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * THE SERVER IS AHEAD OF THIS BUILD.
+ *
+ * The app `.parse()`s every response DTO strictly and ships with no OTA
+ * path, so the day a server removes, renames or retypes a field a shipped
+ * client requires, every one of those clients fails — and used to fail
+ * OPAQUELY: a zod error from `apiGetPrekeyBundle` read as "could not send",
+ * one from `apiWsTicket` as a failed dial, retried on the backoff schedule
+ * forever. Neither is a network problem and neither heals by retrying; the
+ * only fix is an update. So a DTO that no longer parses is its own error,
+ * named so every catch on the send path and the socket can tell it apart,
+ * carrying WHICH shape failed and the field paths — never the values: an
+ * error string is logged, rendered and sometimes copied, and a bundle
+ * carries key material.
+ *
+ * Only the RESPONSE parse is wrapped. A malformed error body, a 5xx, a
+ * timeout and no network keep their own shapes; "update Tacendum" is the
+ * wrong advice for all of them. */
+export class ServerAheadError extends Error {
+  constructor(
+    /** The DTO that failed to parse, by its schema name. */
+    readonly dto: string,
+    /** The field paths zod refused, e.g. `['expiresAt']`. */
+    readonly fields: string[],
+  ) {
+    super(
+      `update Tacendum: the server answered ${dto} in a shape this version cannot read` +
+        (fields.length > 0 ? ` (${fields.join(', ')})` : ''),
+    );
+    this.name = 'ServerAheadError';
+  }
+}
+
+/** Structural, not instanceof: zod's error class may be a different copy
+ * from the one @tacendum/shared built the schema with. */
+function isZodError(err: unknown): err is { issues: Array<{ path: PropertyKey[] }> } {
+  return (
+    err instanceof Error &&
+    err.name === 'ZodError' &&
+    Array.isArray((err as { issues?: unknown }).issues)
+  );
+}
+
+/** Parse a response body against its DTO; a refusal is a ServerAheadError. */
+function parseDto<T>(
+  schema: { parse(input: unknown): T },
+  dto: string,
+  body: unknown,
+): T {
+  try {
+    return schema.parse(body);
+  } catch (err) {
+    if (isZodError(err)) {
+      const fields = [
+        ...new Set(err.issues.map(i => i.path.map(String).join('.')).filter(Boolean)),
+      ];
+      throw new ServerAheadError(dto, fields);
+    }
+    throw err;
+  }
+}
 
 export class ApiRequestError extends Error {
   constructor(
@@ -102,16 +241,19 @@ async function request(
       throw new TypeError('Network request failed');
     }
 
-    const res = await fetch(`${API_BASE}${path}`, {
-      method,
-      headers: {
-        ...(opts.body !== undefined
-          ? { 'content-type': 'application/json' }
-          : {}),
-        ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
-      },
-      ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
-    });
+    const res = await withDeadline(REQUEST_TIMEOUT_MS, signal =>
+      fetch(`${API_BASE}${path}`, {
+        method,
+        headers: {
+          ...(opts.body !== undefined
+            ? { 'content-type': 'application/json' }
+            : {}),
+          ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
+        },
+        ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
+        signal,
+      }),
+    );
 
     if (
       res.status === 401 &&
@@ -180,7 +322,7 @@ async function request(
  */
 export async function apiWsTicket(token: string): Promise<string> {
   const res = await request('POST', '/v1/ws-ticket', { token });
-  return WsTicketResponse.parse(await res.json()).ticket;
+  return parseDto(WsTicketResponse, 'WsTicketResponse', await res.json()).ticket;
 }
 
 export async function apiProbeSession(token: string): Promise<number> {
@@ -243,7 +385,7 @@ export async function apiPostCallMetric(
  */
 export async function apiAuthChallenge(identityKey: string): Promise<AuthChallengeResponse> {
   const res = await request('POST', '/v1/auth/challenge', { body: { identityKey } });
-  return AuthChallengeResponse.parse(await res.json());
+  return parseDto(AuthChallengeResponse, 'AuthChallengeResponse', await res.json());
 }
 
 export async function apiAuth(
@@ -252,7 +394,7 @@ export async function apiAuth(
   signature: string,
 ): Promise<AuthResponse> {
   const res = await request('POST', '/v1/auth', { body: { identityKey, challenge, signature } });
-  return AuthResponse.parse(await res.json());
+  return parseDto(AuthResponse, 'AuthResponse', await res.json());
 }
 
 export async function apiUploadKeys(
@@ -274,9 +416,12 @@ export async function apiUploadKeys(
 export async function apiTurnCredentials(
   token: string,
 ): Promise<TurnCredentialsResponse> {
-  return TurnCredentialsResponse.parse(
-    await request('POST', '/v1/turn-credentials', { body: {}, token }),
-  );
+  // `.json()` on the answer — this used to hand the Response OBJECT to the
+  // schema, which can never parse (found while wrapping the DTO parses;
+  // the callers mock this function whole, so no test had ever reached the
+  // line).
+  const res = await request('POST', '/v1/turn-credentials', { body: {}, token });
+  return parseDto(TurnCredentialsResponse, 'TurnCredentialsResponse', await res.json());
 }
 
 /**
@@ -451,7 +596,7 @@ export async function apiCreateReport(
   body: CreateReportRequest,
 ): Promise<CreateReportResponse> {
   const res = await request('POST', '/v1/reports', { token, body });
-  return CreateReportResponse.parse(await res.json());
+  return parseDto(CreateReportResponse, 'CreateReportResponse', await res.json());
 }
 
 /*
@@ -471,7 +616,7 @@ export async function apiLinkOfferInit(
   body: LinkOfferInitRequest,
 ): Promise<LinkOfferInitResponse> {
   const res = await request('POST', '/v1/devices/link-offer', { body, token });
-  return LinkOfferInitResponse.parse(await res.json());
+  return parseDto(LinkOfferInitResponse, 'LinkOfferInitResponse', await res.json());
 }
 
 /** The SUBMIT leg: only the nonce and A's op="offer" identity
@@ -638,7 +783,7 @@ export async function apiDiscoveryLookupPhone(
     body: { phone },
     token,
   });
-  return DiscoveryLookupResponse.parse(await res.json());
+  return parseDto(DiscoveryLookupResponse, 'DiscoveryLookupResponse', await res.json());
 }
 
 /*
@@ -713,7 +858,7 @@ export async function apiDiscoveryLookupUsername(
     body: { username },
     token,
   });
-  return DiscoveryLookupResponse.parse(await res.json());
+  return parseDto(DiscoveryLookupResponse, 'DiscoveryLookupResponse', await res.json());
 }
 
 /** POST /v1/recovery/request-code with the {phone} field. Uniform 200 —
@@ -738,7 +883,7 @@ export async function apiRecoveryVerifyPhone(
     body: { phone, code, class: deviceClass },
     token,
   });
-  return RecoveryVerifyResponse.parse(await res.json());
+  return parseDto(RecoveryVerifyResponse, 'RecoveryVerifyResponse', await res.json());
 }
 
 /** POST /v1/identifiers/email/discoverable — the consent toggle. THE 204
@@ -767,7 +912,7 @@ export async function apiDiscoveryLookup(
     body: { email },
     token,
   });
-  return DiscoveryLookupResponse.parse(await res.json());
+  return parseDto(DiscoveryLookupResponse, 'DiscoveryLookupResponse', await res.json());
 }
 
 /** POST /v1/recovery/request-code — the recovering device asks for a code.
@@ -792,7 +937,7 @@ export async function apiRecoveryVerify(
     body: { email, code, class: deviceClass },
     token,
   });
-  return RecoveryVerifyResponse.parse(await res.json());
+  return parseDto(RecoveryVerifyResponse, 'RecoveryVerifyResponse', await res.json());
 }
 
 /** POST /v1/recovery/cancel — a surviving member kills the pending recovery.
@@ -847,7 +992,7 @@ export async function apiGetPrekeyBundle(
       parsed.success ? parsed.data.error.code : undefined,
     );
   }
-  const bundle = PrekeyBundle.parse(await res.json());
+  const bundle = parseDto(PrekeyBundle, 'PrekeyBundle', await res.json());
   // The bundle must name the account it was asked for: a bundle served for ULID_X carrying a different `userId`
   // would pin the served key under the WRONG address — the native store
   // pins by the bundle's own userId — while every caller signs or derives
@@ -866,7 +1011,7 @@ export async function apiCreateAttachment(
     body: { contentLength },
     token,
   });
-  return CreateAttachmentResponse.parse(await res.json());
+  return parseDto(CreateAttachmentResponse, 'CreateAttachmentResponse', await res.json());
 }
 
 export async function apiGetAttachmentUrl(
@@ -880,7 +1025,7 @@ export async function apiGetAttachmentUrl(
       token,
     },
   );
-  return GetAttachmentResponse.parse(await res.json());
+  return parseDto(GetAttachmentResponse, 'GetAttachmentResponse', await res.json());
 }
 
 /**
@@ -890,21 +1035,38 @@ export async function apiGetAttachmentUrl(
  * content is base64 ciphertext.
  */
 export async function uploadBlob(url: string, bodyB64: string): Promise<void> {
-  const res = await fetch(url, {
-    method: 'PUT',
-    headers: { 'content-type': 'application/octet-stream' },
-    body: bodyB64,
-  });
+  // Size-scaled (see REQUEST_TIMEOUT_MS): the body is in hand, so the
+  // deadline is exact for what is being pushed.
+  const res = await withDeadline(blobTimeoutMs(bodyB64.length), signal =>
+    fetch(url, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: bodyB64,
+      signal,
+    }),
+  );
   if (!res.ok)
     throw new ApiRequestError(`blob upload failed (${res.status})`, res.status);
 }
 
-export async function downloadBlob(url: string): Promise<string> {
-  const res = await fetch(url);
-  if (!res.ok)
-    throw new ApiRequestError(
-      `blob download failed (${res.status})`,
-      res.status,
-    );
-  return res.text();
+/**
+ * `expectedBytes` scales the deadline when the caller knows the object's
+ * size; without it the budget is a maximum-size blob's, which is generous
+ * but still finite — the point is that a stalled transfer ENDS. The body
+ * read sits inside the deadline too: for a blob the bytes ARE the request,
+ * and a stall after the headers is the common shape of a dying link.
+ */
+export async function downloadBlob(
+  url: string,
+  expectedBytes: number = MAX_BLOB_B64_LENGTH,
+): Promise<string> {
+  return withDeadline(blobTimeoutMs(expectedBytes), async signal => {
+    const res = await fetch(url, { signal });
+    if (!res.ok)
+      throw new ApiRequestError(
+        `blob download failed (${res.status})`,
+        res.status,
+      );
+    return res.text();
+  });
 }

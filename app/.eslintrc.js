@@ -10,7 +10,13 @@ module.exports = {
   // Found 2026-08-18 at phase A4, the first phase whose Gradle runs emit such
   // a report; ignored here rather than in .gitignore because the files are
   // already untracked — being untracked is exactly why nobody noticed them.
-  ignorePatterns: ['android/build/', 'android/.gradle/', 'android/.kotlin/'],
+  // Anchored with `**/` on both sides: the bare form matched only
+  // app/android/build, so the app module's own Gradle tree
+  // (app/android/app/build/reports/tests/*/js/report.js) and every native
+  // module's (app/modules/*/android/build/reports/...) — the same third-party
+  // report bundle — were still linted, and the warning count depended on
+  // whether Gradle had run since the last clean.
+  ignorePatterns: ['**/android/**/build/', '**/android/**/.gradle/', '**/android/**/.kotlin/'],
   rules: {
     // `void somePromise()` — and `onPress={() => void save()}` — is the house
     // idiom for a deliberate fire-and-forget: it satisfies void-return handler

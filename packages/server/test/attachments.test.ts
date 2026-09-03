@@ -92,6 +92,46 @@ describe('attachments — presigned blob endpoints', () => {
     expect(other.statusCode).toBe(200);
   });
 
+  /**
+   * Ten mints a minute × 10 MiB each was ~144 GB/day of S3 PUT capability
+   * per free account, retained 30 days, and nothing recorded who minted
+   * what. The mint now also draws a DAILY BYTE window in whole-MiB tokens (a
+   * 10 MiB mint costs 10, a 1-byte mint 1), so one account's day of uploads
+   * is bounded in bytes, not only in count. */
+  it('mints draw a per-account daily byte window in MiB tokens', async () => {
+    // The per-minute count bucket is not under test here: let it through so
+    // the byte window is the only ceiling in play, and record what it charges.
+    const inner = deps.rateLimit;
+    const charged: Array<[string, number]> = [];
+    deps.rateLimit = {
+      take: async (bucket, opts, count) => {
+        if (bucket.startsWith('attach-create:')) return 0;
+        charged.push([bucket, count ?? 1]);
+        return inner.take(bucket, opts, count);
+      },
+    };
+    const mint = (contentLength: number, user = USER) =>
+      createAttachmentHandler(jsonPost({ contentLength }), deps, auth(user));
+    const perDay = Math.floor(LIMITS.attachmentBytesDaily.capacity / (MAX_ATTACHMENT_BYTES / (1024 * 1024)));
+    for (let i = 0; i < perDay; i++) {
+      expect((await mint(MAX_ATTACHMENT_BYTES)).statusCode, `mint ${i + 1}`).toBe(200);
+    }
+    expect(charged[0]).toEqual([`attach-bytes:${USER}`, 10]);
+    // One more full-size mint does not fit the day.
+    const limited = await mint(MAX_ATTACHMENT_BYTES);
+    expect(limited.statusCode).toBe(429);
+    expect(limited.headers?.['retry-after']).toBeDefined();
+    expect(parseBody<{ error: { code: string } }>(limited.body).error.code).toBe('rate_limited');
+    // Tokens are proportional: a one-byte mint costs one and still fits.
+    expect((await mint(1)).statusCode).toBe(200);
+    expect(charged.at(-1)).toEqual([`attach-bytes:${USER}`, 1]);
+    // Another account has its own day.
+    expect((await mint(MAX_ATTACHMENT_BYTES, 'other')).statusCode).toBe(200);
+    // And the window is a DAY: a day later the full-size mint fits again.
+    deps.advanceMs(24 * 3600 * 1000);
+    expect((await mint(MAX_ATTACHMENT_BYTES)).statusCode).toBe(200);
+  });
+
   it('fetch returns a download URL for a well-formed id (200)', async () => {
     const id = testAttachmentId(7);
     const res = await getAttachmentHandler(fetchEvent(id), deps, auth());

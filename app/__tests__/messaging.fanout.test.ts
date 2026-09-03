@@ -93,6 +93,7 @@ jest.mock('../src/db', () => ({
   listChats: jest.fn(),
   listMessages: jest.fn(),
   listAttachments: jest.fn(),
+  listAttachmentMeta: jest.fn(),
   listRecentMessages: jest.fn(),
   listHeldRevisions: jest.fn(),
   takeHeldRevision: jest.fn(),
@@ -215,6 +216,7 @@ function resetDb(): void {
     ['listChats', []],
     ['listMessages', []],
     ['listAttachments', []],
+    ['listAttachmentMeta', []],
     ['listRecentMessages', []],
     ['listHeldRevisions', []],
     ['takeHeldRevision', null],
@@ -753,6 +755,10 @@ describe('pacing and admission control against a fake clock', () => {
     db.listOutbox!.mockResolvedValue(queuedLegs());
     const t0 = Date.now();
     ws.handlers.state?.('open');
+    // A socket that has produced a frame: attempts are counted only once the
+    // far end has shown it is there, so the "attempts burned" assertions
+    // below need a server frame on record first.
+    ws.handlers.frame?.({ type: 'receipt', msgId: '01UNRELATEDRECEIPT0000000', state: 'sent' });
     await flush();
 
     // ADMISSION CONTROL: the bucket is born empty (the server-side window may

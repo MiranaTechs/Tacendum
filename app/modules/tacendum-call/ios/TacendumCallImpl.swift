@@ -58,6 +58,33 @@ public final class TacendumCallImpl: NSObject {
   /// Pressure observers are registered once per process and only while calling.
   private var monitoringPressure = false
 
+  // / The tokens `startMonitoringPressure` gets back from /
+  // `addObserver(forName:object:queue:using:)` — one per signal, held so /
+  // `stopMonitoringPressure` can hand each one back. Block-based observers /
+  // are removed by TOKEN; `removeObserver(self)` reaches only selector /
+  // registrations, so the old stop leaked all three every call and each /
+  // thermal/power/battery change then fired N `thermalStateChanged` events,
+  // / in and out of calls.
+  fileprivate var pressureObservers: [NSObjectProtocol] = []
+
+  /// The audio-route observer behind `refreshProximity`, held for the life
+  /// of the singleton — block-based observers are removed by TOKEN, never by
+  /// `removeObserver(self)`, which only reaches selector registrations.
+  private var routeObserver: NSObjectProtocol?
+
+  private override init() {
+    super.init()
+    // THE PROXIMITY RULE'S THIRD INPUT. Live-ness and video are recomputed
+    // where the calls map changes; the route changes on its own clock —
+    // the speaker button, a headset plugged in, Bluetooth connecting — and
+    // this is the one signal that says so.
+    routeObserver = NotificationCenter.default.addObserver(
+      forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil
+    ) { [weak self] _ in
+      self?.refreshProximity()
+    }
+  }
+
   /// The APNs ALERT token, which is not the VoIP one.
   ///
   /// This lives in the calling module because that is where the APNs surface
@@ -123,6 +150,60 @@ public final class TacendumCallImpl: NSObject {
       DispatchQueue.main.async {
         UIApplication.shared.applicationIconBadgeNumber = count
       }
+    }
+  }
+
+  // MARK: - missed calls
+
+  /// Every missed-call request id starts with this; the peer's id follows,
+  /// then a nonce. Clearing by peer is a prefix match over what is delivered.
+  private static let missedCallPrefix = "missed-call."
+
+  /**
+   * Post the local "Missed call" notice.
+   *
+   * A missed call on a locked phone used to leave nothing at all: CallKit
+   * ends the ring `.unanswered`, but `includesCallsInRecents` is off (§9.4)
+   * and the app posted no notification, so the only way to learn of the
+   * call was to open the Calls tab. The JS side calls this from the same
+   * path that writes the missed row — the row is the fact; this is its
+   * notice.
+   *
+   * `displayName` is what JS knows; empty when it knows nothing (a locked
+   * workspace refuses the read), in which case the name mirror the ring
+   * itself paints from is consulted, and failing that the body says only
+   * that someone called. The payload carries NOTHING else — no id, no
+   * offer, no thread — because a delivered notification is readable by
+   * anything that can read the lock screen. `threadIdentifier` is the peer
+   * id so the notice groups with that person's message notifications.
+   * Never rejects: a refused post (notifications not authorised) costs the
+   * notice, never the row or the call.
+   */
+  @objc public func postMissedCall(peerId: String, displayName: String) {
+    let known = displayName.isEmpty
+      ? (CallKitCenter.shared.mirroredName(for: peerId) ?? "")
+      : displayName
+    let content = UNMutableNotificationContent()
+    content.title = "Missed call"
+    content.body = known.isEmpty ? "Tap to see who called." : known
+    content.sound = .default
+    content.threadIdentifier = peerId
+    let request = UNNotificationRequest(
+      identifier: Self.missedCallPrefix + peerId + "." + UUID().uuidString,
+      content: content,
+      trigger: nil
+    )
+    UNUserNotificationCenter.current().add(request) { _ in }
+  }
+
+  /// Clear the missed-call notices for `peerId` — every one of them when it
+  /// is empty. The Calls tab clears all on open; a thread clears its peer.
+  @objc public func clearMissedCall(peerId: String) {
+    let prefix = peerId.isEmpty ? Self.missedCallPrefix : Self.missedCallPrefix + peerId + "."
+    let center = UNUserNotificationCenter.current()
+    center.getDeliveredNotifications { delivered in
+      let ids = delivered.map { $0.request.identifier }.filter { $0.hasPrefix(prefix) }
+      if !ids.isEmpty { center.removeDeliveredNotifications(withIdentifiers: ids) }
     }
   }
 
@@ -428,6 +509,49 @@ public final class TacendumCallImpl: NSObject {
       UIApplication.shared.isIdleTimerDisabled = live
     }
     if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
+    refreshProximity()
+  }
+
+  /**
+   * BLANK THE SCREEN AGAINST THE FACE.
+   *
+   * CallKit manages the proximity sensor for the SYSTEM call UI, not for a
+   * third-party in-call screen, and the idle timer above keeps the display
+   * awake for the life of every call — so an earpiece call left a lit,
+   * touch-live `CallScreen` pressed against a cheek, End and Mute along its
+   * bottom edge. `isProximityMonitoringEnabled` is the lever: while it is
+   * on, iOS turns the display off when the sensor covers and back on when it
+   * clears.
+   *
+   * DERIVED, like the idle timer, from three facts read at apply time:
+   *  - a call is live (a peer connection exists — dialling included, since
+   *    the ringback is heard at the ear);
+   *  - the audio is on the RECEIVER. Speaker, a headset or Bluetooth mean
+   *    the phone is not at the face, and blanking then would blank a screen
+   *    the person is looking at;
+   *  - no call carries video. A video call is looked at whatever the camera
+   *    is doing, and `hasLocalVideo` is what the peer connection knows.
+   * Recomputed on every calls-map change, on every negotiation completing
+   * (the video track is born inside it), on audio activation (the route is
+   * applied there) and on every route change. The last connection to leave
+   * therefore always restores the system default, by the same argument the
+   * idle timer makes. */
+  fileprivate func refreshProximity() {
+    let apply = {
+      self.lock.lock()
+      let live = !self.calls.isEmpty
+      let video = self.calls.values.contains { $0.hasLocalVideo }
+      self.lock.unlock()
+      let receiver = AVAudioSession.sharedInstance().currentRoute.outputs.contains {
+        $0.portType == .builtInReceiver
+      }
+      let wanted = live && receiver && !video
+      let device = UIDevice.current
+      if device.isProximityMonitoringEnabled != wanted {
+        device.isProximityMonitoringEnabled = wanted
+      }
+    }
+    if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
   }
 
   // MARK: - negotiation
@@ -443,7 +567,11 @@ public final class TacendumCallImpl: NSObject {
       defer { self.endNegotiation(cid) }
       do {
         let pc = try makeCall(cid)
-        resolve(try await pc.createOffer(withVideo: withVideo))
+        let sdp = try await pc.createOffer(withVideo: withVideo)
+        // The local tracks were born inside the call above; the proximity
+        // rule's video input can only be read now.
+        refreshProximity()
+        resolve(sdp)
       } catch {
         reject("offer_failed", "could not create an offer", error)
       }
@@ -472,7 +600,9 @@ public final class TacendumCallImpl: NSObject {
         // The offer may already have a peer connection if a restart arrived;
         // reuse it so the ICE credentials continue rather than reset.
         let pc = try call(cid) ?? makeCall(cid)
-        resolve(try await pc.createAnswer(remoteOfferSdp: remoteOfferSdp, withVideo: withVideo))
+        let sdp = try await pc.createAnswer(remoteOfferSdp: remoteOfferSdp, withVideo: withVideo)
+        refreshProximity()
+        resolve(sdp)
       } catch {
         reject("answer_failed", "could not create an answer", error)
       }
@@ -753,11 +883,14 @@ extension TacendumCallImpl {
       Notification.Name.NSProcessInfoPowerStateDidChange,
       UIDevice.batteryLevelDidChangeNotification,
     ] {
-      center.addObserver(
-        forName: name, object: nil, queue: .main
-      ) { [weak self] _ in
-        self?.emitPressure()
-      }
+      // Kept by token: the only handle that can remove a block observer.
+      pressureObservers.append(
+        center.addObserver(
+          forName: name, object: nil, queue: .main
+        ) { [weak self] _ in
+          self?.emitPressure()
+        }
+      )
     }
     // Once immediately: a call placed on an already-hot phone must start
     // capped rather than wait for the state to CHANGE, which it may not.
@@ -767,7 +900,13 @@ extension TacendumCallImpl {
   @objc public func stopMonitoringPressure() {
     guard monitoringPressure else { return }
     monitoringPressure = false
-    NotificationCenter.default.removeObserver(self)
+    // Each token, not `self`: these are block observers, and removing `self`
+    // removed nothing — the handlers outlived the call and stacked up.
+    let center = NotificationCenter.default
+    for token in pressureObservers {
+      center.removeObserver(token)
+    }
+    pressureObservers.removeAll()
     DispatchQueue.main.async { UIDevice.current.isBatteryMonitoringEnabled = false }
   }
 
@@ -850,7 +989,12 @@ extension TacendumCallImpl: CallKitEventSink {
   func callKitMuted(cid: String, muted: Bool) {
     send("callKitMute", ["cid": cid, "muted": muted])
   }
-  func callKitAudioActivated() { send("callKitAudioActivated", [:]) }
+  func callKitAudioActivated() {
+    // The route is APPLIED at activation (`didActivate`), so this is the
+    // first moment the proximity rule can read it truthfully.
+    refreshProximity()
+    send("callKitAudioActivated", [:])
+  }
   func callKitAudioDeactivated() { send("callKitAudioDeactivated", [:]) }
   /// `ringCid` — the placeholder ACTUALLY ringing for `from`, "" when none is,
   /// which on a second push for a peer already ringing is the FIRST ring's cid

@@ -88,6 +88,22 @@ export interface CallContext {
   pendingIce: IceCandidate[];
   /** True once the remote description is applied, so ICE can be added live. */
   remoteReady: boolean;
+  /**
+   * A `call.restart` offer has been sent and its answer not yet applied
+   * (§7.6). Only the caller — the fixed restart initiator — ever sets it.
+   *
+   * ICE can heal on its own before the callee's restart answer lands, which
+   * moves the machine back to `connected`; the answer used to be refused
+   * there as unsolicited, leaving the peer connection in `have-local-offer`
+   * with a stale restart until the next real disconnect. This flag is what
+   * tells `connected` apart from "healthy, nobody asked for anything".
+   *
+   * Optional: absent reads as "no restart outstanding", the only value a
+   * context built before the field existed (a hand-rolled test fixture, a
+   * state restored from an older shape) can honestly hold. `newContext`
+   * always writes it.
+   */
+  restartInFlight?: boolean;
 }
 
 export type CallState =
@@ -200,6 +216,11 @@ const MISSED_REASONS: ReadonlySet<CallEndReason> = new Set<CallEndReason>([
   'timeout',
   'cancelled',
   'expired',
+  // Refused because this device was already on a call (or CallKit refused
+  // to present the ring): the person never got the chance to answer, which
+  // is the definition above. Only ever `direction: 'in'` here — a caller who
+  // HEARS busy is not missing anything.
+  'busy',
 ]);
 
 /** Glare bookkeeping is not a call and must never appear in a thread (§6.5). */
@@ -231,6 +252,7 @@ function newContext(fields: {
     remoteOfferSdp: fields.remoteOfferSdp ?? '',
     pendingIce: [],
     remoteReady: false,
+    restartInFlight: false,
   };
 }
 
@@ -348,6 +370,11 @@ export function callReducer(
     }
     // Otherwise we are simply busy, and they deserve to know at once rather
     // than listening to a ringback until their own timeout fires.
+    //
+    // AND WE DESERVE A ROW. The caller's log said "busy"; ours said nothing
+    // at all — no missed row in the thread or the Calls tab for someone who
+    // tried to reach us while we were on the phone. Dated at the offer's
+    // server receipt (the one clock both sides share), never at the refusal.
     return {
       state,
       effects: [
@@ -356,6 +383,18 @@ export function callReducer(
           peerId: event.peerId,
           envelope: { tcm: 'call.end', cid: event.cid, r: 'busy' },
           urgent: false,
+        },
+        {
+          type: 'writeLog',
+          cid: event.cid,
+          peerId: event.peerId,
+          direction: 'in',
+          kind: event.video ? 'video' : 'audio',
+          reason: 'busy',
+          startedAt: event.serverTs,
+          connectedAt: null,
+          endedAt: now,
+          missed: true,
         },
       ],
     };
@@ -373,9 +412,19 @@ export function callReducer(
     case 'localHangup':
     case 'callKitEnded': {
       if (state.name === 'ending') return NOTHING(state);
-      // Before the callee answered, "I hung up" is a cancellation — that is
-      // what makes it a MISSED call on their side rather than a completed one.
-      const reason: CallEndReason = call.connectedAt ? 'hangup' : 'cancelled';
+      // Before the call connected, who is hanging up decides what it means.
+      // The CALLER hanging up is a cancellation — that is what makes it a
+      // MISSED call on the callee's side rather than a completed one. The
+      // CALLEE hanging up — the lock-screen red button after the placeholder
+      // rebind (a CXEndCallAction, not a decline), or End while
+      // "Connecting…" — is a DECLINE: mapping it to `cancelled` told the
+      // caller they had hung up on themselves and wrote the callee a missed
+      // row for a call they had just refused.
+      const reason: CallEndReason = call.connectedAt
+        ? 'hangup'
+        : call.direction === 'in'
+          ? 'decline'
+          : 'cancelled';
       return endCall(call, reason, now, true);
     }
 
@@ -396,9 +445,20 @@ export function callReducer(
     // --- media negotiation --------------------------------------------------
     case 'ringingReceived':
       if (state.name !== 'outgoing_connecting') return NOTHING(state);
+      // The ring clock REPLACES the connect clock. The 45 s connect timer
+      // armed at `placeCall` covers "the offer never reached anyone"; once
+      // the callee's device says it is ringing, the only honest deadline is
+      // the 60 s ring (§6.4). Left armed, it cut every unanswered call off at
+      // 45 s as `failed_ice` — "failed to connect" on both logs and never a
+      // missed row — and the ring timer below was dead code. `answerReceived`
+      // re-arms connect, because that is when "answered but ICE never
+      // connected" starts.
       return {
         state: { name: 'outgoing_ringing', call },
-        effects: [{ type: 'startTimer', timer: 'ring', ms: CALL_RING_TIMEOUT_MS }],
+        effects: [
+          { type: 'cancelTimer', timer: 'connect' },
+          { type: 'startTimer', timer: 'ring', ms: CALL_RING_TIMEOUT_MS },
+        ],
       };
 
     case 'answerReceived': {
@@ -413,10 +473,17 @@ export function callReducer(
       // `connected` is deliberately NOT accepted: an unsolicited answer for a
       // call already carrying media is not a recovery, and applying a remote
       // description to a healthy connection would renegotiate it for free.
+      //
+      // …unless a restart of OURS is still waiting for exactly this answer.
+      // ICE can heal on its own before the callee replies, which lands the
+      // machine back in `connected` with a local restart offer outstanding;
+      // refusing the reply there left the peer connection in
+      // `have-local-offer` until the next real disconnect (§7.6).
       if (
         state.name !== 'outgoing_connecting' &&
         state.name !== 'outgoing_ringing' &&
-        state.name !== 'reconnecting'
+        state.name !== 'reconnecting' &&
+        !(state.name === 'connected' && call.restartInFlight)
       ) {
         return NOTHING(state);
       }
@@ -456,6 +523,8 @@ export function callReducer(
         // coincide where they overlap and neither can be derived from the
         // other where they do not.
         answeredAt: firstAnswer ? now : call.answeredAt,
+        // Whatever this answer replies to, no restart is outstanding now.
+        restartInFlight: false,
       };
       const effects: CallEffect[] = [
         ...(reportAnswer
@@ -481,6 +550,21 @@ export function callReducer(
       // `connected` either way.
       if (state.name === 'reconnecting') {
         return { state: { name: 'reconnecting', call: next }, effects };
+      }
+      // A restart answer landing on an already-healed connection: apply it
+      // (above) and stay connected — nothing here is dialling.
+      if (state.name === 'connected') {
+        return { state: { name: 'connected', call: next }, effects };
+      }
+      // The FIRST answer starts the "answered but ICE never connected" clock
+      // (§6.4): the ring clock is done — the callee picked up — and the
+      // connect clock, cancelled when the ring began, is armed afresh from
+      // here. A redelivered answer re-arms nothing.
+      if (!call.remoteReady) {
+        effects.push(
+          { type: 'cancelTimer', timer: 'ring' },
+          { type: 'startTimer', timer: 'connect', ms: CALL_CONNECT_TIMEOUT_MS },
+        );
       }
       return { state: { name: 'outgoing_connecting', call: next }, effects };
     }
@@ -605,7 +689,13 @@ export function callReducer(
       }
       if (state.name !== 'connected') return NOTHING(state);
       return {
-        state: { name: 'reconnecting', call },
+        state: {
+          name: 'reconnecting',
+          // The restart below is OURS to answer for (caller only): remember
+          // that it is outstanding, so its answer is accepted even if ICE
+          // heals before it lands.
+          call: call.direction === 'out' ? { ...call, restartInFlight: true } : call,
+        },
         effects: [
           { type: 'startTimer', timer: 'reconnect', ms: CALL_RECONNECT_TIMEOUT_MS },
           // Restart HERE, not only on `networkChanged`.
@@ -642,7 +732,7 @@ export function callReducer(
       // sent the original offer owns every restart.
       if (call.direction !== 'out') return NOTHING(state);
       return {
-        state,
+        state: { name: 'reconnecting', call: { ...call, restartInFlight: true } },
         effects: [
           { type: 'restartIce', cid: call.cid },
           send(call, { tcm: 'call.restart', cid: call.cid, sdp: '' }),
@@ -659,7 +749,19 @@ export function callReducer(
       return NOTHING(state);
 
     case 'connectTimeout':
-      if (state.name === 'ending' || state.name === 'connected') return NOTHING(state);
+      // `outgoing_ringing` belongs to the RING clock (§6.4): the callee's
+      // device is ringing, so nothing about ICE has failed yet, and the
+      // connect clock was cancelled when the ring began. A stray connect
+      // timeout that reaches here anyway must not cut a ringing call off as
+      // `failed_ice` — the ring times out on its own as `timeout`, which is
+      // the reason that marks the callee's row missed.
+      if (
+        state.name === 'ending' ||
+        state.name === 'connected' ||
+        state.name === 'outgoing_ringing'
+      ) {
+        return NOTHING(state);
+      }
       return endCall(call, 'failed_ice', now, true);
 
     case 'reconnectTimeout':
@@ -733,9 +835,14 @@ function fromIdle(state: CallState, event: CallEvent, now: number): Step {
         now > event.exp + OFFER_EXP_SKEW_MS ||
         now - event.serverTs > OFFER_MAX_SERVER_AGE_MS;
       if (expired) {
+        // Dated at the server's receipt of the offer — the one clock both
+        // sides share and the one the controller's own decline/silenced rows
+        // already use — never at the moment this device got round to
+        // draining it: a phone off for hours must not file "Missed call ·
+        // just now" for a call made hours ago.
         return {
           state: idleState(),
-          effects: logRow(call, 'expired', now),
+          effects: logRow({ ...call, startedAt: event.serverTs }, 'expired', now),
         };
       }
       return {

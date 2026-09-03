@@ -34,7 +34,14 @@ import { useTheme } from '../theme';
 import { AgentBadge } from '../ui/AgentBadge';
 import { Avatar } from '../ui/Avatar';
 import { InfoDisclosure } from '../ui/InfoDisclosure';
-import { InlineError, ScreenHeader, TextAction } from '../ui/primitives';
+import {
+  InlineError,
+  OutlineButton,
+  ScreenHeader,
+  TextAction,
+} from '../ui/primitives';
+import { RoomMark } from '../ui/RoomMark';
+import { useCoalescedSubscribe } from '../ui/useCoalescedSubscribe';
 
 interface Props {
   groupId: string;
@@ -140,6 +147,14 @@ export const ROOM_COPY = {
   addFull: (max: number) =>
     `This room is full — it holds ${max} people at most.`,
   remove: 'Remove',
+  /** The inline confirm: a Remove is as social and as
+   * announced as Leave — everyone's device is told, the removed person's
+   * included — so it asks the way Leave and both deletes do. Add
+   * afterwards is a fresh invitation, never a restore,
+   * and the body says so. */
+  removeConfirmTitle: (name: string) => `Remove ${name} from this room?`,
+  removeConfirmBody: `Everyone’s ${DEVICE_NOUN} is told to stop sending to them, theirs included. Adding them again sends a new invitation — it doesn’t bring back what they missed.`,
+  removeConfirm: 'Remove',
   removeFailed: 'Tacendum couldn’t change that. Try again.',
 
   leave: 'Leave this room',
@@ -172,6 +187,10 @@ export const ROOM_COPY = {
     `Messages here disappear after ${label.toLowerCase()}.`,
   timerOff: 'Messages here stay until someone deletes them.',
   timerYours: 'Your own timer. The room uses the shortest one anyone set.',
+  /**
+   * Why the chips are off once you have left: a disabled control must
+   * say so, in words, not merely refuse the tap. */
+  timerLeft: 'You’re no longer in this room, so its timer isn’t yours to set.',
 
   blockTitle: 'Blocking',
   blockLead:
@@ -243,7 +262,14 @@ export const ROOM_COPY = {
     'That sharing change didn’t take. Nothing changed or was announced. Try again.',
 } as const;
 
-type Confirming = 'none' | 'leave' | 'deleteLocal' | 'deleteEveryone';
+/** Which inline question is open. Remove carries the member it is about, so
+ * two Remove controls can never share one open question. */
+type Confirming =
+  | 'none'
+  | 'leave'
+  | 'deleteLocal'
+  | 'deleteEveryone'
+  | { kind: 'remove'; id: string };
 
 /**
  * A room's roster surface: the member list with
@@ -345,10 +371,10 @@ export function GroupProfileScreen({
     })().catch(() => {});
   }, [groupId]);
 
-  useEffect(() => {
-    refresh();
-    return messaging.subscribe(refresh);
-  }, [refresh]);
+  // ONE coalesced re-read per notify burst: subscribed raw, every receipt,
+  // frame and socket transition re-ran the seven reads above while a
+  // backlog drained.
+  useCoalescedSubscribe(refresh);
 
   const fold = group
     ? foldRoster(group.ownerId, slots, ownerOnlyPolicy)
@@ -633,6 +659,10 @@ export function GroupProfileScreen({
   const removeMember = (memberId: string) =>
     run(async () => {
       await writeRoster(memberId, 'out');
+      // Only a write that stood closes the question (Leave's own posture):
+      // a failure leaves it open beside the error, so the person can retry
+      // or step back without re-finding the row.
+      setConfirming('none');
     });
 
   const addMember = (memberId: string) =>
@@ -813,11 +843,19 @@ export function GroupProfileScreen({
       >
         <View style={[styles.column, { maxWidth: t.layout.contentMax }]}>
           <View style={styles.hero}>
-            <Avatar
-              peerId={groupId}
-              displayName={roomName}
+            {/* THE room signal at hero size: a person is a
+                circle, a room is a walled square — the same mark the chat
+                list row and the thread header draw, so the identity does
+                not flip between the list and the one screen that is about
+                the room. Hidden from VoiceOver like the disc it replaces:
+                the name beneath it, and the header's "Room", carry the
+                words. */}
+            <RoomMark
+              roomId={groupId}
+              name={roomName}
               size={t.layout.avatar.hero}
               monogramSize={t.type.screenTitle.fontSize}
+              testID="room-hero-mark"
             />
             <Text
               numberOfLines={2}
@@ -886,8 +924,13 @@ export function GroupProfileScreen({
               const state = isMe ? null : stateFor(id);
               const tone = state ? SAFETY_STATUS[state] : null;
               const stateLabel = state ? SAFETY_COPY[state].label : '';
+              const removing =
+                typeof confirming === 'object' &&
+                confirming.kind === 'remove' &&
+                confirming.id === id;
               return (
-                <View key={id} style={styles.memberRow} testID={`member-${id}`}>
+                <React.Fragment key={id}>
+                <View style={styles.memberRow} testID={`member-${id}`}>
                   <Pressable
                     onPress={
                       !isMe && onOpenMember ? () => onOpenMember(id) : undefined
@@ -988,12 +1031,46 @@ export function GroupProfileScreen({
                   {isOwner && !isMe ? (
                     <TextAction
                       label={ROOM_COPY.remove}
-                      onPress={() => removeMember(id)}
-                      disabled={busy}
+                      onPress={() => setConfirming({ kind: 'remove', id })}
+                      disabled={busy || removing}
                       testID={`member-remove-${id}`}
                     />
                   ) : null}
                 </View>
+                {/* The Remove question, in Leave's inline shape,
+                    under the row it is about. Only the confirm writes the
+                    roster; the first tap opened this and nothing else. */}
+                {removing ? (
+                  <View
+                    style={styles.removeConfirm}
+                    testID={`member-remove-question-${id}`}
+                  >
+                    <Text style={[t.type.bodyStrong, { color: t.color.inkStrong }]}>
+                      {ROOM_COPY.removeConfirmTitle(nameFor(id))}
+                    </Text>
+                    <Text
+                      style={[t.type.compactBody, styles.sectionLine, { color: t.color.inkBody }]}
+                    >
+                      {ROOM_COPY.removeConfirmBody}
+                    </Text>
+                    <View style={styles.confirmRow}>
+                      <TextAction
+                        label={ROOM_COPY.removeConfirm}
+                        tone="danger"
+                        onPress={() => removeMember(id)}
+                        disabled={busy}
+                        testID={`member-remove-confirm-${id}`}
+                      />
+                      <TextAction
+                        label={ROOM_COPY.cancel}
+                        onPress={() => setConfirming('none')}
+                        disabled={busy}
+                        testID={`member-remove-cancel-${id}`}
+                      />
+                    </View>
+                  </View>
+                ) : null}
+                </React.Fragment>
               );
             })}
 
@@ -1247,35 +1324,49 @@ export function GroupProfileScreen({
             <View style={styles.timerRow}>
               {DISAPPEAR_OPTIONS.map(option => {
                 const active = option.seconds === mySlotSeconds;
+                // Off for good once I have left: the chips say so to
+                // VoiceOver AND to the eye — a recessed surface with muted
+                // ink, never opacity — and a line beneath says why. `busy`
+                // disables the tap but keeps the live look: a write in
+                // flight is not a reason the person needs telling.
+                const locked = !amIn;
+                const disabled = busy || locked;
                 return (
                   <Pressable
                     key={option.seconds}
                     accessibilityRole="button"
-                    accessibilityState={{ selected: active }}
+                    accessibilityState={{ selected: active, disabled }}
                     accessibilityLabel={option.label}
                     testID={`room-timer-${option.seconds}`}
-                    disabled={busy || !amIn}
+                    disabled={disabled}
                     onPress={() => setTimer(option.seconds)}
                     style={({ pressed }) => [
                       styles.timerChip,
                       {
                         minHeight: t.layout.touchTarget,
                         borderRadius: t.radius.button,
-                        backgroundColor: active
-                          ? t.color.pineWash
-                          : pressed
-                            ? t.color.paperInset
-                            : t.color.paperSheet,
-                        borderColor: active
-                          ? t.color.pineLine
-                          : t.color.lineSoft,
+                        backgroundColor: locked
+                          ? t.color.paperInset
+                          : active
+                            ? t.color.pineWash
+                            : pressed
+                              ? t.color.paperInset
+                              : t.color.paperSheet,
+                        borderColor:
+                          active && !locked ? t.color.pineLine : t.color.lineSoft,
                       },
                     ]}
                   >
                     <Text
                       style={[
                         t.type.compactStrong,
-                        { color: active ? t.color.pine : t.color.inkBody },
+                        {
+                          color: locked
+                            ? t.color.inkMuted
+                            : active
+                              ? t.color.pine
+                              : t.color.inkBody,
+                        },
                       ]}
                     >
                       {option.label}
@@ -1284,6 +1375,14 @@ export function GroupProfileScreen({
                 );
               })}
             </View>
+            {!amIn ? (
+              <Text
+                style={[t.type.compactBody, styles.sectionLine, { color: t.color.inkMuted }]}
+                testID="room-timer-locked"
+              >
+                {ROOM_COPY.timerLeft}
+              </Text>
+            ) : null}
             <Text
               style={[t.type.compactBody, styles.sectionLine, { color: t.color.inkMuted }]}
             >
@@ -1352,12 +1451,13 @@ export function GroupProfileScreen({
                   </View>
                 </View>
               ) : (
-                <OutlineAction
+                <OutlineButton
                   label={ROOM_COPY.leave}
                   tone="warning"
                   onPress={() => setConfirming('leave')}
                   disabled={busy}
                   testID="room-leave"
+                  style={styles.outlineAction}
                 />
               )
             ) : (
@@ -1397,12 +1497,13 @@ export function GroupProfileScreen({
                 </View>
               </View>
             ) : (
-              <OutlineAction
+              <OutlineButton
                 label={ROOM_COPY.deleteLocal}
                 tone="danger"
                 onPress={() => setConfirming('deleteLocal')}
                 disabled={busy}
                 testID="room-delete"
+                style={styles.outlineAction}
               />
             )}
             <InfoDisclosure
@@ -1442,12 +1543,13 @@ export function GroupProfileScreen({
                   </View>
                 </View>
               ) : (
-                <OutlineAction
+                <OutlineButton
                   label={ROOM_COPY.deleteEveryone}
                   tone="danger"
                   onPress={() => setConfirming('deleteEveryone')}
                   disabled={busy}
                   testID="room-delete-everyone"
+                  style={styles.outlineAction}
                 />
               )
             ) : null}
@@ -1462,58 +1564,8 @@ export function GroupProfileScreen({
   );
 }
 
-/**
- * The peer profile's outlined action shape: a considered step, never a filled
- * red button. Local because promoting it would invite a third screen to use
- * it for something alarming.
- */
-function OutlineAction({
-  label,
-  tone,
-  onPress,
-  disabled,
-  testID,
-}: {
-  label: string;
-  tone: 'danger' | 'warning';
-  onPress: () => void;
-  disabled?: boolean;
-  testID: string;
-}) {
-  const t = useTheme();
-  const line = tone === 'danger' ? t.color.danger : t.color.warningMark;
-  const ink = tone === 'danger' ? t.color.danger : t.color.warningInk;
-  const wash = tone === 'danger' ? t.color.dangerWash : t.color.paperInset;
-  return (
-    <Pressable
-      onPress={onPress}
-      disabled={disabled}
-      accessibilityRole="button"
-      accessibilityLabel={label}
-      accessibilityState={{ disabled: !!disabled }}
-      testID={testID}
-      style={({ pressed }) => [
-        styles.outlineAction,
-        {
-          minHeight: t.layout.buttonHeight,
-          borderRadius: t.radius.button,
-          borderColor: disabled ? t.color.lineSoft : line,
-          backgroundColor: disabled
-            ? t.color.paperInset
-            : pressed
-              ? wash
-              : 'transparent',
-        },
-      ]}
-    >
-      <Text
-        style={[t.type.button, { color: disabled ? t.color.inkMuted : ink }]}
-      >
-        {label}
-      </Text>
-    </Pressable>
-  );
-}
+// The outlined action this file used to draw privately is the kit's
+// OutlineButton now.
 
 const styles = StyleSheet.create({
   root: { flex: 1 },
@@ -1569,11 +1621,9 @@ const styles = StyleSheet.create({
 
   confirmRow: { flexDirection: 'row', gap: 16, marginTop: 4 },
   confirmBlock: { marginTop: 16 },
-  outlineAction: {
-    marginTop: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 20,
-    borderWidth: 1,
-  },
+  /** The Remove question sits inside the roster, so it takes the row's
+   * rhythm rather than a section's. */
+  removeConfirm: { marginTop: 8, marginBottom: 8 },
+  /** The kit's OutlineButton: only the gap above it is this screen's. */
+  outlineAction: { marginTop: 12 },
 });

@@ -70,6 +70,26 @@ describe('what a call row says', () => {
     expect(callLabel(row({ missed: true, direction: 'out' }))).toBe('Audio call, no answer');
   });
 
+  it('says "no answer" and "cancelled" from the CALLER\'s reason, which never carries missed', () => {
+    // `missed` is only ever true on the receiving side, so an outgoing call
+    // that rang out rendered as a plain "Outgoing audio call" with no
+    // duration — the label above was unreachable from the caller's rows.
+    expect(callLabel(row({ direction: 'out', reason: 'timeout', connectedAt: null }))).toBe(
+      'Audio call, no answer',
+    );
+    expect(callLabel(row({ direction: 'out', reason: 'cancelled', connectedAt: null, kind: 'video' }))).toBe(
+      'Video call, cancelled',
+    );
+    // A busy refusal on the callee's side is a missed call (the reducer marks
+    // it so); the caller's own busy row keeps its word.
+    expect(callLabel(row({ direction: 'in', reason: 'busy', missed: true, connectedAt: null }))).toBe(
+      'Missed audio call',
+    );
+    expect(callLabel(row({ direction: 'out', reason: 'busy', connectedAt: null }))).toBe(
+      'Audio call, busy',
+    );
+  });
+
   it('distinguishes a failure to connect from a call that happened', () => {
     expect(callLabel(row({ reason: 'failed_ice' }))).toBe('Audio call failed to connect');
     expect(callLabel(row({ reason: 'failed_media', kind: 'video' }))).toBe(

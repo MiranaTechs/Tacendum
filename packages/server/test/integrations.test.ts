@@ -9,7 +9,7 @@ import { registerPushTokenHandler } from '../src/handlers/push.js';
 import { deleteAccountHandler } from '../src/handlers/account.js';
 import { activityActorRef } from '../src/opaque-ref.js';
 import type { AuthContext, HttpEvent } from '../src/handlers/http.js';
-import type { DataLayer } from '../src/db/data.js';
+import type { TestOnlyDataLayer } from '../src/db/data.js';
 import { allQueued, makeMemoryDb, makeTestDeps, parseBody, type TestDeps } from './helpers.js';
 
 /**
@@ -30,7 +30,7 @@ const HUMAN = '01CCCCCCCCCCCCCCCCCCCCCCCC';
 const STRANGER = '01DDDDDDDDDDDDDDDDDDDDDDDD';
 const MSG = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: TestDeps;
 let wsDeps: WsDeps;
 let posted: Array<{ connectionId: string; frame: ServerFrame }>;
@@ -315,6 +315,19 @@ describe('DELETE /v1/integrations/{userId}', () => {
   it('404 on an unknown target', async () => {
     const res = await revoke(OWNER, '01EEEEEEEEEEEEEEEEEEEEEEEE');
     expect(res.statusCode).toBe(404);
+  });
+
+  /**
+   * The path param was checked for presence only; a multi-KB value became a
+   * DynamoDB key and threw (500). A ULID or a 400 — decided before the store
+   * or a limiter is touched. */
+  it('a {userId} that is not a ULID is 400 invalid_request, not a 404 and never a 500', async () => {
+    for (const bad of ['x'.repeat(3000), 'agent-1', BOT.toLowerCase()]) {
+      const res = await revoke(OWNER, bad);
+      expect(res.statusCode, bad.slice(0, 20)).toBe(400);
+      expect(parseBody<{ error: { code: string } }>(res.body).error.code).toBe('invalid_request');
+    }
+    expect(await db.getUserById(BOT)).toBeTruthy();
   });
 });
 

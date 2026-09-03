@@ -8,7 +8,7 @@ import { crewAdoptHandler } from '../src/handlers/crew.js';
 import { integrationBindHandler } from '../src/handlers/integrations.js';
 import { uploadKeysHandler } from '../src/handlers/keys.js';
 import type { HttpEvent } from '../src/handlers/http.js';
-import { makeMemoryDb, makeTestDeps, testIdentityKey, type TestDeps } from './helpers.js';
+import { makeMemoryDb, makeTestDeps, testIdentityKey, type TestDeps, KEY_FIXTURE } from './helpers.js';
 
 /**
  * Log identity-ref remediation: the account-lifecycle log events carried raw
@@ -185,8 +185,8 @@ describe('key_upload_rejected_immutable carries the opaque ref, not the ULID', (
       {
         registrationId: 7,
         identityKeyPub: original,
-        signedPrekey: { keyId: 1, pub: 'c3Br', sig: 'c2ln' },
-        kyberPrekey: { keyId: 2, pub: 'a3li', sig: 'a3Np' },
+        signedPrekey: { keyId: 1, pub: KEY_FIXTURE.curvePub, sig: KEY_FIXTURE.sig },
+        kyberPrekey: { keyId: 2, pub: KEY_FIXTURE.kyberPub, sig: KEY_FIXTURE.sig },
       },
       [],
     );
@@ -195,8 +195,8 @@ describe('key_upload_rejected_immutable carries the opaque ref, not the ULID', (
       bearerEvent('PUT', '/v1/keys', {
         registrationId: 7,
         identityKey: testIdentityKey(0x42), // a DIFFERENT key: refused as immutable
-        signedPrekey: { keyId: 1, pub: 'c3Br', sig: 'c2ln' },
-        kyberPrekey: { keyId: 2, pub: 'a3li', sig: 'a3Np' },
+        signedPrekey: { keyId: 1, pub: KEY_FIXTURE.curvePub, sig: KEY_FIXTURE.sig },
+        kyberPrekey: { keyId: 2, pub: KEY_FIXTURE.kyberPub, sig: KEY_FIXTURE.sig },
         oneTimePrekeys: [],
       }),
       deps,

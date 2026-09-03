@@ -1,4 +1,4 @@
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   // Same trade as the chat list made before this screen existed: Clipboard is
   // deprecated in core but still shipped, and a paste target is the whole
@@ -36,6 +36,7 @@ import { sanitizeDisplayName, spellId } from '../person';
 import * as qr from '../qr';
 import { useTheme } from '../theme';
 import { USERNAME_UI_ENABLED } from '../usernameUi';
+import { usePaneWidth } from '../windowClass';
 import { QrPanel } from '../ui/QrPanel';
 import {
   InlineError,
@@ -66,6 +67,10 @@ const COPY = {
   findByEmailHelper:
     'Works only for someone who verified an email and turned findability on.',
   idLabel: 'Their Tacendum ID',
+  /** The field's heading once the scanner leads: typing is the second
+   * way in, said as such. The field's own accessible name stays
+   * `idLabel` — VoiceOver names the thing, not its rank. */
+  idTypeLabel: 'Or type their Tacendum ID',
   idPlaceholder: 'Enter their ID',
   idCounter: (n: number) => `${n} of ${ID_LENGTH}`,
   startButton: 'Start chat',
@@ -74,6 +79,11 @@ const COPY = {
   ownIdHint: 'Read this out to the person you want to reach.',
   ownIdHelper:
     'Give your ID only to someone you trust — text it, or read it out loud. It is the only way anyone can reach you here.',
+  /**
+   * The own-ID block's door: this screen is for reaching THEM, so your
+   * own id waits behind one tap rather than a scroll. */
+  showOwnId: 'Show my ID',
+  hideOwnId: 'Hide my ID',
   copy: 'Copy',
   share: 'Share',
   // Byte-identical on ProfileScreen and ChatListScreen — the same copy
@@ -214,6 +224,10 @@ function photoError(err: unknown): string {
  */
 export function StartChatScreen({ profile, onBack, onOpenChat, onFindByEmail }: Props) {
   const t = useTheme();
+  // The PANE's width: below narrowWidth the Start chat
+  // button drops under the field — a 26-character mono field and a button
+  // cannot share 340pt without one of them giving way.
+  const stacked = usePaneWidth() <= t.layout.narrowWidth;
   // THE keyboard mechanism: the
   // avoiding-view component this screen carried sat inside the transformed
   // RouteTransition that defeats its own-frame measurement. One
@@ -228,6 +242,8 @@ export function StartChatScreen({ profile, onBack, onOpenChat, onFindByEmail }: 
   const [focused, setFocused] = useState(false);
   const [nameFocused, setNameFocused] = useState(false);
   const [qrOpen, setQrOpen] = useState(false);
+  /** The own-ID block's door: closed on entry. */
+  const [ownIdOpen, setOwnIdOpen] = useState(false);
   const [picking, setPicking] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [errorSettings, setErrorSettings] = useState(false);
@@ -235,6 +251,15 @@ export function StartChatScreen({ profile, onBack, onOpenChat, onFindByEmail }: 
    *  announced again — InlineError's effect keys on [message, seq]. */
   const [attempt, setAttempt] = useState(0);
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Copy → Back inside the notice's 3 s must not fire a state write on a
+  // screen that is gone (the chat list's EmptyChats clears its own the
+  // same way).
+  useEffect(
+    () => () => {
+      if (copyTimer.current) clearTimeout(copyTimer.current);
+    },
+    [],
+  );
   /** Where the 26 characters in the field came from:
    *  a code only ever fills the field, so the rail is remembered here and
    *  recorded when the person commits. Any keystroke makes it 'manual' —
@@ -294,6 +319,11 @@ export function StartChatScreen({ profile, onBack, onOpenChat, onFindByEmail }: 
   );
 
   const startChat = useCallback(() => {
+    // The keyboard's go key fires this with the button still disabled:
+    // nothing typed is not an attempt, so it is not an error either — "0
+    // of 26 characters" was the disabled button's own promise broken from
+    // the other side.
+    if (draftId.trim() === '') return;
     const peerId = extractId(draftId);
     if (peerId === null) {
       setError(idError(draftId));
@@ -467,226 +497,243 @@ export function StartChatScreen({ profile, onBack, onOpenChat, onFindByEmail }: 
             {findDoor.noDirectory}
           </Text>
 
-          <View style={[styles.labelRow, styles.idLabelRow]}>
-            <Text style={[t.type.utilityLabel, { color: t.color.inkMuted }]}>
-              {COPY.idLabel}
-            </Text>
-            {!empty ? (
-              <Text
-                style={[
-                  t.type.counter,
-                  { color: complete ? t.color.pine : t.color.inkMuted },
-                ]}
-                // Progress for the eye; VoiceOver already hears the field.
-                accessibilityElementsHidden
-                importantForAccessibility="no-hide-descendants"
-              >
-                {COPY.idCounter(count)}
-              </Text>
-            ) : null}
-          </View>
-
-          <View style={styles.panelRow}>
-            <TextInput
-              value={draftId}
-              onChangeText={changeDraft}
-              onFocus={() => setFocused(true)}
-              onBlur={() => setFocused(false)}
-              onSubmitEditing={startChat}
-              placeholder={COPY.idPlaceholder}
-              placeholderTextColor={t.color.inkMuted}
-              accessibilityLabel={COPY.idLabel}
-              autoCapitalize="characters"
-              autoComplete="off"
-              autoCorrect={false}
-              autoFocus
-              clearButtonMode="while-editing"
-              returnKeyType="go"
-              spellCheck={false}
-              textContentType="none"
-              testID="new-peer-input"
-              style={[
-                t.type.utilityData,
-                styles.panelInput,
-                {
-                  minHeight: t.layout.buttonHeight,
-                  borderRadius: t.radius.button,
-                  backgroundColor: t.color.paperSheet,
-                  color: t.color.inkStrong,
-                  borderWidth: error || focused ? 2 : 1,
-                  borderColor: error
-                    ? t.color.danger
-                    : focused
-                      ? t.color.pine
-                      : t.color.lineStrong,
-                },
-              ]}
-            />
-            <Pressable
-              onPress={startChat}
-              disabled={empty}
-              accessibilityRole="button"
-              accessibilityLabel={COPY.startButton}
-              accessibilityState={{ disabled: empty }}
-              testID="start-chat"
-              style={({ pressed }) => [
-                styles.panelButton,
-                {
-                  minHeight: t.layout.buttonHeight,
-                  borderRadius: t.radius.button,
-                  // Disabled is a recessed surface, never a dimmed one.
-                  backgroundColor: empty
-                    ? t.color.paperInset
-                    : pressed
-                      ? t.color.pinePressed
-                      : t.color.pine,
-                  borderWidth: empty ? 1 : 0,
-                  borderColor: t.color.lineSoft,
-                },
-              ]}
-            >
-              <Text
-                style={[
-                  t.type.button,
-                  styles.panelButtonLabel,
-                  { color: empty ? t.color.inkMuted : t.color.onPine },
-                ]}
-              >
-                {COPY.startButton}
-              </Text>
-            </Pressable>
-          </View>
-
-          {/* The field's full-width sibling: same height, radius, fill and
-              border weight as the input beside it, so a picture reads as the
-              other way to fill the same box — not as a lesser one. */}
-          <Pressable
-            onPress={readFromCamera}
-            disabled={picking}
-            accessibilityRole="button"
-            accessibilityLabel={COPY.qrScan}
-            accessibilityState={{ disabled: picking }}
-            testID="scan-qr-camera"
-            style={({ pressed }) => [
-              styles.photoAction,
-              {
-                minHeight: t.layout.buttonHeight,
-                borderRadius: t.radius.button,
-                backgroundColor: pressed ? t.color.pineWash : t.color.paperSheet,
-                borderWidth: 1,
-                borderColor: pressed ? t.color.pineLine : t.color.lineStrong,
-              },
-            ]}
-          >
-            <Text style={[t.type.buttonCompact, { color: t.color.pine }]}>
-              {COPY.qrScan}
-            </Text>
-          </Pressable>
-
-          <Pressable
-            onPress={readFromPhoto}
-            disabled={picking}
-            accessibilityRole="button"
-            accessibilityLabel={COPY.qrPick}
-            accessibilityState={{ disabled: picking }}
-            testID="scan-qr-photo"
-            style={({ pressed }) => [
-              styles.photoAction,
-              {
-                minHeight: t.layout.buttonHeight,
-                borderRadius: t.radius.button,
-                backgroundColor: pressed ? t.color.pineWash : t.color.paperSheet,
-                borderWidth: 1,
-                borderColor: pressed ? t.color.pineLine : t.color.lineStrong,
-              },
-            ]}
-          >
-            <Text style={[t.type.buttonCompact, { color: t.color.pine }]}>
-              {COPY.qrPick}
-            </Text>
-          </Pressable>
-          <Text
-            style={[
-              t.type.compactBody,
-              styles.qrPickHelper,
-              { color: t.color.inkMuted },
-            ]}
-          >
-            {COPY.qrRead}
-          </Text>
-
-          {/* Find by email: BELOW the QR/ID rails —
-              the privacy-maximal hand-off keeps the lead — and honestly
-              scoped: only opted-in people can be found. */}
-          <Pressable
-            onPress={onFindByEmail}
-            accessibilityRole="button"
-            accessibilityLabel={findDoor.label}
-            testID="find-by-email"
-            style={({ pressed }) => [
-              styles.photoAction,
-              {
-                minHeight: t.layout.buttonHeight,
-                borderRadius: t.radius.button,
-                backgroundColor: pressed ? t.color.pineWash : t.color.paperSheet,
-                borderWidth: 1,
-                borderColor: pressed ? t.color.pineLine : t.color.lineStrong,
-              },
-            ]}
-          >
-            <Text style={[t.type.buttonCompact, { color: t.color.pine }]}>
-              {findDoor.label}
-            </Text>
-          </Pressable>
-          <Text
-            style={[
-              t.type.compactBody,
-              styles.qrPickHelper,
-              { color: t.color.inkMuted },
-            ]}
-          >
-            {findDoor.helper}
-          </Text>
-
-          {/* One region for both the typed id and the picture, so two errors can
-              never stack and the layout stays where the eye left it. */}
-          {error ? (
+          {naming === null ? (
             <>
-              <InlineError
-                message={error}
-                seq={attempt}
-                testID="start-chat-error"
-              />
-              {errorSettings ? (
-                <Pressable
-                  onPress={() => void Linking.openSettings()}
-                  accessibilityRole="button"
-                  accessibilityLabel={COPY.openSettings}
-                  testID="start-chat-open-photo-settings"
-                  style={({ pressed }) => [
-                    styles.settingsLink,
+              {/* THE SCANNER LEADS: the QR
+                  hand-off is the lead rail (§4), so reading their code is the
+                  first thing on the page; the field below — no longer focused
+                  on entry — is the second way in, and says so.
+                  Same height, radius, fill and border weight as that field, so
+                  a picture reads as the other way to fill the same box. */}
+              <Pressable
+                onPress={readFromCamera}
+                disabled={picking}
+                accessibilityRole="button"
+                accessibilityLabel={COPY.qrScan}
+                accessibilityState={{ disabled: picking }}
+                testID="scan-qr-camera"
+                style={({ pressed }) => [
+                  styles.photoAction,
+                  {
+                    minHeight: t.layout.buttonHeight,
+                    borderRadius: t.radius.button,
+                    backgroundColor: pressed ? t.color.pineWash : t.color.paperSheet,
+                    borderWidth: 1,
+                    borderColor: pressed ? t.color.pineLine : t.color.lineStrong,
+                  },
+                ]}
+              >
+                <Text style={[t.type.buttonCompact, { color: t.color.pine }]}>
+                  {COPY.qrScan}
+                </Text>
+              </Pressable>
+
+              <Pressable
+                onPress={readFromPhoto}
+                disabled={picking}
+                accessibilityRole="button"
+                accessibilityLabel={COPY.qrPick}
+                accessibilityState={{ disabled: picking }}
+                testID="scan-qr-photo"
+                style={({ pressed }) => [
+                  styles.photoAction,
+                  {
+                    minHeight: t.layout.buttonHeight,
+                    borderRadius: t.radius.button,
+                    backgroundColor: pressed ? t.color.pineWash : t.color.paperSheet,
+                    borderWidth: 1,
+                    borderColor: pressed ? t.color.pineLine : t.color.lineStrong,
+                  },
+                ]}
+              >
+                <Text style={[t.type.buttonCompact, { color: t.color.pine }]}>
+                  {COPY.qrPick}
+                </Text>
+              </Pressable>
+              <Text
+                style={[
+                  t.type.compactBody,
+                  styles.qrPickHelper,
+                  { color: t.color.inkMuted },
+                ]}
+              >
+                {COPY.qrRead}
+              </Text>
+
+              <View style={[styles.labelRow, styles.idLabelRow]}>
+                <Text style={[t.type.utilityLabel, { color: t.color.inkMuted }]}>
+                  {COPY.idTypeLabel}
+                </Text>
+                {!empty ? (
+                  <Text
+                    style={[
+                      t.type.counter,
+                      { color: complete ? t.color.pine : t.color.inkMuted },
+                    ]}
+                    // Progress for the eye; VoiceOver already hears the field.
+                    accessibilityElementsHidden
+                    importantForAccessibility="no-hide-descendants"
+                  >
+                    {COPY.idCounter(count)}
+                  </Text>
+                ) : null}
+              </View>
+
+              <View
+                style={[styles.panelRow, stacked && styles.panelStacked]}
+                testID="start-chat-panel"
+              >
+                <TextInput
+                  value={draftId}
+                  onChangeText={changeDraft}
+                  onFocus={() => setFocused(true)}
+                  onBlur={() => setFocused(false)}
+                  onSubmitEditing={startChat}
+                  placeholder={COPY.idPlaceholder}
+                  placeholderTextColor={t.color.inkMuted}
+                  accessibilityLabel={COPY.idLabel}
+                  autoCapitalize="characters"
+                  autoComplete="off"
+                  autoCorrect={false}
+                  // No autoFocus: QR is the lead rail (§4), and a keyboard on
+                  // entry covered the scanner, the photo door, Find by email
+                  // and the person's own ID.
+                  clearButtonMode="while-editing"
+                  returnKeyType="go"
+                  spellCheck={false}
+                  textContentType="none"
+                  testID="new-peer-input"
+                  style={[
+                    t.type.utilityData,
+                    styles.panelInput,
                     {
-                      minHeight: t.layout.touchTarget,
+                      minHeight: t.layout.buttonHeight,
                       borderRadius: t.radius.button,
-                      backgroundColor: pressed ? t.color.pineWash : 'transparent',
+                      backgroundColor: t.color.paperSheet,
+                      color: t.color.inkStrong,
+                      borderWidth: error || focused ? 2 : 1,
+                      borderColor: error
+                        ? t.color.danger
+                        : focused
+                          ? t.color.pine
+                          : t.color.lineStrong,
+                    },
+                  ]}
+                />
+                <Pressable
+                  onPress={startChat}
+                  disabled={empty}
+                  accessibilityRole="button"
+                  accessibilityLabel={COPY.startButton}
+                  accessibilityState={{ disabled: empty }}
+                  testID="start-chat"
+                  style={({ pressed }) => [
+                    styles.panelButton,
+                    stacked ? styles.panelButtonStacked : styles.panelButtonBeside,
+                    {
+                      minHeight: t.layout.buttonHeight,
+                      paddingHorizontal: t.space.s6,
+                      borderRadius: t.radius.button,
+                      // Disabled is a recessed surface, never a dimmed one.
+                      backgroundColor: empty
+                        ? t.color.paperInset
+                        : pressed
+                          ? t.color.pinePressed
+                          : t.color.pine,
+                      borderWidth: empty ? 1 : 0,
+                      borderColor: t.color.lineSoft,
                     },
                   ]}
                 >
-                  <Text style={[t.type.buttonCompact, { color: t.color.pine }]}>
-                    {COPY.openSettings}
+                  <Text
+                    style={[
+                      t.type.button,
+                      styles.panelButtonLabel,
+                      { color: empty ? t.color.inkMuted : t.color.onPine },
+                    ]}
+                  >
+                    {COPY.startButton}
                   </Text>
                 </Pressable>
+              </View>
+
+              {/* Find by email: BELOW the QR/ID rails —
+                  the privacy-maximal hand-off keeps the lead — and honestly
+                  scoped: only opted-in people can be found. */}
+              <Pressable
+                onPress={onFindByEmail}
+                accessibilityRole="button"
+                accessibilityLabel={findDoor.label}
+                testID="find-by-email"
+                style={({ pressed }) => [
+                  styles.photoAction,
+                  {
+                    minHeight: t.layout.buttonHeight,
+                    borderRadius: t.radius.button,
+                    backgroundColor: pressed ? t.color.pineWash : t.color.paperSheet,
+                    borderWidth: 1,
+                    borderColor: pressed ? t.color.pineLine : t.color.lineStrong,
+                  },
+                ]}
+              >
+                <Text style={[t.type.buttonCompact, { color: t.color.pine }]}>
+                  {findDoor.label}
+                </Text>
+              </Pressable>
+              <Text
+                style={[
+                  t.type.compactBody,
+                  styles.qrPickHelper,
+                  { color: t.color.inkMuted },
+                ]}
+              >
+                {findDoor.helper}
+              </Text>
+
+              {/* One region for both the typed id and the picture, so two errors can
+                  never stack and the layout stays where the eye left it. */}
+              {error ? (
+                <>
+                  <InlineError
+                    message={error}
+                    seq={attempt}
+                    testID="start-chat-error"
+                  />
+                  {errorSettings ? (
+                    <Pressable
+                      onPress={() => void Linking.openSettings()}
+                      accessibilityRole="button"
+                      accessibilityLabel={COPY.openSettings}
+                      testID="start-chat-open-photo-settings"
+                      style={({ pressed }) => [
+                        styles.settingsLink,
+                        {
+                          minHeight: t.layout.touchTarget,
+                          borderRadius: t.radius.button,
+                          backgroundColor: pressed ? t.color.pineWash : 'transparent',
+                        },
+                      ]}
+                    >
+                      <Text style={[t.type.buttonCompact, { color: t.color.pine }]}>
+                        {COPY.openSettings}
+                      </Text>
+                    </Pressable>
+                  ) : null}
+                </>
+              ) : notice ? (
+                <InlineNotice
+                  tone="pine"
+                  message={notice}
+                  seq={attempt}
+                  testID="start-chat-notice"
+                />
               ) : null}
             </>
-          ) : notice ? (
-            <InlineNotice
-              tone="pine"
-              message={notice}
-              seq={attempt}
-              testID="start-chat-notice"
-            />
           ) : null}
 
+          {/* On success the ID panel and the rails give way to the naming
+              step: one thing to do, and nothing left above it
+              that could start the same chat again. */}
           {naming !== null ? (
             <View style={styles.naming}>
               <Text style={[t.type.utilityLabel, { color: t.color.inkMuted }]}>
@@ -759,80 +806,110 @@ export function StartChatScreen({ profile, onBack, onOpenChat, onFindByEmail }: 
             </View>
           ) : null}
 
-          <View style={styles.ownId}>
-            <View style={styles.labelRow}>
-              <Text style={[t.type.utilityLabel, { color: t.color.inkMuted }]}>
-                {COPY.ownIdLabel}
-              </Text>
-              <View style={styles.inlineActions}>
-                <TextAction
-                  label={COPY.copy}
-                  onPress={copySelfId}
-                  testID="copy-self-id"
-                />
-                <TextAction
-                  ref={shareAnchor}
-                  label={COPY.share}
-                  onPress={shareSelfId}
-                  testID="share-self-id"
-                />
-              </View>
-            </View>
-            {/* Grouped in fours because the job is transferring it to a person,
-                by voice or by eye — not reading it as one word. */}
-            <Text
-              selectable
-              testID="self-user-id"
-              accessibilityLabel={spellId(profile.userId)}
-              accessibilityHint={COPY.ownIdHint}
-              style={[
-                t.type.utilityData,
-                styles.ownIdValue,
-                { color: t.color.inkStrong },
-              ]}
-            >
-              {groupId(profile.userId)}
-            </Text>
-            {copied ? (
-              <InlineNotice
-                tone="pine"
-                message={COPY.copied}
-                testID="self-id-copied"
-              />
-            ) : (
-              <Text
-                style={[
-                  t.type.compactBody,
-                  styles.ownIdHelper,
-                  { color: t.color.inkMuted },
+          {naming === null ? (
+            <View style={styles.ownId}>
+              {/* Collapsed: this screen is for
+                  reaching THEM. The chat list's empty state and the profile
+                  hand out your own id in the open; here it waits behind one
+                  tap, so the scanner, the field and the find door are what
+                  the page is about. */}
+              <Pressable
+                onPress={() => setOwnIdOpen(open => !open)}
+                accessibilityRole="button"
+                accessibilityLabel={ownIdOpen ? COPY.hideOwnId : COPY.showOwnId}
+                accessibilityState={{ expanded: ownIdOpen }}
+                testID="show-self-id"
+                style={({ pressed }) => [
+                  styles.settingsLink,
+                  {
+                    minHeight: t.layout.touchTarget,
+                    borderRadius: t.radius.button,
+                    backgroundColor: pressed ? t.color.pineWash : 'transparent',
+                  },
                 ]}
               >
-                {COPY.ownIdHelper}
-              </Text>
-            )}
-            {/* After the helper, never before it: the sentence about who should
-                have your ID is the one to read before exposing the picture. */}
-            <Pressable
-              onPress={() => setQrOpen(open => !open)}
-              accessibilityRole="button"
-              accessibilityLabel={qrOpen ? COPY.qrHide : COPY.qrShow}
-              accessibilityState={{ expanded: qrOpen }}
-              testID="show-self-qr"
-              style={({ pressed }) => [
-                styles.settingsLink,
-                {
-                  minHeight: t.layout.touchTarget,
-                  borderRadius: t.radius.button,
-                  backgroundColor: pressed ? t.color.pineWash : 'transparent',
-                },
-              ]}
-            >
-              <Text style={[t.type.buttonCompact, { color: t.color.pine }]}>
-                {qrOpen ? COPY.qrHide : COPY.qrShow}
-              </Text>
-            </Pressable>
-            {qrOpen ? <QrPanel id={profile.userId} /> : null}
-          </View>
+                <Text style={[t.type.buttonCompact, { color: t.color.pine }]}>
+                  {ownIdOpen ? COPY.hideOwnId : COPY.showOwnId}
+                </Text>
+              </Pressable>
+              {ownIdOpen ? (
+                <>
+                  <View style={styles.labelRow}>
+                    <Text style={[t.type.utilityLabel, { color: t.color.inkMuted }]}>
+                      {COPY.ownIdLabel}
+                    </Text>
+                    <View style={styles.inlineActions}>
+                      <TextAction
+                        label={COPY.copy}
+                        onPress={copySelfId}
+                        testID="copy-self-id"
+                      />
+                      <TextAction
+                        ref={shareAnchor}
+                        label={COPY.share}
+                        onPress={shareSelfId}
+                        testID="share-self-id"
+                      />
+                    </View>
+                  </View>
+                  {/* Grouped in fours because the job is transferring it to a person,
+                      by voice or by eye — not reading it as one word. */}
+                  <Text
+                    selectable
+                    testID="self-user-id"
+                    accessibilityLabel={spellId(profile.userId)}
+                    accessibilityHint={COPY.ownIdHint}
+                    style={[
+                      t.type.utilityData,
+                      styles.ownIdValue,
+                      { color: t.color.inkStrong },
+                    ]}
+                  >
+                    {groupId(profile.userId)}
+                  </Text>
+                  {copied ? (
+                    <InlineNotice
+                      tone="pine"
+                      message={COPY.copied}
+                      testID="self-id-copied"
+                    />
+                  ) : (
+                    <Text
+                      style={[
+                        t.type.compactBody,
+                        styles.ownIdHelper,
+                        { color: t.color.inkMuted },
+                      ]}
+                    >
+                      {COPY.ownIdHelper}
+                    </Text>
+                  )}
+                  {/* After the helper, never before it: the sentence about who should
+                      have your ID is the one to read before exposing the picture. */}
+                  <Pressable
+                    onPress={() => setQrOpen(open => !open)}
+                    accessibilityRole="button"
+                    accessibilityLabel={qrOpen ? COPY.qrHide : COPY.qrShow}
+                    accessibilityState={{ expanded: qrOpen }}
+                    testID="show-self-qr"
+                    style={({ pressed }) => [
+                      styles.settingsLink,
+                      {
+                        minHeight: t.layout.touchTarget,
+                        borderRadius: t.radius.button,
+                        backgroundColor: pressed ? t.color.pineWash : 'transparent',
+                      },
+                    ]}
+                  >
+                    <Text style={[t.type.buttonCompact, { color: t.color.pine }]}>
+                      {qrOpen ? COPY.qrHide : COPY.qrShow}
+                    </Text>
+                  </Pressable>
+                  {qrOpen ? <QrPanel id={profile.userId} /> : null}
+                </>
+              ) : null}
+            </View>
+          ) : null}
         </View>
       </ScrollView>
     </View>
@@ -852,14 +929,18 @@ const styles = StyleSheet.create({
   },
   idLabelRow: { marginTop: 20 },
   panelRow: { flexDirection: 'row', marginTop: 6 },
+  /** Below layout.narrowWidth: the button under the field. */
+  panelStacked: { flexDirection: 'column' },
   panelInput: { flex: 1, paddingHorizontal: 14 },
   panelButton: {
-    width: 112,
-    marginLeft: 8,
+    // A floor, not a fixed width: the label grows with Dynamic Type
+    // instead of wrapping to two lines inside a 112pt box.
+    minWidth: 112,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 12,
   },
+  panelButtonBeside: { marginLeft: 8 },
+  panelButtonStacked: { marginTop: 8, alignSelf: 'stretch' },
   panelButtonLabel: { textAlign: 'center' },
   inlineActions: { flexDirection: 'row', marginRight: -8 },
   naming: { marginTop: 14 },

@@ -45,6 +45,15 @@ interface Props {
  *  - the refusal sentences say the server deliberately collapsed the
  *    reason, instead of guessing one.
  */
+/** Whether a code requested at `requestedAt` can still be entered: inside
+ * the server's 5-minute window, and never for a clock that moved
+ * backwards. */
+function codeWindowOpenAt(requestedAt: number | null, now: number): boolean {
+  if (requestedAt == null) return false;
+  const age = now - requestedAt;
+  return age >= 0 && age < accounts.PENDING_CODE_TTL_MS;
+}
+
 export function AccountEmailScreen({ onBack }: Props) {
   const t = useTheme();
   const keyboardInset = useKeyboardInset();
@@ -57,12 +66,27 @@ export function AccountEmailScreen({ onBack }: Props) {
   const [notice, setNotice] = useState<string | null>(null);
   const [confirmingUnlink, setConfirmingUnlink] = useState(false);
   const [confirmingDowngrade, setConfirmingDowngrade] = useState(false);
+  /** When THIS mount last sent a code: the row records the same moment
+   * once the refresh lands, and a duress session's row may not — so the
+   * countdown starts from whichever is later. */
+  const [sentAt, setSentAt] = useState<number | null>(null);
 
   const refresh = useCallback(() => {
     void db
       .loadAccountIdentifier()
       .then(row => {
         setIdentifier(row);
+        // The durable pending row is this screen's context after a
+        // relaunch: the address it asked for prefills an EMPTY draft —
+        // never overwrites a typed one — and while the code is still inside
+        // its window the code-sent notice names it again, from the row.
+        if (row?.email == null && row?.pendingEmail != null) {
+          const pendingEmail = row.pendingEmail;
+          setEmailDraft(draft => (draft === '' ? pendingEmail : draft));
+          if (codeWindowOpenAt(row.pendingRequestedAt, Date.now())) {
+            setNotice(current => current ?? ACCOUNTS_COPY.emailCodeSent(pendingEmail));
+          }
+        }
         setLoaded(true);
       })
       .catch(() => setLoaded(true));
@@ -88,10 +112,13 @@ export function AccountEmailScreen({ onBack }: Props) {
     run(async () => {
       const outcome = await accounts.requestAttachCode(emailDraft);
       if (outcome === 'sent') {
+        setSentAt(Date.now());
         setNotice(ACCOUNTS_COPY.emailCodeSent(emailDraft.trim().toLowerCase()));
       } else {
         setNotice(null);
-        setError(ACCOUNTS_COPY.emailRefused);
+        // A transport failure is not a refusal: nothing was checked, so
+        // the refusal sentence would lie.
+        setError(outcome === 'failed' ? ACCOUNTS_COPY.failed : ACCOUNTS_COPY.emailRefused);
       }
     });
 
@@ -104,7 +131,7 @@ export function AccountEmailScreen({ onBack }: Props) {
         setNotice(null);
         setCodeDraft('');
       } else {
-        setError(ACCOUNTS_COPY.emailRefused);
+        setError(outcome === 'failed' ? ACCOUNTS_COPY.failed : ACCOUNTS_COPY.emailRefused);
       }
     });
 
@@ -134,6 +161,40 @@ export function AccountEmailScreen({ onBack }: Props) {
 
   const verified = identifier?.email != null;
   const pending = !verified && identifier?.pendingEmail != null;
+  // The code field exists only while the code can still be entered: the
+  // row records WHEN it asked and the server's window is 5 minutes — a
+  // field for a code that expired days ago is a dead end, while "Send
+  // another code" stays live from the same row.
+  const codeWindowOpen =
+    pending && codeWindowOpenAt(identifier?.pendingRequestedAt ?? null, Date.now());
+
+  // The window closes while the screen is open: nothing above re-renders at
+  // the boundary on its own, so a timer re-renders once it passes (the
+  // RecoveryScreen clock-tick pattern; re-armed per render, at most one).
+  const [, setClockTick] = useState(0);
+  useEffect(() => {
+    if (!codeWindowOpen) return;
+    const closesAt = (identifier?.pendingRequestedAt ?? 0) + accounts.PENDING_CODE_TTL_MS;
+    const timer = setTimeout(
+      () => setClockTick(n => n + 1),
+      Math.max(250, closesAt - Date.now() + 250),
+    );
+    return () => clearTimeout(timer);
+  });
+
+  // THE RESEND MINUTE, counted down on the button: the server sends
+  // nothing inside it and answers the same, so the button refuses visibly
+  // instead of inviting the tap. From the row (it survives a remount) or
+  // this mount's own send, whichever is later; one-second ticks re-render
+  // the clock while it runs and stop with it.
+  const resendFrom =
+    Math.max(sentAt ?? 0, identifier?.pendingRequestedAt ?? 0) || null;
+  const resendWait = accounts.resendWaitMs(resendFrom, Date.now());
+  useEffect(() => {
+    if (resendWait <= 0) return;
+    const timer = setTimeout(() => setClockTick(n => n + 1), Math.min(1_000, resendWait));
+    return () => clearTimeout(timer);
+  });
 
   return (
     <View
@@ -186,9 +247,15 @@ export function AccountEmailScreen({ onBack }: Props) {
               ]}
             />
             <PrimaryButton
-              label={pending ? ACCOUNTS_COPY.emailRequestAgain : ACCOUNTS_COPY.emailRequest}
+              label={
+                resendWait > 0
+                  ? ACCOUNTS_COPY.requestAgainIn(accounts.formatResendClock(resendWait))
+                  : pending
+                    ? ACCOUNTS_COPY.emailRequestAgain
+                    : ACCOUNTS_COPY.emailRequest
+              }
               onPress={requestCode}
-              disabled={busy || emailDraft.trim() === ''}
+              disabled={busy || emailDraft.trim() === '' || resendWait > 0}
               testID="account-email-request"
             />
             {/* TEACHING, behind the ⓘ (house style): the recipient budget
@@ -202,7 +269,7 @@ export function AccountEmailScreen({ onBack }: Props) {
               lines={ACCOUNTS_COPY.emailCodeBudget}
               testID="account-email-code-budget"
             />
-            {pending ? (
+            {codeWindowOpen ? (
               <>
                 <TextInput
                   value={codeDraft}
@@ -212,6 +279,8 @@ export function AccountEmailScreen({ onBack }: Props) {
                   accessibilityLabel={ACCOUNTS_COPY.codePlaceholder}
                   keyboardType="number-pad"
                   maxLength={6}
+                  autoComplete="one-time-code"
+                  textContentType="oneTimeCode"
                   testID="account-email-code"
                   style={[
                     t.type.utilityData,

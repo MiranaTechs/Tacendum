@@ -116,10 +116,40 @@ export async function hmacKeys(deps: Deps): Promise<readonly IdentifierHmacKey[]
     }
     if (waited === 2) return undefined;
     try {
-      await state.pending;
+      if ((await awaitBounded(state.pending, IDENTIFIER_KEY_WAIT_MS)) === 'timed_out') {
+        return undefined;
+      }
     } catch {
       return undefined;
     }
+  }
+}
+
+/** How long the identifier lane waits on an in-flight K_id fetch before
+ * answering the collapsed refusal. Above the Secrets Manager clients' own
+ * pinned round-trip bound (aws/deps.ts SECRETS_MANAGER_REQUEST_TIMEOUTS: 1 s
+ * connect + 2 s request) so a live fetch is never abandoned early, and far
+ * below every function's Lambda timeout so a HUNG fetch costs the caller one
+ * refusal, not a 5xx after the whole invocation. The fetch itself is not
+ * cancelled: it keeps going and lands in the container cache for the next
+ * request. */
+export const IDENTIFIER_KEY_WAIT_MS = 3_000;
+
+/** Race a pending fetch against the wait bound. The timer is always cleared
+ * (a live fetch must not leave a stray timer holding the event loop), and a
+ * rejected fetch propagates to the caller's catch exactly as before. */
+async function awaitBounded(
+  pending: Promise<void>,
+  ms: number,
+): Promise<'settled' | 'timed_out'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bound = new Promise<'timed_out'>((resolve) => {
+    timer = setTimeout(() => resolve('timed_out'), ms);
+  });
+  try {
+    return await Promise.race([pending.then(() => 'settled' as const), bound]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -181,8 +211,9 @@ export function classRefs(
  * uniform success answer `json(200, {})` so a remote caller learns nothing
  * about the address from the shape of the reply. `sendable` is the
  * one branch the caller decides (a recovery MISS mints and sends nothing);
- * budgets are still charged first so the miss and the hit spend identically.
- */
+ * the identifier-keyed budgets are charged before anything else, one take
+ * per branch of the same size, so the miss and the hit spend identically —
+ * on separate windows (below). */
 async function sendCodeLeg(
   deps: Deps,
   auth: AuthContext,
@@ -207,6 +238,31 @@ async function sendCodeLeg(
   if ((await deps.rateLimit.take(`emailresend:${hash}`, LIMITS.identifierResend)) > 0) {
     return uniform;
   }
+  // THE PER-ADDRESS DAILY WINDOW, SPLIT BY BRANCH. A MISS spends
+  // `emailmiss:<hash>`, a send `emailsend:<hash>` — the same Appendix A size
+  // (5/day), the same HMAC key, the same uniform answer, one write at the
+  // same position either way, so the anti-probing bound and rule 2's
+  // byte/cost uniformity are exactly what they were. What changed: five
+  // strangers' recovery requests naming an address that NOBODY has attached
+  // yet used to spend the address's whole send window, locking its owner out
+  // of attaching it until the UTC day rolled — a free, repeatable denial
+  // handed to anyone who knew the address. Sends to a CLAIMED address (the
+  // paid drain, real mail in the owner's inbox) stay bounded at 5/day and
+  // alarmed through the fleet counter; no reservation can tell the owner's
+  // recovery from a stranger's, and none is attempted.
+  if (input.row === undefined) {
+    // The miss window's own refusal is unobservable by design (the answer
+    // is uniform whatever it says); the take exists so the miss costs what
+    // the hit costs at this point of the leg.
+    await deps.rateLimit.take(`emailmiss:${hash}`, LIMITS.identifierSendRecipient);
+    // The MISS returns BEFORE the fleet take (the R-P7e rule the phone twin
+    // already followed, "a miss costs us nothing and must not be a zero-spend
+    // fleet-DoS lever"): a hundred pristine accounts × ten misses a day could
+    // otherwise spend the whole 1 000/day email lane without one SES call.
+    // The timing consequence stays inside the recorded §12 row 27(a) regime,
+    // exactly as it does for phone.
+    return uniform;
+  }
   if ((await deps.rateLimit.take(`emailsend:${hash}`, LIMITS.identifierSendRecipient)) > 0) {
     return uniform;
   }
@@ -216,7 +272,6 @@ async function sendCodeLeg(
     deps.log('identifier_send_fleet_refused');
     return uniform;
   }
-  if (input.row === undefined) return uniform;
   // The suppression shadow: keyed by the HMAC ref, never the address.
   // A suppressed ref answers uniformly and sends nothing. The read applies
   // the shadow's explicit expiry and reaps an elapsed row — SES
@@ -333,6 +388,15 @@ async function sendPhoneCodeLeg(
   if ((await deps.rateLimit.take(`phoneresend:${hash}`, LIMITS.phoneResend)) > 0) {
     return uniform;
   }
+  // THE PER-NUMBER DAILY WINDOW, SPLIT BY BRANCH (the email leg's rule,
+  // same argument): a miss spends `phonemiss:<hash>`, a send
+  // `phonesend:<hash>`, same size (3/day), same key, same uniform answer.
+  // The MISS branch returns here: nothing to send, the
+  // destination brake moot, the FLEET untouched.
+  if (input.row === undefined) {
+    await deps.rateLimit.take(`phonemiss:${hash}`, LIMITS.phoneSendRecipient);
+    return uniform;
+  }
   if ((await deps.rateLimit.take(`phonesend:${hash}`, LIMITS.phoneSendRecipient)) > 0) {
     return uniform;
   }
@@ -342,9 +406,6 @@ async function sendPhoneCodeLeg(
   // (Stated honestly: `+1` admits all NANP destinations — the vendor-side
   // Protect country rule is the sharp per-country edge; this is the brake.)
   if (!smsDestinationAllowed(input.normalized)) return uniform;
-  // The MISS branch: bytes and identifier-keyed budgets
-  // identical to the hit, the FLEET deliberately untouched.
-  if (input.row === undefined) return uniform;
   // The suppression shadow (phonesupp#): keyed by the HMAC ref, never the
   // number; every active key version walked, elapsed rows reaped by the
   // read (the discipline the email walk pins).

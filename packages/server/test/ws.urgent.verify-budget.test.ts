@@ -4,7 +4,7 @@ import type { ServerFrame } from '@tacendum/shared';
 import { wsDefaultHandler, type WsDeps } from '../src/handlers/ws.js';
 import { deliverPushWake } from '../src/handlers/push-worker.js';
 import { LIMITS } from '../src/ratelimit.js';
-import type { DataLayer } from '../src/db/data.js';
+import type { TestOnlyDataLayer } from '../src/db/data.js';
 import { makeMemoryDb, makeTestDeps, type TestDeps } from './helpers.js';
 
 /**
@@ -37,7 +37,7 @@ const ulid = monotonicFactory();
 const VICTIM = '0000000000000000000VCTM005';
 const CALLER = '0000000000000000000CA11ER0';
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: TestDeps;
 let wsDeps: WsDeps;
 /** What handleSend asked the scheduler for, per wake. */

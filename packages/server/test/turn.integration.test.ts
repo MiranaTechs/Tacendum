@@ -97,14 +97,14 @@ async function mint(): Promise<{ username: string; credential: string }> {
 }
 
 describe('coturn accepts what the handler mints', () => {
-  it('grants a relay allocation for a freshly minted credential', async () => {
-    if (!available) return;
+  it('grants a relay allocation for a freshly minted credential', async (ctx) => {
+    if (!available) return ctx.skip();
     const { username, credential } = await mint();
     expect(await allocationSucceeds(username, credential)).toBe(true);
   }, 60_000);
 
-  it('refuses an EXPIRED credential', async () => {
-    if (!available) return;
+  it('refuses an EXPIRED credential', async (ctx) => {
+    if (!available) return ctx.skip();
     // Same handler, same secret, only the clock moved past the expiry the
     // username encodes — which is the entire point of the scheme.
     const { credential } = await mint();
@@ -113,8 +113,8 @@ describe('coturn accepts what the handler mints', () => {
     expect(await allocationSucceeds(expiredUsername, credential)).toBe(false);
   }, 60_000);
 
-  it('refuses a credential forged without the shared secret', async () => {
-    if (!available) return;
+  it('refuses a credential forged without the shared secret', async (ctx) => {
+    if (!available) return ctx.skip();
     const { username } = await mint();
     // A plausible-looking base64 HMAC computed with the wrong key.
     const { createHmac } = await import('node:crypto');

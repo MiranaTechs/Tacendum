@@ -101,11 +101,9 @@ interface Engine {
 }
 // Required, not imported: the repo's TS config has no node types, and the
 // runtime (jest under Node 22) has the modules.
-// eslint-disable-next-line @typescript-eslint/no-var-requires
 const { DatabaseSync } = require('node:sqlite') as {
   DatabaseSync: new (p: string) => Engine;
 };
-// eslint-disable-next-line @typescript-eslint/no-var-requires
 const { readFileSync } = require('fs') as {
   readFileSync: (p: string, encoding: 'utf8') => string;
 };
@@ -2045,13 +2043,16 @@ describe('dispatch order owns the chat line — never a timestamp, whose clock n
     ).toBe('Disappearing messages on');
   });
 
-  it('a store-busy retry is the SAME event: it cannot outrank the frame that overtook it while it waited', async () => {
+  it('a store-busy retry holds the sender\'s later frames behind it, and the newer frame still owns the line', async () => {
     // M1 (older server stamp) hits the NSE's transient store lock; the
-    // bounded local retry re-enters 1.5s later. M2 (newer stamp) lands and
-    // takes the line inside that window. Both stamps are SERVER ts — one
-    // clock domain — so this is not the accepted cross-clock trade: the
-    // retry is M1's handling continued, and a re-minted dispatch token let
-    // it outrank M2 and drag the line back to older words at a lower sort.
+    // bounded local retry waits 1.5 s IN PLACE. M2 (newer stamp) from the
+    // SAME sender arrives inside that window and WAITS behind it (this test
+    // used to pin M2 overtaking M1, which is exactly how a ciphertext
+    // following a busy-delayed prekey message got classified as tamper and
+    // acked away). Once the retry lands, M2 lands after it, and the line
+    // belongs to M2: both stamps are SERVER ts — one clock domain — and the
+    // retry is M1's handling continued under the dispatch token it entered
+    // with, so it cannot outrank M2 even though it now writes first.
     const cryptoMock = crypto as unknown as { isStoreBusyError: jest.Mock };
     const instance = sqlite.__sqlite.instances.get('tacendum.sqlite')!;
     const base = instance.execute.getMockImplementation()!;
@@ -2078,16 +2079,16 @@ describe('dispatch order owns the chat line — never a timestamp, whose clock n
       await flush(); // M1 hit the lock; retry armed; nothing written, no ack
       expect(q(`SELECT msgId FROM messages WHERE peerId = ?`, BEN)).toHaveLength(0);
 
-      crypto.decryptEnvelope.mockResolvedValueOnce('second words');
       frame(pad('01WBZYB'), 9_200);
       await flush();
-      expect(
-        q(`SELECT lastMessageText FROM chats WHERE peerId = ?`, BEN)[0]
-          .lastMessageText,
-      ).toBe('second words');
+      // M2 is queued behind M1's wait: nothing decrypted, nothing written.
+      expect(crypto.decryptEnvelope).toHaveBeenCalledTimes(1);
+      expect(q(`SELECT msgId FROM messages WHERE peerId = ?`, BEN)).toHaveLength(0);
 
-      // The retry re-decrypts (the ws path carried no plaintext).
+      // The decrypts, in the order they now run: M1's retry re-decrypts (the
+      // ws path carried no plaintext), then M2.
       crypto.decryptEnvelope.mockResolvedValueOnce('first words');
+      crypto.decryptEnvelope.mockResolvedValueOnce('second words');
       await new Promise<void>(resolve => setTimeout(resolve, 1_600));
       await flush();
     } finally {
@@ -2102,7 +2103,8 @@ describe('dispatch order owns the chat line — never a timestamp, whose clock n
       ),
     ).toEqual(['first words', 'second words']);
     expect(acksFor(pad('01WBZYA'))).toHaveLength(1);
-    // — but the LINE belongs to M2, which entered the system after M1.
+    // — and the LINE belongs to M2, which entered the system after M1 and
+    // wrote after the retry.
     const after = q(
       `SELECT lastMessageText, lastMessageAt FROM chats WHERE peerId = ?`,
       BEN,
@@ -2111,12 +2113,16 @@ describe('dispatch order owns the chat line — never a timestamp, whose clock n
     expect(after.lastMessageAt).toBe(9_200);
   });
 
-  it('a parked duplicate resumed after its first copy died unacked is the SAME event: it cannot outrank the frame that overtook it', async () => {
+  it('a duplicate queued behind a copy that died unacked runs after it in arrival order, and the newer frame keeps the line', async () => {
     // The first copy of W_D dies in the PRE-TRY section (a db read
     // rejecting before the main handling begins) — unacked, nothing
-    // written. Its duplicate, parked while the first was in flight,
-    // re-enters from the finally. A newer frame took the line in between;
-    // the re-entry is W_D's handling continued and must not take it back.
+    // written. Its duplicate and a newer frame from the SAME sender arrive
+    // while the first is in flight: a sender's frames run in
+    // arrival order, so both WAIT behind the dying copy instead of
+    // overtaking it (this test used to pin the overtaking). When the chain
+    // moves on, the duplicate lands as W_D's first real handling, then the
+    // newer frame — and the line belongs to the newer frame, which entered
+    // the system later and wrote later.
     let release!: () => void;
     const barrier = new Promise<void>(resolve => {
       release = resolve;
@@ -2136,20 +2142,19 @@ describe('dispatch order owns the chat line — never a timestamp, whose clock n
       // First copy: suspends at the gated hasSeen, then dies unacked.
       frame(wD, 9_100);
       await flush();
-      // Its duplicate arrives while the first is in flight: parked.
+      // Its duplicate arrives while the first is in flight: queued behind it.
       frame(wD, 9_100);
       await flush();
-      // A newer frame lands to completion and takes the line.
-      crypto.decryptEnvelope.mockResolvedValueOnce('second words');
+      // A newer frame from the same sender: queued behind both.
       frame(pad('01WPARKB'), 9_200);
       await flush();
-      expect(
-        q(`SELECT lastMessageText FROM chats WHERE peerId = ?`, BEN)[0]
-          .lastMessageText,
-      ).toBe('second words');
-      // The parked copy re-enters (and now decrypts for the first time —
-      // the dead first copy never got past hasSeen).
+      // Arrival order, one sender: nothing behind the blocked copy has run.
+      expect(crypto.decryptEnvelope).not.toHaveBeenCalled();
+      expect(q(`SELECT msgId FROM messages WHERE peerId = ?`, BEN)).toHaveLength(0);
+      // The decrypts, in the order they now run: the duplicate (W_D's first
+      // real decrypt — the dead copy never got past hasSeen), then W_B.
       crypto.decryptEnvelope.mockResolvedValueOnce('first words');
+      crypto.decryptEnvelope.mockResolvedValueOnce('second words');
       release();
       await flush();
     } finally {
@@ -2162,7 +2167,7 @@ describe('dispatch order owns the chat line — never a timestamp, whose clock n
       ),
     ).toEqual(['first words', 'second words']);
     expect(acksFor(wD)).toHaveLength(1);
-    // — but the LINE stays with the frame that entered the system later.
+    // — and the LINE is the frame that entered the system later.
     const after = q(
       `SELECT lastMessageText, lastMessageAt FROM chats WHERE peerId = ?`,
       BEN,

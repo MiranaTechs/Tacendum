@@ -104,7 +104,7 @@ export function startWsServer(port: number, baseDeps: Deps): Server {
       const result = await drainQueuedMessages(
         userId,
         connectionId,
-        { db: baseDeps.db, sender, now: baseDeps.now },
+        { db: baseDeps.db, sender, now: baseDeps.now, log: baseDeps.log },
         DRAIN_SLICE_BUDGET,
         afterMsgId,
         sessionDigest !== undefined ? { guard: sessionGuard, digest: sessionDigest } : undefined,

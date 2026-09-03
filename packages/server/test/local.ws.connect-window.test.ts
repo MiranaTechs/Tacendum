@@ -4,7 +4,7 @@ import type { Server } from 'node:http';
 import WebSocket from 'ws';
 import type { ServerFrame } from '@tacendum/shared';
 import { startWsServer } from '../src/local/ws.js';
-import { sessionTokenDigest, type ConnectionRecord, type DataLayer } from '../src/db/data.js';
+import { sessionTokenDigest, type ConnectionRecord, type TestOnlyDataLayer } from '../src/db/data.js';
 import { makeMemoryDb, makeTestDeps, testIdentityKey } from './helpers.js';
 
 /**
@@ -47,7 +47,7 @@ import { makeMemoryDb, makeTestDeps, testIdentityKey } from './helpers.js';
 /** The frame that must not be lost. */
 const MSG_ID = '01JBQ0000000000000000000WD';
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: ReturnType<typeof makeTestDeps>;
 let server: Server;
 let wsUrl: string;
@@ -70,7 +70,7 @@ let claimGate: { announce: () => void; hold: Promise<void> } | undefined;
  * connection reads — is the untouched twin, so the ordering under test is the
  * adapter's own.
  */
-function withParkedClaim(inner: DataLayer): DataLayer {
+function withParkedClaim(inner: TestOnlyDataLayer): TestOnlyDataLayer {
   return {
     ...inner,
     async claimConnection(rec: ConnectionRecord, expectedConnectionId: string | undefined) {

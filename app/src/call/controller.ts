@@ -1,6 +1,11 @@
 import { shortId } from '../person';
 import type { CallEnvelope, CallState, IceServer } from '@tacendum/shared';
-import { offerIsRingable, parseCallEnvelope } from '@tacendum/shared';
+import {
+  OFFER_EXP_SKEW_MS,
+  OFFER_MAX_SERVER_AGE_MS,
+  offerIsRingable,
+  parseCallEnvelope,
+} from '@tacendum/shared';
 import { CallService, type CallLogRow as ServiceLogRow, type CallMetricSink } from './service';
 // NOTE: no import of ./policy here, deliberately. The ring decision arrives
 // through `mayRing`, so this file stays testable without a database and the
@@ -271,6 +276,34 @@ export interface StoredCallOffer {
 const REFRESH_AT = 0.8;
 
 /**
+ * The longest call a credential minted NOW is expected to carry (§10.2).
+ *
+ * `REFRESH_AT` keeps the CACHE fresh; it says nothing about a call that
+ * starts with the credential nearly spent. A 12 h credential reused at the
+ * 79 % mark starts a call with ~2.5 h of relay life, and a relayed call that
+ * outlives its credential loses its media with no signalling failure to
+ * explain it. So a call is placed or answered on a credential with at least
+ * this much life left, refreshed first when it has less. Four hours is longer
+ * than any call this product has seen and well inside the 5/hour mint budget
+ * (one extra mint per four-hour call at most).
+ */
+const MAX_CALL_BOUND_MS = 4 * 3_600_000;
+
+/**
+ * How long an inbound `call.end` tombstones its cid.
+ *
+ * A caller can hang up while this phone is dead; the server then drains the
+ * cancellation and the offer it cancels in the same burst, and the live
+ * (`call.end`) frame can precede the queued (`call.offer`) one. The offer must
+ * then ring nothing and write nothing — the cancel already settled it. Held
+ * for as long as an offer can still be ringable by either clock (§6.4), so no
+ * ringable copy of the cancelled offer can arrive after the tombstone lapses.
+ */
+const END_TOMBSTONE_MS = OFFER_MAX_SERVER_AGE_MS + OFFER_EXP_SKEW_MS;
+/** A bound on the tombstone set, so a flood of ends cannot grow it. */
+const MAX_END_TOMBSTONES = 64;
+
+/**
  * How long to wait for a credential before giving up and calling anyway.
  *
  * `ensureCredentials` is awaited on the SERIALIZED envelope queue, so a
@@ -336,6 +369,8 @@ export class CallController {
    */
   private pushRings = new Map<string, string>();
   private pushDeclines = new Map<string, number>();
+  /** cid → when an inbound `call.end` named it (see `END_TOMBSTONE_MS`). */
+  private endedCids = new Map<string, number>();
   private static readonly PUSH_DECLINE_WINDOW_MS = 60_000;
 
   /**
@@ -765,6 +800,29 @@ export class CallController {
    * coordinator asks through `takePushDecline`; the answer is consumed either
    * way, so one decline answers one invite and cannot ambush the next.
    */
+  /** Remember that the peer ended `cid`, for an offer draining behind it. */
+  private tombstoneEnd(cid: string): void {
+    this.pruneEndTombstones();
+    this.endedCids.delete(cid);
+    this.endedCids.set(cid, this.deps.now());
+    if (this.endedCids.size > MAX_END_TOMBSTONES) {
+      const oldest = this.endedCids.keys().next().value;
+      if (oldest !== undefined) this.endedCids.delete(oldest);
+    }
+  }
+
+  private isEndTombstoned(cid: string): boolean {
+    this.pruneEndTombstones();
+    return this.endedCids.has(cid);
+  }
+
+  private pruneEndTombstones(): void {
+    const now = this.deps.now();
+    for (const [cid, at] of this.endedCids) {
+      if (now - at > END_TOMBSTONE_MS) this.endedCids.delete(cid);
+    }
+  }
+
   takePushDecline(peerId: string): boolean {
     const declinedAt = this.pushDeclines.get(peerId);
     if (declinedAt === undefined) return false;
@@ -1925,6 +1983,7 @@ export class CallController {
     this.ringProofDeadlines.clear();
     this.ringProofReasons.clear();
     this.ringCids.clear();
+    this.endedCids.clear();
     this.service.dispose();
   }
 
@@ -2095,12 +2154,36 @@ export class CallController {
         // `dispatch` can all throw before the first dismissal, and the
         // obligation would be gone with nothing left to fire it.
         this.retireRingProof(peerId);
+        // AN OFFER THE PEER ALREADY CANCELLED. The live `call.end` for this
+        // cid beat the queued offer out of the server (see `END_TOMBSTONE_MS`):
+        // it settled the placeholder's fate and the call is over. Ringing it
+        // now would ring a phone for a call nobody is placing, and writing a
+        // row would file a second event for one call. Dropped whole,
+        // whatever the push-ring state — the `call.end` branch already owns
+        // the placeholder, and the dismissal here is the belt on that.
+        if (this.isEndTombstoned(call.cid)) {
+          await this.deps.native
+            .dismissPendingIncomingCall(peerId, 'cancelled', this.ringCidFor(peerId))
+            .catch(() => undefined);
+          this.settleRingProof(peerId);
+          return;
+        }
         // EACH OF THE FIVE DISMISSALS BELOW NAMES THE PLACEHOLDER IT IS
         // ENDING (`ringCidFor`), read at the moment of the dismissal and
         // always BEFORE that path's `settleRingProof`. This is where the cid
         // tag earns its keep on the 1:1 arm: every one of them sits behind
         // awaits — `mayRing`, `saveOffer`, `ensureCredentials`, up to eight
-        // seconds — during which a push can mint a different placeholder.
+        // seconds — during which a push can mint a different placeholder. THE
+        // RING VERDICT (§10.6), read before the first row this branch can
+        // write. Every refusal below — busy, expired, silenced — leaves a
+        // missed row, and the row's poster (`index.ts`) makes a sound for one
+        // that carries no verdict: keyed on `missed` alone, a stranger the
+        // policy silenced could chime the phone through the busy row or a
+        // self-expired offer. The ORDER of the refusals is
+        // unchanged — busy is still answered before the policy is acted on —
+        // only the read moved up, so each row can say whether its caller
+        // could have rung.
+        const permission = await this.mayRing(peerId);
         // The busy-rule half that protects a live session from a stray 1:1 offer.
         // Answered here rather than by the reducer because the reducer models
         // one call and knows nothing about the session that owns the
@@ -2113,6 +2196,26 @@ export class CallController {
             .catch(() => undefined);
           await this.deps.messaging
             .sendCallEnvelope(peerId, { tcm: 'call.end', cid: call.cid, r: 'busy' }, { urgent: true })
+            .catch(() => undefined);
+          // AND A ROW. The reducer's own busy refusal writes one (the
+          // callee's missed call); this refusal is decided a layer up, on the
+          // session's behalf, and used to leave the Calls tab silent about a
+          // person who tried to reach this phone during a group call.
+          await this.deps
+            .writeLog({
+              cid: call.cid,
+              peerId,
+              direction: 'in',
+              kind: call.vid ? 'video' : 'audio',
+              reason: 'busy',
+              startedAt: serverTs,
+              connectedAt: null,
+              endedAt: this.deps.now(),
+              missed: true,
+              // A caller the policy would have silenced gets the row and
+              // nothing audible.
+              silenced: !permission.ring,
+            })
             .catch(() => undefined);
           // Ring proof: fate settled — busy, placeholder dismissed above. The notes
           // are spent with it (`settleRingProof`'s invariant).
@@ -2129,17 +2232,39 @@ export class CallController {
           await this.deps.native
             .dismissPendingIncomingCall(peerId, 'expired', this.ringCidFor(peerId))
             .catch(() => undefined);
-          // Still dispatched: the reducer's expired branch is what writes the
-          // missed-call row, and the person deserves to see the call existed.
-          await this.service.dispatch({
-            type: 'offerReceived',
-            cid: call.cid,
-            peerId,
-            sdp: call.sdp,
-            video: call.vid,
-            exp: call.exp,
-            serverTs,
-          });
+          if (!permission.ring) {
+            // A silenced caller's stale offer never reaches the reducer.
+            // `exp` is the caller's own field, so a stranger can post an
+            // offer that is already expired and reach the reducer's missed
+            // row — and its notice — without ever meeting the ring gate.
+            // The row is written here instead, carrying the verdict,
+            // exactly as the silenced branch below writes its own; the
+            // reducer's expired branch does nothing else.
+            await this.deps.writeLog({
+              cid: call.cid,
+              peerId,
+              direction: 'in',
+              kind: call.vid ? 'video' : 'audio',
+              reason: 'expired',
+              startedAt: serverTs,
+              connectedAt: null,
+              endedAt: this.deps.now(),
+              missed: true,
+              silenced: true,
+            });
+          } else {
+            // Still dispatched: the reducer's expired branch is what writes the
+            // missed-call row, and the person deserves to see the call existed.
+            await this.service.dispatch({
+              type: 'offerReceived',
+              cid: call.cid,
+              peerId,
+              sdp: call.sdp,
+              video: call.vid,
+              exp: call.exp,
+              serverTs,
+            });
+          }
           // Ring proof: fate settled — expired, placeholder dismissed above. The
           // notes are spent with it (`settleRingProof`'s invariant).
           this.settleRingProof(peerId);
@@ -2181,13 +2306,12 @@ export class CallController {
           return;
         }
         // Silence unknown callers, decided BEFORE anything rings and
-        // before any credential is spent. A silenced call still leaves a
-        // missed-call row — the person can see it happened and call back — but
-        // the phone never makes a sound, and the caller learns nothing about
-        // whether it was silenced or simply unanswered.
-        const permission = this.deps.mayRing
-          ? await this.deps.mayRing(peerId)
-          : { ring: true };
+        // before any credential is spent — the verdict was read above, ahead
+        // of the busy and expired refusals, so their rows carry it too. A
+        // silenced call still leaves a missed-call row — the person can see
+        // it happened and call back — but the phone never makes a sound, and
+        // the caller learns nothing about whether it was silenced or simply
+        // unanswered.
         if (!permission.ring) {
           // The VoIP push has ALREADY rung a placeholder by the time this
           // decision runs — the push arrives before anything can decrypt, so
@@ -2212,6 +2336,9 @@ export class CallController {
             connectedAt: null,
             endedAt: this.deps.now(),
             missed: true,
+            // "Never makes a sound" includes the missed-call notice:
+            // the row is the evidence, not a chime.
+            silenced: true,
           });
           // Ring proof: fate settled — silenced, placeholder dismissed above. The
           // notes are spent with it (`settleRingProof`'s invariant).
@@ -2230,8 +2357,12 @@ export class CallController {
         //
         // Failure is swallowed: no stored offer degrades a lock-screen answer
         // after a kill, which is strictly better than refusing the call.
+        // `ringingOfferCid` is NOT retargeted here: the reducer may refuse
+        // this offer (busy), and pointing the idle sweep at the refused cid
+        // left the LIVE call's row — a DTLS fingerprint and candidate
+        // addresses — in `call_offers` until the next launch. The row is
+        // adopted below, or dropped inline on refusal.
         if (this.deps.saveOffer) {
-          this.ringingOfferCid = call.cid;
           await this.deps
             .saveOffer({
               cid: call.cid,
@@ -2251,7 +2382,7 @@ export class CallController {
         // Decided here, before the ring, because `createAnswer` runs whenever
         // the person taps and the policy has to already be in place.
         await this.decideRelayFor(peerId);
-        await this.ensureCredentials();
+        await this.ensureCredentials(MAX_CALL_BOUND_MS);
         await this.pushRelayPolicy();
         await this.service.dispatch({
           type: 'offerReceived',
@@ -2271,6 +2402,11 @@ export class CallController {
         // pending ring has no future.
         const adopted = this.service.current.call;
         if (adopted?.cid !== call.cid) {
+          // The refused offer's row goes NOW, keyed by its own cid, so the
+          // live call's row keeps its owner and is dropped at idle as before.
+          if (this.deps.saveOffer) {
+            void this.deps.dropOffer?.(call.cid).catch(() => undefined);
+          }
           // …unless the machine's live call is from THIS peer. The external
           // review's interleaving: adopted call A is declined during the
           // awaits above, the same peer redials, offer B is adopted by a
@@ -2300,6 +2436,8 @@ export class CallController {
           this.settleRingProof(peerId);
           return;
         }
+        // Adopted: this cid's row is the one the idle sweep drops.
+        if (this.deps.saveOffer) this.ringingOfferCid = call.cid;
         // Ring proof: ADOPTION SPENDS THE NOTED RINGS — the second half of the
         // retire at the top of this branch, and the settlement half of
         // `settleRingProof`'s invariant. The rebind has cleared native
@@ -2357,6 +2495,9 @@ export class CallController {
         break;
 
       case 'call.end': {
+        // Remembered FIRST, whatever else this frame turns out to mean: an
+        // offer for this cid draining behind it is already cancelled.
+        this.tombstoneEnd(call.cid);
         // A cancellation can beat its own offer's ring teardown: the caller
         // hung up while this phone was dead, both frames drained together,
         // and if the offer's ring never got adopted (or the end raced it),
@@ -2571,8 +2712,17 @@ export class CallController {
 
   // --- native events ------------------------------------------------------
 
-  /** A local candidate the module gathered. Batched by the service. */
-  onLocalIceCandidate(candidate: { cand: string; mid: string; idx: number }): void {
+  /**
+   * A local candidate the module gathered. Batched by the service.
+   *
+   * `cid` names the peer connection that gathered it. A candidate for any
+   * other cid — a dead small-group leg's late gathering, a call that ended
+   * while the module was still gathering — is dropped rather than queued
+   * under whatever 1:1 call happens to be live. Optional only for callers
+   * that predate the check (the CLI gate); the app always passes it.
+   */
+  onLocalIceCandidate(candidate: { cand: string; mid: string; idx: number }, cid?: string): void {
+    if (cid !== undefined && this.service.current.call?.cid !== cid) return;
     this.service.queueLocalIce(candidate);
   }
 
@@ -2640,7 +2790,7 @@ export class CallController {
     // answer, happens here — so a policy decided only in `onEnvelope` would be
     // missing from every lock-screen answer.
     await this.decideRelayFor(stored.peerId);
-    await this.ensureCredentials();
+    await this.ensureCredentials(MAX_CALL_BOUND_MS);
     await this.pushRelayPolicy();
     await this.service.dispatch({
       type: 'offerReceived',
@@ -2737,7 +2887,7 @@ export class CallController {
     // the right policy first time, and before the first effect so the answer
     // is settled by the time anything gathers a candidate.
     await this.decideRelayFor(peerId);
-    await this.ensureCredentials();
+    await this.ensureCredentials(MAX_CALL_BOUND_MS);
     if (this.deps.relayOnly() && !this.credentials) {
       throw new Error('always-relay is on but no relay is available');
     }
@@ -2800,8 +2950,11 @@ export class CallController {
    * same moment, and two concurrent mints would both spend the per-user rate
    * limit for one call's worth of benefit.
    */
-  async ensureCredentials(): Promise<void> {
-    if (this.credentials && this.deps.now() < this.credentials.expiresAt) return;
+  async ensureCredentials(minRemainingMs = 0): Promise<void> {
+    // `minRemainingMs` is the life the CALLER needs, over and above the cache
+    // rule: a call about to start asks for `MAX_CALL_BOUND_MS`, everything
+    // else (a warm-up on a VoIP wake, a settings toggle) asks for nothing.
+    if (this.credentials && this.deps.now() + minRemainingMs < this.credentials.expiresAt) return;
     if (this.refreshing) return this.refreshing;
 
     this.refreshing = (async () => {

@@ -90,6 +90,7 @@ jest.mock('../src/db', () => ({
   listChats: jest.fn(),
   listMessages: jest.fn(),
   listAttachments: jest.fn(),
+  listAttachmentMeta: jest.fn(),
   listRecentMessages: jest.fn(),
   listHeldRevisions: jest.fn(),
   takeHeldRevision: jest.fn(),
@@ -294,6 +295,7 @@ function resetDb(): void {
     ['listChats', []],
     ['listMessages', []],
     ['listAttachments', []],
+    ['listAttachmentMeta', []],
     ['listRecentMessages', []],
     ['listHeldRevisions', []],
     ['takeHeldRevision', null],
@@ -1012,6 +1014,7 @@ describe('no fetch a blocked peer can trigger, however delayed', () => {
       } satisfies MessageRow,
     ]);
     db.listAttachments!.mockResolvedValue([] as AttachmentRow[]);
+    db.listAttachmentMeta!.mockResolvedValue([]);
 
     db.listBlockedPeers!.mockResolvedValue([BLOCKED]);
     await messaging.start(ME);

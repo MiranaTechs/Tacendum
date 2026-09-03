@@ -77,6 +77,13 @@ test('blanking is on by default and the chips flip and persist it', async () => 
 
 test('the section tells the truth about screenshots', async () => {
   const tree = await renderSettings();
+  // The screenshot sentence is the SECTION's ⓘ: closed until opened,
+  // under the sheet.
+  await ReactTestRenderer.act(async () => {
+    tree.root
+      .findAll(n => n.props.testID === 'settings-shot-info' && n.props.onPress !== undefined)[0]
+      .props.onPress();
+  });
   const texts = tree.root
     .findAllByType(require('react-native').Text)
     .map(n =>

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Linking,
   Platform,
@@ -44,6 +44,8 @@ import {
   TERMS_URL,
   VERSION_LABEL,
 } from '../version';
+import { ChoiceRow } from '../ui/ChoiceRow';
+import { InfoDisclosure } from '../ui/InfoDisclosure';
 import { PinPad } from '../ui/PinPad';
 import { InlineError, InlineNotice, RuledLabel, ScreenHeader } from '../ui/primitives';
 
@@ -84,9 +86,9 @@ const COPY = {
   disableRow: 'Turn off App Lock',
   autolockLabel: 'Auto-lock',
   autolockOptions: [
-    { label: 'Right away', sec: 0 },
-    { label: '1 min', sec: 60 },
-    { label: '5 min', sec: 300 },
+    { label: 'Right away', value: 0 },
+    { label: '1 min', value: 60 },
+    { label: '5 min', value: 300 },
   ],
   enterPrompt: 'Choose a code — 4 to 10 digits',
   confirmPrompt: 'Enter the same code again',
@@ -95,9 +97,13 @@ const COPY = {
   wrong: 'Wrong code.',
   cooldown: 'Too many tries. Wait a bit, then try again.',
   explainTitle: 'One code, two doors',
-  // The device is named in the
-  // platform's own words via the token wherever a sentence names it.
-  explain: `Unlock with your code and Tacendum opens your conversations. Enter the same code backwards and it opens a decoy instead — invented people, unreadable messages — while your real conversations stay sealed.\n\nThere is no way to recover a forgotten code. You would have to sign out, and message history on this ${DEVICE_NOUN} cannot be restored.`,
+  // The device is named in the platform's own words via the token wherever
+  // a sentence names it. The forgotten-code cost is the TRUE one: there is
+  // no sign-out (registration.ts — the keypair IS the account, and it lives
+  // only here), so a forgotten code means delete-and-reinstall, which also
+  // loses this identity. The old sentence promised a door that does not
+  // exist.
+  explain: `Unlock with your code and Tacendum opens your conversations. Enter the same code backwards and it opens a decoy instead — invented people, unreadable messages — while your real conversations stay sealed.\n\nThere is no way to recover a forgotten code. You would have to delete and reinstall Tacendum on this ${DEVICE_NOUN}, which also loses this identity — nobody can restore it.`,
   confirmEnable: 'Turn on App Lock',
   confirmChange: 'Use this code',
   enabled: 'App Lock is on.',
@@ -106,6 +112,14 @@ const COPY = {
   decoysRebuilt: 'Decoy conversations rebuilt.',
   cancel: 'Cancel',
   failed: 'Something went wrong. Nothing was changed — try again.',
+  /** A row's write failed: the chip has already snapped back, so the
+   * sentence says only what is true. */
+  settingFailed: 'That change did not save. Nothing was changed — try again.',
+  /**
+   * The one ⓘ label every row's teaching paragraph sits behind: the
+   * paragraph explains the row it hangs under. */
+  infoLabel: 'What this changes',
+  shotLabel: 'Screenshots and recordings',
   screenSection: 'SCREEN',
   blankLabel: 'Hide messages while the screen is shared or recorded',
   blankOptions: [
@@ -148,6 +162,16 @@ const COPY = {
         ? `Google gives this ${DEVICE_NOUN} a token that lets Tacendum be woken while it is closed — a call can ring and a message can announce itself even when the ${DEVICE_NOUN} has cut Tacendum’s own connection. The token identifies this ${DEVICE_NOUN} and is stored on our servers; it never carries your words, because the wake carries no content at all — messages and calls themselves still arrive only over Tacendum’s own connection. Turning this off deletes that token from our servers, and none may be registered again while it stays off. Calls will then ring and messages announce themselves only while Tacendum’s own connection is up.`
         : `No push service wakes this ${DEVICE_NOUN}: there is no Google service in the app, and no token identifying this ${DEVICE_NOUN} sits on our servers. Messages and calls arrive over Tacendum’s own connection — the ongoing “Connected” notification is that connection at work. This switch is the standing rule for wake tokens: while it is off, none may ever be registered for this ${DEVICE_NOUN}.`
       : `Apple gives every ${DEVICE_NOUN} a token that lets a call ring it while Tacendum is closed, whether or not you allowed notifications. Turning this off deletes that token from our servers. Calls will only reach you while the app is open, and messages will arrive with no notification.`,
+  /** The consent-grade one-liner that stays VISIBLE under the push chips:
+   * what Off does to the token, per binary — the paragraph above moves
+   * behind the row's ⓘ. The websocket-only Android build has no token to
+   * delete, so its sentence states the standing rule instead. */
+  pushConsent:
+    Platform.OS === 'android'
+      ? pushTransport() === 'fcm'
+        ? `Off deletes the token that lets Google wake this ${DEVICE_NOUN} from our servers.`
+        : `No token identifying this ${DEVICE_NOUN} sits on our servers; while this is off, none may be registered.`
+      : `Off deletes the token that lets Apple wake this ${DEVICE_NOUN} from our servers.`,
   pushFailed:
     'The token was not deleted. Nothing changed on our side — try again.',
   aboutSection: 'ABOUT',
@@ -228,6 +252,11 @@ const COPY = {
     { label: 'On', value: true },
     { label: 'Off', value: false },
   ],
+  /** The consent-grade one-liner that stays VISIBLE under the relay chips:
+   * the IP disclosure, which is the cost of Off. The full note below —
+   * including the first-call protection — sits behind the ⓘ. */
+  relayConsent:
+    'Off: after your first call with someone, later calls may go direct and show the other person’s device your IP address.',
   // The cost of turning it ON and the protection that holds when it is OFF,
   // both stated before the switch is thrown. The middle sentence is the one
   // that must not be left out: the first call with someone new is relayed
@@ -387,6 +416,15 @@ export function SettingsScreen({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /**
+   * Synchronous submit latch for the App Lock flow: a double-tap lands before
+   * the `busy` STATE has re-rendered, so both taps see `busy === false`. Here
+   * that burnt two of the five free attempts on one mis-typed code, or ran
+   * `setupDecoy()` twice — two writers each DELETE-then-INSERTing into the
+   * same decoy tables. The LockScreen latch, for the reason it gives ("two
+   * concurrent unlocks nearly wiped real data"). Checked and set before
+   * `setBusy`, cleared in `finally`. */
+  const busyRef = useRef(false);
   const [blankEnabled, setBlankEnabled] = useState(screenSecurity.blankEnabled);
   const [receipts, setReceipts] = useState(readReceiptsEnabled);
   const [typing, setTyping] = useState(typingIndicatorsEnabled);
@@ -447,13 +485,21 @@ export function SettingsScreen({
   };
 
   const submitPin = async () => {
-    if (busy) return;
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     try {
       if (flow.step === 'current') {
         const result = await lock.verify(value);
         if (result.verdict === 'fail') return setError(COPY.wrong);
         if (result.verdict === 'cooldown') return setError(COPY.cooldown);
+        // The give-away code is not the current code: in a REAL session
+        // only the real verdict opens the change / disable / rebuild
+        // doors — otherwise whoever holds the duress code could change
+        // the real lock. A DURESS session keeps accepting both, as
+        // everything here does (rule 16): the coerced change must look
+        // like it worked.
+        if (session.mode === 'real' && result.verdict !== 'real') return setError(COPY.wrong);
         if (flow.next === 'change') return toFlow({ step: 'enter', mode: 'change' });
         if (flow.next === 'reset') {
           await setupDecoy();
@@ -490,11 +536,13 @@ export function SettingsScreen({
     } finally {
       setValue('');
       setBusy(false);
+      busyRef.current = false;
     }
   };
 
   const commit = async () => {
-    if (flow.step !== 'explain' || busy) return;
+    if (flow.step !== 'explain' || busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     try {
       if (flow.mode === 'enable') {
@@ -515,18 +563,62 @@ export function SettingsScreen({
       setError(COPY.failed);
     } finally {
       setBusy(false);
+      busyRef.current = false;
+    }
+  };
+
+  /**
+   * The optimistic rows whose write can throw: the chip moves with the
+   * finger, and a failed write puts it back where it was and says so under
+   * the row — instead of a flipped chip over an unchanged preference and an
+   * unhandled rejection. The modules that never reject (sound, relay,
+   * silence) keep their plain optimistic shape. */
+  type RowKey = 'autolock' | 'screensec' | 'receipts' | 'typing' | 'preview';
+  const [rowError, setRowError] = useState<RowKey | null>(null);
+  const rowErrorFor = (row: RowKey): string | null =>
+    rowError === row ? COPY.settingFailed : null;
+  const persist = async (
+    row: RowKey,
+    write: () => Promise<void>,
+    revert: () => void,
+  ): Promise<void> => {
+    setRowError(null);
+    try {
+      await write();
+    } catch {
+      revert();
+      setRowError(row);
     }
   };
 
   const chooseAutolock = async (sec: number) => {
+    const previous = autolockSec;
+    const previousUi = session.lockUi.autolockSec;
     setAutolockSec(sec); // session-scoped truth; identical in both modes
     session.setLockUi({ autolockSec: sec });
-    await lock.setAutolock(sec);
+    await persist(
+      'autolock',
+      () => lock.setAutolock(sec),
+      () => {
+        setAutolockSec(previous);
+        session.setLockUi({ autolockSec: previousUi });
+      },
+    );
   };
 
   const chooseBlank = async (nextEnabled: boolean) => {
+    const previous = blankEnabled;
     setBlankEnabled(nextEnabled);
-    await screenSecurity.setBlankEnabled(nextEnabled);
+    await persist(
+      'screensec',
+      () => screenSecurity.setBlankEnabled(nextEnabled),
+      () => {
+        setBlankEnabled(previous);
+        // The live policy moved before the Keychain write refused: put it
+        // back too (best effort — the store already refused once).
+        void screenSecurity.setBlankEnabled(previous).catch(() => undefined);
+      },
+    );
   };
 
   /**
@@ -556,13 +648,29 @@ export function SettingsScreen({
   };
 
   const chooseReceipts = async (nextEnabled: boolean) => {
+    const previous = receipts;
     setReceipts(nextEnabled);
-    await setReadReceipts(nextEnabled);
+    await persist(
+      'receipts',
+      () => setReadReceipts(nextEnabled),
+      () => {
+        setReceipts(previous);
+        void setReadReceipts(previous).catch(() => undefined);
+      },
+    );
   };
 
   const chooseTyping = async (nextEnabled: boolean) => {
+    const previous = typing;
     setTyping(nextEnabled);
-    await setTypingIndicators(nextEnabled);
+    await persist(
+      'typing',
+      () => setTypingIndicators(nextEnabled),
+      () => {
+        setTyping(previous);
+        void setTypingIndicators(previous).catch(() => undefined);
+      },
+    );
   };
 
   /**
@@ -593,11 +701,18 @@ export function SettingsScreen({
   const choosePreview = async (next: PreviewLevel) => {
     // Optimistic, like every other row here: the control must not lag behind
     // the finger over a file write. A failed write leaves the previous value
-    // on disk and the next launch shows it again, which is the honest
-    // outcome — the alternative is a row that silently disagrees with what
-    // the notification will actually do.
+    // on disk — so the chip goes back to it and says so, rather than a row
+    // that silently disagrees with what the notification will do.
+    const previous = preview;
     setPreview(next);
-    await setPreviewLevel(next);
+    await persist(
+      'preview',
+      () => setPreviewLevel(next),
+      () => {
+        setPreview(previous);
+        void setPreviewLevel(previous).catch(() => undefined);
+      },
+    );
   };
 
   /**
@@ -663,49 +778,14 @@ export function SettingsScreen({
                     first
                   />
                   <RowRule />
-                  <View style={[styles.autolockRow, { minHeight: t.layout.rowHeight }]}>
-                    <Text style={[t.type.rowTitle, { color: t.color.inkStrong }]}>
-                      {COPY.autolockLabel}
-                    </Text>
-                    <View style={styles.autolockChoices}>
-                      {COPY.autolockOptions.map(option => {
-                        const selected = autolockSec === option.sec;
-                        return (
-                          <Pressable
-                            key={option.sec}
-                            accessibilityRole="button"
-                            accessibilityState={{ selected }}
-                            testID={`settings-autolock-${option.sec}`}
-                            // 44pt effective without enlarging the visual.
-                            hitSlop={{ top: 5, bottom: 5 }}
-                            onPress={() => void chooseAutolock(option.sec)}
-                            style={[
-                              styles.chip,
-                              {
-                                borderRadius: t.radius.button,
-                                backgroundColor: selected
-                                  ? t.color.pineWash
-                                  : 'transparent',
-                                borderWidth: t.hairline,
-                                borderColor: selected
-                                  ? t.color.pineLine
-                                  : t.color.lineSoft,
-                              },
-                            ]}
-                          >
-                            <Text
-                              style={[
-                                t.type.buttonCompact,
-                                { color: selected ? t.color.pine : t.color.inkMuted },
-                              ]}
-                            >
-                              {option.label}
-                            </Text>
-                          </Pressable>
-                        );
-                      })}
-                    </View>
-                  </View>
+                  <ChoiceRow
+                    label={COPY.autolockLabel}
+                    options={COPY.autolockOptions}
+                    value={autolockSec}
+                    onChange={sec => void chooseAutolock(sec)}
+                    testIDPrefix="settings-autolock"
+                    error={rowErrorFor('autolock')}
+                  />
                   <RowRule />
                   <MenuRow
                     label={COPY.resetDecoysRow}
@@ -790,175 +870,42 @@ export function SettingsScreen({
                   },
                 ]}
               >
-                <View
-                  style={[styles.autolockRow, { minHeight: t.layout.rowHeight }]}
-                >
-                  <Text style={[t.type.rowTitle, { color: t.color.inkStrong }]}>
-                    {COPY.blankLabel}
-                  </Text>
-                  <View style={styles.autolockChoices}>
-                    {COPY.blankOptions.map(option => {
-                      const selected = blankEnabled === option.value;
-                      return (
-                        <Pressable
-                          key={option.label}
-                          accessibilityRole="button"
-                          accessibilityState={{ selected }}
-                          testID={`settings-screensec-${option.value ? 'on' : 'off'}`}
-                          // 44pt effective without enlarging the visual.
-                          hitSlop={{ top: 5, bottom: 5 }}
-                          onPress={() => void chooseBlank(option.value)}
-                          style={[
-                            styles.chip,
-                            {
-                              borderRadius: t.radius.button,
-                              backgroundColor: selected
-                                ? t.color.pineWash
-                                : 'transparent',
-                              borderWidth: t.hairline,
-                              borderColor: selected
-                                ? t.color.pineLine
-                                : t.color.lineSoft,
-                            },
-                          ]}
-                        >
-                          <Text
-                            style={[
-                              t.type.buttonCompact,
-                              {
-                                color: selected
-                                  ? t.color.pine
-                                  : t.color.inkMuted,
-                              },
-                            ]}
-                          >
-                            {option.label}
-                          </Text>
-                        </Pressable>
-                      );
-                    })}
-                  </View>
-                </View>
-                <View
-                  style={[styles.autolockRow, { minHeight: t.layout.rowHeight }]}
-                >
-                  <Text style={[t.type.rowTitle, { color: t.color.inkStrong }]}>
-                    {COPY.receiptsLabel}
-                  </Text>
-                  <View style={styles.autolockChoices}>
-                    {COPY.receiptOptions.map(option => {
-                      const selected = receipts === option.value;
-                      return (
-                        <Pressable
-                          key={option.label}
-                          accessibilityRole="button"
-                          accessibilityState={{ selected }}
-                          testID={`settings-receipts-${option.value ? 'on' : 'off'}`}
-                          hitSlop={{ top: 5, bottom: 5 }}
-                          onPress={() => void chooseReceipts(option.value)}
-                          style={[
-                            styles.chip,
-                            {
-                              borderRadius: t.radius.button,
-                              backgroundColor: selected
-                                ? t.color.pineWash
-                                : 'transparent',
-                              borderWidth: t.hairline,
-                              borderColor: selected
-                                ? t.color.pineLine
-                                : t.color.lineSoft,
-                            },
-                          ]}
-                        >
-                          <Text
-                            style={[
-                              t.type.buttonCompact,
-                              {
-                                color: selected ? t.color.pine : t.color.inkMuted,
-                              },
-                            ]}
-                          >
-                            {option.label}
-                          </Text>
-                        </Pressable>
-                      );
-                    })}
-                  </View>
-                </View>
-                <View
-                  style={[styles.autolockRow, { minHeight: t.layout.rowHeight }]}
-                >
-                  <Text style={[t.type.rowTitle, { color: t.color.inkStrong }]}>
-                    {COPY.typingLabel}
-                  </Text>
-                  <View style={styles.autolockChoices}>
-                    {COPY.typingOptions.map(option => {
-                      const selected = typing === option.value;
-                      return (
-                        <Pressable
-                          key={option.label}
-                          accessibilityRole="button"
-                          accessibilityState={{ selected }}
-                          testID={`settings-typing-${option.value ? 'on' : 'off'}`}
-                          hitSlop={{ top: 5, bottom: 5 }}
-                          onPress={() => void chooseTyping(option.value)}
-                          style={[
-                            styles.chip,
-                            {
-                              borderRadius: t.radius.button,
-                              backgroundColor: selected
-                                ? t.color.pineWash
-                                : 'transparent',
-                              borderWidth: t.hairline,
-                              borderColor: selected
-                                ? t.color.pineLine
-                                : t.color.lineSoft,
-                            },
-                          ]}
-                        >
-                          <Text
-                            style={[
-                              t.type.buttonCompact,
-                              {
-                                color: selected ? t.color.pine : t.color.inkMuted,
-                              },
-                            ]}
-                          >
-                            {option.label}
-                          </Text>
-                        </Pressable>
-                      );
-                    })}
-                  </View>
-                </View>
+                <ChoiceRow
+                  label={COPY.blankLabel}
+                  options={COPY.blankOptions}
+                  value={blankEnabled}
+                  onChange={next => void chooseBlank(next)}
+                  testIDPrefix="settings-screensec"
+                  error={rowErrorFor('screensec')}
+                />
+                <ChoiceRow
+                  label={COPY.receiptsLabel}
+                  options={COPY.receiptOptions}
+                  value={receipts}
+                  onChange={next => void chooseReceipts(next)}
+                  testIDPrefix="settings-receipts"
+                  info={{ label: COPY.infoLabel, lines: [COPY.receiptsNote] }}
+                  error={rowErrorFor('receipts')}
+                />
+                <ChoiceRow
+                  label={COPY.typingLabel}
+                  options={COPY.typingOptions}
+                  value={typing}
+                  onChange={next => void chooseTyping(next)}
+                  testIDPrefix="settings-typing"
+                  info={{ label: COPY.infoLabel, lines: [COPY.typingNote] }}
+                  error={rowErrorFor('typing')}
+                />
               </View>
-              <Text
-                style={[
-                  t.type.compactBody,
-                  styles.sectionNote,
-                  { color: t.color.inkMuted },
-                ]}
-              >
-                {COPY.receiptsNote}
-              </Text>
-              <Text
-                style={[
-                  t.type.compactBody,
-                  styles.sectionNote,
-                  { color: t.color.inkMuted },
-                ]}
-              >
-                {COPY.typingNote}
-              </Text>
-              <Text
-                style={[
-                  t.type.compactBody,
-                  styles.sectionNote,
-                  { color: t.color.inkMuted },
-                ]}
-              >
-                {COPY.shotNote}
-              </Text>
+              {/* The screenshot truth belongs to the SECTION, not to a row:
+                  its ⓘ sits under the sheet. */}
+              <View style={styles.sectionInfo}>
+                <InfoDisclosure
+                  label={COPY.shotLabel}
+                  lines={[COPY.shotNote]}
+                  testID="settings-shot-info"
+                />
+              </View>
 
               {/* The design. Its own section rather than a row under SCREEN: this one
                   is about what leaves the phone over the network, not about
@@ -980,127 +927,28 @@ export function SettingsScreen({
                   },
                 ]}
               >
-                <View
-                  style={[styles.autolockRow, { minHeight: t.layout.rowHeight }]}
-                >
-                  <Text style={[t.type.rowTitle, { color: t.color.inkStrong }]}>
-                    {COPY.relayLabel}
-                  </Text>
-                  <View style={styles.autolockChoices}>
-                    {COPY.relayOptions.map(option => {
-                      const selected = relayAll === option.value;
-                      return (
-                        <Pressable
-                          key={option.label}
-                          accessibilityRole="button"
-                          accessibilityState={{ selected }}
-                          testID={`settings-relay-${option.value ? 'on' : 'off'}`}
-                          hitSlop={{ top: 5, bottom: 5 }}
-                          onPress={() => void chooseRelay(option.value)}
-                          style={[
-                            styles.chip,
-                            {
-                              borderRadius: t.radius.button,
-                              backgroundColor: selected
-                                ? t.color.pineWash
-                                : 'transparent',
-                              borderWidth: t.hairline,
-                              borderColor: selected
-                                ? t.color.pineLine
-                                : t.color.lineSoft,
-                            },
-                          ]}
-                        >
-                          <Text
-                            style={[
-                              t.type.buttonCompact,
-                              {
-                                color: selected
-                                  ? t.color.pine
-                                  : t.color.inkMuted,
-                              },
-                            ]}
-                          >
-                            {option.label}
-                          </Text>
-                        </Pressable>
-                      );
-                    })}
-                  </View>
-                </View>
+                <ChoiceRow
+                  label={COPY.relayLabel}
+                  options={COPY.relayOptions}
+                  value={relayAll}
+                  onChange={next => void chooseRelay(next)}
+                  testIDPrefix="settings-relay"
+                  // The IP disclosure stays VISIBLE (consent-grade); the rest
+                  // of the machinery sits behind the row's ⓘ.
+                  note={COPY.relayConsent}
+                  info={{ label: COPY.infoLabel, lines: [COPY.relayNote] }}
+                />
                 {/* in this sheet rather than its own section: both rows
-                    decide what a call is allowed to do to this phone, and the
-                    SCREEN section above is the precedent for two rows sharing a
-                    sheet with their notes stacked below in the same order. */}
-                <View
-                  style={[styles.autolockRow, { minHeight: t.layout.rowHeight }]}
-                >
-                  <Text style={[t.type.rowTitle, { color: t.color.inkStrong }]}>
-                    {COPY.silenceLabel}
-                  </Text>
-                  <View style={styles.autolockChoices}>
-                    {COPY.silenceOptions.map(option => {
-                      const selected = silenceUnknown === option.value;
-                      return (
-                        <Pressable
-                          key={option.label}
-                          accessibilityRole="button"
-                          accessibilityState={{ selected }}
-                          testID={`settings-silence-${option.value ? 'on' : 'off'}`}
-                          hitSlop={{ top: 5, bottom: 5 }}
-                          onPress={() => void chooseSilence(option.value)}
-                          style={[
-                            styles.chip,
-                            {
-                              borderRadius: t.radius.button,
-                              backgroundColor: selected
-                                ? t.color.pineWash
-                                : 'transparent',
-                              borderWidth: t.hairline,
-                              borderColor: selected
-                                ? t.color.pineLine
-                                : t.color.lineSoft,
-                            },
-                          ]}
-                        >
-                          <Text
-                            style={[
-                              t.type.buttonCompact,
-                              {
-                                color: selected
-                                  ? t.color.pine
-                                  : t.color.inkMuted,
-                              },
-                            ]}
-                          >
-                            {option.label}
-                          </Text>
-                        </Pressable>
-                      );
-                    })}
-                  </View>
-                </View>
+                    decide what a call is allowed to do to this phone. */}
+                <ChoiceRow
+                  label={COPY.silenceLabel}
+                  options={COPY.silenceOptions}
+                  value={silenceUnknown}
+                  onChange={next => void chooseSilence(next)}
+                  testIDPrefix="settings-silence"
+                  info={{ label: COPY.infoLabel, lines: [COPY.silenceNote] }}
+                />
               </View>
-              <Text
-                testID="settings-relay-note"
-                style={[
-                  t.type.compactBody,
-                  styles.sectionNote,
-                  { color: t.color.inkMuted },
-                ]}
-              >
-                {COPY.relayNote}
-              </Text>
-              <Text
-                testID="settings-silence-note"
-                style={[
-                  t.type.compactBody,
-                  styles.sectionNote,
-                  { color: t.color.inkMuted },
-                ]}
-              >
-                {COPY.silenceNote}
-              </Text>
 
               <RuledLabel
                 label={COPY.notificationsSection}
@@ -1119,192 +967,44 @@ export function SettingsScreen({
                   },
                 ]}
               >
-                <View
-                  style={[styles.autolockRow, { minHeight: t.layout.rowHeight }]}
-                >
-                  <Text style={[t.type.rowTitle, { color: t.color.inkStrong }]}>
-                    {COPY.previewLabel}
-                  </Text>
-                  <View style={styles.autolockChoices}>
-                    {COPY.previewOptions.map(option => {
-                      const selected = preview === option.value;
-                      return (
-                        <Pressable
-                          key={option.value}
-                          accessibilityRole="button"
-                          accessibilityState={{ selected }}
-                          testID={`settings-preview-${option.value}`}
-                          hitSlop={{ top: 5, bottom: 5 }}
-                          onPress={() => void choosePreview(option.value)}
-                          style={[
-                            styles.chip,
-                            {
-                              borderRadius: t.radius.button,
-                              backgroundColor: selected
-                                ? t.color.pineWash
-                                : 'transparent',
-                              borderWidth: t.hairline,
-                              borderColor: selected
-                                ? t.color.pineLine
-                                : t.color.lineSoft,
-                            },
-                          ]}
-                        >
-                          <Text
-                            style={[
-                              t.type.buttonCompact,
-                              {
-                                color: selected
-                                  ? t.color.pine
-                                  : t.color.inkMuted,
-                              },
-                            ]}
-                          >
-                            {option.label}
-                          </Text>
-                        </Pressable>
-                      );
-                    })}
-                  </View>
-                </View>
+                <ChoiceRow
+                  label={COPY.previewLabel}
+                  options={COPY.previewOptions}
+                  value={preview}
+                  onChange={next => void choosePreview(next)}
+                  testIDPrefix="settings-preview"
+                  info={{ label: COPY.infoLabel, lines: [COPY.previewNote] }}
+                  error={rowErrorFor('preview')}
+                />
                 {/* Below the preview control because it is the
                     broader switch: previews decide what a notification SHOWS,
                     this decides whether Apple holds a token for this device at
-                    all. */}
-                <View
-                  style={[styles.autolockRow, { minHeight: t.layout.rowHeight }]}
-                >
-                  <Text style={[t.type.rowTitle, { color: t.color.inkStrong }]}>
-                    {COPY.pushLabel}
-                  </Text>
-                  <View style={styles.autolockChoices}>
-                    {COPY.pushOptions.map(option => {
-                      const selected = pushAllowed === option.value;
-                      return (
-                        <Pressable
-                          key={option.label}
-                          accessibilityRole="button"
-                          accessibilityState={{ selected, disabled: pushBusy }}
-                          testID={`settings-push-${option.value ? 'on' : 'off'}`}
-                          hitSlop={{ top: 5, bottom: 5 }}
-                          disabled={pushBusy}
-                          onPress={() => void choosePush(option.value)}
-                          style={[
-                            styles.chip,
-                            {
-                              borderRadius: t.radius.button,
-                              backgroundColor: selected
-                                ? t.color.pineWash
-                                : 'transparent',
-                              borderWidth: t.hairline,
-                              borderColor: selected
-                                ? t.color.pineLine
-                                : t.color.lineSoft,
-                            },
-                          ]}
-                        >
-                          <Text
-                            style={[
-                              t.type.buttonCompact,
-                              {
-                                color: selected
-                                  ? t.color.pine
-                                  : t.color.inkMuted,
-                              },
-                            ]}
-                          >
-                            {option.label}
-                          </Text>
-                        </Pressable>
-                      );
-                    })}
-                  </View>
-                </View>
+                    all. The consent-grade cost stays VISIBLE under the chips;
+                    the mechanism sits behind the row's ⓘ. */}
+                <ChoiceRow
+                  label={COPY.pushLabel}
+                  options={COPY.pushOptions}
+                  value={pushAllowed}
+                  onChange={next => void choosePush(next)}
+                  disabled={pushBusy}
+                  testIDPrefix="settings-push"
+                  note={COPY.pushConsent}
+                  info={{ label: COPY.infoLabel, lines: [COPY.pushNote] }}
+                  error={pushFailed ? COPY.pushFailed : null}
+                />
                 {/* The message chime. Below the push row, the
                     outer authority: that one decides whether a wake reaches
                     this device at all, this only whether a message that
                     does makes a sound. */}
-                <View
-                  style={[styles.autolockRow, { minHeight: t.layout.rowHeight }]}
-                >
-                  <Text style={[t.type.rowTitle, { color: t.color.inkStrong }]}>
-                    {COPY.soundLabel}
-                  </Text>
-                  <View style={styles.autolockChoices}>
-                    {COPY.soundOptions.map(option => {
-                      const selected = sound === option.value;
-                      return (
-                        <Pressable
-                          key={option.label}
-                          accessibilityRole="button"
-                          accessibilityState={{ selected }}
-                          testID={`settings-sound-${option.value ? 'on' : 'off'}`}
-                          hitSlop={{ top: 5, bottom: 5 }}
-                          onPress={() => void chooseSound(option.value)}
-                          style={[
-                            styles.chip,
-                            {
-                              borderRadius: t.radius.button,
-                              backgroundColor: selected
-                                ? t.color.pineWash
-                                : 'transparent',
-                              borderWidth: t.hairline,
-                              borderColor: selected
-                                ? t.color.pineLine
-                                : t.color.lineSoft,
-                            },
-                          ]}
-                        >
-                          <Text
-                            style={[
-                              t.type.buttonCompact,
-                              {
-                                color: selected
-                                  ? t.color.pine
-                                  : t.color.inkMuted,
-                              },
-                            ]}
-                          >
-                            {option.label}
-                          </Text>
-                        </Pressable>
-                      );
-                    })}
-                  </View>
-                </View>
+                <ChoiceRow
+                  label={COPY.soundLabel}
+                  options={COPY.soundOptions}
+                  value={sound}
+                  onChange={next => void chooseSound(next)}
+                  testIDPrefix="settings-sound"
+                  info={{ label: COPY.infoLabel, lines: [COPY.soundNote] }}
+                />
               </View>
-              <Text
-                testID="settings-push-note"
-                style={[
-                  t.type.compactBody,
-                  styles.sectionNote,
-                  { color: t.color.inkMuted },
-                ]}
-              >
-                {COPY.pushNote}
-              </Text>
-              {pushFailed ? (
-                <InlineError message={COPY.pushFailed} testID="settings-push-error" />
-              ) : null}
-              <Text
-                style={[
-                  t.type.compactBody,
-                  styles.sectionNote,
-                  { color: t.color.inkMuted },
-                ]}
-              >
-                {COPY.previewNote}
-              </Text>
-              <Text
-                testID="settings-sound-note"
-                style={[
-                  t.type.compactBody,
-                  styles.sectionNote,
-                  { color: t.color.inkMuted },
-                ]}
-              >
-                {COPY.soundNote}
-              </Text>
 
               <RuledLabel
                 label={COPY.appearanceSection}
@@ -1323,57 +1023,16 @@ export function SettingsScreen({
                   },
                 ]}
               >
-                <View
-                  style={[styles.autolockRow, { minHeight: t.layout.rowHeight }]}
-                >
-                  <Text style={[t.type.rowTitle, { color: t.color.inkStrong }]}>
-                    {COPY.appearanceLabel}
-                  </Text>
-                  <View style={styles.autolockChoices}>
-                    {COPY.appearanceOptions.map(option => {
-                      const selected = appearance === option.value;
-                      return (
-                        <Pressable
-                          key={option.value}
-                          accessibilityRole="button"
-                          accessibilityState={{ selected }}
-                          testID={`settings-appearance-${option.value}`}
-                          hitSlop={{ top: 5, bottom: 5 }}
-                          onPress={() => {
-                            setAppearanceChoice(option.value);
-                            setAppearance(option.value);
-                          }}
-                          style={[
-                            styles.chip,
-                            {
-                              borderRadius: t.radius.button,
-                              backgroundColor: selected
-                                ? t.color.pineWash
-                                : 'transparent',
-                              borderWidth: t.hairline,
-                              borderColor: selected
-                                ? t.color.pineLine
-                                : t.color.lineSoft,
-                            },
-                          ]}
-                        >
-                          <Text
-                            style={[
-                              t.type.buttonCompact,
-                              {
-                                color: selected
-                                  ? t.color.pine
-                                  : t.color.inkMuted,
-                              },
-                            ]}
-                          >
-                            {option.label}
-                          </Text>
-                        </Pressable>
-                      );
-                    })}
-                  </View>
-                </View>
+                <ChoiceRow
+                  label={COPY.appearanceLabel}
+                  options={COPY.appearanceOptions}
+                  value={appearance}
+                  onChange={next => {
+                    setAppearanceChoice(next);
+                    setAppearance(next);
+                  }}
+                  testIDPrefix="settings-appearance"
+                />
               </View>
 
               <RuledLabel
@@ -1621,22 +1280,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
   },
-  autolockRow: {
-    paddingHorizontal: 16,
-    paddingVertical: 5,
-    gap: 8,
-  },
-  // Vertical padding here (not on the row) so the chips' hitSlop has parent
-  // bounds to land in — RN hitSlop never extends past the parent view.
-  autolockChoices: { flexDirection: 'row', gap: 8, paddingVertical: 5 },
-  chip: {
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
   pinFlow: { marginTop: 16, alignItems: 'center' },
-  sectionNote: { marginTop: 10 },
+  /** The section-level ⓘ under a sheet (the screenshot truth). */
+  sectionInfo: { marginTop: 10 },
   prompt: { marginBottom: 16, textAlign: 'center' },
   explain: { marginTop: 12, marginBottom: 24 },
   versionLine: { marginTop: 12, textAlign: 'center' },

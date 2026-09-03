@@ -27,12 +27,31 @@ class FakeSocket {
 }
 (globalThis as unknown as { WebSocket: unknown }).WebSocket = FakeSocket;
 
+/**
+ * Every client this file constructs, stopped after each test. Two of the
+ * tests below end with a `start()` and no `stop()`: the dial they leave
+ * outstanding holds a 20 s watchdog on the plain `setTimeout` scheduler, and
+ * when it fires against the FakeSocket it re-arms through `scheduleReconnect`
+ * forever — which is exactly the "Jest did not exit" hang CI saw. A test that
+ * means to leave a dial running must still have it torn down when the test is
+ * over. */
+const clients: WsClient[] = [];
+function makeClient(): WsClient {
+  const client = new WsClient();
+  clients.push(client);
+  return client;
+}
+
 beforeEach(() => {
   FakeSocket.instances.length = 0;
 });
 
+afterEach(() => {
+  for (const client of clients.splice(0)) client.stop();
+});
+
 test('a late close event after stop() reaches no state handler', () => {
-  const client = new WsClient();
+  const client = makeClient();
   const states: string[] = [];
   client.onState(state => states.push(state));
   client.start('tok');
@@ -46,7 +65,7 @@ test('a late close event after stop() reaches no state handler', () => {
 });
 
 test('a late open from the stopped socket cannot reach handlers armed by the next session', () => {
-  const client = new WsClient();
+  const client = makeClient();
   const states: string[] = [];
   client.onState(state => states.push(`old:${state}`));
   client.start('old');
@@ -60,7 +79,7 @@ test('a late open from the stopped socket cannot reach handlers armed by the nex
 });
 
 test('frame handlers do not stack across stop/start cycles', () => {
-  const client = new WsClient();
+  const client = makeClient();
   const seen: string[] = [];
   client.onFrame(() => seen.push('stale'));
   client.start('tok');

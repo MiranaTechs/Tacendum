@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
-import { useCallState } from '../call';
+import { clearMissedCallNotices, useCallState } from '../call';
 import {
   callDuration,
   callGlyph,
@@ -12,6 +12,8 @@ import { personName, sanitizeDisplayName } from '../person';
 import { useTheme, type Theme } from '../theme';
 import { timeLabel } from '../time';
 import { Avatar } from '../ui/Avatar';
+import { PhoneGlyph, VideoGlyph } from '../ui/CallGlyph';
+import { HomeHeader } from '../ui/primitives';
 
 /**
  * Every call, across every conversation — the second tab.
@@ -27,6 +29,13 @@ import { Avatar } from '../ui/Avatar';
 interface Props {
   onOpenChat(peerId: string): void;
   onCall(peerId: string, kind: 'audio' | 'video'): void;
+  /**
+   * The profile door in the shared home header: the same disc, in the same
+   * corner, as the Chats tab. Both optional so the shell can hand them over
+   * on its own schedule — absent, the header renders without a door rather
+   * than a door that does nothing. */
+  profile?: Pick<db.ProfileRow, 'userId' | 'displayName' | 'avatarB64'> | null;
+  onOpenProfile?(): void;
 }
 
 interface CallListItem {
@@ -54,7 +63,12 @@ function toRowData(r: db.CallLogRow): CallLogRowData {
   };
 }
 
-export function CallsScreen({ onOpenChat, onCall }: Props): React.JSX.Element {
+export function CallsScreen({
+  onOpenChat,
+  onCall,
+  profile,
+  onOpenProfile,
+}: Props): React.JSX.Element {
   const t = useTheme();
   const styles = useMemo(() => makeStyles(t), [t]);
   const [items, setItems] = useState<CallListItem[]>([]);
@@ -95,6 +109,12 @@ export function CallsScreen({ onOpenChat, onCall }: Props): React.JSX.Element {
   }, []);
 
   useEffect(refresh, [refresh]);
+  // Opening the tab ANSWERS the missed-call notices: the rows below are what
+  // they pointed at, so the notices for every peer come down together the
+  // moment the list is on screen.
+  useEffect(() => {
+    void clearMissedCallNotices(null);
+  }, []);
   // A call that just ended is this screen's newest row.
   const callName = call.name;
   useEffect(() => {
@@ -118,16 +138,16 @@ export function CallsScreen({ onOpenChat, onCall }: Props): React.JSX.Element {
             peerId={item.row.peerId}
             displayName={item.rawName}
             photoB64={item.avatarB64}
-            size={44}
+            size={t.layout.avatar.row}
           />
           <View style={styles.rowBody}>
             <Text
-              style={[styles.name, data.missed && styles.missedName]}
+              style={[t.type.rowTitle, styles.name, data.missed && styles.missedName]}
               numberOfLines={1}
             >
               {item.name}
             </Text>
-            <Text style={styles.detail} numberOfLines={1}>
+            <Text style={[t.type.compactBody, styles.detail]} numberOfLines={1}>
               <Text style={data.missed ? styles.missedGlyph : styles.glyph}>
                 {callGlyph(data)}
               </Text>
@@ -137,25 +157,31 @@ export function CallsScreen({ onOpenChat, onCall }: Props): React.JSX.Element {
             </Text>
           </View>
           <View style={styles.rowEnd}>
-            <Text style={styles.when}>{timeLabel(item.row.startedAt)}</Text>
+            <Text style={[t.type.timeStatus, styles.when]}>
+              {timeLabel(item.row.startedAt)}
+            </Text>
+            {/* The glyph kit, not a typographic stand-in: the
+                same camera and handset the thread's call buttons draw, in a
+                full 44pt disc. */}
             <Pressable
               onPress={() => onCall(item.row.peerId, item.row.kind)}
-              hitSlop={8}
               accessibilityRole="button"
               accessibilityLabel={`${
                 item.row.kind === 'video' ? 'Video' : 'Audio'
               } call ${item.name}`}
               style={({ pressed }) => [styles.redial, pressed && styles.redialPressed]}
             >
-              <Text style={styles.redialGlyph}>
-                {item.row.kind === 'video' ? '⧉' : '✆'}
-              </Text>
+              {item.row.kind === 'video' ? (
+                <VideoGlyph size={20} color={t.color.pine} />
+              ) : (
+                <PhoneGlyph size={20} color={t.color.pine} />
+              )}
             </Pressable>
           </View>
         </Pressable>
       );
     },
-    [onCall, onOpenChat, styles],
+    [onCall, onOpenChat, styles, t],
   );
 
   return (
@@ -165,17 +191,20 @@ export function CallsScreen({ onOpenChat, onCall }: Props): React.JSX.Element {
           screen an honest width instead of stretching every row across the
           glass. Width only; on phones — and in the wide shell's list pane —
           the cap never engages. */}
-      <View
-        style={[styles.header, styles.clamp, { paddingHorizontal: t.layout.gutter }]}
-      >
-        <Text style={styles.title} accessibilityRole="header">
-          Calls
-        </Text>
+      <View style={styles.clamp}>
+        {/* The home header the Chats tab shares: the same title
+            role, height and profile door, so a tab switch changes the word
+            and nothing else. */}
+        <HomeHeader
+          title="Calls"
+          profile={profile}
+          onOpenProfile={onOpenProfile}
+        />
       </View>
       {items.length === 0 ? (
         <View style={[styles.empty, styles.clamp]}>
-          <Text style={styles.emptyTitle}>No calls yet</Text>
-          <Text style={styles.emptyBody}>
+          <Text style={[t.type.sectionTitle, styles.emptyTitle]}>No calls yet</Text>
+          <Text style={[t.type.body, styles.emptyBody]}>
             Calls you make and receive stay on this device — nobody else holds
             this list, so nobody else can rewrite it.
           </Text>
@@ -198,37 +227,37 @@ function makeStyles(t: Theme) {
     screen: { flex: 1, backgroundColor: t.color.paperGround },
     /** Full width until contentMax caps it — the Register/Profile pattern. */
     clamp: { width: '100%', maxWidth: t.layout.contentMax, alignSelf: 'center' },
-    header: { paddingTop: 12, paddingBottom: 8 },
-    title: { color: t.color.inkStrong, fontSize: 28, fontWeight: '700' },
-    listContent: { paddingBottom: 24 },
+    listContent: { paddingBottom: t.space.s8 },
+    // The chat list's row geometry: the row disc, the row height, and type
+    // off the scale — so the two tabs' lists read as one.
     row: {
       flexDirection: 'row',
       alignItems: 'center',
+      minHeight: t.layout.chatRowHeight,
       paddingHorizontal: t.layout.gutter,
-      paddingVertical: 10,
-      gap: 12,
+      paddingVertical: t.space.s4,
+      gap: t.space.s5,
     },
     rowPressed: { backgroundColor: t.color.pineWashFaint },
     rowBody: { flex: 1, minWidth: 0 },
-    name: { color: t.color.inkStrong, fontSize: 16, fontWeight: '600' },
+    name: { color: t.color.inkStrong },
     missedName: { color: t.color.danger },
-    detail: { color: t.color.inkMuted, fontSize: 13, marginTop: 2 },
+    detail: { color: t.color.inkMuted, marginTop: t.space.s1 },
     glyph: { color: t.color.pine },
     missedGlyph: { color: t.color.danger },
-    rowEnd: { alignItems: 'flex-end', gap: 6 },
-    when: { color: t.color.inkMuted, fontSize: 12 },
+    rowEnd: { alignItems: 'flex-end', gap: t.space.s2 },
+    when: { color: t.color.inkMuted },
     redial: {
-      width: 34,
-      height: 34,
-      borderRadius: 17,
+      width: t.layout.touchTarget,
+      height: t.layout.touchTarget,
+      borderRadius: t.radius.circle,
       alignItems: 'center',
       justifyContent: 'center',
       backgroundColor: t.color.pineWash,
     },
     redialPressed: { backgroundColor: t.color.pineLine },
-    redialGlyph: { color: t.color.pine, fontSize: 16 },
-    empty: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 32, gap: 8 },
-    emptyTitle: { color: t.color.inkStrong, fontSize: 17, fontWeight: '600' },
-    emptyBody: { color: t.color.inkMuted, fontSize: 14, textAlign: 'center', lineHeight: 20 },
+    empty: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 32, gap: t.space.s4 },
+    emptyTitle: { color: t.color.inkStrong },
+    emptyBody: { color: t.color.inkMuted, textAlign: 'center' },
   });
 }

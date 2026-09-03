@@ -4,9 +4,8 @@ import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { AGPL_SOURCE_URL_DEFAULT } from '@tacendum/shared';
 import { createHttpServer } from '../src/local/http.js';
-import type { Deps } from '../src/handlers/http.js';
 import { makeMemoryCallMetricStore } from '../src/call-metrics.js';
-import { makeMemoryDb, makeTestDeps } from './helpers.js';
+import { makeMemoryDb, makeTestDeps, type TestDeps } from './helpers.js';
 
 /**
  * The HTTP adapter itself (routing, path params, malformed input) — unit tests
@@ -16,7 +15,7 @@ import { makeMemoryDb, makeTestDeps } from './helpers.js';
 
 let server: Server;
 let base: string;
-let deps: Deps;
+let deps: TestDeps;
 const SESSION_TOKEN = 'local-call-metric-token';
 const SESSION_USER = 'local-call-metric-user';
 

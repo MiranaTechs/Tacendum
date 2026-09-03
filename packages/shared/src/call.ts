@@ -380,6 +380,23 @@ export const GroupCallInviteEnvelope = z.object({
    * contract, skew forgiveness and server-age backstop as `call.offer.exp`
    * (§6.4), enforced by `groupCallInviteIsRingable`. */
   exp: z.number().int().positive(),
+  /**
+   * The session epoch the sender holds (§9.4), so a participant added
+   * MID-CALL starts at the epoch the starter is at rather than at 0.
+   *
+   * Without it a late-added member seeded `se: 0` while the starter was at
+   * `k ≥ 1`, and every later authority delta (`se: k+1`) was held forever as
+   * "from the future": the next Add was never applied (so the second-added
+   * person was refused `busy` by the first), a Remove never took, and the
+   * starter's own hangup never ended the call for late joiners.
+   *
+   * OPTIONAL, and additive: an old build's `z.object` strips the key and
+   * seeds 0 as it always did, and an old build's invite (no key) parses here
+   * and seeds 0 — the only epoch an original member can be at. Advisory
+   * from a non-starter (a joiner's leg offer), authoritative only in the one
+   * place a starter's invite is accepted (`ringFresh`).
+   */
+  se: z.number().int().min(0).optional(),
 });
 export type GroupCallInviteEnvelope = z.infer<typeof GroupCallInviteEnvelope>;
 
@@ -511,6 +528,14 @@ export interface GroupCallSessionView {
   se: number;
   /** Whether this session negotiates video — it decides the cap (§9.5). */
   video: boolean;
+  /**
+   * Whether the live session has carried media on at least one leg. A
+   * session that has CONNECTED is never in glare: glare is two invites
+   * crossing in flight, and a call that is already up crossed nothing.
+   * Absent reads as false, the only value a view built before this field
+   * existed could hold.
+   */
+  connected?: boolean;
 }
 
 export type GroupCallRosterVerdict =
@@ -635,5 +660,22 @@ export function admitGroupCallInvite(
   }
   // Two different sessions: one total order over two ULIDs, evaluated
   // identically by every device, no coordination.
+  //
+  // BUT ONLY WHEN GLARE IS POSSIBLE. "Lower sid wins" is the tie-break for
+  // two honest starters whose invites crossed in flight, and it must not
+  // become a way for ANY account to end a call: a ULID's leading characters
+  // are a timestamp, so a forged `sid: '0000…'` always sorts first. Two
+  // gates, both about whether this can be glare at all:
+  //  - the live session has NOT connected. A call already carrying media
+  //    crossed nothing; an invite arriving into it is a second call, and
+  //    a second call is busy.
+  //  - `from` is in the roster held from the starter. Glare is between the
+  //    people on the call — a starter who invited the sender, or a member
+  //    both starters rostered — never a stranger, whatever sid they mint.
+  // A stranger, or anyone into a connected session, is simply busy — the
+  // same refusal a same-sid stranger gets, through the same frame.
+  if (live.connected === true || !live.roster.includes(from)) {
+    return { verdict: 'busy' };
+  }
   return invite.sid < live.sid ? { verdict: 'supersede' } : { verdict: 'busy' };
 }

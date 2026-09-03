@@ -38,6 +38,14 @@ export interface ApnsClientOptions {
   now?: () => number;
   /** Overrides the Apple host. Tests point this at a local HTTP/2 server. */
   origin?: string;
+  /** Structured log; never receives the key, a device token, or any payload
+   * byte. Optional — the transport's owner (push/sender.ts) wires the real
+   * one; a bare client logs nothing. */
+  log?: (event: string, fields?: Record<string, string | number | boolean>) => void;
+  /** Per-attempt deadline override. A TEST seam only (the stalled-session
+   * case needs an attempt to time out in milliseconds, not seconds);
+   * production takes ATTEMPT_TIMEOUT_MS. */
+  attemptTimeoutMs?: number;
 }
 
 /**
@@ -165,6 +173,32 @@ const DEAD_TOKEN_REASONS = new Set([
 ]);
 
 /**
+ * Reasons that mean "this JWT is dead", all carried on a 403: container
+ * clock skew, or a key rotated in Secrets Manager before the
+ * ApnsKeyRevision bump recycled the fleet. They were classified `failed`
+ * and the cached token kept being served until TOKEN_REFRESH_MS — up to
+ * fifty minutes of every wake from that container failing on a token Apple
+ * had already refused. They now drop the cache and earn one retry with a
+ * fresh mint. */
+const PROVIDER_TOKEN_REASONS = new Set([
+  'ExpiredProviderToken',
+  'InvalidProviderToken',
+  'MissingProviderToken',
+]);
+
+/**
+ * Apple's hard cap on an ALERT notification's body (VoIP is 5120). An alert
+ * over it is refused with 413 PayloadTooLarge — which `classify` reports as
+ * `failed`, no retry, no banner. The alert embeds the queued ciphertext so
+ * the extension can render a preview, and the frame schema allows 30 000
+ * base64 chars of it, so any message over ~3.7 KB of ciphertext used to
+ * raise NO notification at all — not even the generic one. The margin keeps
+ * the trim decision clear of Apple's exact accounting; the ciphertext is
+ * what goes, the routing facts stay. */
+const ALERT_BODY_MAX_BYTES = 4096;
+const ALERT_BODY_TRIM_MARGIN = 128;
+
+/**
  * ES256 for APNs must be raw R||S (JOSE), not the DER encoding Node produces
  * by default — `dsaEncoding: 'ieee-p1363'` is what makes the difference
  * between a working push and an opaque 403.
@@ -193,6 +227,8 @@ export function makeApnsClient(options: ApnsClientOptions): ApnsClient {
   const now = options.now ?? (() => Date.now());
   const origin = options.origin ?? HOSTS[options.env ?? 'production'];
   const { credentials } = options;
+  const log = options.log ?? (() => {});
+  const attemptTimeoutMs = options.attemptTimeoutMs ?? ATTEMPT_TIMEOUT_MS;
 
   // The JWT is reused across sends — Apple explicitly asks callers not to mint
   // one per request, and a fresh token per push is a good way to get throttled.
@@ -220,6 +256,22 @@ export function makeApnsClient(options: ApnsClientOptions): ApnsClient {
   }
 
   /**
+   * Tear a session down so the NEXT attempt dials fresh. The per-attempt
+   * deadline used to cancel only the STREAM: a warm container frozen long enough
+   * for the peer or a NAT to drop the TCP connection without FIN/RST thawed with
+   * a session that looked open, stalled its first request to the deadline, and
+   * then reused that same dead session for every later wake until the kernel's
+   * retransmit timeout — minutes of calls to locked phones not ringing, with
+   * only `apns_refused status:0` to show for it. A fresh dial costs one TLS
+   * handshake; a dead session costs every push from the container. Guarded on
+   * identity: a stale stream's late error must never destroy a session a newer
+   * attempt has since opened. */
+  function dropSession(stale: http2.ClientHttp2Session): void {
+    if (session === stale) session = null;
+    if (!stale.destroyed) stale.destroy();
+  }
+
+  /**
    * One APNs request. The push KIND changes three headers and the body; the
    * http2 plumbing, the deadline and the classification are identical, so the
    * kind is a parameter rather than a second copy of all of it.
@@ -233,28 +285,56 @@ export function makeApnsClient(options: ApnsClientOptions): ApnsClient {
     deviceToken: string,
     payload: VoipPayload | AlertPayload,
     kind: 'voip' | 'alert' = 'voip',
-  ): Promise<{ status: number; body: string }> {
+    /** Alert arm only: ship the body WITHOUT the ciphertext regardless of
+     * size — the one-shot fallback after Apple answers 413 on a body our
+     * own threshold let through. */
+    opts: { trimPayload?: boolean } = {},
+  ): Promise<{ status: number; body: string; trimmed: boolean }> {
     return new Promise((resolve, reject) => {
-      const body = JSON.stringify(
-        kind === 'voip'
-          ? payload
-          : {
-              // The visible fallback. iOS shows this verbatim if the
-              // extension never runs — killed for time or memory, or the
-              // device has no key for this sender — so it says the least that
-              // is still useful.
-              aps: {
-                alert: { title: 'Tacendum', body: 'New message' },
-                sound: 'default',
-                'mutable-content': 1,
-                'thread-id': (payload as AlertPayload).from,
-              },
-              // What the extension decrypts. Outside `aps` because Apple
-              // reserves that key and drops anything unrecognised inside it.
-              t: payload,
-            },
-      );
-      const stream = connect().request({
+      const alertBody = (t: AlertPayload): string =>
+        JSON.stringify({
+          // The visible fallback. iOS shows this verbatim if the
+          // extension never runs — killed for time or memory, or the
+          // device has no key for this sender — so it says the least that
+          // is still useful.
+          aps: {
+            alert: { title: 'Tacendum', body: 'New message' },
+            sound: 'default',
+            'mutable-content': 1,
+            'thread-id': t.from,
+          },
+          // What the extension decrypts. Outside `aps` because Apple
+          // reserves that key and drops anything unrecognised inside it.
+          t,
+        });
+      let body: string;
+      let trimmed = false;
+      if (kind === 'voip') {
+        body = JSON.stringify(payload);
+      } else {
+        const alert = payload as AlertPayload;
+        body = alertBody(alert);
+        if (
+          opts.trimPayload ||
+          Buffer.byteLength(body) > ALERT_BODY_MAX_BYTES - ALERT_BODY_TRIM_MARGIN
+        ) {
+          // Over Apple's cap: keep the routing facts, drop the ciphertext.
+          // `payload` stays PRESENT and EMPTY rather than absent — the
+          // extension's decoder requires the field, and a `t` that fails to
+          // decode would skip its blocked-sender check and its
+          // badge/collapse bookkeeping, not just the preview. An empty
+          // payload decodes, decrypts to nothing, and lands on exactly the
+          // degraded path a killed extension takes: the generic body, the
+          // right badge. The ciphertext itself still drains over the socket.
+          body = alertBody({ ...alert, payload: '' });
+          trimmed = true;
+          // Loud, and payload-free: the event is the only sign that long
+          // messages are arriving as generic banners.
+          log('apns_alert_payload_trimmed');
+        }
+      }
+      const live = connect();
+      const stream = live.request({
         ':method': 'POST',
         ':path': `/3/device/${deviceToken}`,
         authorization: `bearer ${authToken()}`,
@@ -290,10 +370,14 @@ export function makeApnsClient(options: ApnsClientOptions): ApnsClient {
       let received = '';
       // Bound the attempt. `stream.close()` sends RST_STREAM and frees the
       // stream; without this a stalled response never settles the promise.
+      // The SESSION goes with it (dropSession): a stall is the one signal a
+      // silently dead connection ever gives, and reusing the session
+      // afterwards turned one lost wake into minutes of them.
       const deadline = setTimeout(() => {
         stream.close(http2.constants.NGHTTP2_CANCEL);
+        dropSession(live);
         reject(new Error('apns attempt timed out'));
-      }, ATTEMPT_TIMEOUT_MS);
+      }, attemptTimeoutMs);
       const settle = <T>(fn: (value: T) => void) => (value: T) => {
         clearTimeout(deadline);
         fn(value);
@@ -303,8 +387,18 @@ export function makeApnsClient(options: ApnsClientOptions): ApnsClient {
         status = Number(headers[':status'] ?? 0);
       });
       stream.on('data', chunk => (received += chunk));
-      stream.on('end', settle(() => resolve({ status, body: received })));
-      stream.on('error', settle(reject));
+      stream.on('end', settle(() => resolve({ status, body: received, trimmed })));
+      // A stream-level transport error (a GOAWAY's cancel, a reset from a
+      // session that is closing) is evidence against the session too: dial
+      // fresh next time rather than find out on the next wake. A fresh dial
+      // is one TLS handshake; the alternative is the failure mode above.
+      stream.on(
+        'error',
+        settle((err: Error) => {
+          dropSession(live);
+          reject(err);
+        }),
+      );
       stream.end(body);
     });
   }
@@ -325,6 +419,25 @@ export function makeApnsClient(options: ApnsClientOptions): ApnsClient {
     return { outcome: 'failed', status, reason };
   }
 
+  /**
+   * Does a first attempt's outcome earn ONE more? Two cases, both narrow:
+   *
+   *  - a 5xx: a response, so proof the request reached Apple and was not
+   *    delivered. Never a 429 (a backed-off retry lands after the call is
+   *    over) and never a dead token (it will not come back);
+   *  - a 403 naming the provider token: the JWT, not the push, was
+   *    refused. The cache is dropped HERE so the retry mints a fresh one —
+   *    without that, the retry would present the same rejected token. */
+  function earnsRetry(first: { status: number }, result: ApnsResult): boolean {
+    if (result.outcome !== 'failed') return false;
+    if (first.status >= 500) return true;
+    if (first.status === 403 && PROVIDER_TOKEN_REASONS.has(result.reason ?? '')) {
+      cachedJwt = null;
+      return true;
+    }
+    return false;
+  }
+
   return {
     origin,
 
@@ -338,16 +451,20 @@ export function makeApnsClient(options: ApnsClientOptions): ApnsClient {
      * the next connect.
      */
     async sendAlert(deviceToken, payload) {
-      let first: { status: number; body: string };
+      let first: { status: number; body: string; trimmed: boolean };
       try {
         first = await attempt(deviceToken, payload, 'alert');
       } catch {
         return { outcome: 'failed' };
       }
       const result = classify(first.status, first.body);
-      if (!(result.outcome === 'failed' && first.status >= 500)) return result;
+      // 413 on a body our own threshold let through: Apple is the authority
+      // on its cap, so retry ONCE with the ciphertext dropped. A body that
+      // was already trimmed has nothing left to drop.
+      const tooLarge = result.outcome === 'failed' && first.status === 413 && !first.trimmed;
+      if (!tooLarge && !earnsRetry(first, result)) return result;
       try {
-        const second = await attempt(deviceToken, payload, 'alert');
+        const second = await attempt(deviceToken, payload, 'alert', { trimPayload: tooLarge });
         return classify(second.status, second.body);
       } catch {
         return { outcome: 'failed' };
@@ -369,9 +486,11 @@ export function makeApnsClient(options: ApnsClientOptions): ApnsClient {
       const result = classify(first.status, first.body);
       // Retry only what a retry could fix AND what we KNOW was processed: a
       // 5xx is a response, so the request definitely reached Apple and was
-      // definitely not delivered. Never a 429 (a backed-off retry lands after
-      // the call is over) and never a dead token (it will not come back).
-      if (!(result.outcome === 'failed' && first.status >= 500)) return result;
+      // definitely not delivered; a provider-token 403 refused the JWT, not
+      // the push, and the retry carries a fresh one (earnsRetry). Never a 429
+      // (a backed-off retry lands after the call is over) and never a dead
+      // token (it will not come back).
+      if (!earnsRetry(first, result)) return result;
 
       try {
         const second = await attempt(deviceToken, payload);

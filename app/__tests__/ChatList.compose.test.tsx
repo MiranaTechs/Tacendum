@@ -137,6 +137,13 @@ describe('StartChatScreen', () => {
     );
 
     expect(byId(tree, 'new-peer-input').length).toBeGreaterThan(0);
+    // Your own id is on this surface too, behind "Show my ID" (the screen
+    // is for reaching THEM). Rewritten deliberately — the earlier
+    // assertion pinned the block open.
+    expect(byId(tree, 'self-user-id').length).toBe(0);
+    await ReactTestRenderer.act(async () => {
+      byId(tree, 'show-self-id')[0].props.onPress();
+    });
     expect(byId(tree, 'self-user-id').length).toBeGreaterThan(0);
     // The no-directory explanation sits in the open here — a dedicated
     // surface has room for it, so it no longer hides behind an ⓘ toggle.

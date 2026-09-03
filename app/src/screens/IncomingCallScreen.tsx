@@ -1,6 +1,7 @@
-import React, { useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Pressable, StatusBar, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { cameraAvailableForAnswer } from '../call';
 import { Avatar } from '../ui/Avatar';
 import { useTheme } from '../theme';
 
@@ -24,7 +25,12 @@ export interface IncomingCallScreenProps {
   peerAvatarB64?: string | null;
   /** The caller opened with video. A hint for what to offer, not a promise. */
   withVideo: boolean;
-  /** Camera denied: video answers are impossible, so do not offer them. */
+  /**
+   * Camera denied: video answers are impossible, so do not offer them.
+   * Omitted, the screen asks the module itself while it rings — the prop
+   * used to default to `true`, so a person who had refused the camera was
+   * offered "Answer with video", the answer said `vid:true`, and the caller
+   * stared at black. */
   cameraAvailable?: boolean;
   onAccept(): void;
   onAcceptAudioOnly(): void;
@@ -35,7 +41,7 @@ export function IncomingCallScreen({
   peerName,
   peerAvatarB64,
   withVideo,
-  cameraAvailable = true,
+  cameraAvailable: cameraAvailableProp,
   onAccept,
   onAcceptAudioOnly,
   onDecline,
@@ -43,6 +49,22 @@ export function IncomingCallScreen({
   const theme = useTheme();
   const insets = useSafeAreaInsets();
   const styles = useMemo(() => makeStyles(theme), [theme]);
+  // The module's answer, when the prop leaves it to the screen. Read once
+  // per ring and only for a video invite — an audio invite offers no video
+  // answer whatever the camera says. Optimistic until it lands (a status
+  // read, not a prompt) so the buttons do not flicker in from nothing.
+  const [cameraRead, setCameraRead] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (cameraAvailableProp !== undefined || !withVideo) return undefined;
+    let live = true;
+    void cameraAvailableForAnswer().then(ok => {
+      if (live) setCameraRead(ok);
+    });
+    return () => {
+      live = false;
+    };
+  }, [cameraAvailableProp, withVideo]);
+  const cameraAvailable = cameraAvailableProp ?? cameraRead ?? true;
 
   // Offered only when it adds something: on an audio call it is the same
   // action as Accept, and two buttons that do the same thing is a worse

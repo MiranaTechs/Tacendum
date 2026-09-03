@@ -132,11 +132,31 @@ describe('the gate repro: transport fails call.answer once, then healthy', () =>
 
     // The app's aftermath, not only its membership: the log row is written…
     expect(rows, 'the call was silently lost — zero log rows').toHaveLength(1);
-    expect(rows[0]).toMatchObject({ cid: ULIDS.cid, direction: 'in', reason: 'cancelled' });
+    // …with the CALLEE's reason. `localHangup` before `connectedAt` is read by
+    // direction (call-machine.ts): the CALLER hanging up is `cancelled`, the
+    // CALLEE hanging up is `decline`. This test predates that split and pinned
+    // `cancelled` on an INCOMING leg, which is the caller's word — and, worse,
+    // `cancelled` is in MISSED_REASONS, so the fold wrote the person a MISSED
+    // row for the call they were in the middle of answering. `decline` is not
+    // missed, which is why `missed: false` is pinned here and not implied.
+    //
+    // "Declined" is still not what HAPPENED — the send died on a held ratchet
+    // lock, nobody refused anything — but the fold is `localHangup` in both
+    // arms, so the CLI says exactly what the app's CallService says for the
+    // identical failure, and app/CLI parity is the property this file exists
+    // to hold. Giving the fatal-send fold a reason of its own (the group arm's
+    // `failed_ice`, say) is a source change to shipped call semantics on both
+    // sides and is a deliberate product decision; it is not a test repair.
+    expect(rows[0]).toMatchObject({
+      cid: ULIDS.cid,
+      direction: 'in',
+      reason: 'decline',
+      missed: false,
+    });
 
     // …and the end is ANNOUNCED (the transport is healthy again), so the
     // caller is not left ringing until their own timeout.
-    expect(endsOf(sent)).toContainEqual(expect.objectContaining({ cid: ULIDS.cid, r: 'cancelled' }));
+    expect(endsOf(sent)).toContainEqual(expect.objectContaining({ cid: ULIDS.cid, r: 'decline' }));
   });
 
   it('the daemon is not busy-forever: a later caller RINGS instead of being refused', async () => {
@@ -200,8 +220,9 @@ describe('the twin entry points of the fatal set', () => {
     // The group executor folds an escaped fatal throw with ITS reason
     // taxonomy (`receiveEnd(cid,'failed_ice')` → re-offer / release —
     // group-call.ts apply catch). A leg that hung up on itself first would
-    // report `cancelled` into the session reducer and the repair gate would
-    // never see the failure class it keys on.
+    // report its own `localHangup` reason into the session reducer —
+    // `decline` on an incoming leg, `cancelled` on an outgoing one — and the
+    // repair gate would never see the failure class it keys on.
     const { runner, rows } = makeRunner(new Set(['call.answer']));
     disposers.push(runner);
     runner.onState = () => {};

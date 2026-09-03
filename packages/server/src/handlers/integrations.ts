@@ -1,4 +1,4 @@
-import { IntegrationBindRequest } from '@tacendum/shared';
+import { IntegrationBindRequest, Ulid } from '@tacendum/shared';
 import { LIMITS } from '../ratelimit.js';
 import { deleteHumanActivity } from '../activity.js';
 import { userRefForLog } from '../opaque-ref.js';
@@ -78,7 +78,12 @@ export const integrationRevokeHandler: AuthedHandler = async (event, deps, auth)
   if (retry > 0) return rateLimitedResult(retry);
 
   const target = event.pathParameters?.userId;
-  if (!target) return errorResult(400, 'invalid_request', 'missing integration userId');
+  // A ULID or a 400: the value is a users-table key on the next line, and an
+  // oversized one threw there (500). Shape refusal is not an oracle — it is
+  // the caller's own request being malformed.
+  if (!target || !Ulid.safeParse(target).success) {
+    return errorResult(400, 'invalid_request', 'integration userId must be a ULID');
+  }
 
   const row = await deps.db.getUserById(target);
   if (!row) {

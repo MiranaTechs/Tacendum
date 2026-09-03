@@ -144,9 +144,30 @@ describe('the sweep', () => {
     const attSweep = swept.filter(s => s.includes('DELETE FROM attachments'));
     expect(attSweep).toHaveLength(1);
     expect(attSweep[0]).toContain('attachments.direction');
-    const reaSweep = swept.filter(s => s.includes('DELETE FROM reactions'));
+    // Selected by the expiry join, not by the table alone: the
+    // sweep also issues the ORPHAN reap (`DELETE FROM reactions WHERE ts <=
+    // ? AND NOT EXISTS …`), which is a different statement with a different
+    // predicate — pinned separately just below. (This filter used to be the
+    // bare table name with `toHaveLength(1)`; rewritten deliberately.)
+    const reaSweep = swept.filter(
+      s => s.includes('DELETE FROM reactions') && s.includes('m.expiresAt'),
+    );
     expect(reaSweep).toHaveLength(1);
     expect(reaSweep[0]).toContain('reactions.targetDirection');
+    // The age reaps run BEFORE the transaction, on every sweep: they
+    // decide nothing the transaction's cascades do, and they must run
+    // whether or not a message is due.
+    const begin = swept.indexOf('BEGIN IMMEDIATE');
+    const orphanReap = swept.findIndex(
+      s => s.includes('DELETE FROM reactions') && s.includes('NOT EXISTS'),
+    );
+    const heldReap = swept.findIndex(
+      s => s.startsWith('DELETE FROM pending_revisions WHERE ts <= ?'),
+    );
+    expect(orphanReap).toBeGreaterThanOrEqual(0);
+    expect(orphanReap).toBeLessThan(begin);
+    expect(heldReap).toBeGreaterThanOrEqual(0);
+    expect(heldReap).toBeLessThan(begin);
   });
 
   it('opens no transaction when nothing is due', async () => {

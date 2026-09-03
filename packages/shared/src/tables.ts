@@ -105,3 +105,21 @@ export const TABLE_ENV_VARS = {
   reports: 'TACENDUM_TABLE_REPORTS',
   consentEdges: 'TACENDUM_TABLE_CONSENT_EDGES',
 } as const satisfies Record<TableKey, string>;
+
+/**
+ * The call-metric dedupe table — deliberately BESIDE `TABLES` /
+ * `TABLE_ENV_VARS`, not inside them: those name the tables EVERY application
+ * function receives (infra's stack suite pins that), and this one is
+ * injected into the HTTP function alone (pinned too). It used to exist only
+ * in CDK, under an env name hard-coded in the stack, the AWS adapter and the
+ * infra test, and the local table script never created it. One contract now:
+ * the stack keeps its literal (no CDK change), the adapter reads it from
+ * here, and `scripts/create-tables.ts` creates the local twin with the same
+ * key and TTL attribute the stack declares. */
+export const CALL_METRIC_DEDUPE_TABLE = {
+  name: 'tacendum_call_metric_dedupe',
+  envVar: 'TACENDUM_TABLE_CALL_METRIC_DEDUPE',
+  /** PK `key` (S) — the opaque dedupe key; never a report body or a caller. */
+  partitionKey: 'key',
+  ttlAttribute: 'expiresAt',
+} as const;

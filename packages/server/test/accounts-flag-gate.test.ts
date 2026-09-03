@@ -5,7 +5,7 @@ import { DeleteCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamod
 import { TABLES } from '@tacendum/shared';
 import { makeDocClient, makeDynamoClient } from '../src/db/client.js';
 import { TABLES as SERVER_TABLES } from '../src/db/tables.js';
-import { makeDataLayer, type DataLayer } from '../src/db/data.js';
+import { makeTestOnlyDataLayer, type TestOnlyDataLayer } from '../src/db/data.js';
 import { accountsRefusal, linkOfferInitRoute } from '../src/handlers/devices.js';
 import {
   deviceRevokeRoute,
@@ -34,7 +34,7 @@ import { activeEmailClaimKeys, activePhoneClaimKeys } from '../src/opaque-ref.js
 // key mapped to the wrong (or no) handler fails here, not in production.
 import { routes as httpDispatch } from '../src/aws/http.lambda.js';
 import { routes as authDispatch } from '../src/aws/auth.lambda.js';
-import { makeTestDeps, type TestDeps } from './helpers.js';
+import { makeTestDeps, type TestDeps, KEY_FIXTURE } from './helpers.js';
 
 /**
  * The `feature#accounts` flag gate: every accounts route added SO FAR is driven with the flag
@@ -55,7 +55,7 @@ import { makeTestDeps, type TestDeps } from './helpers.js';
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
 let doc: DynamoDBDocumentClient;
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 let flagOn = false;
 let phoneFlagOn = false;
@@ -66,7 +66,7 @@ let deps: TestDeps;
 beforeAll(async () => {
   const client = makeDynamoClient();
   doc = makeDocClient(client);
-  const base = makeDataLayer(doc);
+  const base = makeTestOnlyDataLayer(doc);
   db = {
     ...base,
     isAccountsFeatureEnabled: async () => flagOn,
@@ -275,8 +275,8 @@ describe('surfaces join the gate: group-aware behavior on the EXISTING bundle ro
         body: JSON.stringify({
           registrationId: 9,
           identityKey: idKey,
-          signedPrekey: { keyId: 1, pub: idKey, sig: idKey },
-          kyberPrekey: { keyId: 2, pub: idKey, sig: idKey },
+          signedPrekey: { keyId: 1, pub: KEY_FIXTURE.curvePub, sig: KEY_FIXTURE.sig },
+          kyberPrekey: { keyId: 2, pub: KEY_FIXTURE.kyberPub, sig: KEY_FIXTURE.sig },
           oneTimePrekeys: [],
         }),
       },

@@ -60,6 +60,14 @@ export const ACCOUNTS_COPY = {
    * not say which condition refused). */
   emailRefused:
     'That did not work. The code may be wrong or expired, or this address may already be linked elsewhere — the server deliberately does not say which. Request a fresh code to try again.',
+  /** A TRANSPORT failure (offline, DNS, a dead socket — accounts.ts's
+   * 'failed', never its 'refused'), said as what it is: the refusal
+   * sentence above would lie about a code that was never checked, and in a
+   * duress session every call fails this way (rule 15 — the offline cover
+   * story). The sibling decks' sentence (phone and handle), byte-for-byte —
+   * the handle class's word census keeps its name out of this deck, so it
+   * is named by role here. */
+  failed: 'Could not reach Tacendum. Check your connection and try again.',
   emailVerified: (address: string) => `${address} is linked to your account.`,
   emailUnlink: 'Remove this email',
   emailUnlinkConfirm: (address: string) =>
@@ -146,10 +154,42 @@ export const ACCOUNTS_COPY = {
   recoverCodeSent: (address: string) =>
     `If ${address} is linked to an account, a code is on its way. The answer here looks the same either way — only the inbox knows.`,
   recoverVerify: 'Start recovery',
+  /**
+   * The code field without a request: a code already in the inbox — from
+   * a tap on another device, or one this screen forgot. */
+  recoverHaveCode: 'I already have a code',
+  /** The resend cool-down, counted down ON the button: a tap inside the
+   * server's minute sends nothing and answers the same, so the button
+   * says how long the wait is instead of inviting the tap. One sentence
+   * for all three code surfaces (email attach, recovery, and the phone
+   * deck by reference). */
+  requestAgainIn: (clock: string) => `Send another code in ${clock}`,
   recoverRefused:
     'That did not work. The code may be wrong or expired, or this address may not be linked to an account — the server deliberately does not say which.',
   recoverPending: (completes: string) =>
     `Recovery is waiting until ${completes}. Any device still linked to the account has been told and can cancel it — a cancel wins, at any moment inside the wait.`,
+  /**
+   * The wait, relatively: a date three days out reads as a fact; "in 2 days
+   * 3 hours" reads as a wait. Beside the date, never instead of it. */
+  recoverPendingIn: (wait: string) => `Completes in ${wait}.`,
+  /** What happens if the person leaves: App.tsx re-enters this surface at
+   * every launch while the durable row exists (the pending-recovery
+   * routing) — said plainly, and no more than that. */
+  recoverPendingReturn:
+    'You can leave this screen. Tacendum brings you back here the next time it opens, until the recovery is completed or set aside.',
+  /** "2 days 3 hours" / "3 hours" / "12 minutes" / "less than a minute":
+   * the two largest units that are not zero, floored — a wait is never
+   * rounded up into a promise. */
+  waitLabel: (remainingMs: number): string => {
+    const unit = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+    const minutes = Math.floor(Math.max(0, remainingMs) / 60_000);
+    const days = Math.floor(minutes / 1_440);
+    const hours = Math.floor((minutes % 1_440) / 60);
+    if (days > 0) return hours > 0 ? `${unit(days, 'day')} ${unit(hours, 'hour')}` : unit(days, 'day');
+    if (hours > 0) return unit(hours, 'hour');
+    if (minutes > 0) return unit(minutes, 'minute');
+    return 'less than a minute';
+  },
   recoverComplete: 'Complete recovery',
   recoverNotYet: 'The waiting period has not passed yet.',
   recoverCompleteRefused:
@@ -164,11 +204,16 @@ export const ACCOUNTS_COPY = {
   recoverAbandonNote: `This clears the attempt from this ${DEVICE_NOUN} only. The request itself stays open on the server until it expires — and any device still linked to the account keeps seeing it and can cancel it.`,
 
   /* ── recovery notices (the surviving member's surface) ───────── */
+  // CLASS-NEUTRAL: the notice carries the device class only (linking.ts) —
+  // never which identifier class proved the code — so neither sentence may
+  // claim "your account's email". The phone class is dark for now, and
+  // a pin-OFF binary must not name it either; "an identifier linked to
+  // your account" is true of every class.
   noticeRequested: (slot: string, completes: string) =>
-    `Someone used your account’s email to claim this grouping as its ${slot}. If that is not you, cancel before ${completes} — your cancel wins.`,
+    `Someone used an identifier linked to your account to claim this grouping as its ${slot}. If that is not you, cancel before ${completes} — your cancel wins.`,
   noticeCancelAction: 'Cancel the recovery',
   noticeCancelled: 'The recovery was cancelled. Nothing changed.',
   noticeCancelFailed: 'The cancel did not go through. Try again — it wins at any moment inside the wait.',
   noticeCompleted: (slot: string) =>
-    `A recovery completed: a new device joined this account as its ${slot}. If that was not you, revoke it here and remove your email.`,
+    `A recovery completed: a new device joined this account as its ${slot}. If that was not you, revoke it here and remove the identifier it used from your account.`,
 } as const;

@@ -18,6 +18,9 @@ import { LIMITS } from '../ratelimit.js';
 /** Server-minted ids are 32 random bytes base64url (43 chars) — see Deps. */
 const ATTACHMENT_ID = /^[A-Za-z0-9_-]{43}$/;
 
+/** The unit of the daily byte window (LIMITS.attachmentBytesDaily). */
+const MIB = 1024 * 1024;
+
 // POST /v1/attachments -> { attachmentId, uploadUrl }
 export const createAttachmentHandler: AuthedHandler = async (event, deps, auth) => {
   const retry = await deps.rateLimit.take(`attach-create:${auth.userId}`, LIMITS.attachmentCreate);
@@ -25,6 +28,16 @@ export const createAttachmentHandler: AuthedHandler = async (event, deps, auth) 
 
   const parsed = parseJson(event, CreateAttachmentRequest);
   if (!parsed.ok) return parsed.result;
+
+  // THE DAILY BYTE WINDOW: whole MiB per mint, so a day's uploads are
+  // bounded in bytes and not only in count. Taken after the parse (the
+  // length is what is charged) and before the signed PUT exists.
+  const bytesRetry = await deps.rateLimit.take(
+    `attach-bytes:${auth.userId}`,
+    LIMITS.attachmentBytesDaily,
+    Math.ceil(parsed.data.contentLength / MIB),
+  );
+  if (bytesRetry > 0) return rateLimitedResult(bytesRetry);
 
   const attachmentId = deps.newAttachmentId();
   const uploadUrl = await deps.attachments.uploadUrl(attachmentId, parsed.data.contentLength);

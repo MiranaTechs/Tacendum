@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { deliverPushWake } from '../src/handlers/push-worker.js';
-import type { DataLayer } from '../src/db/data.js';
+import type { TestOnlyDataLayer } from '../src/db/data.js';
 import { makeMemoryDb, makeTestDeps, type TestDeps } from './helpers.js';
 
 /**
@@ -69,7 +69,7 @@ const SENDER = 'user-sender';
 const VOIP = 'v'.repeat(64);
 const MSG = '01JBQ0000000000000000000AA';
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: TestDeps;
 
 beforeEach(async () => {
@@ -200,7 +200,7 @@ describe('the denial-of-RING guard', () => {
             name: 'AccessDeniedException',
           });
         },
-      } as DataLayer,
+      } as TestOnlyDataLayer,
     };
     const event = { recipientId: ALICE, senderUserId: SENDER, wakeId: 'wake-5' };
 
@@ -255,7 +255,7 @@ describe("the claim's lifetime", () => {
             expires = expiresAt;
             await deps.db.markWakeRang(wakeId, expiresAt);
           },
-        } as DataLayer,
+        } as TestOnlyDataLayer,
       },
     };
   }
@@ -303,7 +303,7 @@ describe("the claim's lifetime", () => {
 
     // The wall clock, moved for real rather than a `now()` stubbed on one
     // function: `claimRang` and the twin's expiry check both read `Date.now()`
-    // (the DataLayer carries no clock — DynamoDB reaps server-side), so
+    // (the TestOnlyDataLayer carries no clock — DynamoDB reaps server-side), so
     // anything narrower would move one of them and not the other.
     vi.useFakeTimers();
 

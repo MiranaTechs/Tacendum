@@ -20,6 +20,11 @@ app/ios/build/
 .remember/
 .superpowers/
 .worktrees/
+# Local review output: screenshot captures and review PDFs (2026-08-31).
+# Local artefacts, not source — 2 MB of binaries that a plain `git add .`
+# would otherwise sweep into the tree. Anything from here that should ship
+# belongs in the tree by a deliberate move, not by accident.
+output/
 
 # stray tooling temp files
 _tmp_*

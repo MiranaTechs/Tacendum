@@ -154,6 +154,20 @@ function recordingScheduler(): {
   return { scheduler, armed, redials: () => armed.filter(a => a.delayMs !== WATCHDOG_MS) };
 }
 
+/**
+ * The backoff is JITTERED: the armed delay is the base times a CSPRNG factor
+ * in [0.5, 1.5), so a fleet that lost its sockets in one event does not come
+ * back as one wave. These tests used to pin the exact bases (1000, 2000,
+ * 4000); the POLICY they hold down — doubling, the cap, the reset — is now
+ * asserted on the base each delay was drawn from. */
+function expectBackoffBases(delays: number[], bases: number[]): void {
+  expect(delays).toHaveLength(bases.length);
+  for (let i = 0; i < bases.length; i++) {
+    expect(delays[i]!).toBeGreaterThanOrEqual(bases[i]! * 0.5);
+    expect(delays[i]!).toBeLessThan(bases[i]! * 1.5);
+  }
+}
+
 test('every reconnect is armed through the installed clock, and the JS timer wheel alone dials nothing', () => {
   const { scheduler, redials } = recordingScheduler();
   setWsWakeScheduler(scheduler);
@@ -164,7 +178,7 @@ test('every reconnect is armed through the installed clock, and the JS timer whe
   drop();
 
   expect(redials()).toHaveLength(1);
-  expect(redials()[0]!.delayMs).toBe(1000);
+  expectBackoffBases([redials()[0]!.delayMs], [1000]);
 
   // THE DEFECT, STATED AS AN ASSERTION. This is the paused Activity: the frame
   // callback is gone, so the timer wheel is parked. Sixty seconds of it must
@@ -190,9 +204,10 @@ test('the backoff still climbs, one wake at a time', () => {
     drop();
     redials()[redials().length - 1]!.fire();
   }
-  // 1s, 2s, 4s — the same exponential the setTimeout path always had. Moving
-  // the clock must not move the policy.
-  expect(redials().map(a => a.delayMs)).toEqual([1000, 2000, 4000]);
+  // 1s, 2s, 4s bases — the same exponential the setTimeout path always had
+  // (each jittered, see expectBackoffBases). Moving the clock must not move
+  // the policy.
+  expectBackoffBases(redials().map(a => a.delayMs), [1000, 2000, 4000]);
   // ...and never two wakes for one drop.
   expect(FakeSocket.instances).toHaveLength(4);
 
@@ -245,7 +260,7 @@ test('a connection that LASTED resets the backoff even though the healthy timer 
   redials()[0]!.fire();
   drop();
   redials()[1]!.fire();
-  expect(redials().map(a => a.delayMs)).toEqual([1000, 2000]);
+  expectBackoffBases(redials().map(a => a.delayMs), [1000, 2000]);
 
   // The third dial works, and the app goes in a pocket. `armHealthy` is a
   // `setTimeout` — it is one of the timers the Activity parks — so the wall
@@ -257,7 +272,7 @@ test('a connection that LASTED resets the backoff even though the healthy timer 
   // `probed`/`minted` are refunded on, so the next dial deserves the base
   // delay rather than the ceiling an outage six seconds ago had climbed to.
   drop();
-  expect(redials()[2]!.delayMs).toBe(1000);
+  expectBackoffBases([redials()[2]!.delayMs], [1000]);
 
   client.stop();
 });
@@ -276,7 +291,7 @@ test('...and a connection that did NOT last leaves the backoff climbing', () => 
   live().onopen?.();
   jest.setSystemTime(Date.now() + 500);
   drop();
-  expect(redials().map(a => a.delayMs)).toEqual([1000, 2000]);
+  expectBackoffBases(redials().map(a => a.delayMs), [1000, 2000]);
 
   client.stop();
 });
@@ -321,7 +336,7 @@ test('the service is asked for the wake, and the parked timer cannot dial a seco
   drop();
 
   expect(wakes).toHaveLength(1);
-  expect(wakes[0]!.delayMs).toBe(1000);
+  expectBackoffBases([wakes[0]!.delayMs], [1000]);
   expect(FakeSocket.instances).toHaveLength(1);
 
   // The Activity is paused, so this event — the same `emitDeviceEvent` route
@@ -466,7 +481,7 @@ test('a dial that neither opens nor closes is written off, and the socket goes b
   // and back to the queue at the base delay.
   expect(states).toEqual(['connecting', 'closed']);
   expect(redials()).toHaveLength(1);
-  expect(redials()[0]!.delayMs).toBe(1000);
+  expectBackoffBases([redials()[0]!.delayMs], [1000]);
 
   redials()[0]!.fire();
   expect(FakeSocket.instances).toHaveLength(2);
@@ -528,7 +543,7 @@ test('a renewal landing mid-dial never leaves the client with nothing armed (the
   // property the wedge destroyed.
   watchdogs[1]!.fire();
   expect(redials()).toHaveLength(1);
-  expect(redials()[0]!.delayMs).toBe(1000);
+  expectBackoffBases([redials()[0]!.delayMs], [1000]);
 
   client.stop();
 });

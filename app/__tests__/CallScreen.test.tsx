@@ -621,14 +621,33 @@ describe('controls are usable with VoiceOver', () => {
     expect(renderScreen({ muted: true }).byLabel('Unmute')).toBeTruthy();
   });
 
+  // The two cases below render a call that NEGOTIATED video (`video: true`).
+  // They used to render the default audio-negotiated state and still find
+  // the camera controls, which pinned an audio call has no video m-line, no
+  // local track and no renegotiation path, so offering the camera there lied
+  // locally and blacked out the peer. The controls are now offered only on a
+  // call that carries video.
   it('disables flip camera when the camera is off', () => {
-    const { byLabel } = renderScreen({ videoEnabled: false });
+    const { byLabel } = renderScreen({ state: state({ video: true }), videoEnabled: false });
     expect(byLabel('Flip camera').props.accessibilityState.disabled).toBe(true);
   });
 
   it('gives every control a label', () => {
-    const { byLabel } = renderScreen({ videoEnabled: true });
+    const { byLabel } = renderScreen({ state: state({ video: true }), videoEnabled: true });
     for (const label of ['Mute', 'Turn camera off', 'Flip camera', 'Speaker on', 'End call']) {
+      expect(byLabel(label)).toBeTruthy();
+    }
+  });
+
+  it('offers no camera control on a call that negotiated no video', () => {
+    // Placed as audio, or a video invite answered without video: there is no
+    // transceiver for a camera to feed, so there is no camera button and no
+    // flip. Mute, speaker and End remain.
+    const { byLabel } = renderScreen({ state: state({ video: false }), videoEnabled: false });
+    expect(byLabel('Turn camera on')).toBeUndefined();
+    expect(byLabel('Turn camera off')).toBeUndefined();
+    expect(byLabel('Flip camera')).toBeUndefined();
+    for (const label of ['Mute', 'Speaker on', 'End call']) {
       expect(byLabel(label)).toBeTruthy();
     }
   });

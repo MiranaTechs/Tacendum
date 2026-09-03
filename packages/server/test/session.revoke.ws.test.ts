@@ -11,7 +11,7 @@ import { deleteAccountHandler } from '../src/handlers/account.js';
 import { authChallengeHandler, authHandler } from '../src/handlers/auth-account.js';
 import { wsConnectHandler, wsDefaultHandler, type WsDeps } from '../src/handlers/ws.js';
 import { makeSessionGuard } from '../src/handlers/session-guard.js';
-import { sessionTokenDigest, type DataLayer } from '../src/db/data.js';
+import { sessionTokenDigest, type TestOnlyDataLayer } from '../src/db/data.js';
 import type { HttpEvent } from '../src/handlers/http.js';
 import {
   makeMemoryDb,
@@ -41,7 +41,7 @@ import {
 
 const B64 = 'Y2lwaGVydGV4dA==';
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: TestDeps;
 let wsDeps: WsDeps;
 let sender: {

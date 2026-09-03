@@ -415,3 +415,84 @@ test('the jump bar stands down while a message is selected — it was covering t
     tree.root.findAllByProps({ testID: 'jump-latest' }).length,
   ).toBeGreaterThan(0);
 });
+
+test('the mic leaves the send slot while a take is recording or waiting, and a double tap starts one take', async () => {
+  // The mic was gated on "nothing to send" only, so it stayed live under
+  // the recording bar — and a tap there started a second take over the one
+  // in progress, or over a finished take waiting to be sent.
+  const tree = await renderThread();
+  const mic = tree.root
+    .findAllByProps({ testID: 'composer-mic' })
+    .find(n => n.props.onPress);
+  expect(mic).toBeDefined();
+
+  // Two taps inside one frame: one recorder.
+  await ReactTestRenderer.act(async () => {
+    mic!.props.onPress();
+    mic!.props.onPress();
+  });
+  expect(audio.startRecording).toHaveBeenCalledTimes(1);
+
+  // Recording: the slot holds no mic.
+  expect(tree.root.findAllByProps({ testID: 'composer-mic' })).toHaveLength(0);
+  expect(tree.root.findAllByProps({ testID: 'voice-stop' }).length).toBeGreaterThan(0);
+
+  await press(tree, 'voice-stop');
+  // A take waiting to be sent: still no mic — nothing can overwrite it.
+  expect(renderedText(tree)).toContain('Ready to send');
+  expect(tree.root.findAllByProps({ testID: 'composer-mic' })).toHaveLength(0);
+
+  await press(tree, 'voice-discard');
+  // Discarded: the recorder is free and the mic is back.
+  expect(tree.root.findAllByProps({ testID: 'composer-mic' }).length).toBeGreaterThan(0);
+});
+
+test('a playback tick repaints the playing row and no other bubble', async () => {
+  // The play head reached every row, so the
+  // 4 Hz progress tick re-rendered every visible bubble. Text bubbles run
+  // the link tokenizer on every paint, which makes it the honest counter
+  // for "was this bubble repainted".
+  const links = jest.requireActual('../src/linkRuns') as typeof import('../src/linkRuns');
+  const tokenize = jest.spyOn(links, 'linkRuns');
+  const TEXT_A = {
+    msgId: '01TEXTA',
+    peerId: 'peer-1',
+    direction: 'in',
+    body: 'a few words',
+    ts: T0 + 120_000,
+    status: 'received',
+  };
+  const TEXT_B = {
+    msgId: '01TEXTB',
+    peerId: 'peer-1',
+    direction: 'out',
+    body: 'a few more',
+    ts: T0 + 180_000,
+    status: 'sent',
+  };
+  const instance = sqlite.instances.get('tacendum.sqlite')!;
+  const current = instance.execute.getMockImplementation()!;
+  instance.execute.mockImplementation(async (sql: string, params?: unknown) => {
+    if (String(sql).includes('FROM messages')) {
+      return { rows: [VOICE_IN, VOICE_OUT, TEXT_A, TEXT_B] };
+    }
+    return current(sql, params);
+  });
+  audio.__audio.decodedSeconds = 95;
+  const tree = await renderThread();
+  expect(tree.root.findAllByProps({ testID: 'msg-01TEXTA' }).length).toBeGreaterThan(0);
+
+  await press(tree, 'voice-01VOICEIN-in');
+  await ReactTestRenderer.act(async () => {});
+  const painted = tokenize.mock.calls.length;
+  expect(painted).toBeGreaterThan(0);
+
+  await ReactTestRenderer.act(async () => {
+    audio.__audio.emitPlaybackProgress(12);
+  });
+  // The playing row moved on…
+  expect(renderedText(tree)).toContain('0:12');
+  // …and no text bubble was painted for it.
+  expect(tokenize.mock.calls.length).toBe(painted);
+  tokenize.mockRestore();
+});

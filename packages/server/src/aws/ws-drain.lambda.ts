@@ -193,7 +193,9 @@ export async function handler(
   const drained = await drainQueuedMessages(
     userId,
     connectionId,
-    { db, sender: senderFor(domainName, stage), now },
+    // `log` carries the drain's own best-effort events (a delivered receipt
+    // the sender's socket refused) — routing metadata only, rule 4.
+    { db, sender: senderFor(domainName, stage), now, log: (event, fields) => log.info(event, fields) },
     budget,
     afterMsgId,
     sessionDigest !== undefined ? { guard, digest: sessionDigest } : undefined,

@@ -402,3 +402,59 @@ test('EVERY seam that stops messaging first ends a live 1:1 call (the disposeGro
     files.filter(f => /^\s*messaging\.stop\(\);\s*$/m.test(fs.readFileSync(f, 'utf8'))).length,
   ).toBeGreaterThanOrEqual(2);
 });
+
+test('backgrounding during a live GROUP session keeps the socket; the session ending while backgrounded pauses it', async () => {
+  // The backgrounding handler consulted the 1:1 machine only: a live
+  // small-group session — N legs on the same socket — was paused under,
+  // and every ICE restart, hangup, gleave and call.end stopped until the
+  // 30 s reconnect window expired. The post-call pause had the same blind
+  // spot in the other direction: nothing revisited the decision when the
+  // SESSION ended while backgrounded. Mutations caught: restore the bare
+  // `callRef.current.name === 'idle'` at the backgrounding site (the first
+  // expectation fails); drop the `groupSessionKey` effect (the last does).
+  const SELF = '01HQ5E1F00000000000000000A';
+  const tree = await renderApp();
+  for (const key of ['1', '2', '3', '4', '5', '6']) {
+    await press(tree, `pin-key-${key}`);
+  }
+  await press(tree, 'pin-submit');
+  await ReactTestRenderer.act(flush);
+
+  // A live group session through the REAL coordinator and wiring: this
+  // device starts a call to PEER. The transport and the block checks are
+  // spied exactly as call.wiring.test.ts spies them.
+  jest.spyOn(messaging, 'sendGroupCallEnvelope').mockResolvedValue(undefined);
+  jest.spyOn(messaging, 'isBlockedLocally').mockReturnValue(false);
+  jest.spyOn(messaging, 'isPeerBlocked').mockReturnValue(false);
+  calling.setSelfAccountId(SELF);
+  await ReactTestRenderer.act(async () => {
+    await calling.startGroupCall([PEER], false);
+    await calling.groupCall().whenIdle();
+    await flush();
+  });
+  expect(calling.groupCallView()).not.toBeNull();
+  expect(calling.callController().state.name).toBe('idle');
+
+  const pause = jest.spyOn(messaging, 'pause');
+  // Background with the session live: the socket is its signalling path.
+  await transition('background');
+  expect(pause).not.toHaveBeenCalled();
+
+  // The session ends while still backgrounded: the skipped pause is taken.
+  Object.defineProperty(AppState, 'currentState', {
+    value: 'background',
+    configurable: true,
+  });
+  try {
+    await ReactTestRenderer.act(async () => {
+      await calling.groupCall().hangup();
+      await calling.groupCall().whenIdle();
+      await flush();
+    });
+    expect(calling.groupCallView()).toBeNull();
+    expect(pause).toHaveBeenCalled();
+  } finally {
+    delete (AppState as unknown as Record<string, unknown>).currentState;
+    calling.setSelfAccountId(null);
+  }
+});

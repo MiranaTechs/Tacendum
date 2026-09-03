@@ -96,23 +96,53 @@ function defaultDeps(): PeerDevicesDeps {
 /**
  * Record a contact's own identity at the TOFU moment (first bundle fetch —
  * the same moment processPreKeyBundle pins it natively). Never overwrites a
- * recorded key: a different key for the same ULID is the identityChanged
- * path's business, not a silent re-pin.
- */
+ * recorded key on its own: a different key for the same ULID is the
+ * identityChanged path's business, not a silent re-pin.
+ *
+ * TWO WAYS PAST THAT RULE, both owned by the accepted-identity-change path:
+ * `force` re-pins outright, and a row whose key was UNPINNED
+ * (`forgetPeerIdentity` — the empty key) takes the next served key exactly
+ * as a first contact would. Either way the row keeps its place in the
+ * device set (anchor, class, state, certs): what changed is the key, not
+ * the relationship. */
 export async function recordPeerIdentity(
   userId: string,
   identityKeyPub: string,
   deps: PeerDevicesDeps = defaultDeps(),
+  opts: { force?: boolean } = {},
 ): Promise<void> {
   const existing = await deps.db.getPeerDevice(userId);
-  if (existing) return;
+  if (existing && existing.identityKeyPub !== '' && !opts.force) return;
   await deps.db.upsertPeerDevice({
     userId,
-    anchorId: userId,
-    class: 'unknown',
-    state: 'linked',
+    anchorId: existing?.anchorId ?? userId,
+    class: existing?.class ?? 'unknown',
+    state: existing?.state ?? 'linked',
     identityKeyPub,
-    certsJson: '',
+    certsJson: existing?.certsJson ?? '',
+    updatedAt: deps.now(),
+  });
+}
+
+/**
+ * UNPIN a contact's recorded key — the roster half of accepting a changed
+ * safety number. The native TOFU pin is cleared by `resetPeer`; this row is
+ * what verifies a signed `x.acct.notice` from the contact and what vouches
+ * for their cross-signed siblings, and a key the human just retired must do
+ * neither. An empty key is refused by every verifier here
+ * (`applyPeerMutationNotice` drops, `applyServedRoster` does not trust it),
+ * so the failure direction while unpinned is the safe one, and the next
+ * served bundle re-pins through `recordPeerIdentity`'s empty-key path. A
+ * no-op for an unknown contact: there is nothing to forget. */
+export async function forgetPeerIdentity(
+  userId: string,
+  deps: PeerDevicesDeps = defaultDeps(),
+): Promise<void> {
+  const existing = await deps.db.getPeerDevice(userId);
+  if (!existing || existing.identityKeyPub === '') return;
+  await deps.db.upsertPeerDevice({
+    ...existing,
+    identityKeyPub: '',
     updatedAt: deps.now(),
   });
 }

@@ -88,7 +88,6 @@ interface Engine {
   prepare(sql: string): { all(...args: unknown[]): Row[] };
   close(): void;
 }
-// eslint-disable-next-line @typescript-eslint/no-var-requires
 const { DatabaseSync } = require('node:sqlite') as {
   DatabaseSync: new (p: string) => Engine;
 };

@@ -3,7 +3,7 @@ import { ListTablesCommand } from '@aws-sdk/client-dynamodb';
 import { DeleteCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { TABLES, type ServerFrame } from '@tacendum/shared';
 import { makeDocClient, makeDynamoClient } from '../src/db/client.js';
-import { makeDataLayer, type DataLayer } from '../src/db/data.js';
+import { makeTestOnlyDataLayer, type TestOnlyDataLayer } from '../src/db/data.js';
 import {
   drainQueuedMessages,
   wsDefaultHandler,
@@ -26,7 +26,7 @@ import { allQueued, makeTestDeps, type TestDeps } from './helpers.js';
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
 let doc: DynamoDBDocumentClient;
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 
 /** Run-unique, digits-only (valid Crockford base32) ULIDs, so reruns against a
@@ -80,7 +80,7 @@ let scheduled: Array<{
 beforeAll(async () => {
   const client = makeDynamoClient();
   doc = makeDocClient(client);
-  db = makeDataLayer(doc);
+  db = makeTestOnlyDataLayer(doc);
   try {
     const { TableNames = [] } = await client.send(new ListTablesCommand({}));
     available = TableNames.includes(TABLES.users);

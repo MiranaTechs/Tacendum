@@ -6,6 +6,9 @@ import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import androidx.annotation.ChecksSdkIntAtLeast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 
@@ -40,6 +43,17 @@ internal object CallNotifications {
 
   const val ACTION_ANSWER = "com.miranatechnologies.tacendum.call.ANSWER"
   const val ACTION_DECLINE = "com.miranatechnologies.tacendum.call.DECLINE"
+
+  /**
+   * `Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT` (API 34), written out
+   * so the file reads honestly on the minSdk-26 floor — the AudioPolicy idiom
+   * for the API-31 modes. `FullScreenIntentGateTest` pins it to the SDK's own
+   * constant, so it cannot drift.
+   */
+  const val ACTION_MANAGE_FULL_SCREEN_INTENT =
+      "android.settings.MANAGE_APP_USE_FULL_SCREEN_INTENT"
+
+  private const val FULL_SCREEN_SETTINGS_REQUEST = 1
 
   /**
    * The number the launcher should draw.
@@ -126,34 +140,103 @@ internal object CallNotifications {
 
   @Volatile private var silenced = false
 
-  private fun buildRing(context: Context, cid: String, name: String) =
-      NotificationCompat.Builder(context, RING_CHANNEL)
-          .setSmallIcon(android.R.drawable.sym_call_incoming)
-          .setContentTitle(name)
-          .setContentText("Incoming call")
-          .setCategory(NotificationCompat.CATEGORY_CALL)
-          .setPriority(NotificationCompat.PRIORITY_HIGH)
-          .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-          .setOngoing(true)
-          .setAutoCancel(false)
-          .setSilent(silenced)
-          // `true` for the highPriority argument: without it the full-screen
-          // intent degrades to a heads-up banner, which is the difference
-          // between a phone that rings from a locked screen and one that
-          // shows a card nobody sees.
-          .setFullScreenIntent(launchIntent(context), true)
-          .addAction(
-              android.R.drawable.sym_call_incoming,
-              "Answer",
-              actionIntent(context, ACTION_ANSWER, cid),
-          )
-          .addAction(
-              android.R.drawable.sym_call_missed,
-              "Decline",
-              actionIntent(context, ACTION_DECLINE, cid),
-          )
-          .setContentIntent(launchIntent(context))
-          .build()
+  private fun buildRing(context: Context, cid: String, name: String): android.app.Notification {
+    val builder =
+        NotificationCompat.Builder(context, RING_CHANNEL)
+            .setSmallIcon(android.R.drawable.sym_call_incoming)
+            .setContentTitle(name)
+            .setContentText("Incoming call")
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOngoing(true)
+            .setAutoCancel(false)
+            .setSilent(silenced)
+            // `true` for the highPriority argument: without it the full-screen
+            // intent degrades to a heads-up banner, which is the difference
+            // between a phone that rings from a locked screen and one that
+            // shows a card nobody sees.
+            .setFullScreenIntent(launchIntent(context), true)
+            .addAction(
+                android.R.drawable.sym_call_incoming,
+                "Answer",
+                actionIntent(context, ACTION_ANSWER, cid),
+            )
+            .addAction(
+                android.R.drawable.sym_call_missed,
+                "Decline",
+                actionIntent(context, ACTION_DECLINE, cid),
+            )
+            .setContentIntent(launchIntent(context))
+    if (!fullScreenIntentPermitted(context)) {
+      // The app-op is revoked, so the system will drop the full-screen
+      // intent above and this ring is a heads-up card. Answer and Decline
+      // still work from it; the third action is the way back to a ring that
+      // takes the lock screen — this app's own page under the system's
+      // full-screen-intent setting. A Settings row that makes the state
+      // discoverable outside a live ring is the ui-account follow-up; until
+      // it lands, the ring itself is where the person learns why the phone
+      // did not light up.
+      builder.addAction(
+          android.R.drawable.ic_menu_preferences,
+          "Allow full-screen ring",
+          fullScreenIntentSettingsIntent(context),
+      )
+    }
+    return builder.build()
+  }
+
+  /**
+   * From API 34 `USE_FULL_SCREEN_INTENT` is also an app-op the person (or
+   * Play, for an app it does not class as a caller) can revoke, and a ring
+   * posted under a revoked op degrades SILENTLY to a heads-up card: a
+   * locked phone never rings and nothing says why. This asks the platform
+   * before every post — the answer can change between two rings — and the
+   * verdict decides whether the ring carries the Settings action in
+   * [buildRing]. Nothing is logged: the call path keeps no logs at all,
+   * and a verdict is not worth the first one. */
+  fun fullScreenIntentPermitted(context: Context): Boolean =
+      fullScreenIntentPermitted(Build.VERSION.SDK_INT) {
+        val manager = context.getSystemService(NotificationManager::class.java)
+        manager?.canUseFullScreenIntent() ?: true
+      }
+
+  /**
+   * The decision with its platform edges injected, in `TelecomGuard`'s shape,
+   * so the JVM suite (`FullScreenIntentGateTest`) pins what no emulator run
+   * demonstrates: below 34 the reader is NEVER consulted — the method does
+   * not exist there and a call would be a NoSuchMethodError on a device in
+   * someone's hand — and a reader that THROWS reads as permitted, so a
+   * broken read can only leave the ring exactly as it always was, never add
+   * a Settings action to a ring that would have taken the lock screen on its
+   * own.
+   */
+  @ChecksSdkIntAtLeast(api = Build.VERSION_CODES.UPSIDE_DOWN_CAKE, lambda = 1)
+  fun fullScreenIntentPermitted(sdkInt: Int, canUse: () -> Boolean): Boolean {
+    if (sdkInt < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return true
+    return try {
+      canUse()
+    } catch (unreadable: Exception) {
+      true
+    }
+  }
+
+  /**
+   * This app's page under the system's full-screen-intent setting. The
+   * `package:` data URI is the contract of that Settings action; NEW_TASK
+   * because a notification action starts it from no activity of ours.
+   */
+  private fun fullScreenIntentSettingsIntent(context: Context): PendingIntent {
+    val intent = Intent(ACTION_MANAGE_FULL_SCREEN_INTENT)
+    intent.data = Uri.fromParts("package", context.packageName, null)
+    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    return PendingIntent.getActivity(
+        context,
+        FULL_SCREEN_SETTINGS_REQUEST,
+        intent,
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+  }
 
   /**
    * The app's own launcher intent, resolved from the package manager rather

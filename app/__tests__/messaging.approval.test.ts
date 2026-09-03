@@ -91,6 +91,7 @@ jest.mock('../src/db', () => ({
   listChats: jest.fn(),
   listMessages: jest.fn(),
   listAttachments: jest.fn(),
+  listAttachmentMeta: jest.fn(),
   listRecentMessages: jest.fn(),
   listHeldRevisions: jest.fn(),
   takeHeldRevision: jest.fn(),
@@ -191,6 +192,7 @@ beforeEach(async () => {
   db.listChats!.mockResolvedValue([]);
   db.listMessages!.mockResolvedValue([]);
   db.listAttachments!.mockResolvedValue([]);
+  db.listAttachmentMeta!.mockResolvedValue([]);
   db.listRecentMessages!.mockResolvedValue([]);
   db.listHeldRevisions!.mockResolvedValue([]);
   db.listIdentityChanged!.mockResolvedValue([]);

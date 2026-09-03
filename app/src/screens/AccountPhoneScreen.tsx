@@ -9,6 +9,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import { PENDING_CODE_TTL_MS, formatResendClock, resendWaitMs } from '../accounts';
 import * as accountsPhone from '../accountsPhone';
 import { ACCOUNTS_PHONE_COPY } from '../accountsPhoneCopy';
 import * as db from '../db';
@@ -61,6 +62,14 @@ interface Props {
  *    toll-free review criteria list their absence at the opt-in as a
  *    denial reason).
  */
+/** Whether a code requested at `requestedAt` can still be entered — the
+ * AccountEmailScreen helper, per class. */
+function codeWindowOpenAt(requestedAt: number | null, now: number): boolean {
+  if (requestedAt == null) return false;
+  const age = now - requestedAt;
+  return age >= 0 && age < PENDING_CODE_TTL_MS;
+}
+
 export function AccountPhoneScreen({ onBack }: Props) {
   const t = useTheme();
   const keyboardInset = useKeyboardInset();
@@ -79,12 +88,26 @@ export function AccountPhoneScreen({ onBack }: Props) {
   // still checked, and unchecking it re-darkens the send) — consent here is
   // per visit, not per send.
   const [smsConsent, setSmsConsent] = useState(false);
+  /**
+   * When THIS mount last sent a code — the email screen's memory, per class;
+   * the row carries the same moment after the refresh. */
+  const [sentAt, setSentAt] = useState<number | null>(null);
 
   const refresh = useCallback(() => {
     void db
       .loadPhoneIdentifier()
       .then(row => {
         setIdentifier(row);
+        // The durable pending row is this screen's context after a relaunch
+        // — the email screen's restore, per class: prefill an EMPTY draft,
+        // and re-say the code-sent notice while the code lives.
+        if (row?.phone == null && row?.pendingPhone != null) {
+          const pendingPhone = row.pendingPhone;
+          setNumberDraft(draft => (draft === '' ? pendingPhone : draft));
+          if (codeWindowOpenAt(row.pendingRequestedAt, Date.now())) {
+            setNotice(current => current ?? ACCOUNTS_PHONE_COPY.numberCodeSent(pendingPhone));
+          }
+        }
         setLoaded(true);
       })
       .catch(() => setLoaded(true));
@@ -110,13 +133,18 @@ export function AccountPhoneScreen({ onBack }: Props) {
     run(async () => {
       const outcome = await accountsPhone.requestPhoneAttachCode(numberDraft);
       if (outcome === 'sent') {
+        setSentAt(Date.now());
         setNotice(ACCOUNTS_PHONE_COPY.numberCodeSent(numberDraft.trim()));
       } else {
         setNotice(null);
+        // A transport failure is not a refusal: nothing was checked, so
+        // the refusal sentence would lie.
         setError(
           outcome === 'invalid'
             ? ACCOUNTS_PHONE_COPY.numberInvalid
-            : ACCOUNTS_PHONE_COPY.numberRefused,
+            : outcome === 'failed'
+              ? ACCOUNTS_PHONE_COPY.failed
+              : ACCOUNTS_PHONE_COPY.numberRefused,
         );
       }
     });
@@ -130,7 +158,9 @@ export function AccountPhoneScreen({ onBack }: Props) {
         setNotice(null);
         setCodeDraft('');
       } else {
-        setError(ACCOUNTS_PHONE_COPY.numberRefused);
+        setError(
+          outcome === 'failed' ? ACCOUNTS_PHONE_COPY.failed : ACCOUNTS_PHONE_COPY.numberRefused,
+        );
       }
     });
 
@@ -162,12 +192,39 @@ export function AccountPhoneScreen({ onBack }: Props) {
     }
   };
 
+  const verified = identifier?.phone != null;
+  const pending = !verified && identifier?.pendingPhone != null;
+  // The code field exists only while the code can still be entered: a
+  // field for a code that expired days ago is a dead end, while "Send
+  // another code" stays live from the same row.
+  const codeWindowOpen =
+    pending && codeWindowOpenAt(identifier?.pendingRequestedAt ?? null, Date.now());
+  // The boundary re-render (the email screen's timer), ABOVE the dark-pin
+  // return: a hook after a conditional return breaks the rules of hooks.
+  const [, setClockTick] = useState(0);
+  useEffect(() => {
+    if (!codeWindowOpen) return;
+    const closesAt = (identifier?.pendingRequestedAt ?? 0) + PENDING_CODE_TTL_MS;
+    const timer = setTimeout(
+      () => setClockTick(n => n + 1),
+      Math.max(250, closesAt - Date.now() + 250),
+    );
+    return () => clearTimeout(timer);
+  });
+  // THE RESEND MINUTE on the button — the email screen's countdown, per
+  // class (the server's phoneResend budget is the same 60 s).
+  const resendFrom =
+    Math.max(sentAt ?? 0, identifier?.pendingRequestedAt ?? 0) || null;
+  const resendWait = resendWaitMs(resendFrom, Date.now());
+  useEffect(() => {
+    if (resendWait <= 0) return;
+    const timer = setTimeout(() => setClockTick(n => n + 1), Math.min(1_000, resendWait));
+    return () => clearTimeout(timer);
+  });
+
   // THE BUILD-PIN GATE, on the surface itself as well as its doors: a dark build
   // renders NOTHING here even when the route is entered programmatically.
   if (!PHONE_UI_ENABLED) return null;
-
-  const verified = identifier?.phone != null;
-  const pending = !verified && identifier?.pendingPhone != null;
 
   return (
     <View
@@ -286,12 +343,14 @@ export function AccountPhoneScreen({ onBack }: Props) {
             </View>
             <PrimaryButton
               label={
-                pending
-                  ? ACCOUNTS_PHONE_COPY.numberRequestAgain
-                  : ACCOUNTS_PHONE_COPY.numberRequest
+                resendWait > 0
+                  ? ACCOUNTS_PHONE_COPY.numberRequestAgainIn(formatResendClock(resendWait))
+                  : pending
+                    ? ACCOUNTS_PHONE_COPY.numberRequestAgain
+                    : ACCOUNTS_PHONE_COPY.numberRequest
               }
               onPress={requestCode}
-              disabled={busy || numberDraft.trim() === '' || !smsConsent}
+              disabled={busy || numberDraft.trim() === '' || !smsConsent || resendWait > 0}
               testID="account-number-request"
             />
             {/* TEACHING, behind the ⓘ (house style): the phone class's
@@ -303,7 +362,7 @@ export function AccountPhoneScreen({ onBack }: Props) {
               lines={ACCOUNTS_PHONE_COPY.numberCodeBudget}
               testID="account-number-code-budget"
             />
-            {pending ? (
+            {codeWindowOpen ? (
               <>
                 <TextInput
                   value={codeDraft}
@@ -313,6 +372,8 @@ export function AccountPhoneScreen({ onBack }: Props) {
                   accessibilityLabel={ACCOUNTS_PHONE_COPY.codePlaceholder}
                   keyboardType="number-pad"
                   maxLength={6}
+                  autoComplete="one-time-code"
+                  textContentType="oneTimeCode"
                   testID="account-number-code"
                   style={[
                     t.type.utilityData,

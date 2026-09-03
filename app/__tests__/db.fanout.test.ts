@@ -281,3 +281,107 @@ describe('the leg ledger (receipt aggregation through outbox.localMsgId)', () =>
     expect(rows.map(r => r.msgId)).toEqual(['LIVE']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// a plain 1:1 send takes a `seq` too. It used to be enqueued with `seq` NULL,
+// which the flush order reads as 0 — so every plain send sorted ahead of
+// every fan-out and room leg, however old.
+// ---------------------------------------------------------------------------
+
+describe('enqueueOutgoing allocates the flush order', () => {
+  it('reads MAX(seq) INSIDE the transaction and binds base + 1 on the outbox row', async () => {
+    const instance = sqlite.instances.get(REAL)!;
+    const original = instance.execute.getMockImplementation()!;
+    instance.execute.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (/SELECT COALESCE\(MAX\(seq\), 0\) AS base FROM outbox/.test(String(sql))) {
+        return { rows: [{ base: 7 }] };
+      }
+      return original(sql, params);
+    });
+    const later = since();
+    const argsLater = callsSince();
+    await db.enqueueOutgoing(
+      { msgId: '01PLAIN00000000000000000AA', peerId: '01MBR001000000000000000000', direction: 'out', body: 'hi', ts: AT, status: 'pending' },
+      { msgType: 'ciphertext', payload: 'QQQQ' },
+    );
+    instance.execute.mockImplementation(original);
+    const sql = later();
+    // The allocation is part of the atomic write, not a read beside it: a
+    // crash or a concurrent enqueue cannot hand two rows the same number.
+    const begin = sql.indexOf('BEGIN IMMEDIATE');
+    const alloc = sql.findIndex(s => s.includes('COALESCE(MAX(seq), 0) AS base'));
+    const commit = sql.indexOf('COMMIT');
+    expect(begin).toBeGreaterThanOrEqual(0);
+    expect(alloc).toBeGreaterThan(begin);
+    expect(commit).toBeGreaterThan(alloc);
+    const insert = argsLater().find(c => String(c[0]).includes('INSERT OR IGNORE INTO outbox'))!;
+    expect(String(insert[0])).toMatch(/notify, seq\)/);
+    expect((insert[1] as unknown[]).at(-1)).toBe(8);
+  });
+});
+
+describe('flush order honours age across kinds (real engine)', () => {
+  type Row = Record<string, unknown>;
+  interface Engine {
+    prepare(sql: string): { all(...args: unknown[]): Row[] };
+    close(): void;
+  }
+  const { DatabaseSync } = require('node:sqlite') as {
+    DatabaseSync: new (p: string) => Engine;
+  };
+  let engine: Engine;
+
+  beforeEach(async () => {
+    await db.close();
+    engine = new DatabaseSync(':memory:');
+    const instance = sqlite.instances.get(REAL)!;
+    instance.execute.mockImplementation(async (sql: unknown, params?: unknown[]) => {
+      const args = (params ?? []).map(p => (p === undefined ? null : p));
+      const rows = engine.prepare(String(sql)).all(...args);
+      const changes = engine.prepare('SELECT changes() AS c').all()[0]!.c as number;
+      return { rows, rowsAffected: changes };
+    });
+    await db.initDb();
+  });
+
+  afterEach(async () => {
+    await db.close();
+    engine.close();
+  });
+
+  const PLAIN = '01PLAIN00000000000000000AA';
+  const plain = () =>
+    db.enqueueOutgoing(
+      { msgId: PLAIN, peerId: '01MBR001000000000000000000', direction: 'out', body: 'hi', ts: AT, status: 'pending' },
+      { msgType: 'ciphertext', payload: 'QQQQ' },
+    );
+  const live = (l: db.FanoutLeg) => ({ ...l, failed: undefined });
+
+  it('a plain send enqueued AFTER a fan-out flushes after its legs', async () => {
+    await db.enqueueOutgoingFanout(message, legs.slice(0, 2).map(live));
+    await plain();
+    expect((await db.listOutbox()).map(r => r.msgId)).toEqual([
+      legs[0].msgId,
+      legs[1].msgId,
+      PLAIN,
+    ]);
+  });
+
+  it('…and one enqueued BEFORE it flushes first — the order is age, not kind', async () => {
+    await plain();
+    await db.enqueueOutgoingFanout(message, legs.slice(0, 2).map(live));
+    expect((await db.listOutbox()).map(r => r.msgId)).toEqual([
+      PLAIN,
+      legs[0].msgId,
+      legs[1].msgId,
+    ]);
+    // The number really is on the row, consecutive with the legs'.
+    expect(
+      engine.prepare('SELECT msgId, seq FROM outbox ORDER BY seq').all(),
+    ).toEqual([
+      { msgId: PLAIN, seq: 1 },
+      { msgId: legs[0].msgId, seq: 2 },
+      { msgId: legs[1].msgId, seq: 3 },
+    ]);
+  });
+});

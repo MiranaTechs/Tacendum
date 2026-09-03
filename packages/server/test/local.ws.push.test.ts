@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import WebSocket from 'ws';
 import type { ServerFrame } from '@tacendum/shared';
-import { sessionTokenDigest, type DataLayer } from '../src/db/data.js';
+import { sessionTokenDigest, type TestOnlyDataLayer } from '../src/db/data.js';
 import { makeMemoryDb, makeTestDeps, testIdentityKey } from './helpers.js';
 
 /**
@@ -42,7 +42,7 @@ vi.mock('../src/handlers/push-worker.js', () => ({
 
 const { startWsServer } = await import('../src/local/ws.js');
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: ReturnType<typeof makeTestDeps>;
 let server: Server;
 let wsUrl: string;

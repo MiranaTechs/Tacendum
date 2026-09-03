@@ -23,9 +23,9 @@ import {
   emailCooldownKeyFromClaimKey,
   groupRowKey,
   identifierClaimDiscoverable,
-  makeDataLayer,
+  makeTestOnlyDataLayer,
   recoveryRowKey,
-  type DataLayer,
+  type TestOnlyDataLayer,
 } from '../src/db/data.js';
 import {
   activeEmailClaimKeys,
@@ -62,7 +62,7 @@ import { allQueued, makeTestDeps, parseBody, type TestDeps } from './helpers.js'
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
 let doc: DynamoDBDocumentClient;
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 let flagOn = true;
 
@@ -98,7 +98,7 @@ function expectRefused(res: HttpResult): void {
 beforeAll(async () => {
   const client = makeDynamoClient();
   doc = makeDocClient(client);
-  const base = makeDataLayer(doc);
+  const base = makeTestOnlyDataLayer(doc);
   db = { ...base, isAccountsFeatureEnabled: async () => flagOn };
   try {
     const { TableNames = [] } = await client.send(new ListTablesCommand({}));
@@ -283,7 +283,7 @@ describe('recovery-attach: delay, member cancel, cool-down — all against the r
       [phone.userId, tablet.userId].sort(),
     );
     expect((await db.getUserById(device.userId))?.groupId).toBeUndefined();
-    expect(await db.isUserTombstoned(phone.userId)).toBe(false);
+    expect(await db.userAccountState(phone.userId)).toBe('live');
   });
 
   gated('a stolen bearer alone cannot complete: garbage and wrong-key signatures refuse; the delay expiring uncancelled completes as the replace — the recovered ULID is BRAND NEW, the incumbent tombstones, TOFU fires by construction', async () => {
@@ -342,7 +342,7 @@ describe('recovery-attach: delay, member cancel, cool-down — all against the r
     // The incumbent is dead the way a revoke leaves it: row tombstoned with
     // the forwarding hint, identity key tombstoned (never re-auths), its
     // sessions/socket/push torn down as re-drivable cleanup.
-    expect(await db.isUserTombstoned(phone.userId)).toBe(true);
+    expect(await db.userAccountState(phone.userId)).toBe('tombstoned');
     const phoneRow = await doc.send(
       new GetCommand({
         TableName: SERVER_TABLES.users,
@@ -416,7 +416,7 @@ describe('recovery-attach: delay, member cancel, cool-down — all against the r
     // was replaced; the phone survives.
     expect(group?.members.map((m) => m.userId)).toContain(second.device.userId);
     expect(group?.members.map((m) => m.userId)).not.toContain(tablet.userId);
-    expect(await db.isUserTombstoned(tablet.userId)).toBe(true);
+    expect(await db.userAccountState(tablet.userId)).toBe('tombstoned');
     // The recovery row is gone with completion (raw check — the sweep
     // discipline: nothing pending survives its own success).
     const raw = await doc.send(
@@ -450,7 +450,7 @@ describe('recovery-attach: delay, member cancel, cool-down — all against the r
     );
   });
 
-  gated('a pending recovery goes STALE past its window: completion long after the notice scrolled off is refused, roster untouched (gate fix)', async () => {
+  gated('a pending recovery goes STALE past its window: completion long after the notice scrolled off is refused, roster untouched (fix)', async () => {
     const deps = makeTestDeps(db);
     const email = `stale-${RUN}@example.com`;
     const { phone, tablet, groupId } = await mkRecoverableGroup(deps, email);
@@ -473,11 +473,11 @@ describe('recovery-attach: delay, member cancel, cool-down — all against the r
     expect(group?.members.map((m) => m.userId).sort()).toEqual(
       [phone.userId, tablet.userId].sort(),
     );
-    expect(await db.isUserTombstoned(phone.userId)).toBe(false);
+    expect(await db.userAccountState(phone.userId)).toBe('live');
     expect((await db.getUserById(device.userId))?.groupId).toBeUndefined();
   });
 
-  gated('unlink DURING the 72 h window kills the pending recovery: completion refuses once the identifier that proved it is gone (gate fix)', async () => {
+  gated('unlink DURING the 72 h window kills the pending recovery: completion refuses once the identifier that proved it is gone (fix)', async () => {
     const deps = makeTestDeps(db);
     const email = `unlinkwin-${RUN}@example.com`;
     const { phone, tablet, groupId } = await mkRecoverableGroup(deps, email);
@@ -496,7 +496,7 @@ describe('recovery-attach: delay, member cancel, cool-down — all against the r
     expect(group?.members.map((m) => m.userId).sort()).toEqual(
       [phone.userId, tablet.userId].sort(),
     );
-    expect(await db.isUserTombstoned(phone.userId)).toBe(false);
+    expect(await db.userAccountState(phone.userId)).toBe('live');
   });
 });
 

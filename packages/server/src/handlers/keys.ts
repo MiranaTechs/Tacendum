@@ -4,6 +4,7 @@ import {
   type PrekeyBundle,
   type RevokedKeysHint,
   UploadKeysRequest,
+  Ulid,
 } from '@tacendum/shared';
 import type { AccountGroupMember, UserRecord } from '../db/data.js';
 import { type AuthedHandler, errorResult, json, parseJson, rateLimitedResult } from './http.js';
@@ -16,6 +17,12 @@ import { userRefForLog } from '../opaque-ref.js';
  * to the caller; there is no way to publish keys for another user.
  */
 export const uploadKeysHandler: AuthedHandler = async (event, deps, auth) => {
+  // Budgeted per account BEFORE the parse: every accepted call rewrites
+  // the whole prekey pool, and a caller-keyed refusal may say so (429 +
+  // retry-after, like every self-keyed budget).
+  const retry = await deps.rateLimit.take(`keyupload:${auth.userId}`, LIMITS.keyUpload);
+  if (retry > 0) return rateLimitedResult(retry);
+
   const parsed = parseJson(event, UploadKeysRequest);
   if (!parsed.ok) return parsed.result;
 
@@ -105,8 +112,12 @@ function toGroupSibling(member: AccountGroupMember): GroupSibling {
  */
 export const getPrekeyBundleHandler: AuthedHandler = async (event, deps, auth) => {
   const userId = event.pathParameters?.userId;
-  if (!userId) {
-    return errorResult(400, 'invalid_request', 'missing userId');
+  // A ULID or a 400 (the consent.ts pattern): the value becomes a limiter
+  // partition key below, and a multi-KB one made that UpdateCommand throw
+  // ValidationException — a 500 for a malformed request. Decided before any
+  // bucket is named.
+  if (!userId || !Ulid.safeParse(userId).success) {
+    return errorResult(400, 'invalid_request', 'userId must be a ULID');
   }
 
   // The flag read: one strongly consistent GetItem,
@@ -220,8 +231,14 @@ export const getPrekeyBundleHandler: AuthedHandler = async (event, deps, auth) =
   // survive it too.
   const targetBudgetSpent =
     (await deps.rateLimit.take(`prekeyotp:${userId}`, LIMITS.prekeyTargetDaily)) > 0;
-  const oneTimePrekey = targetBudgetSpent ? undefined : await deps.db.consumeOneTimePrekey(userId);
-  const remaining = await deps.db.countOneTimePrekeys(userId);
+  // The pool generation this bundle's signed prekey was uploaded
+  // with: the consume and the count are bound to it, so a replacement
+  // in flight can never pair an old-pool key with the new signed
+  // prekey read above.
+  const oneTimePrekey = targetBudgetSpent
+    ? undefined
+    : await deps.db.consumeOneTimePrekey(userId, user.prekeyPoolGen);
+  const remaining = await deps.db.countOneTimePrekeys(userId, user.prekeyPoolGen);
 
   const bundle: PrekeyBundle = {
     userId,

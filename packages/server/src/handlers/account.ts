@@ -2,9 +2,11 @@ import { LIMITS } from '../ratelimit.js';
 import { deleteHumanActivity } from '../activity.js';
 import { userRefForLog } from '../opaque-ref.js';
 import { revokeConnectionForSessions } from './session-revoke.js';
+import { requireAuth } from './auth.js';
 import {
   type AuthedHandler,
   bearerToken,
+  type Handler,
   type HttpResult,
   json,
   rateLimitedResult,
@@ -88,21 +90,22 @@ export const deleteAccountHandler: AuthedHandler = async (event, deps, auth) => 
     return crewNotEmptyResult(user.crewCount ?? 0);
   }
 
-  // The ROW GOES FIRST, before any purge. The
-  // `requireEmptyCrew` backstop below can still refuse — and a refusal that has
-  // already destroyed the caller's queued ciphertext is a 409 that ate their
-  // data. Ordering it this way means a refused deletion destroys NOTHING.
-  // Idempotency survives the move because sessions still go LAST (a crash
-  // mid-sweep leaves the caller authenticated to re-run the sequence) and
-  // because every purge below is EITHER keyed by userId alone (activity,
-  // queue, consent edges, prekeys, push, code rows — the hintless retry
-  // reaches all of them) OR fused into the row-delete transaction itself
-  // (roster/group/claims/recovery via deleteGroupedUser; the solo path's
-  // pending-recovery row via the pendingRecoveryGroupId hint:
-  // hints that lived only in the deleted row must die WITH
-  // the row, not after it). The one non-transactional hint-dependent walk —
-  // pending link-offer rows — is physically TTL-bounded (sessions table),
-  // stated below.
+  // The ROW GOES FIRST, before any purge. The `requireEmptyCrew` backstop below
+  // can still refuse — and a refusal that has already destroyed the caller's
+  // queued ciphertext is a 409 that ate their data. Ordering it this way means
+  // a refused deletion destroys NOTHING. Idempotency survives the move because
+  // sessions still go LAST (a crash mid-sweep leaves the caller authenticated
+  // to re-run the sequence — and the route's auth wrapper, `deleteAccountRoute`
+  // below, is the ONE that admits a session whose row is already gone, or the
+  // absent-row refusal would answer that retry 401) and because every purge
+  // below is EITHER keyed by userId alone (activity, queue, consent edges,
+  // prekeys, push, code rows — the hintless retry reaches all of them) OR fused
+  // into the row-delete transaction itself (roster/group/claims/recovery via
+  // deleteGroupedUser; the solo path's pending-recovery row via the
+  // pendingRecoveryGroupId hint: hints that lived only in the deleted row must
+  // die WITH the row, not after it). The one non-transactional hint-dependent
+  // walk — pending link-offer rows — is physically TTL-bounded (sessions
+  // table), stated below.
   if (user) {
     if (user.accountClass === 'integration') {
       if (user.identityKeyPub !== undefined) {
@@ -260,22 +263,26 @@ export const deleteAccountHandler: AuthedHandler = async (event, deps, auth) => 
   // gone), until their writers delete them — a stated residual.
   await deps.db.purgeConsentEdges(auth.userId);
   await deps.db.deleteOneTimePrekeys(auth.userId);
-  // The push-token row, which nothing here used to touch.
-  // It was the worst residual deletion left behind, on two counts. It is an
-  // APPLE DEVICE IDENTIFIER bound to the account id, so it is exactly the
-  // kind of "associated personal data" App Store guideline 5.1.1(v) requires
+  // The push-token row, which nothing here used to touch. It was the worst
+  // residual deletion left behind, on two counts. It is an APPLE DEVICE
+  // IDENTIFIER bound to the account id, so it is exactly the kind of
+  // "associated personal data" App Store guideline 5.1.1(v) requires
   // deletion to reach; and it is a CAPABILITY — a live token is the power to
   // make that phone ring. Leaving it to lapse meant a deleted account's
   // device stayed ringable, in principle, for up to the 90-day liveness TTL.
-  // "It expires eventually" is not deletion.
-  // Placed here, in the destructive sweep, for the same reason as its
-  // neighbours: after the guarded user-row delete, so a `crew_not_empty`
-  // refusal never erases anything, and before sessions, so a caller whose
-  // sweep dies halfway still holds a working token to retry with. The
-  // underlying delete is unconditional and keyed by userId alone, so the
-  // retry is idempotent and needs no read — which matters, because this
-  // role deliberately CANNOT read the table (the grant is Put/Update/Delete
-  // only, so a token can be written and destroyed but never fetched).
+  // "It expires eventually" is not deletion. Placed here, in the destructive
+  // sweep, for the same reason as its neighbours: after the guarded user-row
+  // delete, so a `crew_not_empty` refusal never erases anything, and before
+  // sessions, so a caller whose sweep dies halfway still holds a working
+  // token to retry with — working on THIS route only, since the user row is
+  // already gone by now and every other route refuses an absent-row session;
+  // the retry rides `deleteAccountRoute`'s `allowAbsentRow`. The underlying
+  // delete is unconditional and keyed by userId alone, so the retry is
+  // idempotent and needs no read. (This role CAN read the table — GetItem
+  // joined its pushTokens grant on 2026-08-26 for the recovery notices' wake
+  // decision, see the stack — but nothing on this path uses it: a deletion
+  // that needed a read-then-write would be exactly the shape that once 500'd
+  // the register handler on this boundary.)
   await deps.db.deletePushToken(auth.userId);
   // The accounts-program cascade, AUDITED WHOLE — every row class the program created, each either in
   // this sweep, TTL'd with its explicit expiry refused at every read, or a
@@ -316,7 +323,19 @@ export const deleteAccountHandler: AuthedHandler = async (event, deps, auth) => 
   // - peer-device/machine rosters: CLIENT-side stores (E2EE sync payloads);
   // no server row class exists for them — nothing to sweep;
   // - rate-limit windows keyed by ULID or groupId: TTL'd, the stated
-  // reset-button class.
+  // reset-button class;
+  // - `#quota#<thisUlid>` pair-ledger rows in OTHER recipients' queue
+  // partitions — this account as SENDER: NOT reachable from here (finding
+  // them is the recipient enumeration the queue refuses to build); they
+  // hold a count and a sender ULID, never ciphertext, and die with each
+  // recipient's own purge or the 30-day messages TTL — the stated
+  // TTL-bounded class;
+  // - this account's UNDELIVERED SENDS sitting in other recipients' queues:
+  // ciphertext addressed to someone else, carrying this ULID as senderId,
+  // which that recipient drains or the 30-day TTL reaps — TTL-bounded, not
+  // swept. The purge above is the CALLER's own partition, read strongly
+  // consistently, so nothing enqueued TO this account moments before the
+  // delete survives it.
   // the slice (the caller's pending verification-code rows, any pending
   // recovery it opened as the recovering device via the `recoveryGroupId`
   // reverse pointer, and the sole-member solo-group backstop): hints come
@@ -359,6 +378,9 @@ export const deleteAccountHandler: AuthedHandler = async (event, deps, auth) => 
   await revokeConnectionForSessions(deps, auth.userId);
   // Sessions last: while any token still works the caller can retry a partial
   // deletion, and killing our own credential first would strand the rest.
+  // "Still works" means on this route: the row went first, so the retry's
+  // bearer resolves to an ABSENT row, which only `deleteAccountRoute` admits
+  // — every other route has refused it since the row delete.
   await deps.db.deleteSessionsForUser(auth.userId);
   const token = bearerToken(event);
   if (token) {
@@ -373,3 +395,22 @@ export const deleteAccountHandler: AuthedHandler = async (event, deps, auth) => 
   deps.log('account_deleted', { userRef: userRefForLog(auth.userId, deps.userRefSalt) });
   return json(200, {});
 };
+
+/**
+ * The route-table entry for DELETE /v1/account — the ONE authenticated route
+ * that admits a valid, unrevoked session whose user row is already ABSENT.
+ *
+ * The handler above deletes the row FIRST and sweeps after it, sessions last,
+ * so that a crash mid-sweep leaves the caller authenticated to re-run the
+ * sequence. The bearer check (handlers/auth.ts) then made every route refuse an
+ * absent-row session — the exact state a crashed sweep leaves — so the
+ * hintless retry answered 401 and the residue (queued ciphertext, prekeys,
+ * consent edges, the push token, identifier artifacts, link offers, the
+ * connection row, the sessions) had no path to finish. Both adapters
+ * (aws/http.lambda.ts, local/http.ts) wire THIS, never a bare
+ * `requireAuth(deleteAccountHandler)`; account.test.ts drives the crash and
+ * the retry through it. Tombstoned rows still refuse here: the exception is
+ * for a row that is gone, never for a revoked device. */
+export const deleteAccountRoute: Handler = requireAuth(deleteAccountHandler, {
+  allowAbsentRow: true,
+});

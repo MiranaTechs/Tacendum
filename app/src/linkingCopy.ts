@@ -14,10 +14,12 @@ export const LINKING_COPY = {
     'Scan the code the new device is showing. Nothing links yet — a scanned ID alone can never join your devices.',
   /** Scan side, code on screen: the dual-confirmation instruction (the existing device confirms FIRST). */
   codeInstruction: `Compare this code with the one on the new device. If every group matches, confirm here on this ${DEVICE_NOUN} first, then on the new device.`,
-  /** New-device side, code on screen. `who` comes from personName /
-   * shortId — the "who is asking" rendering. */
+  /** New-device side, code on screen. `who` is the offerer's `shortId`
+   * ("…K3MQ") — the "who is asking" rendering, said as what it is: a
+   * device, named by its ID (the older sentence read the ID as a person's
+   * name). */
   codeInstructionNew: (who: string) =>
-    `${who} wants to link this device to their account. Compare the code on both screens — confirm only if every group matches.`,
+    `The device with ID ${who} wants to link this one to its account. Compare the code on both screens — confirm only if every group matches.`,
   /** The stall, stated (shown while waiting for the other side). */
   waiting:
     'Waiting for the new device to confirm. Nothing is linked until it does — both devices confirm one code, and both keys sign.',
@@ -40,6 +42,38 @@ export const LINKING_COPY = {
    * not say which condition refused. */
   refused:
     'That did not work. The link may have expired, or the slot may be taken — start again from the new device.',
+  /** The offer ran out before the new device confirmed: said as what it is,
+   * never dressed as the collapsed refusal above. */
+  expired:
+    'The request expired before the new device confirmed it. Start again from the new device.',
+  /** A TRANSPORT failure — offline, DNS, a timeout — and never the server's
+   * refusal: the refused sentence above would blame an expired link for a
+   * request that never arrived. The account decks' sentence, byte-for-byte.
+   */
+  transportFailed: 'Could not reach Tacendum. Check your connection and try again.',
+  /** The scan side's reading failures, per class — the class is the
+   * contract, never the thrown text. The photo sentences are
+   * StartChatScreen's, byte-for-byte: the same iOS condition must never get
+   * two different sentences. */
+  cameraFailed:
+    'Tacendum couldn’t use the camera. Check that Tacendum has camera access in Settings, or choose a photo of the code instead.',
+  photosDenied:
+    'Tacendum doesn’t have access to your photos. You can turn it on in Settings.',
+  photoTooBig: 'That photo is too large to read. Choose a smaller one.',
+  photoUnreadable: 'Tacendum couldn’t read that photo. Choose another one.',
+  photoNoCode:
+    'There’s no QR code in that photo. Choose the picture the new device is showing, or scan it with the camera instead.',
+  qrMultiple:
+    'That photo has more than one QR code. Tacendum won’t guess which one is the new device’s — choose a photo with a single code.',
+  /** The waiting phase: the offer's own clock, what a mismatch on the other
+   * screen means, and the honest shape of stopping — the server has no
+   * withdrawal route, so stopping is said as what it is. */
+  expiresIn: (clock: string) => `Expires in ${clock}`,
+  mismatchHint:
+    'If the new device says the codes don’t match, this request will simply expire.',
+  stopWaiting: 'Stop waiting',
+  stopWaitingHint:
+    'Stopping here does not withdraw the request — it expires on its own. If the new device confirms before then, it appears under Linked devices, where you can unlink it.',
   /** No verification code could be derived: the
    * ceremony refuses rather than rendering a blank code region. */
   noCode:

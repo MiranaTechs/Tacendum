@@ -303,7 +303,15 @@ function notify(listeners: Set<Listener>): void {
 
 /* ── the offerer ceremony (scan side, ULID_A) ─────────────────────── */
 
-export type OffererPhase = 'code' | 'submitting' | 'waiting' | 'linked' | 'failed';
+export type OffererPhase =
+  | 'code'
+  | 'submitting'
+  | 'waiting'
+  | 'linked'
+  | 'failed'
+  /** The screen stopped waiting: this object probes no further;
+   * the durable row still does, on the roster surface. */
+  | 'cancelled';
 
 /** The durable record of a submitted-but-uncommitted offer:
  * the offerer is deliberately excluded from the memberLinked fan-out
@@ -605,6 +613,26 @@ export class OffererCeremony {
     if (linked) this.phase = 'linked';
     return linked;
   }
+
+  /** The offer's own expiry (epoch seconds, as the wire has it) once the
+   * server minted it at `confirm()`; null before. The waiting phase's
+   * clock. */
+  get expiresAt(): number | null {
+    return this.init?.expiresAt ?? null;
+  }
+
+  /**
+   * Stop probing from THIS object — the waiting phase's "Stop waiting". The
+   * pending row is deliberately KEPT: the server has no offer-withdrawal
+   * route (`LINK_OPS` names none), and the offerer is excluded from the
+   * memberLinked fan-out (§2.2 step 7), so that row is the only path by
+   * which this device ever learns of a late acceptance — deleting it would
+   * let the new device join the account with this one none the wiser.
+   * `reconcilePendingLink` completes or reaps it the next time the roster
+   * surface opens, where an unwanted device can be unlinked. */
+  cancel(): void {
+    if (this.phase === 'waiting') this.phase = 'cancelled';
+  }
 }
 
 /* ── the acceptor ceremony (new-device side, ULID_B) ──────────────── */
@@ -612,6 +640,62 @@ export class OffererCeremony {
 export type LinkOfferNotice = Extract<AccountsNotice, { kind: 'linkOffer' }>;
 
 export type AcceptorPhase = 'code' | 'accepting' | 'linked' | 'failed';
+
+/**
+ * The newest LIVE pending offer row, or null — expired, unparseable and
+ * mis-addressed rows are reaped and the next-newest tried: one stale late
+ * offer must never mask a live earlier one. The read-and-reap
+ * head of `AcceptorCeremony.open`, shared with `pendingOfferWaiting` so the
+ * two answer "is there an offer" identically; nothing past the reaping —
+ * no bundle fetch, no pin, no signature check — happens here.
+ */
+async function nextLivePendingOffer(
+  deps: LinkingDeps,
+  selfUserId: string,
+): Promise<{ stored: { offerNonce: string }; offer: LinkOfferNotice } | null> {
+  for (;;) {
+    const stored = await deps.db.loadPendingLinkOffer();
+    if (!stored) return null;
+    let offer: LinkOfferNotice;
+    try {
+      const parsed = AccountsNotice.parse(JSON.parse(stored.noticeJson));
+      if (parsed.kind !== 'linkOffer') throw new Error('not an offer');
+      offer = parsed;
+    } catch {
+      await deps.db.deletePendingLinkOffer(stored.offerNonce);
+      continue;
+    }
+    if (Math.floor(deps.now() / 1000) >= offer.expiresAt) {
+      await deps.db.deletePendingLinkOffer(stored.offerNonce);
+      continue;
+    }
+    if (offer.acceptorUserId !== selfUserId) {
+      // Stored for an account this install no longer is — dead weight
+      // that would otherwise be re-read forever.
+      await deps.db.deletePendingLinkOffer(stored.offerNonce);
+      continue;
+    }
+    return { stored, offer };
+  }
+}
+
+/**
+ * Whether a live pending offer is waiting to be shown. The notice-time hop
+ * to the confirm surface fires only when a home surface is on glass at that
+ * instant; an offer that lands mid-thread, in Settings or on Profile sat in
+ * `link_pending_offer` unread until its ten minutes ran out. App.tsx asks
+ * this on every arrival at a home surface and hops when it answers true. A
+ * PROBE, not the ceremony: it reaps dead rows (so the hop never lands on
+ * "there is no link request waiting") and fetches nothing —
+ * `AcceptorCeremony.open` does the fetch, the pin and the signature check
+ * when the confirm surface actually opens. */
+export async function pendingOfferWaiting(
+  deps: LinkingDeps = defaultDeps(),
+): Promise<boolean> {
+  const selfUserId = await deps.selfId();
+  if (!selfUserId) return false;
+  return (await nextLivePendingOffer(deps, selfUserId)) !== null;
+}
 
 export class AcceptorCeremony {
   phase: AcceptorPhase = 'code';
@@ -657,27 +741,12 @@ export class AcceptorCeremony {
     const selfUserId = await deps.selfId();
     if (!token || !selfUserId) return null;
     for (;;) {
-      const stored = await deps.db.loadPendingLinkOffer();
-      if (!stored) return null;
-      let offer: LinkOfferNotice;
-      try {
-        const parsed = AccountsNotice.parse(JSON.parse(stored.noticeJson));
-        if (parsed.kind !== 'linkOffer') throw new Error('not an offer');
-        offer = parsed;
-      } catch {
-        await deps.db.deletePendingLinkOffer(stored.offerNonce);
-        continue;
-      }
-      if (Math.floor(deps.now() / 1000) >= offer.expiresAt) {
-        await deps.db.deletePendingLinkOffer(stored.offerNonce);
-        continue;
-      }
-      if (offer.acceptorUserId !== selfUserId) {
-        // Stored for an account this install no longer is — dead weight
-        // that would otherwise be re-read forever.
-        await deps.db.deletePendingLinkOffer(stored.offerNonce);
-        continue;
-      }
+      // The read-and-reap head lives in `nextLivePendingOffer` (shared with
+      // the pending-offer probe); the loop stays HERE because a failed offer
+      // signature below reaps and tries the next row exactly the same way.
+      const live = await nextLivePendingOffer(deps, selfUserId);
+      if (!live) return null;
+      const { stored, offer } = live;
       if (!(await deps.db.pristineForLink())) return 'not_pristine';
       if (offer.acceptorClass !== localDeviceClass()) return 'class_mismatch';
       const bundle = await deps.api.getPrekeyBundle(token, offer.offererUserId);

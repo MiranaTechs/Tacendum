@@ -10,7 +10,7 @@ import {
   type WsDeps,
 } from '../src/handlers/ws.js';
 import { wsTicketHandler } from '../src/handlers/ws-ticket.js';
-import { CONNECTION_ROW_TTL_SECONDS, connectionExpiresAt, type DataLayer } from '../src/db/data.js';
+import { CONNECTION_ROW_TTL_SECONDS, connectionExpiresAt, type TestOnlyDataLayer } from '../src/db/data.js';
 import { makeMemoryDb, makeTestDeps, parseBody, testIdentityKey, type TestDeps } from './helpers.js';
 
 /** Monotonic so msgIds minted in the same millisecond still sort in order. */
@@ -86,7 +86,7 @@ const BOB_KEY = testIdentityKey(0x12);
  * of going live with nothing pointing at it.
  */
 describe('gate.connrow — a one-shot send must not unroute a live listener', () => {
-  let db: DataLayer;
+  let db: TestOnlyDataLayer;
   let deps: TestDeps;
   let sender: ReturnType<typeof makeFakeSender>;
   let wsDeps: WsDeps;
@@ -621,7 +621,7 @@ describe('gate.connrow — a one-shot send must not unroute a live listener', ()
       sender.dead.add('conn-old');
       // The interleaving no re-read can see: a reconnect's conditional claim
       // lands between this connect's LAST read and its write. Only the store's
-      // own conditional write can arbitrate that gap (DataLayer.claimConnection);
+      // own conditional write can arbitrate that gap (TestOnlyDataLayer.claimConnection);
       // the handler's whole job is to lose gracefully when it says no. A handler
       // that fell back to read-then-Put here would re-read 'conn-old', conclude
       // "go", and clobber the winner.

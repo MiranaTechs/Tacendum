@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { deleteAccountHandler } from '../src/handlers/account.js';
-import type { AuthContext, HttpEvent } from '../src/handlers/http.js';
-import { IDKEY_CLAIM_PREFIX, type DataLayer } from '../src/db/data.js';
+import { deleteAccountHandler, deleteAccountRoute } from '../src/handlers/account.js';
+import { requireAuth } from '../src/handlers/auth.js';
+import { json, type AuthContext, type HttpEvent } from '../src/handlers/http.js';
+import { DeleteCommand, TransactWriteCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { IDKEY_CLAIM_PREFIX, makeDataLayer, type DataLayer } from '../src/db/data.js';
 import { activityActorRef } from '../src/opaque-ref.js';
 import {
   allQueued,
@@ -246,5 +248,146 @@ describe('delete account', () => {
     const res = await deleteAccountHandler(event(), deps, auth);
     expect(res.statusCode).toBe(429);
     expect(res.headers?.['retry-after']).toBeDefined();
+  });
+
+  /**
+   * The row goes
+   * FIRST and the residue sweep runs after it, with sessions last, so that a
+   * crash mid-sweep leaves the caller authenticated to re-run the sequence.
+   * The bearer check then made `authenticate` refuse a session whose user row is
+   * ABSENT — which is exactly the state a crashed sweep leaves behind — and
+   * the idempotency cases above never noticed, because they hand the handler
+   * a pre-built auth context and never pass through `authenticate`. These
+   * two go THROUGH the wrapper the route tables wire. */
+  it('a crash mid-sweep AFTER the row delete is retryable THROUGH requireAuth — the deletion route admits an absent-row session', async () => {
+    // The sweep dies right after the guarded row delete (a Lambda timeout, a
+    // DDB throttle): the user row is gone; the queue, prekeys, push token,
+    // connection row and sessions are not.
+    let crashed = false;
+    const crashing: DataLayer = {
+      ...deps.db,
+      purgeQueuedMessages: async () => {
+        crashed = true;
+        throw new Error('simulated crash mid-sweep');
+      },
+    };
+    await expect(deleteAccountRoute(event(), { ...deps, db: crashing })).rejects.toThrow(
+      'simulated crash mid-sweep',
+    );
+    expect(crashed).toBe(true);
+    expect(await deps.db.getUserById('user-1')).toBeUndefined();
+    expect(await deps.db.userAccountState('user-1')).toBe('absent');
+    expect((await allQueued(deps.db, 'user-1')).map((m) => m.msgId)).toEqual(['01QUEUED']);
+    expect(await deps.db.getPushToken('user-1')).toBeDefined();
+    expect(await deps.db.getSession('token-1')).toBeDefined();
+
+    // Every OTHER route refuses this bearer now...
+    const me = await requireAuth(async (_e, _d, a) => json(200, a))(event(), deps);
+    expect(me.statusCode).toBe(401);
+
+    // ...but the hintless retry of the deletion route, same bearer, finishes
+    // the userId-keyed sweep: nothing is stranded.
+    const retry = await deleteAccountRoute(event(), deps);
+    expect(retry.statusCode).toBe(200);
+    expect(await allQueued(deps.db, 'user-1')).toEqual([]);
+    expect(await deps.db.consumeOneTimePrekey('user-1')).toBeUndefined();
+    expect(await deps.db.getPushToken('user-1')).toBeUndefined();
+    expect(await deps.db.getConnection('user-1')).toBeUndefined();
+    expect(await deps.db.getSession('token-1')).toBeUndefined();
+    // With the sessions gone the bearer is dead on this route too.
+    expect((await deleteAccountRoute(event(), deps)).statusCode).toBe(401);
+  });
+
+  it('the deletion route still refuses a TOMBSTONED row — the exception is for a row that is GONE, never for a revoked one', async () => {
+    // Live reference: the memory db serves rows by reference (see the
+    // crew_not_empty race above), so this is a revoke's committed footprint.
+    const row = await deps.db.getUserById('user-1');
+    expect(row).toBeDefined();
+    row!.tombstoned = true;
+    expect(await deps.db.userAccountState('user-1')).toBe('tombstoned');
+
+    const res = await deleteAccountRoute(event(), deps);
+    expect(res.statusCode).toBe(401);
+    // Refused at auth: nothing was destroyed.
+    expect((await allQueued(deps.db, 'user-1')).map((m) => m.msgId)).toEqual(['01QUEUED']);
+    expect(await deps.db.getPushToken('user-1')).toBeDefined();
+    expect(await deps.db.getSession('token-1')).toBeDefined();
+  });
+});
+
+/**
+ * The deleteUser FALLBACK — the single-item row delete taken when the
+ * transaction's claim leg refused because the claim is tombstoned — applied
+ * only the empty-crew condition. The mirror guard (`requireNoCrewId`) was
+ * dropped on that path, so its `crew_appeared`
+ * answer could never fire there: a teardown that passed `requireNoCrewId`
+ * together with an `identityKeyPub` would have deleted an adopted member's
+ * row unconditionally and leaked the owner's slot. Latent with today's
+ * callers; pinned on the wire with a scripted doc. */
+describe('deleteUser fallback carries the SAME row condition as the transaction', () => {
+  const USER = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
+  const IDKEY = 'idkey-fallback-fixture';
+
+  function scriptedDoc(fallbackRefuses: boolean): {
+    deletes: DeleteCommand[];
+    doc: DynamoDBDocumentClient;
+  } {
+    const deletes: DeleteCommand[] = [];
+    const send = async (cmd: unknown): Promise<unknown> => {
+      if (cmd instanceof TransactWriteCommand) {
+        // The user leg passes, the claim leg refuses (tombstoned claim):
+        // the exact shape that takes the fallback.
+        throw Object.assign(new Error('cancelled'), {
+          name: 'TransactionCanceledException',
+          CancellationReasons: [{}, { Code: 'ConditionalCheckFailed' }],
+        });
+      }
+      if (cmd instanceof DeleteCommand) {
+        deletes.push(cmd);
+        if (fallbackRefuses) {
+          throw Object.assign(new Error('refused'), { name: 'ConditionalCheckFailedException' });
+        }
+        return {};
+      }
+      return {};
+    };
+    return { deletes, doc: { send } as unknown as DynamoDBDocumentClient };
+  }
+
+  it('requireNoCrewId: the fallback delete is conditioned on attribute_not_exists(crewId)', async () => {
+    const { deletes, doc } = scriptedDoc(false);
+    const db = makeDataLayer(doc);
+    await expect(
+      db.deleteUser(USER, { identityKeyPub: IDKEY }, { requireNoCrewId: true }),
+    ).resolves.toBe('deleted');
+    expect(deletes).toHaveLength(1);
+    expect(deletes[0]!.input.ConditionExpression).toBe('attribute_not_exists(crewId)');
+  });
+
+  it("requireNoCrewId: a crewId that appeared in the gap answers 'crew_appeared' from the fallback, nothing deleted", async () => {
+    const { deletes, doc } = scriptedDoc(true);
+    const db = makeDataLayer(doc);
+    await expect(
+      db.deleteUser(USER, { identityKeyPub: IDKEY }, { requireNoCrewId: true }),
+    ).resolves.toBe('crew_appeared');
+    expect(deletes).toHaveLength(1);
+  });
+
+  it('requireEmptyCrew: the fallback keeps the empty-crew condition it always had', async () => {
+    const { deletes, doc } = scriptedDoc(false);
+    const db = makeDataLayer(doc);
+    await expect(
+      db.deleteUser(USER, { identityKeyPub: IDKEY }, { requireEmptyCrew: true }),
+    ).resolves.toBe('deleted');
+    expect(deletes[0]!.input.ConditionExpression).toBe(
+      'attribute_not_exists(crewCount) OR crewCount = :zero',
+    );
+  });
+
+  it('no guard: the fallback delete is unconditional', async () => {
+    const { deletes, doc } = scriptedDoc(false);
+    const db = makeDataLayer(doc);
+    await expect(db.deleteUser(USER, { identityKeyPub: IDKEY })).resolves.toBe('deleted');
+    expect(deletes[0]!.input.ConditionExpression).toBeUndefined();
   });
 });

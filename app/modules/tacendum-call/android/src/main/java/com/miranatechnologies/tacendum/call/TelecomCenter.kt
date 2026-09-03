@@ -791,6 +791,22 @@ internal object TelecomCenter {
     connection.setActive()
   }
 
+  /**
+   * An answer taken on the app's OWN screen, for a call reported under `cid`
+   * (a session's sid, for its one Telecom connection). The iOS twin requests
+   * the `CXAnswerCallAction` CallKit never saw; here the Telecom equivalent
+   * is making the ringing connection ACTIVE, which is this platform's
+   * activation moment (§7.4, re-derived in `CallAudioGate`). No event goes up
+   * — JS is the one answering — and a connection that is not ringing (already
+   * answered from the notification, or outgoing) is left exactly as it is. */
+  fun answerFromApp(cid: String) {
+    val connection = synchronized(lock) { connectionsByCid[cid] } ?: return
+    if (connection.state != android.telecom.Connection.STATE_RINGING) return
+    cancelWatchdog(ifGuarding = connection)
+    connection.setActive()
+    CallNotifications.clearRing(appContext)
+  }
+
   fun endCall(cid: String, reason: String) {
     // LOOKUP, never create: JS tears calls down that Telecom sometimes never
     // had (a report refused, a mapping already forgotten by the disconnect
@@ -996,7 +1012,10 @@ internal object TelecomCenter {
    * null shows the placeholder — never the raw ULID, which means nothing to
    * anyone.
    */
-  private fun mirroredName(peerId: String): String? {
+  // Internal, not private: the missed-call notice (`MissedCallNotification`)
+  // reads the same mirror when the JS side knows no name — the locked
+  // phone's case, the one a missed call most often lands on.
+  fun mirroredName(peerId: String): String? {
     if (peerId.isEmpty()) return null
     val context = appContext ?: return null
     return try {

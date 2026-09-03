@@ -370,3 +370,60 @@ describe('peer profile — blocking', () => {
     await ReactTestRenderer.act(() => tree.unmount());
   });
 });
+
+// ---------------------------------------------------------------------------
+// a blocked person's timer chips are off — for VoiceOver, for the eye, and
+// with one line saying why.
+// ---------------------------------------------------------------------------
+
+/** The chip element itself — the composite carrying accessibilityState. */
+function chip(tree: ReactTestRenderer.ReactTestRenderer, testID: string) {
+  return tree.root.findAll(
+    n => n.props?.testID === testID && n.props?.accessibilityState !== undefined,
+  )[0]!;
+}
+
+describe('peer profile — the timer while blocked', () => {
+  test('blocked: every chip is disabled in its accessibilityState, drawn recessed and muted, and the reason is on screen', async () => {
+    blockedAt.at = T0;
+    const { StyleSheet } = jest.requireActual<typeof import('react-native')>(
+      'react-native',
+    );
+    const { themeTokens } = jest.requireActual<typeof import('../src/theme')>(
+      '../src/theme',
+    );
+    const { DISAPPEAR_OPTIONS } = jest.requireActual<
+      typeof import('../src/blocking')
+    >('../src/blocking');
+    const theme = themeTokens();
+    const tree = await renderProfile();
+    expect(has(tree, 'peer-unblock')).toBe(true); // the fixture reached "blocked"
+
+    for (const option of DISAPPEAR_OPTIONS) {
+      const c = chip(tree, `peer-disappear-${option.seconds}`);
+      expect(c.props.disabled).toBe(true);
+      expect(c.props.accessibilityState.disabled).toBe(true);
+      const style = StyleSheet.flatten(c.props.style({ pressed: false }));
+      expect(style.backgroundColor).toBe(theme.color.paperInset);
+      expect(style.borderColor).toBe(theme.color.lineSoft);
+      const label = c.findByType(Text);
+      expect(StyleSheet.flatten(label.props.style).color).toBe(
+        theme.color.inkMuted,
+      );
+    }
+    expect(has(tree, 'peer-disappear-locked')).toBe(true);
+    expect(texts(tree).join('\n')).toContain(
+      'Nothing is sent to them while they’re blocked, so the timer can’t change. Unblock them first.',
+    );
+    await ReactTestRenderer.act(() => tree.unmount());
+  });
+
+  test('not blocked: the chips are live and the reason line is absent', async () => {
+    const tree = await renderProfile();
+    const c = chip(tree, 'peer-disappear-0');
+    expect(c.props.disabled).toBe(false);
+    expect(c.props.accessibilityState).toEqual({ selected: true, disabled: false });
+    expect(has(tree, 'peer-disappear-locked')).toBe(false);
+    await ReactTestRenderer.act(() => tree.unmount());
+  });
+});

@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ApiRequestError } from '../api';
 import * as qr from '../qr';
 import { DEVICE_SLOT_CLASSES, type DeviceSlotClass } from '../deviceNoun';
-import { PickCancelled, pickImageFile } from '../media';
+import { PickCancelled, PickDenied, PickTooLarge, pickImageFile } from '../media';
 import { safetyGroups } from '../safety';
 import { useTheme } from '../theme';
 import {
@@ -47,13 +48,60 @@ import type { ProfileRow } from '../db';
 export const LINK_POLL_STEPS_MS = [15_000, 15_000, 30_000, 30_000] as const;
 export const LINK_POLL_TAIL_MS = 60_000;
 
+/** Which reader produced the ULID — the same thrown class means a different
+ * thing on each path (see `readError`). */
+type ScanSource = 'camera' | 'photo';
+
 type Phase =
   | { name: 'scan'; error: string | null }
   | { name: 'starting' }
   | { name: 'code'; ceremony: OffererCeremony; klass: DeviceSlotClass; busy: boolean }
   | { name: 'waiting'; ceremony: OffererCeremony }
   | { name: 'linked' }
-  | { name: 'failed' };
+  | { name: 'failed'; message: string };
+
+/**
+ * Every way READING the code can fail, in our own words (StartChatScreen's
+ * `photoError` idiom: the class is the contract, never the thrown text).
+ * `source` is which reader ran: the same `QrImageUnreadable` means "the
+ * camera would not open" on one path and "that file would not decode" on
+ * the other, and `QrNoCode` is a cancelled scan on the camera (no sentence
+ * — qr.ts says so) but a real answer about a chosen photo. Null means back
+ * to the intro without a word. */
+function readError(error: unknown, source: ScanSource): string | null {
+  if (error instanceof PickCancelled) return null;
+  if (error instanceof qr.QrNoCode) {
+    return source === 'camera' ? null : LINKING_COPY.photoNoCode;
+  }
+  if (error instanceof qr.QrOwnId) {
+    return 'That is this device’s own code — scan the NEW device’s code.';
+  }
+  if (error instanceof qr.QrNotAnId) return 'That code isn’t a Tacendum ID.';
+  if (error instanceof qr.QrAmbiguous) return LINKING_COPY.qrMultiple;
+  if (error instanceof PickDenied) return LINKING_COPY.photosDenied;
+  if (error instanceof PickTooLarge) return LINKING_COPY.photoTooBig;
+  return source === 'camera' ? LINKING_COPY.cameraFailed : LINKING_COPY.photoUnreadable;
+}
+
+/**
+ * Every way the CEREMONY can fail past the reader. A server answer is the
+ * collapsed refusal the server deliberately made; anything else — offline,
+ * DNS, a timeout — never reached it, and "expired or taken" about a request
+ * that was never delivered is a lie about the person's own code. The
+ * accounts module's `isRefusal` line, drawn here. */
+function ceremonyError(error: unknown): string {
+  if (error instanceof NoVerificationCodeError) return LINKING_COPY.noCode;
+  if (error instanceof ApiRequestError) return LINKING_COPY.refused;
+  return LINKING_COPY.transportFailed;
+}
+
+/** `m:ss` from a remaining span; never negative. */
+function clockFrom(remainingMs: number): string {
+  const total = Math.max(0, Math.ceil(remainingMs / 1000));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
+}
 
 export function LinkDeviceScreen({
   profile,
@@ -75,10 +123,16 @@ export function LinkDeviceScreen({
   );
 
   const beginFrom = useCallback(
-    async (read: () => Promise<string>) => {
+    async (read: () => Promise<string>, source: ScanSource) => {
       setPhase({ name: 'starting' });
+      let scannedId: string;
       try {
-        const scannedId = await read();
+        scannedId = await read();
+      } catch (error) {
+        if (mounted.current) setPhase({ name: 'scan', error: readError(error, source) });
+        return;
+      }
+      try {
         const ceremony = await OffererCeremony.begin(scannedId);
         if (!mounted.current) return;
         // The declared slot (the offering device declares): in v1 an
@@ -92,18 +146,7 @@ export function LinkDeviceScreen({
           localDeviceClass();
         setPhase({ name: 'code', ceremony, klass, busy: false });
       } catch (error) {
-        if (!mounted.current) return;
-        const message =
-          error instanceof qr.QrNoCode || error instanceof PickCancelled
-            ? null // cancelled camera/picker or nothing found: back to the intro
-            : error instanceof qr.QrOwnId
-              ? 'That is this device’s own code — scan the NEW device’s code.'
-              : error instanceof qr.QrNotAnId || error instanceof qr.QrAmbiguous
-                ? 'That code isn’t a Tacendum ID.'
-                : error instanceof NoVerificationCodeError
-                  ? LINKING_COPY.noCode
-                  : LINKING_COPY.refused;
-        setPhase({ name: 'scan', error: message });
+        if (mounted.current) setPhase({ name: 'scan', error: ceremonyError(error) });
       }
     },
     [],
@@ -126,8 +169,11 @@ export function LinkDeviceScreen({
           .then(linked => {
             if (cancelled || !mounted.current) return;
             if (linked) setPhase({ name: 'linked' });
-            else if (phase.ceremony.phase === 'failed') setPhase({ name: 'failed' });
-            else schedule();
+            // The ceremony fails itself only at its own expiry (checkLinked):
+            // said as an expiry, not as a refusal.
+            else if (phase.ceremony.phase === 'failed') {
+              setPhase({ name: 'failed', message: LINKING_COPY.expired });
+            } else schedule();
           })
           .catch(() => {
             if (!cancelled && mounted.current) schedule();
@@ -141,6 +187,16 @@ export function LinkDeviceScreen({
     };
   }, [phase]);
 
+  // The offer's own clock: re-read once a second while waiting. Wall-clock
+  // on purpose — the ceremony's expiry check reads the same one.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (phase.name !== 'waiting') return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [phase]);
+
   const confirm = useCallback(() => {
     if (phase.name !== 'code' || phase.busy) return;
     setPhase({ ...phase, busy: true });
@@ -149,9 +205,17 @@ export function LinkDeviceScreen({
       .then(() => {
         if (mounted.current) setPhase({ name: 'waiting', ceremony: phase.ceremony });
       })
-      .catch(() => {
-        if (mounted.current) setPhase({ name: 'failed' });
+      .catch(error => {
+        if (mounted.current) setPhase({ name: 'failed', message: ceremonyError(error) });
       });
+  }, [phase]);
+
+  const stopWaiting = useCallback(() => {
+    if (phase.name !== 'waiting') return;
+    // This object probes no further; the durable row still does — linking.ts
+    // `cancel` says why the row is kept, and the copy below says so too.
+    phase.ceremony.cancel();
+    setPhase({ name: 'scan', error: null });
   }, [phase]);
 
   return (
@@ -163,11 +227,15 @@ export function LinkDeviceScreen({
             <Text style={[t.type.body, { color: t.color.inkStrong }]}>
               {LINKING_COPY.scanIntro}
             </Text>
-            {phase.error !== null && <InlineError message={phase.error} />}
+            {phase.error !== null && (
+              <InlineError message={phase.error} testID="link-scan-error" />
+            )}
             <PrimaryButton
               label="Scan with camera"
               testID="link-scan-camera"
-              onPress={() => void beginFrom(() => qr.readIdFromCamera(profile.userId))}
+              onPress={() =>
+                void beginFrom(() => qr.readIdFromCamera(profile.userId), 'camera')
+              }
             />
             <TextAction
               label="Choose a photo of the code"
@@ -176,7 +244,7 @@ export function LinkDeviceScreen({
                 void beginFrom(async () => {
                   const file = await pickImageFile('library');
                   return qr.readIdFromImage(file.uri, profile.userId);
-                })
+                }, 'photo')
               }
             />
           </>
@@ -220,6 +288,25 @@ export function LinkDeviceScreen({
             <Text style={[t.type.body, { color: t.color.inkStrong }]}>
               {LINKING_COPY.waiting}
             </Text>
+            <Text
+              style={[t.type.utilityData, { color: t.color.inkStrong }]}
+              testID="link-expires"
+            >
+              {LINKING_COPY.expiresIn(
+                clockFrom((phase.ceremony.expiresAt ?? 0) * 1000 - now),
+              )}
+            </Text>
+            <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
+              {LINKING_COPY.mismatchHint}
+            </Text>
+            <TextAction
+              label={LINKING_COPY.stopWaiting}
+              testID="link-stop-waiting"
+              onPress={stopWaiting}
+            />
+            <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
+              {LINKING_COPY.stopWaitingHint}
+            </Text>
           </>
         )}
 
@@ -234,7 +321,7 @@ export function LinkDeviceScreen({
 
         {phase.name === 'failed' && (
           <>
-            <InlineError message={LINKING_COPY.refused} />
+            <InlineError message={phase.message} testID="link-failed" />
             <TextAction
               label="Start again"
               testID="link-retry"

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { GetCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { GetCommand, QueryCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { makeDataLayer } from '../src/db/data.js';
 import { TABLES } from '../src/db/tables.js';
 
@@ -60,6 +60,84 @@ describe('gate.consistentread — getConnection is not served stale', () => {
     expect((command as GetCommand).input).toEqual({
       TableName: TABLES.connections,
       Key: { userId: '01KYDBSSDJSPC9J0E5N2AWMJ5Y' },
+      ConsistentRead: true,
+    });
+  });
+
+  /**
+   * `getPushToken` was eventually consistent: a wake scheduled milliseconds
+   * after `DELETE /v1/push-token` at sign-out could read the deleted row back
+   * and ring a device that no longer holds the account — which, per the CallKit
+   * contract, then has to report a placeholder call for it. Same class of
+   * assertion as above: the property is decided on the command, so it is
+   * checked on the command. */
+  it('reads the push-token row with ConsistentRead', async () => {
+    const { commands, db } = recordingLayer();
+
+    await db.getPushToken('01KYDBSSDJSPC9J0E5N2AWMJ5Y');
+
+    expect(commands).toHaveLength(1);
+    const command = commands[0];
+    expect(command).toBeInstanceOf(GetCommand);
+    expect((command as GetCommand).input).toEqual({
+      TableName: TABLES.pushTokens,
+      Key: { userId: '01KYDBSSDJSPC9J0E5N2AWMJ5Y' },
+      ConsistentRead: true,
+    });
+  });
+});
+
+/**
+ * Two more reads decided on the command, for the same reason as above.
+ *
+ * `getSession` backs every HTTP bearer validation. Served at the default
+ * consistency, a token revoked by DELETE /v1/session, /v1/sessions/others,
+ * DELETE /v1/account or a superseding sign-in could still resolve from a
+ * stale replica for a sub-second window after the revoke answered 200 —
+ * while the WebSocket path (`getSessionByDigest`) already read consistently.
+ *
+ * `purgeQueuedMessages` is the account-deletion sweep of a partition of
+ * ciphertext. Its sibling `purgeConsentEdges` reads consistently and says
+ * why in its own comment; a stale page here could miss a row written moments
+ * before the delete, and that ciphertext (with its sender/recipient/ts
+ * metadata) would then live to its 30-day TTL — an unstated exception to the
+ * deletion enumeration. */
+describe('gate.consistentread — session validation and the deletion purge are not served stale', () => {
+  function recordingLayer() {
+    const commands: object[] = [];
+    const send = async (command: object): Promise<unknown> => {
+      commands.push(command);
+      return {};
+    };
+    return { commands, db: makeDataLayer({ send } as unknown as DynamoDBDocumentClient) };
+  }
+
+  it('reads the session row with ConsistentRead', async () => {
+    const { commands, db } = recordingLayer();
+
+    await db.getSession('a-bearer-token-under-test');
+
+    expect(commands).toHaveLength(1);
+    const command = commands[0];
+    expect(command).toBeInstanceOf(GetCommand);
+    expect((command as GetCommand).input).toMatchObject({
+      TableName: TABLES.sessions,
+      ConsistentRead: true,
+    });
+  });
+
+  it('pages the queued-message purge with ConsistentRead', async () => {
+    const { commands, db } = recordingLayer();
+
+    await db.purgeQueuedMessages('01KYDBSSDJSPC9J0E5N2AWMJ5Y');
+
+    expect(commands).toHaveLength(1);
+    const command = commands[0];
+    expect(command).toBeInstanceOf(QueryCommand);
+    expect((command as QueryCommand).input).toMatchObject({
+      TableName: TABLES.messages,
+      KeyConditionExpression: 'recipientId = :r',
+      ExpressionAttributeValues: { ':r': '01KYDBSSDJSPC9J0E5N2AWMJ5Y' },
       ConsistentRead: true,
     });
   });

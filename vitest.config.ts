@@ -135,6 +135,28 @@ const heavy = [
   // exists to end (classify by what a file touches).
   'packages/server/test/accounts-phone-discovery.test.ts',
   'packages/server/test/accounts-phone-discovery-budget.test.ts',
+  // The rest of the phone suites, and the self-lookup discovery
+  // suite. Each opens ListTables against :8000 in beforeAll and drives the
+  // routes against the REAL store; accounts-phone additionally pages a full
+  // Scan of two tables for its "nothing survives anywhere" dump grep, which
+  // timed out at this project's 15s against a fat local store. None of these
+  // was ever fast — they were merely unlisted, which the split's own rule
+  // (classify by what a file touches) forbids.
+  //
+  // MOVING A FILE HERE TAKES IT OUT OF CI. The `check` job runs exactly one vitest
+  // command — `vitest run --project fast` — and nothing anywhere runs `--project
+  // heavy`, so a file listed here runs on a developer's machine and nowhere else.
+  // Each of the three below carried store-blind pins that had been running on
+  // every PR (byte vectors, wire-compat replays, the memory twin); the
+  // reclassification silently dropped them, and the fix was to SPLIT rather than
+  // to un-classify. The store-blind halves now live in fast
+  // siblings — accounts-phone.pins.test.ts, accounts-phone-recovery.wire.test.ts,
+  // and accounts-discovery-self.twin.test.ts (over the shared
+  // accounts-discovery-self.suite.ts) — and must stay there. Before adding a file
+  // to this list, check what CI stops running.
+  'packages/server/test/accounts-phone.test.ts',
+  'packages/server/test/accounts-phone-recovery.test.ts',
+  'packages/server/test/accounts-discovery-self.test.ts',
   'packages/server/test/accounts-agent-reach.test.ts',
   'packages/server/test/accounts-agent-supersede.test.ts',
   'packages/server/test/accounts-deletion-sweep.test.ts',

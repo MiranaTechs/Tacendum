@@ -14,6 +14,7 @@ import { currentToken } from './reauth';
 import { DEVICE_SLOT_CLASS, type DeviceSlotClass } from './deviceNoun';
 import { dissolveGrouping } from './linking';
 import { sanitizeDisplayName } from './person';
+import { session } from './session';
 import { PHONE_UI_ENABLED } from './phoneUi';
 
 /**
@@ -395,6 +396,111 @@ export function recoveryIntent(): boolean {
   return recoveryIntentFlag;
 }
 
+/**
+ * The server's code window: an attach or recovery code works for 5 minutes
+ * (the decks' code-sent sentences say so). One constant for the three code
+ * surfaces, so a pending row older than this renders as expired and a
+ * recovery-request memo older than this is forgotten. */
+export const PENDING_CODE_TTL_MS = 5 * 60_000;
+
+/**
+ * The server's resend cool-down: one code per address (or number) per 60 s
+ * (ratelimit.ts `identifierResend` / `phoneResend`). A tap inside it sends
+ * nothing and answers the same — so the three code surfaces count it down
+ * on the button instead of inviting the tap. */
+export const RESEND_COOLDOWN_MS = 60_000;
+
+/** Milliseconds still to wait before another code may be asked for; 0 when
+ * none — including for an unknown request time, and for a clock that moved
+ * backwards (a wait computed from the future would lock the button for as
+ * long as the clock is wrong). */
+export function resendWaitMs(requestedAt: number | null, now: number): number {
+  if (requestedAt == null) return 0;
+  const age = now - requestedAt;
+  if (age < 0) return 0;
+  return Math.max(0, RESEND_COOLDOWN_MS - age);
+}
+
+/** "1:00" / "0:47" — the countdown's clock, rounded UP to the second so it
+ * never reads 0:00 while the button is still refusing. */
+export function formatResendClock(remainingMs: number): string {
+  const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
+/* ── the recovery-request memo ────────────────────────── */
+
+/**
+ * Which address a recovery code was asked for, and when. Nothing local
+ * records a REQUESTED (not yet proven) recovery code — the attach flow
+ * writes `pendingEmail`, this flow wrote nothing — so an App Lock relock
+ * ("Right away" is the default) or a relaunch between "Email me a code"
+ * and the inbox threw the screen back to an empty form, where a re-request
+ * inside the resend minute quietly sends nothing. The memo lives in the
+ * Keychain (the lock's own at-rest store; no schema change), for the code's
+ * own 5-minute life, and never in a duress session (rule 16: the decoy
+ * workspace must not carry the real workspace's address).
+ */
+export interface RecoveryRequestRecord {
+  address: string;
+  kind: dbModule.IdentifierKind;
+  requestedAt: number;
+}
+
+const KEY_RECOVERY_REQUEST = 'recovery.request';
+
+async function rememberRecoveryRequest(record: RecoveryRequestRecord): Promise<void> {
+  if (session.mode === 'duress') return;
+  try {
+    await cryptoModule.setSecret(KEY_RECOVERY_REQUEST, JSON.stringify(record));
+  } catch {
+    // A memo, never the flow: the code is on its way regardless.
+  }
+}
+
+export async function clearRecoveryRequest(): Promise<void> {
+  try {
+    await cryptoModule.deleteSecret(KEY_RECOVERY_REQUEST);
+  } catch {
+    // Best-effort hygiene; an unreadable memo is forgotten on the next read.
+  }
+}
+
+/** The live memo, or null. An expired memo — or one a clock that moved
+ * backwards makes implausible — is forgotten on read, never restored. */
+export async function loadRecoveryRequest(
+  now: () => number = Date.now,
+): Promise<RecoveryRequestRecord | null> {
+  if (session.mode === 'duress') return null;
+  let raw: string | null | undefined;
+  try {
+    raw = await cryptoModule.getSecret(KEY_RECOVERY_REQUEST);
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+  let parsed: Partial<RecoveryRequestRecord> | null = null;
+  try {
+    parsed = JSON.parse(raw) as Partial<RecoveryRequestRecord>;
+  } catch {
+    parsed = null;
+  }
+  const valid =
+    parsed !== null &&
+    typeof parsed === 'object' &&
+    typeof parsed.address === 'string' &&
+    parsed.address !== '' &&
+    (parsed.kind === dbModule.EMAIL_KIND || parsed.kind === dbModule.PHONE_KIND) &&
+    typeof parsed.requestedAt === 'number' &&
+    Number.isFinite(parsed.requestedAt);
+  const age = valid ? now() - (parsed as RecoveryRequestRecord).requestedAt : -1;
+  if (!valid || age < 0 || age >= PENDING_CODE_TTL_MS) {
+    await clearRecoveryRequest();
+    return null;
+  }
+  return parsed as RecoveryRequestRecord;
+}
+
 export async function requestRecoveryCode(
   rawEmail: string,
   deps: AccountsDeps = defaultDeps(),
@@ -407,6 +513,11 @@ export async function requestRecoveryCode(
   } catch (error) {
     return isRefusal(error) ? 'refused' : 'failed';
   }
+  await rememberRecoveryRequest({
+    address: normalized,
+    kind: dbModule.EMAIL_KIND,
+    requestedAt: deps.now(),
+  });
   return 'sent';
 }
 
@@ -441,6 +552,8 @@ export async function confirmRecoveryCode(
     completesAt: answer.completesAt,
     verifiedAt: deps.now(),
   });
+  // The code is proven: the request memo has done its work.
+  await clearRecoveryRequest();
   return { outcome: 'pending', completesAt: answer.completesAt };
 }
 
@@ -472,6 +585,11 @@ export async function requestRecoveryCodeByPhone(
   } catch (error) {
     return isRefusal(error) ? 'refused' : 'failed';
   }
+  await rememberRecoveryRequest({
+    address: normalized,
+    kind: dbModule.PHONE_KIND,
+    requestedAt: deps.now(),
+  });
   return 'sent';
 }
 
@@ -497,6 +615,7 @@ export async function confirmRecoveryCodeByPhone(
     completesAt: answer.completesAt,
     verifiedAt: deps.now(),
   });
+  await clearRecoveryRequest();
   return { outcome: 'pending', completesAt: answer.completesAt };
 }
 

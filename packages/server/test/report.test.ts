@@ -26,7 +26,14 @@ import { describe, expect, it, beforeEach } from 'vitest';
 import { createReportHandler } from '../src/handlers/report.js';
 import type { ReportRecord } from '../src/db/data.js';
 import type { AuthContext } from '../src/handlers/http.js';
-import { makeMemoryDb, makeTestDeps, jsonPost, type TestDeps } from './helpers.js';
+import { makeMemoryDb, makeTestDeps, jsonPost, parseBody, type TestDeps } from './helpers.js';
+
+// ULID-shaped parties (`reportedUserId` is a ULID at the schema — a report
+// names an account, and an account id has one shape — so the fixtures carry
+// the shape a real client sends).
+const REPORTER = '01REP0RTER0000000000000001';
+const TARGET = '01TARGET000000000000000001';
+const NEVER_EXISTED = '01NEVEREX1STED000000000000';
 
 describe('POST /v1/reports', () => {
   let deps: TestDeps;
@@ -35,7 +42,7 @@ describe('POST /v1/reports', () => {
 
   beforeEach(() => {
     deps = makeTestDeps(makeMemoryDb());
-    auth = { userId: 'reporter-1' };
+    auth = { userId: REPORTER };
     // The DataLayer has no `getReport` and must not grow one, so tests
     // observe writes the same way the deletion-ordering tests do.
     written = [];
@@ -47,7 +54,7 @@ describe('POST /v1/reports', () => {
   });
 
   const body = (over: Record<string, unknown> = {}) =>
-    jsonPost({ reportedUserId: 'target-1', reason: 'harassment', ...over });
+    jsonPost({ reportedUserId: TARGET, reason: 'harassment', ...over });
 
   it('files a report with no message content at all', async () => {
     const res = await createReportHandler(body(), deps, auth);
@@ -57,8 +64,8 @@ describe('POST /v1/reports', () => {
     // The DEFAULT report. Account plus category is complete and actionable,
     // and nothing about it required the user to surrender message text.
     expect(written[0]).toMatchObject({
-      reporterId: 'reporter-1',
-      reportedUserId: 'target-1',
+      reporterId: REPORTER,
+      reportedUserId: TARGET,
       reason: 'harassment',
     });
     expect(written[0]!.excerpts).toBeUndefined();
@@ -75,7 +82,7 @@ describe('POST /v1/reports', () => {
     );
 
     expect(res.statusCode).toBe(201);
-    expect(written[0]!.reporterId).toBe('reporter-1');
+    expect(written[0]!.reporterId).toBe(REPORTER);
   });
 
   it('stores only the excerpts the reporter chose', async () => {
@@ -134,12 +141,21 @@ describe('POST /v1/reports', () => {
 
   it('refuses a self-report', async () => {
     const res = await createReportHandler(
-      body({ reportedUserId: 'reporter-1' }),
+      body({ reportedUserId: REPORTER }),
       deps,
       auth,
     );
 
     expect(res.statusCode).toBe(400);
+    expect(written).toHaveLength(0);
+  });
+
+  it('refuses a reportedUserId that is not a ULID (400) — an oversized one never reaches the store', async () => {
+    for (const bad of ['x'.repeat(3000), 'target-1', TARGET.toLowerCase(), '']) {
+      const res = await createReportHandler(body({ reportedUserId: bad }), deps, auth);
+      expect(res.statusCode, bad.slice(0, 20)).toBe(400);
+      expect(parseBody<{ error: { code: string } }>(res.body).error.code).toBe('invalid_request');
+    }
     expect(written).toHaveLength(0);
   });
 
@@ -149,7 +165,7 @@ describe('POST /v1/reports', () => {
     // no index precisely so it cannot be walked. One dead row that expires
     // on its own is the cheaper mistake.
     const res = await createReportHandler(
-      body({ reportedUserId: 'never-existed' }),
+      body({ reportedUserId: NEVER_EXISTED }),
       deps,
       auth,
     );
@@ -163,8 +179,8 @@ describe('POST /v1/reports', () => {
     const line = deps.logs.find((l) => l.event === 'report_created');
     expect(line).toBeDefined();
     const serialized = JSON.stringify(line);
-    expect(serialized).not.toContain('reporter-1');
-    expect(serialized).not.toContain('target-1');
+    expect(serialized).not.toContain(REPORTER);
+    expect(serialized).not.toContain(TARGET);
     expect(serialized).not.toContain('harassment');
   });
 

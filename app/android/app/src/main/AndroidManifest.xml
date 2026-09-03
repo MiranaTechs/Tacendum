@@ -78,11 +78,25 @@
         check (route asserted intact over CDP across a posture move and a
         density flip on a fold emulator) is the standing re-demonstration.
       -->
+      <!--
+        `taskAffinity=""`. This activity is
+        `singleTask` and exported — the launcher entry has to be both — and
+        with the DEFAULT affinity (the package name) that is the StrandHogg-1
+        shape on API 26–29: another app declaring our package name as its
+        affinity can plant an activity in this task and be brought forward as
+        if it were ours. An empty affinity means no other app's activity can
+        name this task. Notification taps still land here: the launch intent
+        carries FLAG_ACTIVITY_NEW_TASK and the platform matches the existing
+        task by its root COMPONENT before it ever consults affinity, so
+        `onNewIntent` (PendingNav's warm path) is delivered exactly as before.
+        Pinned by ManifestTaskAffinityTest.
+      -->
       <activity
         android:name=".MainActivity"
         android:label="@string/app_name"
         android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|density"
         android:launchMode="singleTask"
+        android:taskAffinity=""
         android:windowSoftInputMode="adjustResize"
         android:exported="true">
         <intent-filter>

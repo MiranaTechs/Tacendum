@@ -217,7 +217,15 @@ export function LinkedDevicesScreen({
                 key={device.userId}
                 testID={`linked-device-${device.userId}`}
                 accessibilityRole="button"
-                accessibilityLabel={`Device ${shortId(device.userId)}, ${device.class}`}
+                // Announced the way it is shown: the own device is
+                // "This device", and the class reaches the label only
+                // through the P3 slot-word chokepoint — never the raw
+                // token.
+                accessibilityLabel={`${
+                  device.userId === profile.userId
+                    ? 'This device'
+                    : `Device ${shortId(device.userId)}`
+                }, ${LINKING_COPY.slotLabel(device.class)}`}
                 onPress={() =>
                   setDetail({
                     name: 'device',

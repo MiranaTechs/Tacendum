@@ -1,6 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AccessibilityInfo,
+  // Deprecated in core but still shipped (the StartChatScreen trade): a
+  // paste target is the whole point of an id.
+  Clipboard,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -20,6 +23,7 @@ import {
 } from '../blocking';
 import * as db from '../db';
 import { DEVICE_NOUN } from '../deviceNoun';
+import { useKeyboardInset } from '../keyboardInset';
 import { messaging } from '../messaging';
 import { alwaysRelayEnabled } from '../call';
 import { personRef, sanitizeDisplayName, shortId } from '../person';
@@ -44,11 +48,14 @@ import {
   IdentityRow,
   InlineError,
   InlineNotice,
+  OutlineButton,
   PrimaryButton,
   ScreenHeader,
+  TextAction,
 } from '../ui/primitives';
 import { InfoDisclosure } from '../ui/InfoDisclosure';
 import { QuietRoom } from '../ui/QuietRoom';
+import { useCoalescedSubscribe } from '../ui/useCoalescedSubscribe';
 import { VaultSection } from '../ui/VaultSection';
 
 interface Props {
@@ -59,6 +66,9 @@ interface Props {
 
 /** Long enough for "Mum", "Sam from the allotment", or a full name. */
 const NICKNAME_MAX = 40;
+
+/** How long a copy or save confirmation holds — StartChatScreen's number. */
+const NOTICE_MS = 3000;
 
 const COPY = {
   title: 'Profile',
@@ -78,6 +88,14 @@ const COPY = {
   nicknamePrivacy: 'Only you see this. It is never sent to them.',
   save: 'Save',
   clear: 'Clear',
+  /** Save's answer: `write()` swallows a failed record on purpose, so
+   * the one moment worth a word is the one that stood — and where it
+   * stood, since it is never sent to them. */
+  nicknameSaved: `Saved on this ${DEVICE_NOUN}.`,
+  copy: 'Copy',
+  /** The bare id, for handing on to someone who should have it. Not the
+   * own-id sentence: this is THEIR address, not one to read out in fours. */
+  idCopied: (who: string) => `Copied ${who}’s ID.`,
 
   safetyTitle: 'Safety number',
   safetyHint:
@@ -86,6 +104,12 @@ const COPY = {
   confirmMatch: 'They match',
   confirmMismatch: 'They don’t match',
   confirmNotYet: 'Not yet',
+  /** Why the timer chips are off on a blocked person: the timer is a
+   * shared setting carried to them in a message, and a block sends
+   * nothing — so the control is honest about being off, and about the
+   * one way back. */
+  timerWhileBlocked:
+    'Nothing is sent to them while they’re blocked, so the timer can’t change. Unblock them first.',
 } as const;
 
 /**
@@ -242,6 +266,24 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
   const [confirming, setConfirming] = useState(false);
   const [nickname, setNickname] = useState('');
   const [nickFocused, setNickFocused] = useState(false);
+  /** Save's brief "saved" line; its timer clears on unmount and on a peer
+   * change, so nothing writes at a surface that is gone. */
+  const [nickSaved, setNickSaved] = useState(false);
+  const nickSavedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** The ID row's Copy confirmation; same lifetime rules. */
+  const [idCopied, setIdCopied] = useState(false);
+  const idCopiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * Sequenced: the device pass in `refresh` is one native safety-number
+   * read per listed device, so two refreshes can overlap and an OLDER pass
+   * must not overwrite a newer one — nor land after the screen is gone.
+   * Bumped on unmount for exactly that. */
+  const refreshSeq = useRef(0);
+  // THE keyboard mechanism (keyboardInset.ts), on
+  // the one input-bearing screen that lacked it: the nickname field sits a
+  // QuietRoom and a hero down the page, and on a short phone it and Save
+  // ended under the keyboard with no scroll extent to lift them.
+  const keyboardInset = useKeyboardInset();
   /** The stored nickname is loaded once per peer: a refresh triggered by an
    * arriving message must never overwrite what is being typed. */
   const seeded = useRef(false);
@@ -264,6 +306,7 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
   );
 
   const refresh = useCallback(() => {
+    const seq = ++refreshSeq.current;
     void db
       .getChat(peerId)
       .then(row => {
@@ -272,6 +315,10 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
           seeded.current = true;
           setNickname(row.localName ?? '');
         }
+        // The agreed timer is a property of the conversation, so it is read
+        // from the chat row — THIS read of it: the row used to be fetched a
+        // second time for the one column.
+        setDisappearSec(row?.disappearSec ?? 0);
       })
       .catch(() => {});
     void messaging
@@ -285,12 +332,6 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
     // Re-read on every notify, so the standing warning leaves the moment a
     // reconcile finally rewrites the mirror — and arrives if one fails.
     setBlockPartial(messaging.isBlockNotificationMirrorStale());
-    // The agreed timer is a property of the conversation, so it is read from
-    // the chat row rather than held in this screen's state across peers.
-    void db.getChat(peerId).then(
-      chat => setDisappearSec(chat?.disappearSec ?? 0),
-      () => {},
-    );
     // The device set: this device's own verified record, re-read on
     // every notify so a device added (or dropped by a signed notice) while
     // the screen is open surfaces without a reopen.
@@ -299,6 +340,7 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
         const shown = rows.filter(
           r => r.userId !== peerId && (r.state === 'linked' || r.state === 'pending'),
         );
+        if (seq !== refreshSeq.current) return;
         setPeerDeviceRows(shown);
         // The per-pair numbers, one native read per listed device (≤2 in
         // v1): null renders as the honest "no number yet" line.
@@ -317,6 +359,9 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
                 .catch(() => ({ checkedAt: null, mismatchAt: null })),
             );
           }
+          // A newer refresh has started, or the screen is gone: this pass
+          // describes a moment already moved past.
+          if (seq !== refreshSeq.current) return;
           setDeviceSafety(numbers);
           setPairRecords(records);
         })();
@@ -331,14 +376,27 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
     setConfirmingBlock(false);
     setBlockFailed(false);
     setAccepted(false);
+    setNickSaved(false);
+    setIdCopied(false);
   }, [peerId]);
 
-  useEffect(() => {
-    refresh();
-    // A card, an avatar blob, or an identity change can land while this screen
-    // is open; the profile must never show a version the thread has moved past.
-    return messaging.subscribe(refresh);
-  }, [refresh]);
+  // The two notices' timers go with the screen, or with the peer they were
+  // about; and no device pass started for a gone screen may land on it.
+  useEffect(
+    () => () => {
+      if (nickSavedTimer.current) clearTimeout(nickSavedTimer.current);
+      if (idCopiedTimer.current) clearTimeout(idCopiedTimer.current);
+      refreshSeq.current++;
+    },
+    [peerId],
+  );
+
+  // A card, an avatar blob, or an identity change can land while this screen
+  // is open; the profile must never show a version the thread has moved
+  // past. ONE coalesced re-read per notify burst: subscribed raw, every
+  // receipt, frame and socket transition re-ran the reads above, a native
+  // safety-number call per listed device among them.
+  useCoalescedSubscribe(refresh);
 
   // Sanitized at the read: this hero is the largest render of a
   // peer-chosen card in the app, so it paints exactly the bytes personName
@@ -568,7 +626,23 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
       // Sibling sync 'name': siblings inherit the local name. Fire-and-
       // forget — the record is this device's, the sync a convenience.
       void messaging.syncLocalName(peerId, cleaned === '' ? null : cleaned);
+      // Only a write that stood says so: `write()` swallows a failure on
+      // purpose, and a "saved" over one would be a lie.
+      setNickSaved(true);
+      if (nickSavedTimer.current) clearTimeout(nickSavedTimer.current);
+      nickSavedTimer.current = setTimeout(() => setNickSaved(false), NOTICE_MS);
     });
+
+  /** The bare id, and no pasteboard expiry (contrast pasteboard.ts): an id
+   * is an address, not a secret — the whole point is that it gets pasted.
+   * The one row on this screen with nothing to look up had no way to hand
+   * the id on; StartChat's own-id row always had. */
+  const copyPeerId = () => {
+    Clipboard.setString(peerId);
+    setIdCopied(true);
+    if (idCopiedTimer.current) clearTimeout(idCopiedTimer.current);
+    idCopiedTimer.current = setTimeout(() => setIdCopied(false), NOTICE_MS);
+  };
 
   const clearNickname = () =>
     write(async () => {
@@ -584,7 +658,13 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
     state !== 'mismatched';
 
   return (
-    <View style={[styles.root, { backgroundColor: t.color.paperGround }]}>
+    <View
+      style={[
+        styles.root,
+        { backgroundColor: t.color.paperGround, paddingBottom: keyboardInset },
+      ]}
+      testID="peer-profile-root"
+    >
       <ScreenHeader
         title={COPY.title}
         onBack={onBack}
@@ -710,10 +790,13 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
               ]}
             />
             <View style={styles.nicknameActions}>
+              {/* Off while nothing changed: a Save that writes
+                  the bytes already stored has nothing to say. Compared on
+                  the sanitized bytes, since those are what gets stored. */}
               <TextAction
                 label={COPY.save}
                 onPress={() => void saveNickname()}
-                disabled={busy}
+                disabled={busy || sanitizeDisplayName(nickname) === local}
                 testID="peer-nickname-save"
               />
               {local || nickname !== '' ? (
@@ -725,9 +808,18 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
                 />
               ) : null}
             </View>
-            <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
-              {COPY.nicknamePrivacy}
-            </Text>
+            {nickSaved ? (
+              <InlineNotice
+                tone="pine"
+                message={COPY.nicknameSaved}
+                marginTop={0}
+                testID="peer-nickname-saved"
+              />
+            ) : (
+              <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
+                {COPY.nicknamePrivacy}
+              </Text>
+            )}
           </View>
 
           {/* Full-bleed sheet: the row keeps its own 16pt padding, so the
@@ -750,8 +842,20 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
               first
               valueTestID="peer-user-id"
               spellValue
+              action={{
+                label: COPY.copy,
+                onPress: copyPeerId,
+                testID: 'peer-copy-id',
+              }}
             />
           </View>
+          {idCopied ? (
+            <InlineNotice
+              tone="pine"
+              message={COPY.idCopied(who)}
+              testID="peer-id-copied"
+            />
+          ) : null}
 
           <View style={styles.safety}>
             <Text
@@ -809,35 +913,11 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
             ) : (
               <>
                 {safety !== null ? (
-                  // Twelve five-digit groups, three to a row, four rows at
-                  // every width and every text size — a number two people read
-                  // to each other must not re-wrap into ragged half-groups.
-                  <View
+                  <SafetyGrid
+                    number={safety}
+                    hint={COPY.safetyHint}
                     testID="peer-safety-number"
-                    accessible
-                    accessibilityLabel={spokenSafetyNumber(safety)}
-                    accessibilityHint={COPY.safetyHint}
-                    style={styles.grid}
-                  >
-                    {safetyGroups(safety).map((group, i) => (
-                      <Text
-                        key={i}
-                        selectable
-                        // The grid above carries the spoken number; without
-                        // this VoiceOver would read all twelve groups twice.
-                        importantForAccessibility="no-hide-descendants"
-                        adjustsFontSizeToFit
-                        numberOfLines={1}
-                        style={[
-                          t.type.safetyNumber,
-                          styles.cell,
-                          { color: t.color.pine },
-                        ]}
-                      >
-                        {group}
-                      </Text>
-                    ))}
-                  </View>
+                  />
                 ) : null}
                 <Text
                   style={[
@@ -879,11 +959,13 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
             )}
 
             {state === 'changed' && copy.action ? (
-              <DangerAction
+              <OutlineButton
                 label={copy.action}
+                tone="danger"
                 onPress={() => void acceptChange()}
                 disabled={busy}
                 testID="peer-safety-accept"
+                style={styles.action}
               />
             ) : null}
 
@@ -909,11 +991,13 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
                   testID="peer-safety-match"
                   style={styles.action}
                 />
-                <DangerAction
+                <OutlineButton
                   label={COPY.confirmMismatch}
+                  tone="danger"
                   onPress={() => void markMismatch()}
                   disabled={busy}
                   testID="peer-safety-mismatch"
+                  style={styles.action}
                 />
                 {/* A question with only two answers and no exit is a trap:
                     somebody who opened this before actually comparing must not
@@ -991,19 +1075,19 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
                   {/* The pair's OWN number (the drill-down): twelve
                       groups a human can actually
                       compare device-by-device, or the honest absence. */}
-                  <Text
-                    style={[t.type.compactBody, { color: t.color.inkMuted }]}
-                    accessibilityLabel={
-                      deviceSafety.get(row.userId)
-                        ? spokenSafetyNumber(deviceSafety.get(row.userId)!)
-                        : PEER_DEVICES.noNumber
-                    }
-                    testID={`peer-device-number-${row.userId}`}
-                  >
-                    {deviceSafety.get(row.userId)
-                      ? safetyGroups(deviceSafety.get(row.userId)!).join('  ')
-                      : PEER_DEVICES.noNumber}
-                  </Text>
+                  {deviceSafety.get(row.userId) ? (
+                    <SafetyGrid
+                      number={deviceSafety.get(row.userId)!}
+                      testID={`peer-device-number-${row.userId}`}
+                    />
+                  ) : (
+                    <Text
+                      style={[t.type.compactBody, { color: t.color.inkMuted }]}
+                      testID={`peer-device-number-${row.userId}`}
+                    >
+                      {PEER_DEVICES.noNumber}
+                    </Text>
+                  )}
                   {/* The pair's OWN match record:
                       the stamp, then the same two-outcome comparison the
                       anchor pair offers — per pair, because "verified" is a
@@ -1049,10 +1133,12 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
                                   onPress={() => markPairMatched(row.userId)}
                                   testID={`peer-device-match-${row.userId}`}
                                 />
-                                <DangerAction
+                                <OutlineButton
                                   label={PEER_DEVICES.pairMismatch}
+                                  tone="danger"
                                   onPress={() => markPairMismatched(row.userId)}
                                   testID={`peer-device-mismatch-${row.userId}`}
+                                  style={styles.action}
                                 />
                               </>
                             )}
@@ -1101,14 +1187,21 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
             <View style={styles.disappearRow}>
               {DISAPPEAR_OPTIONS.map(option => {
                 const active = option.seconds === disappearSec;
+                // Off while they are blocked: the chips say so to
+                // VoiceOver AND to the eye — a recessed surface with muted
+                // ink, never opacity — and a line beneath says why. `busy`
+                // disables the tap but keeps the live look: a write in
+                // flight is not a reason the person needs telling.
+                const locked = blockedAt != null;
+                const disabled = busy || locked;
                 return (
                   <Pressable
                     key={option.seconds}
                     accessibilityRole="button"
-                    accessibilityState={{ selected: active }}
+                    accessibilityState={{ selected: active, disabled }}
                     accessibilityLabel={option.label}
                     testID={`peer-disappear-${option.seconds}`}
-                    disabled={busy || blockedAt != null}
+                    disabled={disabled}
                     onPress={() => {
                       setDisappearFailed(false);
                       const previous = disappearSec;
@@ -1128,19 +1221,28 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
                       {
                         minHeight: t.layout.touchTarget,
                         borderRadius: t.radius.button,
-                        backgroundColor: active
-                          ? t.color.pineWash
-                          : pressed
-                            ? t.color.paperInset
-                            : t.color.paperSheet,
-                        borderColor: active ? t.color.pineLine : t.color.lineSoft,
+                        backgroundColor: locked
+                          ? t.color.paperInset
+                          : active
+                            ? t.color.pineWash
+                            : pressed
+                              ? t.color.paperInset
+                              : t.color.paperSheet,
+                        borderColor:
+                          active && !locked ? t.color.pineLine : t.color.lineSoft,
                       },
                     ]}
                   >
                     <Text
                       style={[
                         t.type.compactStrong,
-                        { color: active ? t.color.pine : t.color.inkBody },
+                        {
+                          color: locked
+                            ? t.color.inkMuted
+                            : active
+                              ? t.color.pine
+                              : t.color.inkBody,
+                        },
                       ]}
                     >
                       {option.label}
@@ -1149,6 +1251,14 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
                 );
               })}
             </View>
+            {blockedAt != null ? (
+              <Text
+                style={[t.type.compactBody, styles.explainerLine, { color: t.color.inkMuted }]}
+                testID="peer-disappear-locked"
+              >
+                {COPY.timerWhileBlocked}
+              </Text>
+            ) : null}
             <Text
               style={[t.type.compactBody, styles.explainerLine, { color: t.color.inkMuted }]}
             >
@@ -1232,14 +1342,16 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
                   </Text>
                 ))}
                 {!confirmingBlock ? (
-                  <WarningAction
+                  <OutlineButton
                     label={BLOCK.action}
+                    tone="warning"
                     onPress={() => {
                       setBlockFailed(false);
                       setConfirmingBlock(true);
                     }}
                     disabled={busy}
                     testID="peer-block"
+                    style={styles.action}
                   />
                 ) : (
                   <View style={styles.confirm}>
@@ -1257,11 +1369,13 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
                     >
                       {BLOCK.confirmBody}
                     </Text>
-                    <WarningAction
+                    <OutlineButton
                       label={BLOCK.confirm}
+                      tone="warning"
                       onPress={() => void blockPerson()}
                       disabled={busy}
                       testID="peer-block-confirm"
+                      style={styles.action}
                     />
                     {/* Three controls, never two: a question with only two
                         answers and no exit is a trap. */}
@@ -1347,8 +1461,49 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
   );
 }
 
-/** A pine text button beside a field. Same anatomy as the primitives' inline
- * actions; kept local because it carries a disabled state they do not. */
+/**
+ * A safety number, laid out as one: twelve five-digit groups, three to a
+ * row, four rows at every width and every text size — a number two people
+ * read to each other must not re-wrap into ragged half-groups. The anchor
+ * pair's grid, extracted so a device pair's number is drawn the same way
+ * rather than as a proportional-font run that wrapped wherever the width
+ * fell — the exact thing safety.ts's grouping exists to prevent. */
+function SafetyGrid({
+  number,
+  hint,
+  testID,
+}: {
+  number: string;
+  hint?: string;
+  testID?: string;
+}) {
+  const t = useTheme();
+  return (
+    <View
+      {...(testID ? { testID } : {})}
+      accessible
+      accessibilityLabel={spokenSafetyNumber(number)}
+      {...(hint ? { accessibilityHint: hint } : {})}
+      style={styles.grid}
+    >
+      {safetyGroups(number).map((group, i) => (
+        <Text
+          key={i}
+          selectable
+          // The grid carries the spoken number; without this VoiceOver would
+          // read all twelve groups twice.
+          importantForAccessibility="no-hide-descendants"
+          adjustsFontSizeToFit
+          numberOfLines={1}
+          style={[t.type.safetyNumber, styles.cell, { color: t.color.pine }]}
+        >
+          {group}
+        </Text>
+      ))}
+    </View>
+  );
+}
+
 /**
  * The machine actions (adopt into crew / revoke), server-answered.
  *
@@ -1488,17 +1643,47 @@ function ReportSection({ peerId }: { peerId: string }) {
           <Text style={[t.type.bodyStrong, { color: t.color.inkStrong }]}>
             {REPORT_COPY.reasonQuestion}
           </Text>
-          {REPORT_COPY.reasons.map(option => (
-            <TextAction
-              key={option.value}
-              label={
-                reason === option.value ? `• ${option.label}` : option.label
-              }
-              onPress={() => setReason(option.value)}
-              disabled={busy}
-              testID={`peer-report-reason-${option.value}`}
-            />
-          ))}
+          {/* The timer's and the relay's idiom: chips in a
+              row, one selected — and SAID to be, so VoiceOver hears
+              "selected" rather than a bullet read out as a word. */}
+          <View style={styles.reasonRow}>
+            {REPORT_COPY.reasons.map(option => {
+              const active = reason === option.value;
+              return (
+                <Pressable
+                  key={option.value}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: active, disabled: busy }}
+                  accessibilityLabel={option.label}
+                  testID={`peer-report-reason-${option.value}`}
+                  disabled={busy}
+                  onPress={() => setReason(option.value)}
+                  style={({ pressed }) => [
+                    styles.reasonChip,
+                    {
+                      minHeight: t.layout.touchTarget,
+                      borderRadius: t.radius.button,
+                      backgroundColor: active
+                        ? t.color.pineWash
+                        : pressed
+                          ? t.color.paperInset
+                          : t.color.paperSheet,
+                      borderColor: active ? t.color.pineLine : t.color.lineSoft,
+                    },
+                  ]}
+                >
+                  <Text
+                    style={[
+                      t.type.compactStrong,
+                      { color: active ? t.color.pine : t.color.inkBody },
+                    ]}
+                  >
+                    {option.label}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
           {/* The consent sentence, above the send control. Its first clause is
               the surprising fact — that nothing they wrote is included — since
               in an encrypted messenger the surprise is that anything could
@@ -1779,14 +1964,16 @@ function MachineSection({ peerId }: { peerId: string }) {
             disabled={busy}
             testID="peer-machine-adopt"
           />
-          <WarningAction
+          <OutlineButton
             label={MACHINE.revoke}
+            tone="warning"
             onPress={() => {
               setNote(null);
               setConfirming('revoke');
             }}
             disabled={busy}
             testID="peer-machine-revoke"
+            style={styles.action}
           />
         </>
       ) : (
@@ -1802,11 +1989,13 @@ function MachineSection({ peerId }: { peerId: string }) {
               testID="peer-machine-adopt-confirm"
             />
           ) : (
-            <WarningAction
+            <OutlineButton
               label={MACHINE.revokeConfirm}
+              tone="warning"
               onPress={() => void act('revoke')}
               disabled={busy}
               testID="peer-machine-revoke-confirm"
+              style={styles.action}
             />
           )}
           <View style={styles.confirmOut}>
@@ -1834,151 +2023,10 @@ function MachineSection({ peerId }: { peerId: string }) {
   );
 }
 
-function TextAction({
-  label,
-  onPress,
-  disabled,
-  testID,
-}: {
-  label: string;
-  onPress: () => void;
-  disabled?: boolean;
-  testID: string;
-}) {
-  const t = useTheme();
-  return (
-    <Pressable
-      onPress={onPress}
-      disabled={disabled}
-      accessibilityRole="button"
-      accessibilityLabel={label}
-      accessibilityState={{ disabled: !!disabled }}
-      testID={testID}
-      style={({ pressed }) => [
-        styles.textAction,
-        { borderRadius: t.radius.button },
-        pressed && !disabled && { backgroundColor: t.color.pineWash },
-      ]}
-    >
-      <Text
-        style={[
-          t.type.buttonCompact,
-          { color: disabled ? t.color.inkMuted : t.color.pine },
-        ]}
-      >
-        {label}
-      </Text>
-    </Pressable>
-  );
-}
-
-/**
- * A destructive step is never a filled red button: accepting an identity
- * change, or recording that two numbers differed, is a considered answer, not
- * the page's happy path.
- */
-function DangerAction({
-  label,
-  onPress,
-  disabled,
-  testID,
-}: {
-  label: string;
-  onPress: () => void;
-  disabled?: boolean;
-  testID: string;
-}) {
-  const t = useTheme();
-  return (
-    <Pressable
-      onPress={onPress}
-      disabled={disabled}
-      accessibilityRole="button"
-      accessibilityLabel={label}
-      accessibilityState={{ disabled: !!disabled }}
-      testID={testID}
-      style={({ pressed }) => [
-        styles.dangerAction,
-        {
-          minHeight: t.layout.buttonHeight,
-          borderRadius: t.radius.button,
-          borderWidth: 1,
-          borderColor: disabled ? t.color.lineSoft : t.color.danger,
-          backgroundColor: disabled
-            ? t.color.paperInset
-            : pressed
-              ? t.color.dangerWash
-              : 'transparent',
-        },
-      ]}
-    >
-      <Text
-        style={[
-          t.type.button,
-          { color: disabled ? t.color.inkMuted : t.color.danger },
-        ]}
-      >
-        {label}
-      </Text>
-    </Pressable>
-  );
-}
-
-/**
- * DangerAction's shape in the block's tone. Kept local for the same reason
- * DangerAction is: it exists for exactly one section, and promoting it to the
- * primitives would invite a third screen to use it for something alarming.
- *
- * Slate, not red: safety.ts already assigns warningMark/warningInk to "a thing
- * to do, not a thing gone wrong", and rendering somebody's own decision in the
- * colour reserved for an intercepted conversation frames it as a fault.
- */
-function WarningAction({
-  label,
-  onPress,
-  disabled,
-  testID,
-}: {
-  label: string;
-  onPress: () => void;
-  disabled?: boolean;
-  testID: string;
-}) {
-  const t = useTheme();
-  return (
-    <Pressable
-      onPress={onPress}
-      disabled={disabled}
-      accessibilityRole="button"
-      accessibilityLabel={label}
-      accessibilityState={{ disabled: !!disabled }}
-      testID={testID}
-      style={({ pressed }) => [
-        styles.dangerAction,
-        {
-          minHeight: t.layout.buttonHeight,
-          borderRadius: t.radius.button,
-          borderWidth: 1,
-          borderColor: disabled ? t.color.lineSoft : t.color.warningMark,
-          backgroundColor: disabled
-            ? t.color.paperInset
-            : pressed
-              ? t.color.paperInset
-              : 'transparent',
-        },
-      ]}
-    >
-      <Text
-        style={[
-          t.type.button,
-          { color: disabled ? t.color.inkMuted : t.color.warningInk },
-        ]}
-      >
-        {label}
-      </Text>
-    </Pressable>
-  );
-}
+// The private TextAction/DangerAction/WarningAction this file used to draw
+// are the kit's TextAction and OutlineButton now: the same outlined 52pt
+// button existed in three screens with three paddings and three disabled
+// rules.
 
 const styles = StyleSheet.create({
   root: { flex: 1 },
@@ -1997,11 +2045,6 @@ const styles = StyleSheet.create({
   nickname: { marginTop: 28 },
   field: { marginTop: 8, minHeight: 52, paddingHorizontal: 14 },
   nicknameActions: { flexDirection: 'row', marginLeft: -8, marginBottom: 4 },
-  textAction: {
-    minHeight: 44,
-    justifyContent: 'center',
-    paddingHorizontal: 8,
-  },
 
   identity: { marginTop: 28 },
 
@@ -2047,10 +2090,14 @@ const styles = StyleSheet.create({
   // Negative margin keeps the label optically on the gutter despite the
   // pressable's own padding, as the shared inline actions do.
   confirmOut: { marginTop: 4, marginLeft: -8, alignSelf: 'flex-start' },
-  dangerAction: {
-    marginTop: 12,
+  // The report reasons' chip geometry, under its own name for the relay
+  // row's reason: five labels that are phrases wrap at their own width,
+  // and a shared token would make tuning one retune the others.
+  reasonRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 12 },
+  reasonChip: {
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 20,
+    paddingHorizontal: 14,
+    borderWidth: 1,
   },
 });

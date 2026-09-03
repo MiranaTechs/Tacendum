@@ -69,13 +69,23 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!--
-      Bluetooth headsets, from API 31, for the route matrix: without it
-      `availableCommunicationDevices` cannot see a connected headset and the
-      "never yank an accessory" rule has nothing to read.
+      NO BLUETOOTH_CONNECT, deliberately. It was
+      declared here on the belief that `availableCommunicationDevices` could
+      not see a headset without it. It can: the route matrix reads devices by
+      TYPE and selects one by port id (CallAudioGate.applyRoute), and the
+      permission gates the android.bluetooth.* APIs and the MAC-address string
+      only — nothing this module reads. Pinned by CallModuleManifestTest.
     -->
-    <uses-permission
-        android:name="android.permission.BLUETOOTH_CONNECT"
-        android:minSdkVersion="31" />
+
+    <!--
+      The proximity wake lock. Telecom manages the
+      proximity sensor for the system dialer's UI, not for a self-managed
+      call's own, so an earpiece call left the screen lit and touch-live
+      against the face. `PROXIMITY_SCREEN_OFF_WAKE_LOCK` is the one lever
+      that blanks it, and this is its permission. Held only while a call is
+      live on the earpiece with no video (ProximityGuard).
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- A voice call is still a call on a device with no camera. -->
     <uses-feature

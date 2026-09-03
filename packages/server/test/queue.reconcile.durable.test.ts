@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  DeleteCommand,
   GetCommand,
   QueryCommand,
   TransactWriteCommand,
@@ -9,6 +10,8 @@ import {
 import {
   makeDataLayer,
   QueuedQuotaExceededError,
+  RECONCILE_DEBOUNCE_MAX_KEYS,
+  RECONCILE_LEASE_MS,
   type LedgerReconcileRequest,
 } from '../src/db/data.js';
 
@@ -165,6 +168,32 @@ describe('quota repair is durable: the handoff completes BEFORE the refusal sett
     expect(hook).toHaveBeenCalledTimes(1);
   });
 
+  it('the debounce map is BOUNDED: past the cap the oldest entry is evicted, never merely the expired ones', async () => {
+    // Nothing expires inside this test (one wall-clock instant), so before
+    // the fix the map simply grew past the cap: the prune only removed
+    // expired entries and the set ran regardless. Now the 513th distinct
+    // ledger evicts the FIRST one, whose next refusal therefore schedules
+    // again — while the second, still inside the map, stays debounced.
+    const { doc } = refusingDoc();
+    const hook = vi.fn(async (): Promise<void> => {});
+    const db = makeDataLayer(doc, LEDGER_QUOTA, { scheduleReconcile: hook });
+    const at = (i: number) => ({ ...msg, recipientId: `R${i}` });
+    for (let i = 0; i <= RECONCILE_DEBOUNCE_MAX_KEYS; i++) {
+      await expect(db.enqueueMessage(at(i))).rejects.toBeInstanceOf(QueuedQuotaExceededError);
+    }
+    expect(hook).toHaveBeenCalledTimes(RECONCILE_DEBOUNCE_MAX_KEYS + 1);
+    // R0 was evicted to make room: it schedules again (evicting the next
+    // oldest in turn — the map never holds more than the cap).
+    await expect(db.enqueueMessage(at(0))).rejects.toBeInstanceOf(QueuedQuotaExceededError);
+    expect(hook).toHaveBeenCalledTimes(RECONCILE_DEBOUNCE_MAX_KEYS + 2);
+    // The most recent ledger is still inside the window: debounced, and a
+    // debounced repeat evicts nothing.
+    await expect(
+      db.enqueueMessage(at(RECONCILE_DEBOUNCE_MAX_KEYS)),
+    ).rejects.toBeInstanceOf(QueuedQuotaExceededError);
+    expect(hook).toHaveBeenCalledTimes(RECONCILE_DEBOUNCE_MAX_KEYS + 2);
+  });
+
   it('a failed handoff clears the debounce so the next refusal retries the schedule', async () => {
     const { doc } = refusingDoc();
     let calls = 0;
@@ -258,5 +287,101 @@ describe('reconcileQueueLedger — the outcome the worker continues on', () => {
     expect(persisted?.input.ExpressionAttributeValues?.[':c']).toBe(
       '01ARZ3NDEKTSV4RRFFQ69G5FAV',
     );
+  });
+});
+
+/**
+ * One clock inside the store. The debounce window, the reconcile lease and
+ * the ack-release expiry boundary read `Date.now()` directly while the
+ * connection-TTL clamp read the injected `DataLayerHooks.nowMs`, so a test
+ * could pin one and not the others. All three ride the store's clock now;
+ * these cases drive them with it. */
+describe('the store has ONE clock: the injected nowMs drives the debounce, the lease and the expiry boundary', () => {
+  const T0 = 1_700_000_000_000;
+
+  it('the durable-handoff debounce expires on the injected clock', async () => {
+    const { doc } = refusingDoc();
+    let now = T0;
+    const hook = vi.fn(async (): Promise<void> => {});
+    const db = makeDataLayer(doc, LEDGER_QUOTA, { scheduleReconcile: hook, nowMs: () => now });
+    await expect(db.enqueueMessage(msg)).rejects.toBeInstanceOf(QueuedQuotaExceededError);
+    now += RECONCILE_LEASE_MS - 1;
+    await expect(db.enqueueMessage(msg)).rejects.toBeInstanceOf(QueuedQuotaExceededError);
+    expect(hook).toHaveBeenCalledTimes(1); // inside the window: debounced
+    now += 1;
+    await expect(db.enqueueMessage(msg)).rejects.toBeInstanceOf(QueuedQuotaExceededError);
+    expect(hook).toHaveBeenCalledTimes(2); // the window elapsed on the store's clock
+  });
+
+  it('the reconcile lease is taken and bounded on the injected clock', async () => {
+    const leases: UpdateCommand[] = [];
+    const { doc } = recordingDoc((cmd) => {
+      if (cmd instanceof UpdateCommand) {
+        if ((cmd.input.UpdateExpression ?? '').includes('qReconUntil = :until')) {
+          leases.push(cmd);
+          return { Attributes: { qItems: 5, qBytes: 500, qGen: 'G1', qVer: 7 } };
+        }
+        return {};
+      }
+      if (cmd instanceof QueryCommand) return { Items: [], Count: 0 };
+      return {};
+    });
+    const db = makeDataLayer(doc, LEDGER_QUOTA, { nowMs: () => T0 });
+    await db.reconcileQueueLedger('R', { kind: 'stranger' });
+    expect(leases).toHaveLength(1);
+    expect(leases[0]!.input.ExpressionAttributeValues?.[':nowMs']).toBe(T0);
+    expect(leases[0]!.input.ExpressionAttributeValues?.[':until']).toBe(T0 + RECONCILE_LEASE_MS);
+  });
+
+  it('the recount page budget is measured on the injected clock, so a slice under a pinned past clock still pages', async () => {
+    // The deadline is minted from the store's clock (nowMs + RECONCILE_SLICE_MS);
+    // a loop guard reading the WALL clock instead would already be past a
+    // deadline pinned in 2023 and the slice would count nothing — no Query at
+    // all — while reporting a recount it never made.
+    const queries: QueryCommand[] = [];
+    const { doc } = recordingDoc((cmd) => {
+      if (cmd instanceof UpdateCommand) {
+        if ((cmd.input.UpdateExpression ?? '').includes('qReconUntil = :until')) {
+          return { Attributes: { qItems: 5, qBytes: 500, qGen: 'G1', qVer: 7 } };
+        }
+        return {};
+      }
+      if (cmd instanceof QueryCommand) {
+        queries.push(cmd);
+        return { Items: [], Count: 0 };
+      }
+      return {};
+    });
+    const db = makeDataLayer(doc, LEDGER_QUOTA, { nowMs: () => T0 });
+    await db.reconcileQueueLedger('R', { kind: 'stranger' });
+    expect(queries).toHaveLength(1);
+  });
+
+  it('the ack-release expiry boundary is decided on the injected clock', async () => {
+    // A row whose `expiresAt` (unix seconds) is long past on the WALL clock
+    // but still live on the store's injected clock: the release must take
+    // the live path (a TransactWrite that decrements the ledger), never the
+    // expired path (a bare row delete that leaves the ledger alone).
+    const { commands, doc } = recordingDoc((cmd) => {
+      if (cmd instanceof GetCommand) {
+        const key = cmd.input.Key as { msgId: string };
+        if (key.msgId === MSG_ID) {
+          return { Item: { senderId: 'S', msgBytes: 10, expiresAt: 1_000, qNonce: 'n' } };
+        }
+        return { Item: { qItems: 1, qBytes: 10, qGen: 'G1', qVer: 1 } };
+      }
+      return {};
+    });
+    const db = makeDataLayer(doc, LEDGER_QUOTA, { nowMs: () => 500 * 1000 });
+    await db.deleteQueuedMessage('R', MSG_ID);
+    expect(commands.some((c) => c instanceof TransactWriteCommand)).toBe(true);
+    // No bare delete of the MESSAGE row (the expired path's shape). The
+    // conditional reap of an empty pair ledger that follows the live path
+    // is a DeleteCommand too, keyed by the ledger row — not this one.
+    const bareRowDelete = commands.some(
+      (c) =>
+        c instanceof DeleteCommand && (c.input.Key as { msgId?: string }).msgId === MSG_ID,
+    );
+    expect(bareRowDelete).toBe(false);
   });
 });

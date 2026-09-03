@@ -134,14 +134,23 @@ export function checkUsernameLocally(raw: string): UsernameLocalCheck {
  * enforced — the server is the gate.
  */
 export function usernameClaimWaitHours(userId: string, nowMs: number): number | null {
-  let createdAt: number;
+  const opensAt = usernameClaimOpensAtMs(userId);
+  if (opensAt === null) return null;
+  const remainingMs = opensAt - nowMs;
+  return remainingMs > 0 ? Math.ceil(remainingMs / 3_600_000) : 0;
+}
+
+/** When the §4.5 age gate opens for this account, in milliseconds since the
+ * epoch — the server-minted ID's own time half plus the three days the
+ * server counts on the CALLER's createdAt; null for an ID that does not
+ * decode. The screen arms a timer on it so a wait that ends on-screen
+ * re-enables the claim button. */
+export function usernameClaimOpensAtMs(userId: string): number | null {
   try {
-    createdAt = decodeTime(userId);
+    return decodeTime(userId) + DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000;
   } catch {
     return null;
   }
-  const remainingMs = createdAt + DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000 - nowMs;
-  return remainingMs > 0 ? Math.ceil(remainingMs / 3_600_000) : 0;
 }
 
 /** Whether an unlink this device performed still holds the cool-down
@@ -237,15 +246,15 @@ export async function unlinkUsername(
     return isRefusal(error) ? 'refused' : 'failed';
   }
   await deps.db.clearUsernameIdentifier();
-  // The device's memory of what it just did (build 24): the server
-  // stamped its 30-day cool-down on the unlink, and only the exact name is
+  // The device's memory of what it just did (build 24): the server stamped
+  // its 30-day cool-down on the unlink, and only the exact name is
   // reclaimable inside it — the claim form reads this row to say so before
   // the tap, because the wire will never say why. Written UNCONDITIONALLY
-  // on a landed unlink (gate fix): a device whose local row is missing or
-  // stale (the name was claimed on a sibling, the row not yet synced or
-  // wiped) still performed the unlink the server stamped, so the memory
-  // records the moment with an EMPTY name — the wire never echoes one
-  // — and the form warns without naming the reclaimable name.
+  // on a landed unlink (fix): a device whose local row is missing or stale
+  // (the name was claimed on a sibling, the row not yet synced or wiped)
+  // still performed the unlink the server stamped, so the memory records
+  // the moment with an EMPTY name — the wire never echoes one — and the
+  // form warns without naming the reclaimable name.
   await deps.db.saveUsernameUnlink({ username: held?.username ?? '', unlinkedAt: deps.now() });
   return 'ok';
 }

@@ -79,6 +79,9 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
   const [emailDraft, setEmailDraft] = useState('');
   const [codeDraft, setCodeDraft] = useState('');
   const [codeRequested, setCodeRequested] = useState(false);
+  /** When a code was last asked for — this mount's own send, or the memo's
+   * stamp after a relock: the resend minute counts from it. */
+  const [requestedAt, setRequestedAt] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -88,7 +91,7 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
   const refresh = useCallback(() => {
     void db
       .loadLocalRecovery()
-      .then(row => {
+      .then(async row => {
         // THE DARK PIN HOLDS ON THE PERSISTED ROW TOO:
         // a kind='phone' recovery row in a false-pin binary renders NOTHING
         // — not the pending wait, not the complete button — exactly as
@@ -97,7 +100,32 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
         // mirrored client-side — a pin-ON binary resumes
         // the wait from the same row. `completeRecovery` refuses the same
         // row independently, so this gate is rendering, not the guard.
-        setPending(accounts.recoveryRowVisible(row) ? row : null);
+        const visible = accounts.recoveryRowVisible(row) ? row : null;
+        setPending(visible);
+        // A CODE WAS ASKED FOR AND NOT YET PROVEN: the memo restores the
+        // class, the address and the code field for the code's own
+        // 5-minute life, so a relock ("Right away" is the default) or a
+        // relaunch between the tap and the inbox no longer throws the
+        // person back to an empty form — where a re-request inside the
+        // resend minute sends nothing. A typed draft is never
+        // overwritten. A phone memo in a dark-pin binary stays dark, like
+        // the phone row above.
+        if (visible === null) {
+          const memo = await accounts.loadRecoveryRequest();
+          if (memo !== null && (PHONE_UI_ENABLED || memo.kind !== db.PHONE_KIND)) {
+            setClassSel(memo.kind);
+            setEmailDraft(draft => (draft === '' ? memo.address : draft));
+            setCodeRequested(true);
+            setRequestedAt(memo.requestedAt);
+            setNotice(
+              current =>
+                current ??
+                (memo.kind === db.PHONE_KIND
+                  ? ACCOUNTS_PHONE_COPY.recoverCodeSentNumber(memo.address)
+                  : ACCOUNTS_COPY.recoverCodeSent(memo.address)),
+            );
+          }
+        }
         setLoaded(true);
       })
       .catch(() => setLoaded(true));
@@ -120,6 +148,7 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
         : await accounts.requestRecoveryCode(emailDraft);
       if (outcome === 'sent') {
         setCodeRequested(true);
+        setRequestedAt(Date.now());
         setNotice(
           byNumber
             ? ACCOUNTS_PHONE_COPY.recoverCodeSentNumber(emailDraft.trim())
@@ -129,6 +158,10 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
         // The honest LOCAL refusal: this device's own knowledge of the
         // E.164 shape — never dressed up as the server's collapse.
         setError(ACCOUNTS_PHONE_COPY.numberInvalid);
+      } else if (outcome === 'failed') {
+        // A transport failure is not a refusal: nothing was checked, so
+        // the collapsed-refusal sentence would lie.
+        setError(ACCOUNTS_COPY.failed);
       } else {
         setError(ACCOUNTS_COPY.recoverRefused);
       }
@@ -144,6 +177,8 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
         refresh();
       } else if (result.outcome === 'invalid') {
         setError(ACCOUNTS_PHONE_COPY.numberInvalid);
+      } else if (result.outcome === 'failed') {
+        setError(ACCOUNTS_COPY.failed);
       } else {
         setError(ACCOUNTS_COPY.recoverRefused);
       }
@@ -156,6 +191,8 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
         setDone(true);
       } else if (outcome === 'not_ready') {
         setError(ACCOUNTS_COPY.recoverNotYet);
+      } else if (outcome === 'failed') {
+        setError(ACCOUNTS_COPY.failed);
       } else {
         setError(ACCOUNTS_COPY.recoverCompleteRefused);
       }
@@ -184,6 +221,18 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
       () => setClockTick(n => n + 1),
       Math.max(250, Math.min(remainingMs + 250, 60_000)),
     );
+    return () => clearTimeout(timer);
+  });
+
+  // THE RESEND MINUTE, counted down on the button: the server sends
+  // nothing inside it and answers the same, so the button refuses visibly
+  // instead of inviting the tap — the attach screens' countdown, from the
+  // memo here (it survives the relock). One-second ticks while it runs;
+  // the effect above keeps its own, longer clock for the wait.
+  const resendWait = accounts.resendWaitMs(requestedAt, Date.now());
+  useEffect(() => {
+    if (resendWait <= 0) return;
+    const timer = setTimeout(() => setClockTick(n => n + 1), Math.min(1_000, resendWait));
     return () => clearTimeout(timer);
   });
 
@@ -283,6 +332,9 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
                         setEmailDraft('');
                         setCodeDraft('');
                         setCodeRequested(false);
+                        // The budget is per address: another class is
+                        // another address, so its minute is not this one's.
+                        setRequestedAt(null);
                         setNotice(null);
                         setError(null);
                       }}
@@ -355,14 +407,26 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
               // The verb follows the class: the phone
               // door must not promise an email.
               label={
-                byNumber
-                  ? ACCOUNTS_PHONE_COPY.recoverRequestNumber
-                  : ACCOUNTS_COPY.recoverRequest
+                resendWait > 0
+                  ? ACCOUNTS_COPY.requestAgainIn(accounts.formatResendClock(resendWait))
+                  : byNumber
+                    ? ACCOUNTS_PHONE_COPY.recoverRequestNumber
+                    : ACCOUNTS_COPY.recoverRequest
               }
               onPress={requestCode}
-              disabled={busy || emailDraft.trim() === ''}
+              disabled={busy || emailDraft.trim() === '' || resendWait > 0}
               testID="recovery-request-code"
             />
+            {/* The code field without a request: a code already
+                in the inbox — asked for on another device, or by a screen
+                that has since forgotten. */}
+            {!codeRequested ? (
+              <TextAction
+                label={ACCOUNTS_COPY.recoverHaveCode}
+                onPress={() => setCodeRequested(true)}
+                testID="recovery-have-code"
+              />
+            ) : null}
             {codeRequested ? (
               <>
                 <TextInput
@@ -373,6 +437,8 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
                   accessibilityLabel={ACCOUNTS_COPY.codePlaceholder}
                   keyboardType="number-pad"
                   maxLength={6}
+                  autoComplete="one-time-code"
+                  textContentType="oneTimeCode"
                   testID="recovery-code-input"
                   style={[
                     t.type.utilityData,
@@ -390,7 +456,10 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
                 <PrimaryButton
                   label={ACCOUNTS_COPY.recoverVerify}
                   onPress={verifyCode}
-                  disabled={busy || codeDraft.trim().length !== 6}
+                  // The address is the verify's other half: a revealed code
+                  // field over an empty address must not fire a request
+                  // the server can only refuse.
+                  disabled={busy || codeDraft.trim().length !== 6 || emailDraft.trim() === ''}
                   testID="recovery-verify"
                 />
               </>
@@ -405,6 +474,27 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
               testID="recovery-pending"
             >
               {ACCOUNTS_COPY.recoverPending(completesLabel(pending.completesAt))}
+            </Text>
+            {/* The wait, relatively: the date above is the
+                fact, this is how long it is from here — re-rendered by the
+                clock tick above while the screen is open. And what leaving
+                costs: nothing — App.tsx re-enters this surface at every
+                launch while the row exists. */}
+            {!readyToComplete ? (
+              <Text
+                style={[t.type.body, { color: t.color.inkStrong }]}
+                testID="recovery-pending-relative"
+              >
+                {ACCOUNTS_COPY.recoverPendingIn(
+                  ACCOUNTS_COPY.waitLabel(pending.completesAt * 1000 - Date.now()),
+                )}
+              </Text>
+            ) : null}
+            <Text
+              style={[t.type.compactBody, { color: t.color.inkMuted }]}
+              testID="recovery-pending-return"
+            >
+              {ACCOUNTS_COPY.recoverPendingReturn}
             </Text>
             <PrimaryButton
               label={ACCOUNTS_COPY.recoverComplete}

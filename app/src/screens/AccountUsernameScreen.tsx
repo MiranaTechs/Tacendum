@@ -27,6 +27,10 @@ import {
 
 interface Props {
   onBack: () => void;
+  /** Opens the email surface from the "Link an email" door beside the
+   * no-identifier sentence. Optional: without it the sentence stands
+   * alone, exactly as it did. */
+  onOpenAccountEmail?: () => void;
 }
 
 /**
@@ -68,15 +72,17 @@ interface Props {
  *    the parser (linking.ts) already cleared the row in every binary; this
  *    screen is where the person is told, and the dismiss clears the notice.
  */
-export function AccountUsernameScreen({ onBack }: Props) {
+export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
   const t = useTheme();
   const keyboardInset = useKeyboardInset();
   const [identifier, setIdentifier] = useState<db.UsernameIdentifierRow | null>(null);
   const [revoked, setRevoked] = useState<db.UsernameNoticeRow | null>(null);
   const [hasPossessionIdentifier, setHasPossessionIdentifier] = useState(true);
-  // The age gate, counted from the server-minted ID (build 24): null =
-  // unknown, quiet; 0 = open; n = hours still to wait, said before the tap.
-  const [claimWaitHours, setClaimWaitHours] = useState<number | null>(null);
+  // The age gate, counted from the server-minted ID (build 24): the ID is
+  // kept and the hours are DERIVED at render, so the clock tick below can
+  // move them — null = unknown, quiet; 0 = open; n = hours still to wait,
+  // said under the button it disables.
+  const [profileId, setProfileId] = useState<string | null>(null);
   // THIS device's memory of the unlink it performed (build 24): seeded
   // once from its row at mount, then moved by this screen's own verbs — the
   // unlink sets it, a landed claim clears it. Never re-read on refresh: it is
@@ -94,8 +100,7 @@ export function AccountUsernameScreen({ onBack }: Props) {
   // it from the row's CURRENT findability (below), so every path back to
   // CLAIM mode — keep, unlink, a revocation landing mid-rename — must put
   // the default back: a claim form opened after a rename of an unfindable
-  // name would otherwise inherit `false` and send it as if chosen (gate
-  // finding).
+  // name would otherwise inherit `false` and send it as if chosen.
   const [consent, setConsent] = useState(true);
 
   const refresh = useCallback(() => {
@@ -110,9 +115,7 @@ export function AccountUsernameScreen({ onBack }: Props) {
         setIdentifier(row);
         setRevoked(notice);
         setHasPossessionIdentifier(email?.email != null || phone?.phone != null);
-        setClaimWaitHours(
-          profile ? accountsUsername.usernameClaimWaitHours(profile.userId, Date.now()) : null,
-        );
+        setProfileId(profile?.userId ?? null);
         setLoaded(true);
       })
       .catch(() => setLoaded(true));
@@ -233,6 +236,29 @@ export function AccountUsernameScreen({ onBack }: Props) {
       await db.clearUsernameNotice();
     });
 
+  const claimWaitHours =
+    profileId === null ? null : accountsUsername.usernameClaimWaitHours(profileId, Date.now());
+  // THE AGE GATE IS THIS DEVICE'S OWN TRUTH: the server counts the CALLER's
+  // createdAt, which the ULID carries — so the claim button waits it out
+  // rather than inviting a tap the wire can only refuse with the same
+  // reasonless 403. The identifier precondition is NOT enforced here: it is
+  // group-level, and a sibling may hold the verification this device has
+  // not mirrored. A wait that ends while the screen is open must re-enable
+  // the button on its own: the RecoveryScreen clock tick, capped at 60 s so
+  // a long wait costs a trivial timer.
+  const claimGateClosed = claimWaitHours !== null && claimWaitHours > 0;
+  const [, setClockTick] = useState(0);
+  useEffect(() => {
+    if (profileId === null || !claimGateClosed) return;
+    const opensAt = accountsUsername.usernameClaimOpensAtMs(profileId);
+    if (opensAt === null) return;
+    const timer = setTimeout(
+      () => setClockTick(n => n + 1),
+      Math.max(250, Math.min(opensAt - Date.now() + 250, 60_000)),
+    );
+    return () => clearTimeout(timer);
+  });
+
   // THE BUILD-PIN GATE, on the surface itself as well as its door: a dark build
   // renders NOTHING here even when the route is entered programmatically.
   if (!USERNAME_UI_ENABLED) return null;
@@ -310,15 +336,26 @@ export function AccountUsernameScreen({ onBack }: Props) {
       </Pressable>
       {!consent ? (
         <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
-          {ACCOUNTS_USERNAME_COPY.heldUnfindable}
+          {/* The CLAIM form speaks of a name not yet held;
+              a RENAME keeps the held sentence — the name IS held. */}
+          {held ? ACCOUNTS_USERNAME_COPY.heldUnfindable : ACCOUNTS_USERNAME_COPY.claimUnfindable}
         </Text>
       ) : null}
       <PrimaryButton
         label={held ? ACCOUNTS_USERNAME_COPY.renameSubmit : ACCOUNTS_USERNAME_COPY.claim}
         onPress={submit}
-        disabled={busy || localCheck !== 'ok'}
+        disabled={busy || localCheck !== 'ok' || (!held && claimGateClosed)}
         testID="account-username-submit"
       />
+      {/* The hours sentence sits UNDER the button it disables,
+          and leaves with the wait. */}
+      {!held && claimGateClosed ? (
+        <InlineNotice
+          tone="quiet"
+          message={ACCOUNTS_USERNAME_COPY.needsAge(claimWaitHours!)}
+          testID="account-username-needs-age"
+        />
+      ) : null}
       {held ? (
         <TextAction
           label={ACCOUNTS_USERNAME_COPY.renameKeep}
@@ -388,18 +425,21 @@ export function AccountUsernameScreen({ onBack }: Props) {
             because every refusal the wire answers is the same reasonless
             403. */}
         {loaded && !held && !hasPossessionIdentifier ? (
-          <InlineNotice
-            tone="quiet"
-            message={ACCOUNTS_USERNAME_COPY.needsIdentifier}
-            testID="account-username-needs-identifier"
-          />
-        ) : null}
-        {loaded && !held && claimWaitHours !== null && claimWaitHours > 0 ? (
-          <InlineNotice
-            tone="quiet"
-            message={ACCOUNTS_USERNAME_COPY.needsAge(claimWaitHours)}
-            testID="account-username-needs-age"
-          />
+          <>
+            <InlineNotice
+              tone="quiet"
+              message={ACCOUNTS_USERNAME_COPY.needsIdentifier}
+              testID="account-username-needs-identifier"
+            />
+            {/* The step the sentence names, one tap away. */}
+            {onOpenAccountEmail ? (
+              <TextAction
+                label={ACCOUNTS_USERNAME_COPY.needsIdentifierAction}
+                onPress={onOpenAccountEmail}
+                testID="account-username-link-email"
+              />
+            ) : null}
+          </>
         ) : null}
         {loaded &&
         !held &&

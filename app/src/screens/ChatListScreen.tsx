@@ -18,7 +18,9 @@ import {
   View,
 } from 'react-native';
 import { BLOCK_COPY as BLOCK } from '../blocking';
+import { getSecret, setSecret } from 'tacendum-crypto';
 import * as db from '../db';
+import * as lock from '../lock';
 import { DEVICE_NOUN } from '../deviceNoun';
 import { parseEnvelope, previewFor } from '../envelope';
 import { messaging } from '../messaging';
@@ -30,10 +32,17 @@ import { useTheme } from '../theme';
 import { timeLabel } from '../time';
 import { Avatar } from '../ui/Avatar';
 import { InfoDisclosure } from '../ui/InfoDisclosure';
-import { InlineError, InlineNotice, TextAction } from '../ui/primitives';
+import {
+  HomeHeader,
+  InlineError,
+  InlineNotice,
+  OutlineButton,
+  TextAction,
+} from '../ui/primitives';
 import { QuietRoom } from '../ui/QuietRoom';
 import { RoomMark } from '../ui/RoomMark';
 import { shareWithAnchor, type ShareAnchor } from '../ui/shareWithAnchor';
+import { useCoalescedSubscribe } from '../ui/useCoalescedSubscribe';
 
 interface Props {
   profile: db.ProfileRow;
@@ -46,6 +55,10 @@ interface Props {
   onOpenProfile: () => void;
   /** The + control: reaching someone new lives on its own surface. */
   onStartChat: () => void;
+  /** The App Lock nudge's route in: Settings, where the lock lives.
+   * Optional — without it the nudge still shows and still says where, it
+   * just offers no button that would claim a route it lacks. */
+  onOpenAppLock?: () => void;
   /** A room is made FROM people already here, so its entry lives with the
    * list rather than behind the + (which reaches someone new). */
   onStartRoom: () => void;
@@ -107,6 +120,10 @@ const COPY = {
   emptyTitle: 'Nobody else is here yet',
   stepOne: 'Send someone your ID.',
   stepTwo: 'Tap +, then enter theirs.',
+  /** Where a conversation's actions live: Block and Delete sit behind a
+   * long press and the … each row carries, and nothing on the screen
+   * used to say so. */
+  actionsHint: 'Later, the … beside a chat holds Block and Delete.',
   copyId: 'Copy ID',
   shareId: 'Share ID',
   // Byte-identical to StartChatScreen.tsx — the same copy action must never
@@ -128,6 +145,11 @@ const REFRESH_DEBOUNCE_MS = 80;
 
 /** How long the copy confirmation holds — StartChatScreen's own number. */
 const COPY_NOTICE_MS = 3000;
+
+/** The + button's geometry: where it floats and how big it is. The list's
+ * bottom inset is derived from these, so the two cannot drift apart. */
+const FAB_BOTTOM = 24;
+const FAB_SIZE = 56;
 
 /**
  * Which step of a row's attached actions is showing. Blocking gets its own
@@ -155,8 +177,13 @@ function previewLine(chat: db.ChatRow): string {
  * One conversation, plus the actions attached beneath it. A continuous row,
  * not a card: the only edges are the pressed wash and the seam the list draws
  * between rows.
- */
-function ConversationRow({
+ *
+ * Memoised: every prop is a primitive, a row object the list holds, or a
+ * stable callback, so a re-render of the list for one row's drawer, a socket
+ * transition or a keystroke in the filter leaves the other rows' trees
+ * untouched. `renderItem` below is a `useCallback` for the same reason — an
+ * inline arrow handed VirtualizedList a new function every render. */
+const ConversationRow = React.memo(function ConversationRowBody({
   chat,
   room,
   unread,
@@ -444,6 +471,40 @@ function ConversationRow({
             ) : null}
           </View>
         </View>
+        {/* The visible door to Block and Delete: a long press and the
+            VoiceOver rotor action reached
+            the drawer, and nothing on screen said so. A 44pt target at the
+            row's trailing edge opens — and closes — the same drawer. Hidden
+            from VoiceOver on purpose: the row is ONE element whose rotor
+            action already reaches the drawer, and a glyph read out as
+            "ellipsis" after every preview would be noise, not a door. */}
+        <Pressable
+          onPress={() =>
+            onMenu(chat.peerId, menu === 'none' ? 'actions' : 'none')
+          }
+          accessibilityElementsHidden
+          importantForAccessibility="no-hide-descendants"
+          testID={`chat-more-${chat.peerId}`}
+          style={({ pressed }) => [
+            styles.rowMore,
+            {
+              width: t.layout.touchTarget,
+              minHeight: t.layout.touchTarget,
+              borderRadius: t.radius.circle,
+              backgroundColor: pressed ? t.color.pineWash : 'transparent',
+            },
+          ]}
+        >
+          <Text
+            allowFontScaling={false}
+            style={[
+              t.type.iconGlyph,
+              { color: menu === 'none' ? t.color.inkMuted : t.color.pine },
+            ]}
+          >
+            …
+          </Text>
+        </Pressable>
       </Pressable>
 
       {menu === 'actions' ? (
@@ -606,41 +667,18 @@ function ConversationRow({
               disabled={blockBusy}
               testID={`chat-block-cancel-${chat.peerId}`}
             />
-            <Pressable
+            {/* The kit's outlined button in its warning tone:
+                slate, never red — a block is the person's own settled
+                decision, not an alarm. */}
+            <OutlineButton
+              label={BLOCK.confirm}
+              tone="warning"
+              size="compact"
               onPress={() => runBlockWrite(onBlock)}
               disabled={blockBusy}
-              accessibilityRole="button"
-              accessibilityLabel={BLOCK.confirm}
-              accessibilityState={{ disabled: blockBusy }}
               testID={`chat-block-confirm-${chat.peerId}`}
-              style={({ pressed }) => [
-                styles.confirmDelete,
-                {
-                  minHeight: t.layout.touchTarget,
-                  borderRadius: t.radius.button,
-                  borderWidth: 1,
-                  borderColor: blockBusy
-                    ? t.color.lineSoft
-                    : t.color.warningMark,
-                  backgroundColor: blockBusy
-                    ? t.color.paperInset
-                    : pressed
-                      ? t.color.paperInset
-                      : 'transparent',
-                },
-              ]}
-            >
-              <Text
-                style={[
-                  t.type.buttonCompact,
-                  {
-                    color: blockBusy ? t.color.inkMuted : t.color.warningInk,
-                  },
-                ]}
-              >
-                {BLOCK.confirm}
-              </Text>
-            </Pressable>
+              style={styles.confirmDelete}
+            />
           </View>
           {blockFailed ? (
             <InlineError
@@ -678,37 +716,15 @@ function ConversationRow({
               disabled={busy}
               testID={`chat-keep-${chat.peerId}`}
             />
-            <Pressable
+            <OutlineButton
+              label={COPY.delete}
+              tone="danger"
+              size="compact"
               onPress={remove}
               disabled={busy}
-              accessibilityRole="button"
-              accessibilityLabel={COPY.delete}
-              accessibilityState={{ disabled: busy }}
               testID={`chat-delete-confirm-${chat.peerId}`}
-              style={({ pressed }) => [
-                styles.confirmDelete,
-                {
-                  minHeight: t.layout.touchTarget,
-                  borderRadius: t.radius.button,
-                  borderWidth: 1,
-                  borderColor: busy ? t.color.lineSoft : t.color.danger,
-                  backgroundColor: busy
-                    ? t.color.paperInset
-                    : pressed
-                      ? t.color.dangerWash
-                      : 'transparent',
-                },
-              ]}
-            >
-              <Text
-                style={[
-                  t.type.buttonCompact,
-                  { color: busy ? t.color.inkMuted : t.color.danger },
-                ]}
-              >
-                {COPY.delete}
-              </Text>
-            </Pressable>
+              style={styles.confirmDelete}
+            />
           </View>
           {failed ? (
             <InlineError
@@ -722,7 +738,7 @@ function ConversationRow({
       ) : null}
     </View>
   );
-}
+});
 
 /** Filter over rows already on this device. No lookup, so never "search". */
 function FilterField({
@@ -883,6 +899,15 @@ function EmptyChats({
             </Text>
           </View>
         </View>
+        {/* Not a numbered step — there is nothing to do yet — but the one
+            sentence that used to be missing: where a row's
+            actions live once there are rows. */}
+        <Text
+          style={[t.type.compactBody, styles.emptyHint, { color: t.color.inkMuted }]}
+          testID="empty-actions-hint"
+        >
+          {COPY.actionsHint}
+        </Text>
       </View>
 
       {nudge}
@@ -961,6 +986,114 @@ function NamingNudge({
 }
 
 /**
+ * The one-time App Lock nudge. After the naming moment nothing ever said
+ * the app can be locked: the lock lives in Settings, and a person who never
+ * opens Settings never learns that their chats are exactly as private as
+ * the phone's own lock. The list says it once, in the naming nudge's slot
+ * and shape — a quiet card, never an alert: an InlineNotice announces on
+ * every mount, and this list mounts on every return to it.
+ *
+ * Owed while App Lock is off and nothing has answered. Either control
+ * settles it durably in the Keychain — the store the lock's own state lives
+ * in (lock.ts), and the store every other small device preference uses
+ * (readReceipts.ts, pushConsent.ts). Device-scoped on purpose: the lock is
+ * this device's, so the answer is too, and a sign-out does not re-ask.
+ * Never in a duress session: one exists only under a lock that is on. */
+const LOCK_NUDGE_COPY = {
+  title: 'Add a lock code',
+  body: 'Your chats are only as private as this phone’s lock. A lock code of your own is asked for whenever Tacendum opens.',
+  where: 'Turn it on in Settings → App Lock, whenever you like.',
+  open: 'Open Settings',
+  skip: 'Not now',
+  infoLabel: 'What a lock code does',
+  infoLines: [
+    'With App Lock on, Tacendum asks for its own code when it opens and after it has been in the background — on top of the phone’s passcode.',
+    'The code never leaves this phone. Forgetting it means setting the app up again, so pick one you will remember.',
+  ],
+} as const;
+
+const LOCK_NUDGE_KEY = 'lockNudge.dismissed';
+
+async function lockNudgeDue(): Promise<boolean> {
+  if ((await lock.status()).enabled) return false;
+  return (await getSecret(LOCK_NUDGE_KEY)) !== '1';
+}
+
+function settleLockNudge(): Promise<void> {
+  return setSecret(LOCK_NUDGE_KEY, '1');
+}
+
+function LockNudge({
+  placement,
+  onOpen,
+  onSkip,
+}: {
+  placement: 'empty' | 'list';
+  /** The route into Settings, when the host wired one. */
+  onOpen: (() => void) | undefined;
+  onSkip: () => void;
+}) {
+  const t = useTheme();
+  return (
+    <View
+      testID="lock-nudge"
+      style={[
+        styles.nudge,
+        placement === 'empty'
+          ? styles.nudgeEmpty
+          : [styles.nudgeList, { marginHorizontal: t.layout.gutter }],
+        {
+          borderRadius: t.radius.drawer,
+          backgroundColor: t.color.paperSheet,
+          borderColor: t.color.lineSoft,
+          borderWidth: t.hairline,
+        },
+      ]}
+    >
+      <Text
+        accessibilityRole="header"
+        style={[t.type.sectionTitle, { color: t.color.inkStrong }]}
+      >
+        {LOCK_NUDGE_COPY.title}
+      </Text>
+      <Text
+        style={[t.type.compactBody, styles.nudgeBody, { color: t.color.inkBody }]}
+      >
+        {LOCK_NUDGE_COPY.body}
+      </Text>
+      {onOpen ? null : (
+        // No button can promise a route this screen was not given, so the
+        // words carry the way instead.
+        <Text
+          style={[t.type.compactBody, styles.nudgeBody, { color: t.color.inkBody }]}
+        >
+          {LOCK_NUDGE_COPY.where}
+        </Text>
+      )}
+      <InfoDisclosure
+        label={LOCK_NUDGE_COPY.infoLabel}
+        lines={LOCK_NUDGE_COPY.infoLines}
+        testID="lock-nudge-info"
+      />
+      <View style={styles.nudgeActions}>
+        {onOpen ? (
+          <TextAction
+            label={LOCK_NUDGE_COPY.open}
+            onPress={onOpen}
+            testID="lock-nudge-open"
+          />
+        ) : null}
+        <TextAction
+          label={LOCK_NUDGE_COPY.skip}
+          onPress={onSkip}
+          testID="lock-nudge-skip"
+        />
+      </View>
+    </View>
+  );
+}
+
+/**
  * Chat list: who you talk to, and the only way to reach someone new. Tacendum
  * has no directory, so the start-chat panel is permanent furniture rather than
  * a hidden compose action — an id typed by hand is the entire address book.
@@ -972,6 +1105,7 @@ export function ChatListScreen({
   onOpenProfile,
   onStartChat,
   onStartRoom,
+  onOpenAppLock,
 }: Props) {
   const t = useTheme();
   const [chats, setChats] = useState<db.ChatRow[]>([]);
@@ -1011,8 +1145,18 @@ export function ChatListScreen({
     step: 'actions' | 'confirm' | 'blockConfirm';
   } | null>(null);
 
+  /** Sequenced (CallsScreen's own guard): this refresh is N async reads
+   * long — listChats, then a getGroup per row — and it is called both
+   * directly after a delete/block and from the 80 ms notify window, so two
+   * can overlap. Every set below lands only if no newer refresh has
+   * started since, or a just-deleted row's OLDER snapshot could resolve
+   * last and paint the row back. */
+  const refreshSeq = useRef(0);
   const refresh = useCallback(() => {
+    const seq = ++refreshSeq.current;
+    const current = () => seq === refreshSeq.current;
     void db.listChats().then(async rows => {
+      if (!current()) return;
       setChats(rows);
       // The anchors identify the rooms among the rows. A row whose anchor
       // read fails renders as a person — the quiet posture every other
@@ -1023,15 +1167,21 @@ export function ChatListScreen({
             [row.peerId, await db.getGroup(row.peerId).catch(() => null)] as const,
         ),
       );
+      if (!current()) return;
       setRooms(
         new Map(
           anchors.filter((pair): pair is [string, db.GroupRow] => pair[1] !== null),
         ),
       );
     });
-    void db.unreadCounts().then(setUnread, () => {
-      // Marks are an enhancement: a list without them still works.
-    });
+    void db.unreadCounts().then(
+      counts => {
+        if (current()) setUnread(counts);
+      },
+      () => {
+        // Marks are an enhancement: a list without them still works.
+      },
+    );
     void db.unreadRoomBodies().then(
       byRoom => {
         const hit = new Set<string>();
@@ -1052,7 +1202,7 @@ export function ChatListScreen({
             }
           }
         }
-        setMentioned(hit);
+        if (current()) setMentioned(hit);
       },
       () => {
         // The unread marks' own quiet posture: a list that cannot read the
@@ -1060,7 +1210,9 @@ export function ChatListScreen({
       },
     );
     void db.listBlockedPeers().then(
-      ids => setBlockedIds(new Set(ids)),
+      ids => {
+        if (current()) setBlockedIds(new Set(ids));
+      },
       () => {
         // Same quiet posture as the unread marks: a list that cannot read the
         // table still shows every conversation, and enforcement does not live
@@ -1073,32 +1225,17 @@ export function ChatListScreen({
     // fresh on every call.
   }, [profile.userId]);
 
-  useEffect(() => {
-    refresh();
-    // ONE COALESCED REQUERY WINDOW per notify burst.
-    // Under the wide shell this list is LIVE beside an open thread,
-    // and messaging.notify() fires on every receipt, inbound frame, socket
-    // transition and attachment tick — subscribed raw, a draining backlog
-    // cost one full list requery (listChats + a getGroup per row + three
-    // more reads) PER notify, doubled against the thread's own requeries.
-    // The window is the same 80ms, same shape, as the thread's and
-    // ProfileWatcher's: a window rather than a resetting debounce, so a
-    // continuous drain still refreshes instead of starving. The screen's
-    // own mutations (delete/block/unblock) keep calling refresh() directly
-    // and are not delayed.
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const off = messaging.subscribe(() => {
-      if (timer) return;
-      timer = setTimeout(() => {
-        timer = null;
-        refresh();
-      }, REFRESH_DEBOUNCE_MS);
-    });
-    return () => {
-      if (timer) clearTimeout(timer);
-      off();
-    };
-  }, [refresh]);
+  // ONE COALESCED REQUERY WINDOW per notify burst.
+  // Under the wide shell this list is LIVE beside an open thread, and
+  // messaging.notify() fires on every receipt, inbound frame, socket
+  // transition and attachment tick — subscribed raw, a draining backlog
+  // cost one full list requery (listChats + a getGroup per row + three
+  // more reads) PER notify, doubled against the thread's own requeries.
+  // The window itself lives in useCoalescedSubscribe now, so the profile
+  // and composer screens hold the same one; the screen's own mutations
+  // (delete/block/unblock) keep calling refresh() directly and are not
+  // delayed.
+  useCoalescedSubscribe(refresh, REFRESH_DEBOUNCE_MS);
 
   // Colour alone cannot carry connection state, so the marker always travels
   // with the word (the bare dot is cut).
@@ -1237,19 +1374,28 @@ export function ChatListScreen({
 
   // The one-time naming nudge: owed while the account is nameless AND
   // unanswered, whatever the list holds. Read once per mount — the answer
-  // only ever moves one way.
+  // only ever moves one way. The App Lock nudge is read in the same pass and
+  // committed in the same batch, so the two answers land together: naming
+  // first, and the lock nudge never paints for a frame before the naming
+  // answer arrives to hide it.
   const [nudge, setNudge] = useState(false);
+  const [lockNudge, setLockNudge] = useState(false);
   useEffect(() => {
     let live = true;
-    if (!namingNudgeDue(profile, false)) {
-      setNudge(false);
-      return undefined;
-    }
-    void isNamingSettled()
-      .then(settled => {
-        if (live) setNudge(namingNudgeDue(profile, settled));
-      })
-      .catch(() => undefined);
+    void (async () => {
+      const naming = namingNudgeDue(profile, false)
+        ? namingNudgeDue(
+            profile,
+            // An unreadable answer counts as answered: a nudge that cannot
+            // settle must not show.
+            await isNamingSettled().catch(() => true),
+          )
+        : false;
+      const lockDue = await lockNudgeDue().catch(() => false);
+      if (!live) return;
+      setNudge(naming);
+      setLockNudge(lockDue);
+    })();
     return () => {
       live = false;
     };
@@ -1264,6 +1410,22 @@ export function ChatListScreen({
     settleNudge();
     onOpenProfile();
   }, [onOpenProfile, settleNudge]);
+  const skipLockNudge = useCallback(() => {
+    setLockNudge(false);
+    void settleLockNudge().catch(() => undefined);
+  }, []);
+  const openAppLock = useMemo(
+    () =>
+      onOpenAppLock
+        ? () => {
+            // Same rule as addName: the one showing is spent by opening
+            // Settings, whether or not a code gets set there.
+            skipLockNudge();
+            onOpenAppLock();
+          }
+        : undefined,
+    [onOpenAppLock, skipLockNudge],
+  );
 
   const filtering = chats.length >= FILTER_FROM;
   const trimmedQuery = query.trim();
@@ -1293,6 +1455,8 @@ export function ChatListScreen({
               the existing nameless account is exactly who it is for. */}
           {nudge ? (
             <NamingNudge placement="list" onAdd={addName} onSkip={settleNudge} />
+          ) : lockNudge ? (
+            <LockNudge placement="list" onOpen={openAppLock} onSkip={skipLockNudge} />
           ) : null}
           {filtering ? <FilterField value={query} onChange={setQuery} /> : null}
           {/* The room entry lives with the list, not behind the + : a room
@@ -1319,7 +1483,19 @@ export function ChatListScreen({
           </View>
         </View>
       ),
-    [addName, chats.length, filtering, nudge, onStartRoom, query, settleNudge, t],
+    [
+      addName,
+      chats.length,
+      filtering,
+      lockNudge,
+      nudge,
+      onStartRoom,
+      openAppLock,
+      query,
+      settleNudge,
+      skipLockNudge,
+      t,
+    ],
   );
 
   const separator = useCallback(
@@ -1345,17 +1521,54 @@ export function ChatListScreen({
     () => ({ menu, unread, blockedIds, rooms, mentioned, selectedPeerId }),
     [menu, unread, blockedIds, rooms, mentioned, selectedPeerId],
   );
+  const listInset = useMemo(() => {
+    const clearance = FAB_BOTTOM + FAB_SIZE + t.space.s6;
+    return { paddingBottom: clearance, indicator: { bottom: clearance } };
+  }, [t]);
+
+  // Stable across renders: the memoised row skips when its props are
+  // unchanged, and that needs the callbacks — these five are already
+  // useCallbacks — and this function to keep their identity.
+  const renderRow = useCallback(
+    ({ item }: { item: db.ChatRow }) => (
+      <ConversationRow
+        chat={item}
+        room={rooms.get(item.peerId)}
+        unread={(unread[item.peerId] ?? 0) > 0}
+        mentioned={mentioned.has(item.peerId)}
+        blocked={blockedIds.has(item.peerId)}
+        selected={item.peerId === selectedPeerId}
+        menu={menu?.peerId === item.peerId ? menu.step : 'none'}
+        onOpen={openChat}
+        onMenu={changeMenu}
+        onDelete={deleteChat}
+        onBlock={blockPeer}
+        onUnblock={unblockPeer}
+      />
+    ),
+    [
+      blockPeer,
+      blockedIds,
+      changeMenu,
+      deleteChat,
+      menu,
+      mentioned,
+      openChat,
+      rooms,
+      selectedPeerId,
+      unblockPeer,
+      unread,
+    ],
+  );
 
   return (
     <View style={[styles.root, { backgroundColor: t.color.paperGround }]}>
-      <View style={[styles.header, { paddingHorizontal: t.layout.gutter }]}>
-        <View style={styles.headerTitles}>
-          <Text
-            style={[t.type.screenTitle, { color: t.color.inkStrong }]}
-            accessibilityRole="header"
-          >
-            {COPY.title}
-          </Text>
+      {/* The home header the Calls tab shares: one title role,
+          one height, the same profile door — only the word changes when the
+          tab does. The connection line rides under the title as before. */}
+      <HomeHeader
+        title={COPY.title}
+        statusLine={
           <View style={styles.connection} testID={`ws-${wsState}`}>
             <View
               style={[
@@ -1373,29 +1586,11 @@ export function ChatListScreen({
               {connection.label}
             </Text>
           </View>
-        </View>
-        <Pressable
-          onPress={onOpenProfile}
-          accessibilityRole="button"
-          accessibilityLabel={COPY.profileAction}
-          style={({ pressed }) => [
-            styles.profileTarget,
-            {
-              width: t.layout.touchTarget,
-              height: t.layout.touchTarget,
-              borderRadius: t.radius.circle,
-              backgroundColor: pressed ? t.color.pineWash : 'transparent',
-            },
-          ]}
-        >
-          <Avatar
-            peerId={profile.userId}
-            displayName={profile.displayName}
-            photoB64={profile.avatarB64}
-            size={t.layout.avatar.header}
-          />
-        </Pressable>
-      </View>
+        }
+        profile={profile}
+        onOpenProfile={onOpenProfile}
+        profileLabel={COPY.profileAction}
+      />
 
       {/* The standing, VISIBLE form of the partial-mirror
           warning. The announcements above speak once, to VoiceOver, at the
@@ -1413,6 +1608,12 @@ export function ChatListScreen({
         extraData={listExtra}
         keyExtractor={chat => chat.peerId}
         keyboardShouldPersistTaps="handled"
+        // The + button floats over the list's bottom edge: the content ends
+        // one FAB-clearance above it, so the last row — and the Block/Delete
+        // drawer it opens — scrolls clear of the disc instead of sitting
+        // under it. The indicator is inset by the same amount.
+        contentContainerStyle={listInset}
+        scrollIndicatorInsets={listInset.indicator}
         ListHeaderComponent={header}
         ItemSeparatorComponent={separator}
         ListEmptyComponent={
@@ -1439,27 +1640,18 @@ export function ChatListScreen({
                     onAdd={addName}
                     onSkip={settleNudge}
                   />
+                ) : lockNudge ? (
+                  <LockNudge
+                    placement="empty"
+                    onOpen={openAppLock}
+                    onSkip={skipLockNudge}
+                  />
                 ) : null
               }
             />
           )
         }
-        renderItem={({ item }) => (
-          <ConversationRow
-            chat={item}
-            room={rooms.get(item.peerId)}
-            unread={(unread[item.peerId] ?? 0) > 0}
-            mentioned={mentioned.has(item.peerId)}
-            blocked={blockedIds.has(item.peerId)}
-            selected={item.peerId === selectedPeerId}
-            menu={menu?.peerId === item.peerId ? menu.step : 'none'}
-            onOpen={openChat}
-            onMenu={changeMenu}
-            onDelete={deleteChat}
-            onBlock={blockPeer}
-            onUnblock={unblockPeer}
-          />
-        )}
+        renderItem={renderRow}
       />
 
       {/* The one way to reach someone new. A flat pine circle on the paper —
@@ -1489,17 +1681,8 @@ export function ChatListScreen({
 const styles = StyleSheet.create({
   root: { flex: 1 },
 
-  header: {
-    minHeight: 64,
-    paddingVertical: 4,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  headerTitles: { flex: 1 },
   connection: { flexDirection: 'row', alignItems: 'center', marginTop: 2 },
   connectionMark: { width: 6, height: 6, marginRight: 6 },
-  profileTarget: { alignItems: 'center', justifyContent: 'center' },
 
   filterWrap: { paddingTop: 12, paddingBottom: 12 },
   filterInput: { paddingHorizontal: 14 },
@@ -1538,26 +1721,27 @@ const styles = StyleSheet.create({
     marginLeft: 8,
   },
 
+  /** The trailing … target: a 44pt disc at the row's edge, held in by
+   * the row's own gutter. */
+  rowMore: { alignItems: 'center', justifyContent: 'center', marginLeft: 4 },
+
   rowDrawer: { width: '100%' },
   rowDrawerAction: { justifyContent: 'center' },
   rowDrawerNote: { paddingBottom: 12 },
   rowConfirm: { borderLeftWidth: 3, padding: 12 },
   rowConfirmBody: { marginTop: 8 },
   confirmActions: { flexDirection: 'row', alignItems: 'center', marginTop: 10 },
-  confirmDelete: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 12,
-    marginLeft: 8,
-  },
+  /** The kit's compact OutlineButton beside the TextAction: only the gap
+   * between them is this screen's. */
+  confirmDelete: { marginLeft: 8 },
 
   noMatch: { marginTop: 24, textAlign: 'center' },
 
   fab: {
     position: 'absolute',
-    bottom: 24,
-    width: 56,
-    height: 56,
+    bottom: FAB_BOTTOM,
+    width: FAB_SIZE,
+    height: FAB_SIZE,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -1576,6 +1760,7 @@ const styles = StyleSheet.create({
     gap: 4,
     marginLeft: -8,
   },
+  emptyHint: { marginTop: 16 },
 
   nudge: { padding: 16 },
   nudgeEmpty: { marginTop: 28, width: 280 },

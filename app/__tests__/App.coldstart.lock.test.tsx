@@ -137,7 +137,6 @@ let live: { renderer: typeof ReactTestRenderer; tree: ReactTestRenderer.ReactTes
  */
 function coldStart(): Boot {
   jest.resetModules();
-  /* eslint-disable @typescript-eslint/no-require-imports */
   const React = require('react') as typeof import('react');
   const renderer = require('react-test-renderer') as typeof ReactTestRenderer;
   const sqlite = (
@@ -197,7 +196,6 @@ function coldStart(): Boot {
     live.push({ renderer, tree });
     return tree;
   };
-  /* eslint-enable @typescript-eslint/no-require-imports */
 
   return {
     renderer,

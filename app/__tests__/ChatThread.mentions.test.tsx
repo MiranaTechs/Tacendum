@@ -584,7 +584,10 @@ test('the quote box of a reply-to-a-mention resolves names — never the words w
   ]);
   const tree = await renderThread();
   const box = tree.root.findByProps({ testID: `quote-${replyId}` });
-  const node = box.findAllByType(Text)[0];
+  // The quoted WORDS are the box's last text: the
+  // author's name stands above them.
+  const boxTexts = box.findAllByType(Text);
+  const node = boxTexts[boxTexts.length - 1]!;
   const text = Array.isArray(node.props.children)
     ? node.props.children.join('')
     : String(node.props.children ?? '');

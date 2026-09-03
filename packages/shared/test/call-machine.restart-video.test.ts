@@ -147,3 +147,42 @@ describe('peerVideo across an ICE restart', () => {
     expect(state.call?.peerVideo).toBe(false);
   });
 });
+
+describe('the restart answer after ICE healed on its own', () => {
+  it("is applied in `connected` while the caller's restart is in flight, then the flag clears", () => {
+    // A blip: connected → reconnecting emits the restart; ICE heals before
+    // the callee's answer lands, so the machine is `connected` again with a
+    // local restart offer outstanding. Refusing the answer there left the
+    // peer connection in have-local-offer until the next real disconnect.
+    const healed = drive(
+      [
+        { type: 'iceStateChanged', cid: CID, ice: 'disconnected' },
+        { type: 'iceStateChanged', cid: CID, ice: 'connected' },
+      ],
+      connectedCaller(),
+    );
+    expect(healed.name).toBe('connected');
+    expect(healed.call?.restartInFlight).toBe(true);
+
+    const step = callReducer(
+      healed,
+      { type: 'answerReceived', cid: CID, sdp: 'restart-answer-sdp', video: true },
+      NOW,
+    );
+    expect(step.effects).toContainEqual(
+      expect.objectContaining({ type: 'setRemoteAnswer', cid: CID, sdp: 'restart-answer-sdp' }),
+    );
+    expect(step.state.name).toBe('connected');
+    expect(step.state.call?.restartInFlight).toBe(false);
+  });
+
+  it('still refuses an unsolicited answer on a healthy call with nothing in flight', () => {
+    const step = callReducer(
+      connectedCaller(),
+      { type: 'answerReceived', cid: CID, sdp: 'unsolicited-answer', video: true },
+      NOW,
+    );
+    expect(step.effects).toHaveLength(0);
+    expect(step.state.name).toBe('connected');
+  });
+});

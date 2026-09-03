@@ -6,7 +6,7 @@ import type { APIGatewayRequestAuthorizerEvent } from 'aws-lambda';
 import { wsConnectHandler, type WsDeps } from '../src/handlers/ws.js';
 import { startWsServer } from '../src/local/ws.js';
 import { makeMemoryDb, makeTestDeps, testIdentityKey, type TestDeps } from './helpers.js';
-import type { DataLayer } from '../src/db/data.js';
+import type { TestOnlyDataLayer } from '../src/db/data.js';
 
 /**
  * the transitional `?token=` scheme is GONE, on every host.
@@ -94,7 +94,7 @@ describe('pure $connect handler refuses a bearer in the query string', () => {
 });
 
 describe('local adapter refuses a bearer in the query string', () => {
-  let db: DataLayer;
+  let db: TestOnlyDataLayer;
   let deps: TestDeps;
   let server: Server;
   let wsUrl: string;

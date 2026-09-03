@@ -10,6 +10,7 @@ import {
   UsernameUnlinkRequest,
   normalizeUsernameIdentifier,
   usernameSkeleton,
+  hasReservedUsernameAffix,
 } from '@tacendum/shared';
 import { LIMITS } from '../ratelimit.js';
 import {
@@ -96,7 +97,10 @@ export function usernameTaken(): HttpResult {
 function isReservedUsername(normalized: string, skeleton: string): boolean {
   return (
     (RESERVED_USERNAMES as readonly string[]).includes(normalized) ||
-    RESERVED_USERNAME_SKELETONS.has(skeleton)
+    RESERVED_USERNAME_SKELETONS.has(skeleton) ||
+    // The operator/brand affix rule: each end segment exact and
+    // skeleton-vs-skeleton, same refusal bytes.
+    hasReservedUsernameAffix(normalized)
   );
 }
 

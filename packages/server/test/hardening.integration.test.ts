@@ -10,10 +10,11 @@ import {
 import { PrivateKey } from '@signalapp/libsignal-client';
 import { authSignedBytes, TABLES, type AuthResponse } from '@tacendum/shared';
 import { makeDocClient } from '../src/db/client.js';
-import { IDKEY_CLAIM_PREFIX, makeDataLayer, type DataLayer } from '../src/db/data.js';
+import { IDKEY_CLAIM_PREFIX, makeTestOnlyDataLayer, type TestOnlyDataLayer } from '../src/db/data.js';
 import { authChallengeHandler, authHandler } from '../src/handlers/auth-account.js';
 import { getPrekeyBundleHandler, uploadKeysHandler } from '../src/handlers/keys.js';
 import type { AuthContext, Deps, HttpEvent } from '../src/handlers/http.js';
+import { KEY_FIXTURE } from './helpers.js';
 
 /**
  * Hardening regressions — these only fail on REAL DynamoDB semantics
@@ -26,7 +27,7 @@ const B64 = 'QUJDMTIz';
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
 let doc: DynamoDBDocumentClient;
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 const cleanupUsers: string[] = [];
 const cleanupIdentityKeys: string[] = [];
@@ -75,15 +76,18 @@ function uploadBody(n: number, startId = 1) {
   return {
     registrationId: 5,
     identityKey: B64,
-    signedPrekey: { keyId: 1, pub: B64, sig: B64 },
-    kyberPrekey: { keyId: 1, pub: B64, sig: B64 },
-    oneTimePrekeys: Array.from({ length: n }, (_, i) => ({ keyId: startId + i, pub: B64 })),
+    signedPrekey: { keyId: 1, pub: KEY_FIXTURE.curvePub, sig: KEY_FIXTURE.sig },
+    kyberPrekey: { keyId: 1, pub: KEY_FIXTURE.kyberPub, sig: KEY_FIXTURE.sig },
+    oneTimePrekeys: Array.from({ length: n }, (_, i) => ({
+      keyId: startId + i,
+      pub: KEY_FIXTURE.curvePub,
+    })),
   };
 }
 
 beforeAll(async () => {
   doc = makeDocClient();
-  db = makeDataLayer(doc);
+  db = makeTestOnlyDataLayer(doc);
   try {
     await doc.send(
       new QueryCommand({

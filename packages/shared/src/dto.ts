@@ -170,6 +170,46 @@ export const KyberPrekey = z.object({
 });
 export type KyberPrekey = z.infer<typeof KyberPrekey>;
 
+/**
+ * Byte lengths of the key material every shipped client uploads, pinned at
+ * the UPLOAD schema only. libsignal is deliberately off the HTTP function,
+ * so the server cannot verify a signed prekey's signature at the door — but
+ * it can refuse material of the wrong SIZE, which closes the cheapest
+ * poisoning: a stolen bearer publishing garbage under the victim's identity
+ * key so every peer's bundle processing fails until a re-upload. A
+ * Curve25519 public key serializes with its type byte (33), a signature is
+ * 64 bytes, an ML-KEM-1024 public key serializes with its type byte (1569)
+ * — iOS and Android libsignal, the CLI, and the Android device gate
+ * (the Android verify pass) all agree. The RESPONSE shapes
+ * (`PrekeyBundle`) are untouched: the app parses those strictly, and a
+ * served bundle only ever carries what this accepted. */
+export const CURVE_PUBLIC_KEY_BYTES = 33;
+export const SIGNATURE_BYTES = 64;
+export const KYBER_PUBLIC_KEY_BYTES = 1569;
+
+/** Decoded length of a base64 string, padded or not. Arithmetic, not
+ * decode-then-measure, so this module stays platform-free (no Buffer). */
+function base64ByteLength(s: string): number {
+  const unpadded = s.replace(/=+$/, '').length;
+  return Math.floor((unpadded * 3) / 4);
+}
+const base64OfBytes = (bytes: number) =>
+  Base64.refine((s) => base64ByteLength(s) === bytes, `must encode exactly ${bytes} bytes`);
+
+/** The upload-side twins of the three prekey shapes: same fields, byte
+ * lengths pinned. Request-side only — see the note above. */
+export const UploadSignedPrekey = SignedPrekey.extend({
+  pub: base64OfBytes(CURVE_PUBLIC_KEY_BYTES),
+  sig: base64OfBytes(SIGNATURE_BYTES),
+});
+export const UploadOneTimePrekey = OneTimePrekey.extend({
+  pub: base64OfBytes(CURVE_PUBLIC_KEY_BYTES),
+});
+export const UploadKyberPrekey = KyberPrekey.extend({
+  pub: base64OfBytes(KYBER_PUBLIC_KEY_BYTES),
+  sig: base64OfBytes(SIGNATURE_BYTES),
+});
+
 // PUT /v1/keys  ->  204
 export const UploadKeysRequest = z.object({
   registrationId: z.number().int().nonnegative(),
@@ -178,9 +218,9 @@ export const UploadKeysRequest = z.object({
   // endpoints must agree on one spelling or an account can be locked out of
   // its own key upload. See CanonicalBase64 above.
   identityKey: CanonicalBase64.max(128),
-  signedPrekey: SignedPrekey,
-  kyberPrekey: KyberPrekey,
-  oneTimePrekeys: z.array(OneTimePrekey).max(1000),
+  signedPrekey: UploadSignedPrekey,
+  kyberPrekey: UploadKyberPrekey,
+  oneTimePrekeys: z.array(UploadOneTimePrekey).max(1000),
 });
 export type UploadKeysRequest = z.infer<typeof UploadKeysRequest>;
 
@@ -408,7 +448,13 @@ export const WsTicketResponse = z.object({
    * survive one.
    */
   ticket: Base64Url.max(128),
-  expiresAt: z.number().int().positive(),
+  /** Unix seconds. OPTIONAL on the wire:
+   * the server always emits it, but no shipped client reads it, and a
+   * required field the client never uses is pure breakage surface — with no
+   * OTA path, a response that ever dropped it would stop every installed
+   * build from dialling. The app's strict parse tolerates its absence now;
+   * the server-side tests keep pinning its presence. */
+  expiresAt: z.number().int().positive().optional(),
 });
 export type WsTicketResponse = z.infer<typeof WsTicketResponse>;
 
@@ -449,8 +495,10 @@ export const AGPL_SOURCE_URL_DEFAULT = 'https://github.com/MiranaTechs/Tacendum'
 
 export const AuthChallengeResponse = z.object({
   challenge: ChallengeB64,
-  /** Unix seconds. The client should not bother signing a stale one. */
-  expiresAt: z.number().int().nonnegative(),
+  /** Unix seconds. The client should not bother signing a stale one.
+   * OPTIONAL on the wire: always emitted, never read by a shipped client
+   * — see `WsTicketResponse`. */
+  expiresAt: z.number().int().nonnegative().optional(),
   /**
    * The §13 source offer — see `AGPL_SOURCE_URL_DEFAULT`. Mirrored by a
    * `Link: <url>; rel="source https://tacendum.com/rel/source"` header on the
@@ -1182,6 +1230,45 @@ export const RESERVED_USERNAME_SKELETONS: ReadonlySet<string> = new Set(
 );
 
 /**
+ * THE AFFIX RULE: the operator/brand subset of the denylist, refused as the
+ * FIRST or LAST `_`-separated segment of a name as well as whole —
+ * `tacendum_support`, `mirana_official`, `admin_alice`, `security_team` were
+ * all claimable under the exact/skeleton check alone. Each end segment is
+ * matched exact AND skeleton-vs-skeleton (`adm1n_bob`, `rnirana_help`), so
+ * the §4.3 fold reaches the affixes too. Deliberately affix-shaped, not
+ * substring-shaped (`teamster`, `adminsky` and `alice_team_x` stay
+ * claimable), and deliberately small: the list is pinned by test, and
+ * additions are code deploys like the denylist's. Squatting stays bounded
+ * rather than eliminated — this tightens the bound.
+ */
+export const RESERVED_USERNAME_AFFIXES = [
+  'tacendum',
+  'mirana',
+  'admin',
+  'support',
+  'security',
+  'official',
+  'staff',
+  'team',
+] as const;
+
+const RESERVED_USERNAME_AFFIX_SKELETONS: ReadonlySet<string> = new Set(
+  RESERVED_USERNAME_AFFIXES.map(usernameSkeleton),
+);
+
+/** Does a NORMALIZED username start or end with a reserved affix (with `_`
+ * separators)? Exact or by skeleton, per end segment. */
+export function hasReservedUsernameAffix(normalized: string): boolean {
+  const segments = normalized.split('_').filter((segment) => segment.length > 0);
+  if (segments.length < 2) return false;
+  return [segments[0]!, segments[segments.length - 1]!].some(
+    (segment) =>
+      (RESERVED_USERNAME_AFFIXES as readonly string[]).includes(segment) ||
+      RESERVED_USERNAME_AFFIX_SKELETONS.has(usernameSkeleton(segment)),
+  );
+}
+
+/**
  * The username TOMBSTONE window:
  * a renamed, unlinked, deleted, or revoked name's claim rows are overwritten
  * with `{tombstoned, formerGroupId?, freesAt: now + this}` and re-claimable
@@ -1589,7 +1676,11 @@ export type DiscoveryLookupMember = z.infer<typeof DiscoveryLookupMember>;
  * member's bundle via the EXISTING per-user route and pins keys TOFU. */
 export const DiscoveryLookupResponse = z.object({
   members: z.array(DiscoveryLookupMember).min(1).max(3),
-  rosterVersion: z.number().int().nonnegative(),
+  /** OPTIONAL on the wire: the server always emits it; the app reads only
+   * `members` (pickDiscoveryAnchor), so a required-but-unread field only
+   * widened the strict-parse blast radius. The server-side discovery tests
+   * keep pinning its presence. */
+  rosterVersion: z.number().int().nonnegative().optional(),
 });
 export type DiscoveryLookupResponse = z.infer<typeof DiscoveryLookupResponse>;
 
@@ -1928,7 +2019,10 @@ export type ReportExcerpt = z.infer<typeof ReportExcerpt>;
 export const CreateReportRequest = z.object({
   /** The account being reported. The reporter is the authenticated caller and
    * is never supplied by the client. */
-  reportedUserId: z.string().min(1).max(64),
+  // A ULID: a report names an account, and an account id has exactly one
+  // shape. Request-side tightening only — every shipped client already sends
+  // the peer's ULID.
+  reportedUserId: Ulid,
   reason: ReportReason,
   /**
    * At most five, and only what the reporter picked one by one. The cap is

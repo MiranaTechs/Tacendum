@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomInt, randomUUID } from 'node:crypto';
 import {
   BatchWriteCommand,
   DeleteCommand,
@@ -70,6 +70,14 @@ export interface UserRecord {
   signedPrekey?: SignedPrekey;
   /** Signed last-resort Kyber prekey (PQXDH; required by current libsignal). */
   kyberPrekey?: KyberPrekey;
+  /** The one-time prekey POOL GENERATION: minted by every `storeKeys`,
+   * written in the same Update that publishes the signed prekey, and
+   * stamped on every one-time prekey of that upload. A bundle fetch reads
+   * it here and consumes ONLY rows carrying it, so a pool replacement in
+   * flight can never serve an old-pool key under the new signed prekey.
+   * Absent on a row that has not uploaded since this shipped — its
+   * (unstamped) pool consumes unconditioned until it does. */
+  prekeyPoolGen?: string;
   /**
    * Account class, set at birth and never.
    * Absent = human. An integration account is send-restricted server-side:
@@ -880,6 +888,14 @@ export interface QueuedMessage {
   payload: string; // b64 ciphertext — never logged
   ts: number; // unix ms
   expiresAt: number; // unix seconds (TTL)
+  /**
+   * The frame's `urgent` bit, persisted so the reconnect drain can post
+   * call signalling ahead of the ordered backlog
+   * (`listUrgentQueuedMessages`, the drain's priority lane). The server
+   * already read this bit to decide the VoIP wake, so the row discloses
+   * nothing it did not know; it never reaches the wire (drain frames are
+   * built field-by-field). Present-and-true or absent — never false. */
+  urgent?: true;
 }
 
 /**
@@ -1063,6 +1079,11 @@ export interface GroupQuotaContext {
 const QUEUE_PAIR_LEDGER_PREFIX = '#quota#';
 const QUEUE_STRANGER_LEDGER_KEY = '#quota-strangers';
 const QUEUE_CONTROL_CEILING = '/';
+/** Rows one page of the urgent lane's filtered Query may evaluate: the lane
+ * wants a handful of rows out of a partition that may hold thousands, so
+ * each page evaluates many and the scan bound the caller passes decides how
+ * many pages there are. */
+const URGENT_LANE_QUERY_PAGE = 1000;
 
 export function queuePairLedgerKey(senderId: string): string {
   return `${QUEUE_PAIR_LEDGER_PREFIX}${senderId}`;
@@ -1208,7 +1229,6 @@ export interface DataLayer {
   ): Promise<UserRecord | undefined>;
   touchActivity(userId: string, nowMs: number, signal?: AbortSignal): Promise<void>;
   deleteActivity(userId: string, nowMs: number): Promise<void>;
-  createUser(user: UserRecord): Promise<void>;
   createSession(session: SessionRecord): Promise<void>;
   getSession(token: string): Promise<SessionRecord | undefined>;
   /**
@@ -1313,15 +1333,6 @@ export interface DataLayer {
     | 'crew_contended'
   >;
   /**
-   * Give one adopted slot back. This is NOT called on member teardown — that is
-   * `deleteCrewMemberAndReleaseSlot`, which makes the release atomic with the
-   * row's removal. This remains for release-without-delete uses (and tests).
-   * Idempotent; a release against a deleted or never-counted owner is a
-   * swallowed no-op — NOT a write, because `ADD` on a missing item would mint
-   * a ghost user row at crewCount = -1.
-   */
-  releaseCrewSlot(ownerUserId: string): Promise<void>;
-  /**
    * Tear down an adopted crew member: delete its user row AND release its
    * owner's slot in ONE TransactWriteItems, so the release is exactly-once BY
    * CONSTRUCTION (superseding the ordered two-step).
@@ -1349,18 +1360,6 @@ export interface DataLayer {
    * No-op when the key has no claim row.
    */
   tombstoneIdentityKey(identityKeyPub: string): Promise<void>;
-  /**
-   * The account holding this identity key, resolved through the CLAIM row:
-   * two point GetItems, no Query.
-   *
-   * The shape matters as much as the result. No execution role in this stack
-   * holds `dynamodb:Query` on the users table, and none may ever get one — a
-   * Query there is a bulk "who is registered" oracle, which is precisely the
-   * primitive the deleted phone GSI was. Resolving through a claim row answers
-   * the same question for exactly one caller-supplied key at a time. Enforced
-   * in infra/test/tacendum-security.test.ts.
-   */
-  getUserByIdentityKeyClaim(identityKeyPub: string): Promise<UserRecord | undefined>;
   /** Store the challenge issued for a key. Concurrent challenges COEXIST —
    * each (key, nonce) pair is its own row — so issuing one can never invalidate
    * another that is mid-flight. Banking nonces buys an attacker nothing: a
@@ -1421,12 +1420,17 @@ export interface DataLayer {
     nowSeconds: number,
   ): Promise<{ userId: string; role: WsTicketRole; sessionDigest?: string } | undefined>;
 
-  /** Atomically remove and return one one-time prekey, or undefined if none. */
-  consumeOneTimePrekey(userId: string): Promise<OneTimePrekey | undefined>;
-  /** Count remaining one-time prekeys for a user. */
-  countOneTimePrekeys(userId: string): Promise<number>;
+  /** Atomically remove and return one one-time prekey, or undefined if none.
+   * `poolGen` is the generation the caller read off the user row
+   * (`UserRecord.prekeyPoolGen`): given, only rows of that
+   * generation are candidates and the conditional delete re-checks it;
+   * omitted (a row from before generations existed), any row serves. */
+  consumeOneTimePrekey(userId: string, poolGen?: string): Promise<OneTimePrekey | undefined>;
+  /** Count remaining one-time prekeys for a user — of `poolGen` only when
+   * given, so a foreign-generation leftover never hides a low pool. */
+  countOneTimePrekeys(userId: string, poolGen?: string): Promise<number>;
 
-  // --- Real-time routing ---
+  // --- Account deletion (DELETE /v1/account) ---
   /** Account deletion (DELETE /v1/account). Each is idempotent — the handler
    * re-runs the whole sequence on retry.
    *
@@ -1485,7 +1489,8 @@ export interface DataLayer {
    */
   deleteSessionsForUser(userId: string, exceptToken?: string): Promise<number>;
   purgeQueuedMessages(recipientId: string): Promise<void>;
-  putConnection(rec: ConnectionRecord): Promise<void>;
+
+  // --- Real-time routing (Phase 3) ---
   /**
    * Claim the connection row for a user, but ONLY if it still holds
    * `expectedConnectionId` (or is absent when that is undefined).
@@ -1518,13 +1523,8 @@ export interface DataLayer {
   putReport(rec: ReportRecord): Promise<void>;
 
   // --- VoIP push tokens ---
-  putPushToken(rec: PushTokenRecord): Promise<void>;
   getPushToken(userId: string): Promise<PushTokenRecord | undefined>;
   deletePushToken(userId: string): Promise<void>;
-  /** Delete ONLY if the stored token still matches the one that was found
-   * dead. A device that re-registered while a push was in flight must not
-   * have its fresh row deleted by a stale 410. */
-  deletePushTokenIfMatches(userId: string, voipToken: string): Promise<void>;
   /** Remove ONE dead token from the row, conditional on its exact value, and
    * the row itself only when nothing usable remains. Deleting the whole row
    * for one dead token was erasing the OTHER, still-working registration —
@@ -1667,6 +1667,15 @@ export interface DataLayer {
    * stream strictly after that key — the drain's continuation cursor (S2b);
    * quota ledger rows never surface here regardless. */
   listQueuedMessages(recipientId: string, afterMsgId?: string): AsyncIterable<QueuedMessage[]>;
+  /**
+   * The URGENT rows of a recipient's queue in msgId order, one page at a time
+   * — the drain's priority lane. A filtered Query over the same partition,
+   * bounded by `maxScanned` EVALUATED rows (DynamoDB applies `Limit` before
+   * the filter), so a flooded partition can never turn the lane into a full
+   * scan: an urgent row past the bound simply arrives in the ordered walk, as
+   * every row did before the lane existed. Ledger rows never surface here
+   * either. */
+  listUrgentQueuedMessages(recipientId: string, maxScanned: number): AsyncIterable<QueuedMessage[]>;
   /**
    * Delete a queued row AND release its quota (S1): the pair ledger — and the
    * unknown-sender aggregate when the row was billed there — comes down in
@@ -1830,30 +1839,23 @@ export interface DataLayer {
    */
   isAccountsUsernameFeatureEnabled(): Promise<boolean>;
   /**
-   * Write a pending link offer (written by the auth Lambda
-   * AFTER verifying A's signature). ONE transaction: the offer row
-   * plus the nonce added to both named users' `linkOfferNonces` reverse
-   * sets, so the deletion sweep can find every offer naming a member
-   * without a scan or index. 'exists' when
-   * the nonce is already claimed: a nonce is single-mint as well as
-   * single-use, and the loser must never overwrite the winner's tuple.
-   * 'unknown_member' when either named user row is missing — refused so the
-   * pointer write can never mint a ghost user row. Throws on a malformed
-   * tuple (first-link without offererClass, class self-collision,
-   * self-link) — those are programming errors at the caller, not refusable
-   * states.
-   */
-  putLinkOffer(rec: LinkOfferRecord): Promise<'created' | 'exists' | 'unknown_member'>;
-  /**
-   * Write the INIT-leg row for a ceremony: the tuple the
-   * server minted for A to sign, recorded before any signature exists. The
-   * SAME one-transaction shape as `putLinkOffer` — init row plus the nonce
-   * ADDed to both named users' `linkOfferNonces` reverse sets (the ADD is
+   * Write the INIT-leg row for a ceremony: the tuple the server minted for
+   * A to sign, recorded before any signature exists. The SAME
+   * one-transaction shape as `putLinkOffer` — init row plus the nonce ADDed
+   * to both named users' `linkOfferNonces` reverse sets (the ADD is
    * idempotent, so the later promote re-asserting the same nonce costs
    * nothing) — because an init row carries the same ULIDs an offer row does
    * and owes the sweep the same findability.
-   */
-  putLinkOfferInit(rec: LinkOfferInitRecord): Promise<'created' | 'exists' | 'unknown_member'>;
+   *
+   * The offerer's pointer set is CAPPED at LINK_OFFER_POINTER_CAP as a
+   * transaction condition; a full set is reaped of every nonce whose rows
+   * are gone or past their explicit expiry (`nowSeconds` is the clock for
+   * that) and the write retried once, so 'pointer_cap' means a set full of
+   * LIVE ceremonies — collapsed upstream. */
+  putLinkOfferInit(
+    rec: LinkOfferInitRecord,
+    nowSeconds: number,
+  ): Promise<'created' | 'exists' | 'unknown_member' | 'pointer_cap'>;
   /**
    * The pending init row for exactly this nonce, or undefined when absent OR
    * past its explicit `expiresAt` (TTL reaping is never the enforcement).
@@ -1862,27 +1864,32 @@ export interface DataLayer {
   /**
    * Promote a verified init row into the pending-offer row — called by the
    * auth Lambda AFTER verifying A's signature over the recorded tuple, and
-   * ONLY then (no offer row exists before the signature
-   * verifies). ONE transaction: conditional delete of the init row (kind +
-   * unexpired — single-use, the challenge-row consume) plus the offer-row
-   * Put under `attribute_not_exists`. 'gone' when the init row was already
-   * consumed, expired, or never existed — the collapsed refusal upstream.
-   */
+   * ONLY then (no offer row exists before the signature verifies). ONE
+   * transaction: conditional delete of the init row (kind + unexpired —
+   * single-use, the challenge-row consume) plus the offer-row Put under
+   * `attribute_not_exists`. 'gone' when the init row was already consumed,
+   * expired, or never existed — the collapsed refusal upstream.
+   * 'pointer_cap' when the ACCEPTOR's reverse-pointer set is full of live
+   * ceremonies even after the reap (the cap-with-reap the
+   * `putLinkOfferInit` doc describes, applied to the row the caller does
+   * NOT own); collapsed upstream too. */
   promoteLinkOfferInit(
     offerNonce: string,
     offerSig: string,
     nowSeconds: number,
-  ): Promise<'promoted' | 'gone'>;
+  ): Promise<'promoted' | 'gone' | 'pointer_cap'>;
   /**
    * Is this user row revoked-with-tombstone ? Strongly consistent and
    * projection-thin: this is the READ-TIME ENFORCEMENT bearer-session
-   * validation runs on every authenticated request (the
-   * roster/tombstone transaction is the enforcement; session teardown is
-   * cleanup a crash may have skipped), so it must see a commit the moment it
-   * lands, and it must stay cheap. False for a missing row: absence is the
-   * deleted-account path, refused elsewhere on its own terms.
-   */
-  isUserTombstoned(userId: string): Promise<boolean>;
+   * validation runs on every authenticated request (the roster/tombstone
+   * transaction is the enforcement; session teardown is cleanup a crash may
+   * have skipped), so it must see a commit the moment it lands, and it must
+   * stay cheap. 'absent' for a missing row: a deleted account — or a revoked
+   * integration, whose row is DELETED rather than tombstoned — has no row,
+   * and a session that outlived it must not keep row-less capabilities
+   * (attachment mints, TURN credentials, WS tickets, reports). The caller
+   * refuses everything but 'live'. */
+  userAccountState(userId: string): Promise<'live' | 'tombstoned' | 'absent'>;
   /**
    * The pending offer for exactly this nonce, or undefined when absent OR
    * expired — the explicit `expiresAt` decides, not the TTL reaper (the
@@ -2393,6 +2400,64 @@ export interface DataLayer {
 }
 
 /**
+ * The TEST-ONLY extension of the store: the unconditional, guard-bypassing
+ * primitives the suites use to plant state, kept OFF the production
+ * `DataLayer` so no handler can reach them — `createUser` (a bare conditional
+ * Put, where production births a row only through
+ * `getOrCreateUserByIdentityKey`'s claim transaction), `putConnection` (the
+ * unconditional Put whose overwrite race `claimConnection` exists to close),
+ * `putPushToken` (a whole-row replace that bypasses `mergePushToken`'s
+ * environment/bundle pin), `putLinkOffer` (writes the acceptor pointer without
+ * the signature rule the signed ceremony carries), `getUserByIdentityKeyClaim`
+ * (a claim-row resolve nothing in the request path needs) and
+ * `releaseCrewSlot` (release-without-delete). Every host builds its store
+ * through `makeDataLayer`, whose return type is the narrow interface, and
+ * `Deps.db` is that interface; a source-scan test pins that nothing under
+ * `src/` names `makeTestOnlyDataLayer` or calls these. */
+export interface TestOnlyDataLayer extends DataLayer {
+  createUser(user: UserRecord): Promise<void>;
+  /**
+   * Give one adopted slot back. This is NOT called on member teardown — that
+   * is
+   * `deleteCrewMemberAndReleaseSlot`, which makes the release atomic with the
+   * row's removal. This remains for release-without-delete uses (and tests).
+   * Idempotent; a release against a deleted or never-counted owner is a
+   * swallowed no-op — NOT a write, because `ADD` on a missing item would mint
+   * a ghost user row at crewCount = -1.
+   */
+  releaseCrewSlot(ownerUserId: string): Promise<void>;
+  /**
+   * The account holding this identity key, resolved through the CLAIM row:
+   * two point GetItems, no Query.
+   *
+   * The shape matters as much as the result. No execution role in this stack
+   * holds `dynamodb:Query` on the users table, and none may ever get one — a
+   * Query there is a bulk "who is registered" oracle, which is precisely the
+   * primitive the deleted phone GSI was. Resolving through a claim row answers
+   * the same question for exactly one caller-supplied key at a time. Enforced
+   * in infra/test/tacendum-security.test.ts.
+   */
+  getUserByIdentityKeyClaim(identityKeyPub: string): Promise<UserRecord | undefined>;
+  putConnection(rec: ConnectionRecord): Promise<void>;
+  putPushToken(rec: PushTokenRecord): Promise<void>;
+  /**
+   * Write a pending link offer (written by the auth Lambda AFTER verifying
+   * A's signature). ONE transaction: the offer row
+   * plus the nonce added to both named users' `linkOfferNonces` reverse
+   * sets, so the deletion sweep can find every offer naming a member
+   * without a scan or index. 'exists' when
+   * the nonce is already claimed: a nonce is single-mint as well as
+   * single-use, and the loser must never overwrite the winner's tuple.
+   * 'unknown_member' when either named user row is missing — refused so the
+   * pointer write can never mint a ghost user row. Throws on a malformed
+   * tuple (first-link without offererClass, class self-collision,
+   * self-link) — those are programming errors at the caller, not refusable
+   * states.
+   */
+  putLinkOffer(rec: LinkOfferRecord): Promise<'created' | 'exists' | 'unknown_member'>;
+}
+
+/**
  * The SHA-256 digest (hex) of a bearer token — what the sessions table is
  * keyed by, so the plaintext is never persisted. Exported because the
  * WebSocket ticket and connection rows carry this same digest to bind a socket
@@ -2797,6 +2862,12 @@ const emailCodeKey = (userId: string, purpose: EmailCodeRecord['purpose']): stri
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * The pause between `deleteSessionsForUser`'s two index walks: comfortably
+ * past ordinary GSI propagation (tens of milliseconds) and short enough
+ * that the revoke paths it rides on stay interactive. */
+export const SESSION_SWEEP_RECHECK_MS = 250;
+
 function errName(err: unknown): string {
   return (err as { name?: string }).name ?? '';
 }
@@ -3147,9 +3218,17 @@ async function unlinkIdentifierRefs(
 type WriteRequest = { PutRequest?: { Item: Record<string, unknown> }; DeleteRequest?: { Key: Record<string, unknown> } };
 
 /** All one-time-prekey keyIds for a user (strongly consistent, paginated). */
+/** How many one-time prekey candidates a consume reads per page, and picks
+ * from at random. Ten, tried lowest-first, had every concurrent fetch racing
+ * the same candidates in the same order. */
+export const PREKEY_CANDIDATE_PAGE = 25;
+
+/** Every one-time prekey keyId of a user — or, with `exceptPoolGen`, every
+ * one NOT stamped with that generation (the stale sweep in `storeKeys`). */
 async function listOneTimePrekeyIds(
   doc: DynamoDBDocumentClient,
   userId: string,
+  opts: { exceptPoolGen?: string } = {},
 ): Promise<number[]> {
   const ids: number[] = [];
   let lastKey: Record<string, unknown> | undefined;
@@ -3159,16 +3238,32 @@ async function listOneTimePrekeyIds(
         TableName: TABLES.prekeys,
         KeyConditionExpression: 'userId = :u',
         ExpressionAttributeValues: { ':u': userId },
-        ProjectionExpression: 'keyId',
+        ProjectionExpression: 'keyId, poolGen',
         ConsistentRead: true,
         ExclusiveStartKey: lastKey,
       }),
     );
-    for (const item of res.Items ?? []) ids.push(item.keyId as number);
+    for (const item of res.Items ?? []) {
+      if (opts.exceptPoolGen !== undefined && item.poolGen === opts.exceptPoolGen) continue;
+      ids.push(item.keyId as number);
+    }
     lastKey = res.LastEvaluatedKey;
   } while (lastKey);
   return ids;
 }
+
+/** The reconcile lease window: one reconciler per ledger row per window
+ * (the conditional lease write), and the per-container debounce of the
+ * durable handoff. */
+export const RECONCILE_LEASE_MS = 30_000;
+
+/**
+ * The per-container cap on the durable-reconcile debounce map: past it, the
+ * OLDEST entry is evicted — not only the expired ones — so a flood of
+ * distinct refused ledgers cannot grow the map without bound. An evicted
+ * ledger merely re-schedules on its next refusal (the worker's row lease
+ * still dedupes across containers). */
+export const RECONCILE_DEBOUNCE_MAX_KEYS = 512;
 
 /** BatchWrite in chunks of 25, retrying UnprocessedItems with backoff so no
  * item is ever silently dropped under throttling. */
@@ -3192,7 +3287,22 @@ async function chunkedBatchWrite(
   }
 }
 
+/**
+ * The production store: the narrow `DataLayer` every host and handler sees.
+ * The full object (with the test-only members) is built by
+ * `makeTestOnlyDataLayer`; this is the same object under the narrow type, so
+ * a handler holding `Deps.db` cannot name a test-only primitive. */
 export function makeDataLayer(
+  doc: DynamoDBDocumentClient,
+  queueQuota: QueueQuota = DEFAULT_QUEUE_QUOTA,
+  hooks: DataLayerHooks = {},
+): DataLayer {
+  return makeTestOnlyDataLayer(doc, queueQuota, hooks);
+}
+
+/** The store WITH the test-only members (see `TestOnlyDataLayer`). Suites
+ * that plant state call this; no file under `src/` may. */
+export function makeTestOnlyDataLayer(
   doc: DynamoDBDocumentClient,
   // The per-pair offline-queue cap. Injected so tests can drive small,
   // exhaustible caps against the REAL store cheaply; production takes the
@@ -3202,10 +3312,12 @@ export function makeDataLayer(
   // scheduleReconcile; the local adapter and tests pass nothing and keep the
   // in-process repair.
   hooks: DataLayerHooks = {},
-): DataLayer {
+): TestOnlyDataLayer {
   const quota = resolveQueueQuota(queueQuota);
-  // The store's OWN clock for the connection-TTL clamp (DataLayerHooks.nowMs
-  // is a test seam; production always runs on Date.now).
+  // The store's OWN clock — the connection-TTL clamp, the durable-handoff
+  // debounce, the reconcile lease and the ack-release expiry boundary all
+  // read it (DataLayerHooks.nowMs is a test seam; production always runs on
+  // Date.now). One clock, so a test that pins it pins every stamp.
   const wallNowMs = hooks.nowMs ?? Date.now;
 
   /** The (senderId -> recipientId) pair-ledger item, or undefined when absent
@@ -3374,7 +3486,6 @@ export function makeDataLayer(
    *    reconciled is at its cap: new pair/stranger rows are being refused, so
    *    the partition under the filter is not growing under the scan.
    */
-  const RECONCILE_LEASE_MS = 30_000;
   const RECONCILE_SLICE_MS = 2_000;
   const RECONCILE_MAX_PAGES = 4;
   /** Every reconcile bookkeeping attribute, for the REMOVE clauses: state
@@ -3392,7 +3503,6 @@ export function makeDataLayer(
   // ledger per lease window per container; the worker's row lease is what
   // holds across containers. Bounded: expired entries are pruned in place.
   const reconcileScheduledUntil = new Map<string, number>();
-  const RECONCILE_DEBOUNCE_MAX_KEYS = 512;
 
   /** The ledger row key and recount filter a reconcile target denotes —
    * derived HERE, from the same constants the enqueue path stamps, never
@@ -3437,12 +3547,21 @@ export function makeDataLayer(
     const key = `${recipientId}\u0000${ledgerMsgId}`;
     const durable = hooks.scheduleReconcile;
     if (durable) {
-      const nowMs = Date.now();
+      // The store's clock, like every other stamp here.
+      const nowMs = wallNowMs();
       const until = reconcileScheduledUntil.get(key);
       if (until !== undefined && until > nowMs) return;
       if (reconcileScheduledUntil.size >= RECONCILE_DEBOUNCE_MAX_KEYS) {
         for (const [k, t] of reconcileScheduledUntil) {
           if (t <= nowMs) reconcileScheduledUntil.delete(k);
+        }
+        // Still full — nothing had expired — so evict the OLDEST entry (a
+        // Map iterates in insertion order) rather than growing past the
+        // cap. The evicted ledger merely re-schedules on its next refusal;
+        // the worker's row lease is what dedupes across containers.
+        if (reconcileScheduledUntil.size >= RECONCILE_DEBOUNCE_MAX_KEYS) {
+          const oldest = reconcileScheduledUntil.keys().next().value;
+          if (oldest !== undefined) reconcileScheduledUntil.delete(oldest);
         }
       }
       reconcileScheduledUntil.set(key, nowMs + RECONCILE_LEASE_MS);
@@ -3469,7 +3588,7 @@ export function makeDataLayer(
     ledgerMsgId: string,
     filter: { FilterExpression: string; values: Record<string, unknown> },
   ): Promise<LedgerReconcileOutcome> => {
-    const nowMs = Date.now();
+    const nowMs = wallNowMs();
     const tok = randomUUID();
     // 1. Take the lease — or stand down. The conditional write is the
     // single-flight arbiter: exactly one reconciler per ledger row may pass
@@ -3695,7 +3814,11 @@ export function makeDataLayer(
     let bytes = carried.bytes;
     let resume: string | undefined = cursor;
     let pages = 0;
-    while (pages < budget.maxPages && Date.now() < budget.deadlineMs) {
+    // The deadline was minted from the store's clock (`wallNowMs`) and is
+    // measured against the same clock: under an injected `nowMs` the wall clock
+    // could sit past the deadline before the first page, and the slice would
+    // silently count nothing.
+    while (pages < budget.maxPages && wallNowMs() < budget.deadlineMs) {
       const res = await doc.send(
         new QueryCommand({
           TableName: TABLES.messages,
@@ -3831,7 +3954,18 @@ export function makeDataLayer(
 
     async getSession(token) {
       const res = await doc.send(
-        new GetCommand({ TableName: TABLES.sessions, Key: { token: sessionKey(token) } }),
+        new GetCommand({
+          TableName: TABLES.sessions,
+          Key: { token: sessionKey(token) },
+          // STRONGLY CONSISTENT. This backs
+          // every HTTP bearer validation; served at the default consistency,
+          // a token revoked by sign-out, sign-out-others, account deletion or
+          // a superseding sign-in could still resolve from a stale replica
+          // for a sub-second window after the revoke answered 200. The
+          // WebSocket recheck (`getSessionByDigest`) already read this way;
+          // "never cached, strongly consistent" is now true of both paths.
+          ConsistentRead: true,
+        }),
       );
       const item = res.Item;
       if (!item || item.kind !== 'session') return undefined;
@@ -3997,16 +4131,20 @@ export function makeDataLayer(
         }
         if (!claimRefused) throw err;
         // The claim is tombstoned and must stay. Delete the user row alone —
-        // still under the crew condition when the guard is up: this retry IS
-        // the read-then-delete gap again, just narrower, and an adopt landing
-        // in it would orphan its crew exactly as one landing before the
-        // transaction would.
+        // still under the SAME row condition the transaction carried
+        // (`rowCondition`: the empty-crew guard OR the no-crewId mirror
+        // guard): this retry IS the read-then-delete gap again, just
+        // narrower, and an adopt landing in it would orphan its crew — or,
+        // under `requireNoCrewId`, leak the owner's slot — exactly as one
+        // landing before the transaction would. The fallback used to apply
+        // only the empty-crew half, so the `crew_appeared` answer below
+        // could never fire here.
         try {
           await doc.send(
             new DeleteCommand({
               TableName: TABLES.users,
               Key: { userId },
-              ...(requireEmptyCrew ? emptyCrewCondition : {}),
+              ...rowCondition,
             }),
           );
         } catch (fallbackErr) {
@@ -4057,37 +4195,56 @@ export function makeDataLayer(
 
     async deleteSessionsForUser(userId, exceptToken) {
       const spared = exceptToken === undefined ? undefined : sessionKey(exceptToken);
-      const keys: string[] = [];
-      let lastKey: Record<string, unknown> | undefined;
-      do {
-        const page = await doc.send(
-          new QueryCommand({
-            TableName: TABLES.sessions,
-            IndexName: SESSIONS_USER_INDEX,
-            KeyConditionExpression: 'userId = :u',
-            ExpressionAttributeValues: { ':u': userId },
-            // Keys-only: the index projects nothing else, and a session row is
-            // a credential we have no reason to read in order to delete.
-            ProjectionExpression: '#t',
-            ExpressionAttributeNames: { '#t': 'token' },
-            ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
-          }),
-        );
-        for (const item of page.Items ?? []) {
-          const key = item.token as string;
-          if (key !== spared) keys.push(key);
+      // One pass: walk the index, delete what it names (keys-only — the index
+      // projects nothing else, and a session row is a credential we have no
+      // reason to read in order to delete). Returns the count deleted.
+      const sweep = async (): Promise<number> => {
+        const keys: string[] = [];
+        let lastKey: Record<string, unknown> | undefined;
+        do {
+          const page = await doc.send(
+            new QueryCommand({
+              TableName: TABLES.sessions,
+              IndexName: SESSIONS_USER_INDEX,
+              KeyConditionExpression: 'userId = :u',
+              ExpressionAttributeValues: { ':u': userId },
+              ProjectionExpression: '#t',
+              ExpressionAttributeNames: { '#t': 'token' },
+              ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+            }),
+          );
+          for (const item of page.Items ?? []) {
+            const key = item.token as string;
+            if (key !== spared) keys.push(key);
+          }
+          lastKey = page.LastEvaluatedKey;
+        } while (lastKey);
+        if (keys.length > 0) {
+          await chunkedBatchWrite(
+            doc,
+            TABLES.sessions,
+            keys.map((token) => ({ DeleteRequest: { Key: { token } } })),
+          );
         }
-        lastKey = page.LastEvaluatedKey;
-      } while (lastKey);
-
-      if (keys.length > 0) {
-        await chunkedBatchWrite(
-          doc,
-          TABLES.sessions,
-          keys.map((token) => ({ DeleteRequest: { Key: { token } } })),
-        );
-      }
-      return keys.length;
+        return keys.length;
+      };
+      // TWO PASSES, ALWAYS. A global secondary index cannot be read
+      // consistently: a session row written inside the index's propagation
+      // window is invisible to the first walk and survives the revoke — and
+      // since sessions are minted only with the identity-key signature, a
+      // session that young on a revoke-all path is exactly the attacker's fresh
+      // sign-in. The second walk, after a pause well past ordinary GSI lag,
+      // sweeps it. UNCONDITIONAL rather than "when the first pass found rows":
+      // on the supersede path the only other row may be the lagging one, and
+      // even the caller's own just-minted row may not have propagated yet — a
+      // pass that found nothing is no evidence there was nothing. The price is
+      // one more keys-only Query and ~a quarter second on sign-in,
+      // sign-out-others, account deletion and integration revoke — none of them
+      // hot paths, all of them the paths that must not have windows.
+      const first = await sweep();
+      await sleep(SESSION_SWEEP_RECHECK_MS);
+      const second = await sweep();
+      return first + second;
     },
 
     async purgeQueuedMessages(recipientId) {
@@ -4102,6 +4259,13 @@ export function makeDataLayer(
             ExpressionAttributeValues: { ':r': recipientId },
             ProjectionExpression: 'recipientId, msgId',
             ExclusiveStartKey: lastKey,
+            // STRONGLY CONSISTENT, the purgeConsentEdges discipline: this
+            // is a DESTRUCTIVE sweep on account deletion, and a stale page
+            // could miss a row enqueued moments before — ciphertext plus
+            // sender/recipient/ts metadata that would then outlive the
+            // account to its 30-day TTL. "It expires eventually" is not
+            // deletion.
+            ConsistentRead: true,
           }),
         );
         await chunkedBatchWrite(
@@ -4569,7 +4733,7 @@ export function makeDataLayer(
             }
             // Refused at write time, adoptable at read time: a race resolved
             // underneath us. Fall through to the owner's refusal if it has
-            // one (or to an pin retry); otherwise propagate so the
+            // one (or to a pin retry); otherwise propagate so the
             // caller retries the whole adopt.
             if (ownerOutcome === undefined && !pinRefused) throw err;
           }
@@ -4908,18 +5072,31 @@ export function makeDataLayer(
       // retry) is allowed through, and a DIFFERENT key is refused. Rotation is
       // not a supported operation — a new key is a new account, which is what
       // "the keypair is the identity" actually means.
+      //
+      // THE POOL GENERATION. Every upload mints one, stamps it on the row IN
+      // THE SAME UPDATE that publishes the new signed prekey, and on every
+      // one-time prekey it writes; the consume is conditioned on the
+      // generation the bundle read off the row. The replace is still three
+      // writes — row, new pool, stale sweep — but the row flips FIRST and
+      // nothing of a foreign generation is ever served under it: a fetch
+      // inside the window sees the new signed prekey and no matching one-time
+      // prekey (the honest signed-prekey-only bundle the handler already
+      // produces on exhaustion), never an old-pool key the reinstalled device
+      // no longer holds.
+      const poolGen = randomUUID();
       try {
         await doc.send(
           new UpdateCommand({
             TableName: TABLES.users,
             Key: { userId },
             UpdateExpression:
-              'SET registrationId = :r, identityKeyPub = :ik, signedPrekey = :sp, kyberPrekey = :kp',
+              'SET registrationId = :r, identityKeyPub = :ik, signedPrekey = :sp, kyberPrekey = :kp, prekeyPoolGen = :g',
             ExpressionAttributeValues: {
               ':r': core.registrationId,
               ':ik': core.identityKeyPub,
               ':sp': core.signedPrekey,
               ':kp': core.kyberPrekey,
+              ':g': poolGen,
             },
             ConditionExpression:
               'attribute_exists(userId) AND (attribute_not_exists(identityKeyPub) OR identityKeyPub = :ik)',
@@ -4933,55 +5110,91 @@ export function makeDataLayer(
         throw err;
       }
 
-      // Replace the pool: delete any prekeys from a prior identity first, so a
-      // re-upload after reinstall never serves a stale prekey under the new key.
-      const stale = await listOneTimePrekeyIds(doc, userId);
-      await chunkedBatchWrite(
-        doc,
-        TABLES.prekeys,
-        stale.map((keyId) => ({ DeleteRequest: { Key: { userId, keyId } } })),
-      );
-
-      // Dedupe by keyId (a duplicate keyId in one BatchWrite request is a hard
-      // ValidationException), then write with UnprocessedItems retry.
+      // The new pool, generation-stamped. Dedupe by keyId (a duplicate keyId
+      // in one BatchWrite request is a hard ValidationException), then write
+      // with UnprocessedItems retry.
       const byKeyId = new Map<number, OneTimePrekey>();
       for (const pk of oneTimePrekeys) byKeyId.set(pk.keyId, pk);
       await chunkedBatchWrite(
         doc,
         TABLES.prekeys,
         [...byKeyId.values()].map((pk) => ({
-          PutRequest: { Item: { userId, keyId: pk.keyId, pub: pk.pub } },
+          PutRequest: { Item: { userId, keyId: pk.keyId, pub: pk.pub, poolGen } },
         })),
+      );
+
+      // Then sweep every row of a FOREIGN generation: a prior identity's
+      // pool, a prior upload's leftovers, unstamped legacy rows — so a
+      // re-upload after reinstall never leaves a stale prekey on disk. A
+      // keyId the Put above re-stamped is the new pool's and is spared.
+      // Consume already excludes these (the row's generation), so a crash
+      // before this step costs an inflated legacy count, never a served
+      // key — and the next upload sweeps them.
+      const stale = await listOneTimePrekeyIds(doc, userId, { exceptPoolGen: poolGen });
+      await chunkedBatchWrite(
+        doc,
+        TABLES.prekeys,
+        stale.map((keyId) => ({ DeleteRequest: { Key: { userId, keyId } } })),
       );
       return true;
     },
 
-    async consumeOneTimePrekey(userId) {
+    async consumeOneTimePrekey(userId, poolGen) {
       // Correctness under concurrency comes from the conditional DeleteItem:
       // if a racing request already took a candidate, the condition fails and we
       // try the next one. No one-time prekey is ever handed out twice.
+      //
+      // WHICH candidate: a page of PREKEY_CANDIDATE_PAGE and a RANDOM pick
+      // from it. N concurrent fetches used to race the same ten lowest keyIds
+      // in the same order, and after 50 loops of losing every race the
+      // consume reported the pool empty — a signed-prekey-only bundle with
+      // keys still on disk.
+      //
+      // WHICH generation: when the caller read one off the user row, only
+      // rows stamped with it are candidates, and the delete re-checks it —
+      // see `storeKeys`.
+      const genValues = poolGen === undefined ? {} : { ':g': poolGen };
+      let startKey: Record<string, unknown> | undefined;
       for (let outer = 0; outer < 50; outer++) {
         const res = await doc.send(
           new QueryCommand({
             TableName: TABLES.prekeys,
             KeyConditionExpression: 'userId = :u',
-            ExpressionAttributeValues: { ':u': userId },
+            ...(poolGen === undefined ? {} : { FilterExpression: 'poolGen = :g' }),
+            ExpressionAttributeValues: { ':u': userId, ...genValues },
             // Strong read: an eventually-consistent empty result must not be
             // mistaken for an empty pool while keys still exist.
             ConsistentRead: true,
-            Limit: 10,
+            Limit: PREKEY_CANDIDATE_PAGE,
+            ...(startKey === undefined ? {} : { ExclusiveStartKey: startKey }),
           }),
         );
-        const candidates = res.Items ?? [];
-        if (candidates.length === 0) return undefined; // pool empty
+        const candidates = [...(res.Items ?? [])];
+        if (candidates.length === 0) {
+          // Limit applies BEFORE the filter: a page of foreign-generation
+          // rows only is not an empty pool while more rows follow it.
+          if (res.LastEvaluatedKey !== undefined) {
+            startKey = res.LastEvaluatedKey;
+            continue;
+          }
+          return undefined; // pool empty
+        }
+        // A page that races away entirely is re-read from the top: the
+        // picture has changed, and the lowest rows may be free again.
+        startKey = undefined;
 
-        for (const candidate of candidates) {
+        while (candidates.length > 0) {
+          const candidate = candidates.splice(randomInt(candidates.length), 1)[0]!;
           try {
             const del = await doc.send(
               new DeleteCommand({
                 TableName: TABLES.prekeys,
                 Key: { userId, keyId: candidate.keyId },
-                ConditionExpression: 'attribute_exists(keyId)',
+                ConditionExpression:
+                  poolGen === undefined
+                    ? 'attribute_exists(keyId)'
+                    : 'attribute_exists(keyId) AND poolGen = :g',
+                ...(poolGen === undefined ? {} : { ExpressionAttributeValues: genValues }),
                 ReturnValues: 'ALL_OLD',
               }),
             );
@@ -5002,7 +5215,7 @@ export function makeDataLayer(
       return undefined; // extreme contention only (not expected locally)
     },
 
-    async countOneTimePrekeys(userId) {
+    async countOneTimePrekeys(userId, poolGen) {
       let count = 0;
       let lastKey: Record<string, unknown> | undefined;
       do {
@@ -5010,7 +5223,14 @@ export function makeDataLayer(
           new QueryCommand({
             TableName: TABLES.prekeys,
             KeyConditionExpression: 'userId = :u',
-            ExpressionAttributeValues: { ':u': userId },
+            // The caller's generation only: `Count` is the post-filter
+            // count, so a foreign-generation leftover never hides a low
+            // pool from the lowPrekeyCount signal.
+            ...(poolGen === undefined ? {} : { FilterExpression: 'poolGen = :g' }),
+            ExpressionAttributeValues: {
+              ':u': userId,
+              ...(poolGen === undefined ? {} : { ':g': poolGen }),
+            },
             Select: 'COUNT',
             ConsistentRead: true,
             ExclusiveStartKey: lastKey,
@@ -5105,7 +5325,19 @@ export function makeDataLayer(
 
     async getPushToken(userId) {
       const res = await doc.send(
-        new GetCommand({ TableName: TABLES.pushTokens, Key: { userId } }),
+        new GetCommand({
+          TableName: TABLES.pushTokens,
+          Key: { userId },
+          // STRONGLY CONSISTENT. The one reader is the push worker, and the
+          // read it must not get wrong is the one milliseconds after `DELETE
+          // /v1/push-token` at sign-out: an eventually consistent answer can
+          // still return the deleted row, and the signed-out device then
+          // receives a VoIP push it must report to CallKit as a placeholder
+          // for an account it no longer holds. The worker already pays a
+          // consistent read for the wake claim next to this one; the token
+          // read is the same price.
+          ConsistentRead: true,
+        }),
       );
       return res.Item ? (res.Item as PushTokenRecord) : undefined;
     },
@@ -5145,26 +5377,6 @@ export function makeDataLayer(
       } catch {
         // An unclaimed wake rings again if the platform redelivers it. That
         // is the safe direction, and the only one.
-      }
-    },
-
-    async deletePushTokenIfMatches(userId, voipToken) {
-      try {
-        await doc.send(
-          new DeleteCommand({
-            TableName: TABLES.pushTokens,
-            Key: { userId },
-            ConditionExpression: 'voipToken = :t',
-            ExpressionAttributeValues: { ':t': voipToken },
-          }),
-        );
-      } catch (err) {
-        // The row changed under us — a re-registration won the race, and its
-        // token is the live one. Nothing to do, and certainly nothing to
-        // delete.
-        if ((err as { name?: string }).name !== 'ConditionalCheckFailedException') {
-          throw err;
-        }
       }
     },
 
@@ -5721,7 +5933,10 @@ export function makeDataLayer(
             throw new QueuedQuotaExceededError();
           }
           // TransactionConflict (or a cancellation with no condition failure
-          // of ours): retry the whole decision against fresh state.
+          // of ours): re-send the SAME transactItems. Nothing is recomputed
+          // here — the ledger conditions the items carry are what re-decide,
+          // evaluated by DynamoDB against the items as they are on the next
+          // attempt; a genuine refusal then lands in the branch above.
         }
       }
       throw new QueuedQuotaExceededError();
@@ -5760,6 +5975,38 @@ export function makeDataLayer(
         if (page.length > 0) yield page;
         lastKey = res.LastEvaluatedKey;
       } while (lastKey);
+    },
+
+    async *listUrgentQueuedMessages(recipientId, maxScanned) {
+      let lastKey: Record<string, unknown> | undefined;
+      let scanned = 0;
+      do {
+        const res = await doc.send(
+          new QueryCommand({
+            TableName: TABLES.messages,
+            // The same range predicate as the ordered stream, so the ledger
+            // namespace stays out of the lane too.
+            KeyConditionExpression: 'recipientId = :r AND msgId > :after',
+            // Present-and-true or absent (QueuedMessage.urgent): a row that
+            // never carried the bit fails the filter.
+            FilterExpression: 'urgent = :t',
+            ExpressionAttributeValues: {
+              ':r': recipientId,
+              ':after': QUEUE_CONTROL_CEILING,
+              ':t': true,
+            },
+            ScanIndexForward: true,
+            // `Limit` counts EVALUATED rows, before the filter — it is the
+            // scan bound, paid out page by page against `maxScanned`.
+            Limit: Math.max(1, Math.min(URGENT_LANE_QUERY_PAGE, maxScanned - scanned)),
+            ExclusiveStartKey: lastKey,
+          }),
+        );
+        scanned += res.ScannedCount ?? res.Items?.length ?? 0;
+        const page = (res.Items ?? []) as QueuedMessage[];
+        if (page.length > 0) yield page;
+        lastKey = res.LastEvaluatedKey;
+      } while (lastKey && scanned < maxScanned);
     },
 
     async getQueuedMessage(recipientId, msgId) {
@@ -5891,17 +6138,19 @@ export function makeDataLayer(
       // re-made — at which point the row re-reads as expired and takes the
       // no-decrement path.
       for (let attempt = 0; attempt < 6; attempt++) {
-        // an EXPIRED row (past its TTL, not yet reaped) may
-        // already have been dropped from the ledger by a refusal-path recount,
-        // which filters `expiresAt > now`. Decrementing for it would take the
-        // ledger BELOW the live truth — a defeated cap. Delete the physical
-        // row WITHOUT touching any ledger: the safe drift direction is UP (a
-        // stale count the refusal path reconciles away, and the ledger's own
-        // TTL clears), never DOWN. The store reads wall time here exactly as
-        // production enqueue set the row's `expiresAt` from it; re-read each
-        // attempt so a decision delayed across the boundary is re-made on the
-        // right side of it.
-        const nowSeconds = Math.floor(Date.now() / 1000);
+        // an EXPIRED row (past its TTL, not yet reaped) may already have been
+        // dropped from the ledger by a refusal-path recount, which filters
+        // `expiresAt > now`. Decrementing for it would take the ledger BELOW
+        // the live truth — a defeated cap. Delete the physical row WITHOUT
+        // touching any ledger: the safe drift direction is UP (a stale count
+        // the refusal path reconciles away, and the ledger's own TTL clears),
+        // never DOWN. The store reads wall time here exactly as production
+        // enqueue set the row's `expiresAt` from it; re-read each attempt so a
+        // decision delayed across the boundary is re-made on the right side of
+        // it. The store's clock: production runs on Date.now, and a test that
+        // pins `nowMs` drives this boundary with the same clock as the
+        // connection-TTL clamp.
+        const nowSeconds = Math.floor(wallNowMs() / 1000);
         if (typeof row.expiresAt === 'number' && row.expiresAt <= nowSeconds) {
           await deleteRowAlone();
           return;
@@ -6560,8 +6809,14 @@ export function makeDataLayer(
       const item = res.Item;
       if (!item || item.kind !== 'linkOffer') return undefined;
       // The clock decides, not the TTL reaper (the pair-ledger discipline):
-      // an expired-but-unreaped row reads as gone.
-      if ((item.expiresAt as number) <= nowSeconds) return undefined;
+      // an expired-but-unreaped row reads as gone — and the refusing read
+      // REAPS it: the row and both parties' reverse
+      // pointers to it, which nothing else would ever remove (a link
+      // deletes only the winning nonce).
+      if ((item.expiresAt as number) <= nowSeconds) {
+        await reapExpiredLinkOfferRow(doc, 'linkOffer', item);
+        return undefined;
+      }
       return {
         offerNonce: item.offerNonce as string,
         groupId: item.groupId as string,
@@ -6577,58 +6832,80 @@ export function makeDataLayer(
       };
     },
 
-    async putLinkOfferInit(rec) {
+    async putLinkOfferInit(rec, nowSeconds) {
       assertWellFormedLinkTuple(rec);
-      const cancelled = await sendRosterTransact(doc, [
-        {
-          Put: {
-            TableName: TABLES.sessions,
-            // NO `userId` attribute — the auth-challenge rule the offer row
-            // follows, for the same reason (the sessions user-index).
-            Item: {
-              token: linkInitKey(rec.offerNonce),
-              kind: 'linkOfferInit',
-              offerNonce: rec.offerNonce,
-              groupId: rec.groupId,
-              offererUserId: rec.offererUserId,
-              acceptorUserId: rec.acceptorUserId,
-              acceptorClass: rec.acceptorClass,
-              ...(rec.offererClass !== undefined ? { offererClass: rec.offererClass } : {}),
-              rosterEpoch: rec.rosterEpoch,
-              expiresAt: rec.expiresAt,
+      const attempt = (): Promise<Array<{ Code?: string }> | undefined> =>
+        sendRosterTransact(doc, [
+          {
+            Put: {
+              TableName: TABLES.sessions,
+              // NO `userId` attribute — the auth-challenge rule the offer row
+              // follows, for the same reason (the sessions user-index).
+              Item: {
+                token: linkInitKey(rec.offerNonce),
+                kind: 'linkOfferInit',
+                offerNonce: rec.offerNonce,
+                groupId: rec.groupId,
+                offererUserId: rec.offererUserId,
+                acceptorUserId: rec.acceptorUserId,
+                acceptorClass: rec.acceptorClass,
+                ...(rec.offererClass !== undefined ? { offererClass: rec.offererClass } : {}),
+                rosterEpoch: rec.rosterEpoch,
+                expiresAt: rec.expiresAt,
+              },
+              // Single-mint, exactly as the offer row: a nonce collision's
+              // loser must never overwrite the winner's tuple.
+              ConditionExpression: 'attribute_not_exists(#t)',
+              ExpressionAttributeNames: { '#t': 'token' },
             },
-            // Single-mint, exactly as the offer row: a nonce collision's
-            // loser must never overwrite the winner's tuple.
-            ConditionExpression: 'attribute_not_exists(#t)',
-            ExpressionAttributeNames: { '#t': 'token' },
           },
-        },
-        // The reverse pointer — OFFERER ONLY (unsigned-init
-        // amplification). The INIT leg verifies no signature, so writing a
-        // pointer onto the ACCEPTOR's row here let any bearer append permanent,
-        // uncleanable residue to a third party's row on the CALLER's budget
-        // (13k entries brick a users item at the 400 KB cap). The standing
-        // discipline only ever wrote the reverse pointer AFTER a signature
-        // verified; this unsigned call had widened that surface, so the
-        // acceptor's pointer moves to `promoteLinkOfferInit` (the submit leg,
-        // where A's signature is checked). The offerer writes only its OWN row
-        // here — self-inflicted, priced by its own linkOffer bucket — and an
-        // init abandoned before submit stays sweep-findable from that side; an
-        // acceptor gains nothing from a ceremony that never produced a signed
-        // offer.
-        {
-          Update: {
-            TableName: TABLES.users,
-            Key: { userId: rec.offererUserId },
-            UpdateExpression: 'ADD linkOfferNonces :n',
-            ConditionExpression: 'attribute_exists(userId)',
-            ExpressionAttributeValues: { ':n': new Set([rec.offerNonce]) },
+          // The reverse pointer — OFFERER ONLY (unsigned-init
+          // amplification). The INIT leg verifies no signature, so writing a
+          // pointer onto the ACCEPTOR's row here let any bearer append permanent,
+          // uncleanable residue to a third party's row on the CALLER's budget
+          // (13k entries brick a users item at the 400 KB cap). The standing
+          // discipline only ever wrote the reverse pointer AFTER a signature
+          // verified; this unsigned call had widened that surface, so the
+          // acceptor's pointer moves to `promoteLinkOfferInit` (the submit leg,
+          // where A's signature is checked). The offerer writes only its OWN row
+          // here — self-inflicted, priced by its own linkOffer bucket — and an
+          // init abandoned before submit stays sweep-findable from that side; an
+          // acceptor gains nothing from a ceremony that never produced a signed
+          // offer.
+          {
+            Update: {
+              TableName: TABLES.users,
+              Key: { userId: rec.offererUserId },
+              UpdateExpression: 'ADD linkOfferNonces :n',
+              // CAPPED: even the self-inflicted set never grows past
+              // LINK_OFFER_POINTER_CAP — an abandoned init leaves a pointer
+              // nothing else removes, and a flaky client at 10/hour would
+              // otherwise brick its own row in time.
+              ConditionExpression: LINK_OFFER_POINTER_CONDITION,
+              ExpressionAttributeValues: {
+                ':n': new Set([rec.offerNonce]),
+                ':cap': LINK_OFFER_POINTER_CAP,
+              },
+            },
           },
-        },
-      ]);
+        ]);
+      let cancelled = await attempt();
+      if (cancelled !== undefined && isCcf(cancelled[1]) && !isCcf(cancelled[0])) {
+        // The pointer refused: the row is gone, or its set is full. A full
+        // set is REAPED — every nonce whose rows are absent or past their
+        // explicit expiry leaves — and the write retried once; a set full
+        // of LIVE ceremonies is the honest refusal.
+        const reaped = await reapDeadLinkOfferPointers(doc, rec.offererUserId, nowSeconds);
+        if (reaped === 'absent') return 'unknown_member';
+        if (reaped === 'nothing') return 'pointer_cap';
+        cancelled = await attempt();
+      }
       if (!cancelled) return 'created';
-      if (cancelled[0]?.Code === 'ConditionalCheckFailed') return 'exists';
-      if (cancelled[1]?.Code === 'ConditionalCheckFailed') return 'unknown_member';
+      if (isCcf(cancelled[0])) return 'exists';
+      // The reap just proved the row present, so a second refusal here is the
+      // cap (a row vanishing inside the gap collapses to the same refusal
+      // upstream).
+      if (isCcf(cancelled[1])) return 'pointer_cap';
       throw new Error('link offer init: unclassifiable transaction cancellation');
     },
 
@@ -6643,72 +6920,103 @@ export function makeDataLayer(
       // upstream, and there are no parameters left to smuggle here.
       const init = await readLinkOfferInit(doc, offerNonce, nowSeconds);
       if (!init) return 'gone';
-      const cancelled = await sendRosterTransact(doc, [
-        {
-          Delete: {
-            TableName: TABLES.sessions,
-            Key: { token: linkInitKey(offerNonce) },
-            // Single-use consume, the challenge-row discipline: kind and the
-            // explicit expiry re-checked inside the condition even though
-            // the read above just did — every reader of the namespace checks
-            // attributes rather than trusting key shape or its own snapshot.
-            ConditionExpression: 'kind = :k AND expiresAt > :now',
-            ExpressionAttributeValues: { ':k': 'linkOfferInit', ':now': nowSeconds },
-          },
-        },
-        {
-          Put: {
-            TableName: TABLES.sessions,
-            Item: {
-              token: linkOfferKey(offerNonce),
-              kind: 'linkOffer',
-              offerNonce: init.offerNonce,
-              groupId: init.groupId,
-              offererUserId: init.offererUserId,
-              acceptorUserId: init.acceptorUserId,
-              acceptorClass: init.acceptorClass,
-              ...(init.offererClass !== undefined ? { offererClass: init.offererClass } : {}),
-              rosterEpoch: init.rosterEpoch,
-              expiresAt: init.expiresAt,
-              offerSig,
+      const attempt = (): Promise<Array<{ Code?: string }> | undefined> =>
+        sendRosterTransact(doc, [
+          {
+            Delete: {
+              TableName: TABLES.sessions,
+              Key: { token: linkInitKey(offerNonce) },
+              // Single-use consume, the challenge-row discipline: kind and the
+              // explicit expiry re-checked inside the condition even though
+              // the read above just did — every reader of the namespace checks
+              // attributes rather than trusting key shape or its own snapshot.
+              ConditionExpression: 'kind = :k AND expiresAt > :now',
+              ExpressionAttributeValues: { ':k': 'linkOfferInit', ':now': nowSeconds },
             },
-            ConditionExpression: 'attribute_not_exists(#t)',
-            ExpressionAttributeNames: { '#t': 'token' },
           },
-        },
-        // The ACCEPTOR's reverse pointer lands HERE, not at init (the
-        // unsigned-init amplification) — A's op="offer" signature has now
-        // verified upstream, so this keeps the posture of
-        // writing the reverse pointer only AFTER a signature. `attribute_exists`
-        // guards it: an acceptor deleted between init and submit fails the
-        // condition, the whole promote cancels ('gone'), and submit answers the
-        // collapsed refusal. The OFFERER's pointer already exists from the init
-        // write (set ADD is idempotent), so it is not repeated.
-        {
-          Update: {
-            TableName: TABLES.users,
-            Key: { userId: init.acceptorUserId },
-            UpdateExpression: 'ADD linkOfferNonces :n',
-            ConditionExpression: 'attribute_exists(userId)',
-            ExpressionAttributeValues: { ':n': new Set([init.offerNonce]) },
+          {
+            Put: {
+              TableName: TABLES.sessions,
+              Item: {
+                token: linkOfferKey(offerNonce),
+                kind: 'linkOffer',
+                offerNonce: init.offerNonce,
+                groupId: init.groupId,
+                offererUserId: init.offererUserId,
+                acceptorUserId: init.acceptorUserId,
+                acceptorClass: init.acceptorClass,
+                ...(init.offererClass !== undefined ? { offererClass: init.offererClass } : {}),
+                rosterEpoch: init.rosterEpoch,
+                expiresAt: init.expiresAt,
+                offerSig,
+              },
+              ConditionExpression: 'attribute_not_exists(#t)',
+              ExpressionAttributeNames: { '#t': 'token' },
+            },
           },
-        },
-      ]);
-      return cancelled ? 'gone' : 'promoted';
+          // The ACCEPTOR's reverse pointer lands HERE, not at init (the
+          // unsigned-init amplification) — A's op="offer" signature has now
+          // verified upstream, so this keeps the posture of
+          // writing the reverse pointer only AFTER a signature. `attribute_exists`
+          // guards it: an acceptor deleted between init and submit fails the
+          // condition, the whole promote cancels ('gone'), and submit answers the
+          // collapsed refusal. The OFFERER's pointer already exists from the init
+          // write (set ADD is idempotent), so it is not repeated.
+          //
+          // CAPPED. A's signature proves A consented — it proves NOTHING
+          // about B, and A is the caller: any account that knew a solo user's
+          // ULID could grow that row 10×/hour per free identity, and the
+          // pointer left only when B accepted, so ~13k abandoned offers
+          // bricked the victim at the 400 KB item cap (every growing write on
+          // the row — key upload, link, attach — failing 500 forever,
+          // byte-identical to "not allowed"). The set now never exceeds
+          // LINK_OFFER_POINTER_CAP as a transaction condition; a full set is
+          // reaped of dead nonces below and the write retried once.
+          {
+            Update: {
+              TableName: TABLES.users,
+              Key: { userId: init.acceptorUserId },
+              UpdateExpression: 'ADD linkOfferNonces :n',
+              ConditionExpression: LINK_OFFER_POINTER_CONDITION,
+              ExpressionAttributeValues: {
+                ':n': new Set([init.offerNonce]),
+                ':cap': LINK_OFFER_POINTER_CAP,
+              },
+            },
+          },
+        ]);
+      const pointerRefused = (reasons: Array<{ Code?: string }>): boolean =>
+        isCcf(reasons[2]) && !isCcf(reasons[0]) && !isCcf(reasons[1]);
+      let cancelled = await attempt();
+      if (cancelled !== undefined && pointerRefused(cancelled)) {
+        // Row gone, or set full: reap the dead nonces (rows absent or past
+        // their explicit expiry) and retry once; a set full of LIVE
+        // ceremonies is the honest refusal. The init row was NOT consumed —
+        // the transaction cancelled whole — so the retry is legitimate.
+        const reaped = await reapDeadLinkOfferPointers(doc, init.acceptorUserId, nowSeconds);
+        if (reaped === 'absent') return 'gone';
+        if (reaped === 'nothing') return 'pointer_cap';
+        cancelled = await attempt();
+      }
+      if (!cancelled) return 'promoted';
+      return pointerRefused(cancelled) ? 'pointer_cap' : 'gone';
     },
 
-    async isUserTombstoned(userId) {
+    async userAccountState(userId) {
       const res = await doc.send(
         new GetCommand({
           TableName: TABLES.users,
           Key: { userId },
-          ProjectionExpression: 'tombstoned',
+          // The key is projected so an existing row always comes back as an
+          // item (absent vs. present is the distinction the auth path draws).
+          ProjectionExpression: 'userId, tombstoned',
           // Strongly consistent: this backs the read-time enforcement a
-          // just-committed revoke depends on.
+          // just-committed revoke (or deletion) depends on.
           ConsistentRead: true,
         }),
       );
-      return res.Item?.tombstoned === true;
+      if (res.Item === undefined) return 'absent';
+      return res.Item.tombstoned === true ? 'tombstoned' : 'live';
     },
 
     async linkDeviceToGroup({ offerNonce, acceptSig, nowSeconds, linkedAtMs }) {
@@ -6725,8 +7033,12 @@ export function makeDataLayer(
       const offer = offerRes.Item;
       if (!offer || offer.kind !== 'linkOffer') return 'offer_consumed';
       // Explicit expiry field, checked here AND inside the conditional
-      // delete below — TTL reaping is cleanup, never the enforcement.
-      if ((offer.expiresAt as number) <= nowSeconds) return 'offer_expired';
+      // delete below — TTL reaping is cleanup, never the enforcement. The
+      // refusing read reaps the dead row and its pointers.
+      if ((offer.expiresAt as number) <= nowSeconds) {
+        await reapExpiredLinkOfferRow(doc, 'linkOffer', offer);
+        return 'offer_expired';
+      }
 
       const groupId = offer.groupId as string;
       const offererUserId = offer.offererUserId as string;
@@ -7854,11 +8166,16 @@ export function makeDataLayer(
         };
       }
       // ELAPSED: inert to the claim condition already (it reads as absent),
-      // and REAPED by this read — the suppression-shadow rule (the
-      // users table has no TTL attribute, so the read is the reaper). Each
-      // delete takes only a still-elapsed TOMBSTONE, so a claim that just
-      // overwrote either key with a live row is never collateral. The
-      // skeleton tombstone goes with the claim tombstone that remembers it.
+      // and REAPED by this read — the suppression-shadow rule (the users
+      // table has no TTL attribute, so the read is the reaper). Each delete
+      // takes only a still-elapsed TOMBSTONE, so a claim that just overwrote
+      // either key with a live row is never collateral. The skeleton
+      // tombstone goes with the claim tombstone that remembers it — and goes
+      // FIRST: the only pointer to the skeleton row is `skeletonKey` on the
+      // claim tombstone, so a crash between the two deletes must strand the
+      // REACHABLE row (re-read and reaped again next time; its skeleton
+      // delete then no-ops on the absent row), never the unreachable one on
+      // a TTL-less table.
       const reap = async (key: string, kind: 'identifierClaim' | 'usernameSkeleton') => {
         try {
           await doc.send(
@@ -7873,8 +8190,8 @@ export function makeDataLayer(
           if (errName(err) !== 'ConditionalCheckFailedException') throw err;
         }
       };
-      await reap(claimKey, 'identifierClaim');
       if (skeletonKey !== undefined) await reap(skeletonKey, 'usernameSkeleton');
+      await reap(claimKey, 'identifierClaim');
       return undefined;
     },
     async claimUsername({
@@ -8989,6 +9306,131 @@ function assertWellFormedLinkTuple(rec: LinkOfferInitRecord): void {
 /** The init-row read behind `getLinkOfferInit` and the promote — strongly
  * consistent, kind-checked, explicit-expiry-checked (the pair-ledger
  * discipline: an expired-but-unreaped row reads as gone). */
+/**
+ * THE REVERSE-POINTER CAP: the most link-offer nonces one user row's
+ * `linkOfferNonces` set may hold, enforced as a transaction condition on
+ * every pointer ADD (`putLinkOfferInit` for the offerer's own row,
+ * `promoteLinkOfferInit` for the acceptor's — the row the caller does NOT
+ * own). Sixty-four is dozens of simultaneously LIVE ceremonies for one person
+ * (a ceremony lives LINK_OFFER_TTL_SECONDS and a device is linked a handful
+ * of times in its life) and two orders of magnitude under the ~13k that brick
+ * an item at DynamoDB's 400 KB cap. Dead pointers never make a full set
+ * permanent: a refusing write reaps them (`reapDeadLinkOfferPointers`) and a
+ * refusing read of an expired row reaps that row's
+ * (`reapExpiredLinkOfferRow`), so the residue this cap bounds is also, at
+ * last, collectable. */
+export const LINK_OFFER_POINTER_CAP = 64;
+
+/** The condition every reverse-pointer ADD carries: the row must exist (a
+ * pointer write must never mint a ghost row for a deleted account) and its
+ * set must be under the cap. `:cap` is LINK_OFFER_POINTER_CAP. */
+const LINK_OFFER_POINTER_CONDITION =
+  'attribute_exists(userId) AND (attribute_not_exists(linkOfferNonces) OR size(linkOfferNonces) < :cap)';
+
+const isCcf = (reason: { Code?: string } | undefined): boolean =>
+  reason?.Code === 'ConditionalCheckFailed';
+
+/** Remove `nonces` from one user row's reverse set. Best-effort cleanup,
+ * never enforcement: conditioned on the row existing (a DELETE on a missing
+ * row would mint a ghost user row), a missing row swallowed, a DELETE of an
+ * absent element a no-op. DynamoDB drops the attribute with its last
+ * element, so an empty set never lingers. */
+async function dropLinkOfferPointers(
+  doc: DynamoDBDocumentClient,
+  userId: string,
+  nonces: readonly string[],
+): Promise<void> {
+  if (nonces.length === 0) return;
+  try {
+    await doc.send(
+      new UpdateCommand({
+        TableName: TABLES.users,
+        Key: { userId },
+        UpdateExpression: 'DELETE linkOfferNonces :n',
+        ConditionExpression: 'attribute_exists(userId)',
+        ExpressionAttributeValues: { ':n': new Set(nonces) },
+      }),
+    );
+  } catch (err) {
+    if (errName(err) !== 'ConditionalCheckFailedException') throw err;
+  }
+}
+
+/** Does a nonce still name a LIVE ceremony — an init or offer row present
+ * and inside its explicit expiry? Two strongly consistent, projection-thin
+ * GetItems; the TTL reaper never decides. */
+async function linkOfferNonceLive(
+  doc: DynamoDBDocumentClient,
+  nonce: string,
+  nowSeconds: number,
+): Promise<boolean> {
+  for (const token of [linkOfferKey(nonce), linkInitKey(nonce)]) {
+    const res = await doc.send(
+      new GetCommand({
+        TableName: TABLES.sessions,
+        Key: { token },
+        ProjectionExpression: 'expiresAt',
+        ConsistentRead: true,
+      }),
+    );
+    if (res.Item !== undefined && (res.Item.expiresAt as number) > nowSeconds) return true;
+  }
+  return false;
+}
+
+/**
+ * Reap a user row's DEAD reverse pointers — every nonce whose init and offer
+ * rows are both gone or past their explicit expiry — so a set that filled
+ * with abandoned ceremonies empties instead of
+ * refusing forever. Runs only on the refusing write, so its cost (one
+ * consistent read of the set, two thin reads per nonce, one DELETE) is paid
+ * at most once per refusal and bounded by the caller's budget. 'absent' when
+ * the row itself is gone, 'nothing' when every pointer names a live ceremony
+ * (the cap is then the honest answer), 'reaped' when the set shrank. */
+async function reapDeadLinkOfferPointers(
+  doc: DynamoDBDocumentClient,
+  userId: string,
+  nowSeconds: number,
+): Promise<'absent' | 'reaped' | 'nothing'> {
+  const res = await doc.send(
+    new GetCommand({
+      TableName: TABLES.users,
+      Key: { userId },
+      ProjectionExpression: 'linkOfferNonces',
+      ConsistentRead: true,
+    }),
+  );
+  if (res.Item === undefined) return 'absent';
+  const dead: string[] = [];
+  for (const nonce of (res.Item.linkOfferNonces as Set<string> | undefined) ?? []) {
+    if (!(await linkOfferNonceLive(doc, nonce, nowSeconds))) dead.push(nonce);
+  }
+  if (dead.length === 0) return 'nothing';
+  await dropLinkOfferPointers(doc, userId, dead);
+  return 'reaped';
+}
+
+/**
+ * Reap the REVERSE POINTERS of an init or offer row met PAST its explicit
+ * expiry at a refusing read: the offerer's for either
+ * row, the acceptor's too for an offer row (an init row never wrote one).
+ * The row itself is left to the sessions-table TTL, exactly as before
+ * — its explicit expiry already refuses it at every read, and every reader
+ * classifies "present but expired" on its own terms (`offer_expired`, the
+ * accounts-group suite pins it) — so this changes no answer, only the
+ * residue: the pointers nothing else would ever remove. */
+async function reapExpiredLinkOfferRow(
+  doc: DynamoDBDocumentClient,
+  kind: 'linkOffer' | 'linkOfferInit',
+  item: Record<string, unknown>,
+): Promise<void> {
+  const nonce = item.offerNonce as string;
+  await dropLinkOfferPointers(doc, item.offererUserId as string, [nonce]);
+  if (kind === 'linkOffer') {
+    await dropLinkOfferPointers(doc, item.acceptorUserId as string, [nonce]);
+  }
+}
+
 async function readLinkOfferInit(
   doc: DynamoDBDocumentClient,
   offerNonce: string,
@@ -9003,7 +9445,13 @@ async function readLinkOfferInit(
   );
   const item = res.Item;
   if (!item || item.kind !== 'linkOfferInit') return undefined;
-  if ((item.expiresAt as number) <= nowSeconds) return undefined;
+  if ((item.expiresAt as number) <= nowSeconds) {
+    // Expired-but-unreaped: refused exactly as before, and REAPED at this
+    // refusing read — the row and the offerer's
+    // pointer to it (an init row never wrote the acceptor's).
+    await reapExpiredLinkOfferRow(doc, 'linkOfferInit', item);
+    return undefined;
+  }
   return {
     offerNonce: item.offerNonce as string,
     groupId: item.groupId as string,

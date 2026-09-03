@@ -82,6 +82,7 @@ import {
   subscribeAppearance,
 } from './src/appearance';
 import {
+  acceptIncomingCall,
   adoptPushRegistration,
   adoptWorkspaceForCalling,
   callController,
@@ -112,7 +113,7 @@ import {
 // A cid is a ULID, and msgid.ts already owns the app's generator — including
 // its pre-fetched entropy pool. A second one here would be a second place for
 // randomness to be got wrong.
-import { onPendingOffer, onRecoveryNotice } from './src/linking';
+import { onPendingOffer, onRecoveryNotice, pendingOfferWaiting } from './src/linking';
 import { recoveryIntent, recoveryRowVisible, setRecoveryIntent } from './src/accounts';
 import { nextMsgId } from './src/msgid';
 import { personName } from './src/person';
@@ -218,7 +219,15 @@ type Route =
   | { name: 'accountUsername' }
   | { name: 'discover' }
   | { name: 'recover'; from?: 'landing' | 'chats' }
-  | { name: 'peerProfile'; peerId: string; from?: 'chats' | 'calls' }
+  | {
+      name: 'peerProfile';
+      peerId: string;
+      from?: 'chats' | 'calls';
+      // Where the profile was opened from when not its own thread: a room
+      // member's profile pops back to the ROOM profile, never into a 1:1
+      // with someone you only share a room with.
+      via?: { name: 'groupProfile'; groupId: string };
+    }
   | { name: 'groupProfile'; groupId: string; from?: 'chats' | 'calls' }
   | {
       name: 'photoViewer';
@@ -477,6 +486,11 @@ function AppContent() {
     // server's probe then finds the frozen socket alive and spares it as
     // incumbent, and the caller's own retries keep resetting the idle timeout
     // (the immortal-incumbent defect, client half).
+    //
+    // …unless a small-group session still holds the process awake: the
+    // socket is ITS signalling path now, and its own end revisits this
+    // decision (the `groupSessionKey` effect below).
+    if (groupCall().view !== null) return;
     messaging.pause();
     // syncBadge KEEPS the old guard: it is a convenience (a fresh count after
     // a call), not the incident fix, and behind the lock it would read
@@ -500,6 +514,22 @@ function AppContent() {
   const groupView = useGroupCallState();
   const groupSessionKey = groupView?.sessionKey ?? null;
   const groupRoomId = groupView?.roomId ?? null;
+  // THE PAUSE THAT BACKGROUNDING SKIPPED FOR A GROUP SESSION, taken when the
+  // SESSION ends instead — the twin of the
+  // `prevCallName` effect above, keyed on the session's opaque identity so a
+  // glare swap (one session replaced by another) is not an end. Unconditional
+  // for the same reasons that effect is; the 1:1 machine is consulted so two
+  // shapes never pause under each other (R11 makes that a corner, not a case).
+  const prevGroupSessionKey = useRef(groupSessionKey);
+  useEffect(() => {
+    const was = prevGroupSessionKey.current;
+    prevGroupSessionKey.current = groupSessionKey;
+    if (was === null || groupSessionKey !== null) return;
+    if (callRef.current.name !== 'idle') return;
+    const state = AppState.currentState;
+    if (state !== 'background' && state !== 'inactive') return;
+    messaging.pause();
+  }, [groupSessionKey]);
   /** Names this phone holds for the session's roster. Only REAL names are
    * mapped: `personName`'s id fallback is refused here so it cannot reach a
    * tile, which the design forbids from ever showing an id. An unmapped member is
@@ -1474,7 +1504,14 @@ function AppContent() {
         // call the process is NOT frozen (voip background mode) and the
         // socket is the call's signalling path; pausing it would drop ICE
         // restarts and hangup frames mid-call.
-        if (callRef.current.name === 'idle') {
+        //
+        // EITHER SHAPE OF CALL. `callRef` mirrors the 1:1 machine only; a
+        // live small-group session is N legs on the same socket, and pausing
+        // under it stopped every ICE restart, hangup, `gleave` and `call.end`
+        // until the 30 s reconnect window expired as `failed_media`. The
+        // coordinator's own view is read rather than mirrored: it is a
+        // module-level fact, current at the moment this listener runs.
+        if (callRef.current.name === 'idle' && groupCall().view === null) {
           messaging.pause();
         }
       } else if (next === 'active') {
@@ -1513,12 +1550,20 @@ function AppContent() {
           // resume its transport nor navigate for it.
           if (openingGeneration.current !== checkedGeneration) return;
           const current = routeRef.current.name;
+          // FAIL CLOSED on the clock: `away` is wall-clock arithmetic, and
+          // a clock moved backwards while backgrounded makes it negative —
+          // which must relock, never resume. `away == null` stays a resume
+          // on purpose: it is null exactly on an inactive→active edge with
+          // no background edge recorded (control centre, the Face ID
+          // prompt, an incoming-call banner), and relocking there would
+          // lock the app on every such edge under the default "Right away"
+          // autolock.
           const mustRelock =
             status.enabled &&
             current !== 'locked' &&
             current !== 'loading' &&
             away != null &&
-            away >= status.autolockSec * 1000;
+            (away < 0 || away >= status.autolockSec * 1000);
           if (mustRelock) {
             await relock();
             return;
@@ -1597,19 +1642,64 @@ function AppContent() {
     }
   }, [route]);
 
+  // The link-offer hop's ONE-SHOT LATCH: armed at boot (a durable
+  // link_pending_offer row may predate this process) and by every landing
+  // notice; spent by the hop that serves it, or by a probe that finds
+  // nothing waiting. Spent — never re-armed by a home arrival on its own —
+  // because the confirm surface's chevron and its Close controls leave the
+  // row in place (only accept/decline consume it), and a re-read on the way
+  // back to chats would re-open the surface until the offer expired: a
+  // ten-minute trap.
+  const offerHopOwed = useRef(true);
+
   useEffect(() => {
     // A pending link offer landed: surface
     // the confirm screen — but only over a HOME surface. Mid-thread,
     // mid-call, or pre-verdict, the offer stays durably stored
     // (link_pending_offer) and the person reaches it the next time a home
-    // surface is on glass; navigation is never stolen from under a hand.
+    // surface is on glass (the effect below); navigation is never stolen
+    // from under a hand.
     return onPendingOffer(() => {
+      offerHopOwed.current = true;
       const name = routeRef.current.name;
       if (name === 'chats' || name === 'calls') {
+        offerHopOwed.current = false;
         setRoute({ name: 'linkConfirm' });
       }
     });
   }, []);
+
+  useEffect(() => {
+    // A pending link offer that landed OFF a home surface: the notice-time
+    // hop above fires only when chats/calls is on glass at that instant;
+    // otherwise the durable link_pending_offer row sat unread until its ten
+    // minutes ran out. Re-read it when a home surface next comes on glass —
+    // an offer that arrived mid-thread, in Settings or on Profile is shown
+    // at the next natural moment. Through the PROBE (no fetch, no pin, no
+    // signature check; dead rows reaped), so the hop never lands on "there
+    // is no link request waiting". Real session only: a duress session never
+    // links.
+    if (route.name !== 'chats' && route.name !== 'calls') return;
+    if (session.mode !== 'real' || !profile) return;
+    if (!offerHopOwed.current) return;
+    let stale = false;
+    void pendingOfferWaiting()
+      .then(waiting => {
+        if (stale) return;
+        if (!waiting) {
+          offerHopOwed.current = false;
+          return;
+        }
+        const name = routeRef.current.name;
+        if (name !== 'chats' && name !== 'calls') return;
+        offerHopOwed.current = false;
+        setRoute({ name: 'linkConfirm' });
+      })
+      .catch(() => undefined);
+    return () => {
+      stale = true;
+    };
+  }, [route.name, profile]);
 
   useEffect(() => {
     // A recovery was REQUESTED against this account's grouping: the cancel — which WINS at any moment
@@ -1727,10 +1817,18 @@ function AppContent() {
         onOpenProfile={() => setRoute({ name: 'profile' })}
         onStartChat={() => setRoute({ name: 'newChat' })}
         onStartRoom={() => setRoute({ name: 'newRoom' })}
+        // The App Lock nudge's "Open Settings": the lock lives on the
+        // Settings surface, so that is where the door goes.
+        onOpenAppLock={() => setRoute({ name: 'settings' })}
       />
     ));
   const callsSurface = profile && (
     <CallsScreen
+      // The shared home header's profile door: the same disc, in the same
+      // corner, as the Chats tab above — the screen renders it only when
+      // BOTH are given, and nothing gave them.
+      profile={profile}
+      onOpenProfile={() => setRoute({ name: 'profile' })}
       onOpenChat={peerId => setRoute({ name: 'thread', peerId, from: 'calls' })}
       onCall={(peerId, kind) => {
         void (async () => {
@@ -1874,6 +1972,12 @@ function AppContent() {
 
         {route.name === 'thread' && profile && (
           <ChatThreadScreen
+            // A different conversation is a different INSTANCE. Un-keyed, a
+            // thread→thread route change — the wide shell's list pane, a
+            // foreground push redemption — reused the mounted screen with a
+            // new peerId, and its composer state (draft, reply chip, failed
+            // photo) crossed over with it.
+            key={route.peerId}
             peerId={route.peerId}
             onBack={() =>
               setRoute(route.from === 'calls' ? { name: 'calls' } : { name: 'chats' })
@@ -2003,7 +2107,10 @@ function AppContent() {
             itself renders null while the pin is false, so even a
             programmatic route entry shows nothing in a dark build. */}
         {route.name === 'accountUsername' && profile && (
-          <AccountUsernameScreen onBack={() => setRoute({ name: 'settings' })} />
+          <AccountUsernameScreen
+            onBack={() => setRoute({ name: 'settings' })}
+            onOpenAccountEmail={() => setRoute({ name: 'accountEmail' })}
+          />
         )}
 
         {/* Recovery: reachable from Landing
@@ -2035,13 +2142,13 @@ function AppContent() {
           <PeerProfileScreen
             peerId={route.peerId}
             me={profile}
-            onBack={() =>
-              setRoute({
-                name: 'thread',
-                peerId: route.peerId,
-                from: route.from,
-              })
-            }
+            // One source for the chevron, the swipe and hardware back: the
+            // destination depends on where the profile was opened from,
+            // and backDestination is where that is stated.
+            onBack={() => {
+              const destination = backDestination(route);
+              if (destination) setRoute(destination);
+            }}
           />
         )}
 
@@ -2059,7 +2166,12 @@ function AppContent() {
             // A member's safety number and block control live on their own
             // profile — one door per room, and it already exists.
             onOpenMember={peerId =>
-              setRoute({ name: 'peerProfile', peerId, from: route.from })
+              setRoute({
+                name: 'peerProfile',
+                peerId,
+                from: route.from,
+                via: { name: 'groupProfile', groupId: route.groupId },
+              })
             }
             // Both deletes land here: the thread behind this screen is gone,
             // so back must not walk into it.
@@ -2142,7 +2254,7 @@ function AppContent() {
             >
               <RouteTransition
                 routeKey={detailOpen ? routeKey(route) : 'empty-detail'}
-                depth={detailOpen ? DEPTH[route.name] : DEPTH.chats}
+                depth={detailOpen ? routeDepth(route) : DEPTH.chats}
                 crossfade={false}
                 // The edge swipe is DISABLED in wide: POP_DISTANCE and
                 // GESTURE_FLOOR are window-relative, phone-tuned numbers —
@@ -2163,7 +2275,7 @@ function AppContent() {
         <>
           <RouteTransition
             routeKey={routeKey(route)}
-            depth={DEPTH[route.name]}
+            depth={routeDepth(route)}
             crossfade={route.name === 'photoViewer'}
             // photoViewer pops (hardware back, its own close control) but does
             // not SWIPE: the crossfade has no horizontal movement to drag.
@@ -2202,11 +2314,17 @@ function AppContent() {
           peerName={callPeerName ?? personName(call.call.peerId)}
           peerAvatarB64={callPeerAvatar}
           withVideo={call.call.peerVideo}
-          onAccept={() => void callController().accept()}
+          // Through `acceptIncomingCall`, never `accept()` directly: it asks
+          // for the microphone (and camera) FIRST, as the three outgoing
+          // paths do, so a first-ever call that is incoming does not put the
+          // system prompts over the connecting screen after `didActivate` —
+          // and a denied camera degrades the answer to audio rather than
+          // promising `vid:true` to a caller who then stares at black.
+          onAccept={() => void acceptIncomingCall(true)}
           // Both buttons called the same accept(), so "Answer without video"
           // answered WITH video: the camera came on for someone who had just
           // said not to.
-          onAcceptAudioOnly={() => void callController().accept({ video: false })}
+          onAcceptAudioOnly={() => void acceptIncomingCall(false)}
           onDecline={() => void callController().decline()}
         />
       )}
@@ -2315,44 +2433,58 @@ function AppContent() {
       )}
       {groupView && groupAdding && (
         <View style={[StyleSheet.absoluteFill, styles.addScrim]}>
-          <CallPicker
-            // A session change must also destroy the picker's private
-            // selections; hiding A's sheet for one render does not make those
-            // dead choices belong to B when Add opens again.
-            key={groupView.sessionKey}
-            // The same map the tiles read, and the same absence: an unmapped
-            // member arrives as null and the picker renders the placeholder.
-            // It used to fall back to `personName(id)` with no name arguments
-            // at all, which is the ULID fragment by construction — the exact
-            // bug the in-call surfaces above were fixed for, one screen over.
-            candidates={groupAddCandidates.map(id => ({
-              peerId: id,
-              name: groupNames.get(id) ?? null,
-            }))}
-            cap={smallGroupCallParticipantCap(groupView.video)}
-            // The call already holds this many seats; see the prop's own note
-            // on why counting only oneself here would be a lie.
-            seatsTaken={groupView.roster.length}
-            maxHeight={220}
-            startLabel="Add to call"
-            onCancel={() => setGroupAdding(false)}
-            onStart={others => {
-              setGroupAdding(false);
-              void (async () => {
-                for (const id of others) {
-                  // PER PERSON, so one refusal is one person not added rather
-                  // than a silent end to the loop. The coordinator refuses
-                  // anyone the room no longer holds (and anyone the cap or the
-                  // epoch refuses); the same contract as every other call
-                  // refusal here — the thing that would have happened simply
-                  // does not.
-                  await groupCall()
-                    .addParticipant(id)
-                    .catch(() => undefined);
-                }
-              })().catch(() => undefined);
+          {/* The OPAQUE sheet is the picker's own container — never the
+              full-screen layer above it. Painting the absoluteFill would
+              blank the live call (every tile, every control) behind a paper
+              field, and the seam below would then separate paper from paper.
+              The layer stays transparent: it is layout (flex-end) and a touch
+              catch, nothing else. */}
+          <View
+            style={{
+              backgroundColor: t.color.paperLayer,
+              borderTopWidth: t.hairline,
+              borderTopColor: t.color.lineStrong,
             }}
-          />
+          >
+            <CallPicker
+              // A session change must also destroy the picker's private
+              // selections; hiding A's sheet for one render does not make those
+              // dead choices belong to B when Add opens again.
+              key={groupView.sessionKey}
+              // The same map the tiles read, and the same absence: an unmapped
+              // member arrives as null and the picker renders the placeholder.
+              // It used to fall back to `personName(id)` with no name arguments
+              // at all, which is the ULID fragment by construction — the exact
+              // bug the in-call surfaces above were fixed for, one screen over.
+              candidates={groupAddCandidates.map(id => ({
+                peerId: id,
+                name: groupNames.get(id) ?? null,
+              }))}
+              cap={smallGroupCallParticipantCap(groupView.video)}
+              // The call already holds this many seats; see the prop's own note
+              // on why counting only oneself here would be a lie.
+              seatsTaken={groupView.roster.length}
+              maxHeight={220}
+              startLabel="Add to call"
+              onCancel={() => setGroupAdding(false)}
+              onStart={others => {
+                setGroupAdding(false);
+                void (async () => {
+                  for (const id of others) {
+                    // PER PERSON, so one refusal is one person not added rather
+                    // than a silent end to the loop. The coordinator refuses
+                    // anyone the room no longer holds (and anyone the cap or the
+                    // epoch refuses); the same contract as every other call
+                    // refusal here — the thing that would have happened simply
+                    // does not.
+                    await groupCall()
+                      .addParticipant(id)
+                      .catch(() => undefined);
+                  }
+                })().catch(() => undefined);
+              }}
+            />
+          </View>
         </View>
       )}
       {/* Keeps the profile fresh when a card is saved from another surface. */}
@@ -2464,9 +2596,13 @@ function AppContent() {
 
 /** Identity of the current surface — a change drives the route transition. */
 function routeKey(route: Route): string {
-  return route.name === 'thread' || route.name === 'peerProfile'
-    ? `${route.name}:${route.peerId}`
-    : route.name;
+  // A member's profile reached through a room is a different surface from
+  // the same person's profile reached from their thread: the key says so,
+  // or the transition between the two would not run.
+  if (route.name === 'peerProfile') {
+    return `${route.name}:${route.peerId}${route.via ? `:via:${route.via.groupId}` : ''}`;
+  }
+  return route.name === 'thread' ? `${route.name}:${route.peerId}` : route.name;
 }
 
 /**
@@ -2507,6 +2643,14 @@ const DEPTH: Record<Route['name'], number> = {
   discover: 3,
   recover: 1,
 };
+
+/**
+ * DEPTH, with the one surface that sits deeper than its name: a room
+ * member's profile is opened FROM the room profile, and both are at 3, so an
+ * equal-depth pop back to the room would animate FORWARD. */
+function routeDepth(route: Route): number {
+  return DEPTH[route.name] + (route.name === 'peerProfile' && route.via ? 1 : 0);
+}
 
 /**
  * Where a surface pops back to, or null if it is a root. The router does not
@@ -2558,7 +2702,11 @@ function backDestination(route: Route): Route | null {
       // makes the same choice on `profile`).
       return route.from === 'chats' ? { name: 'chats' } : { name: 'landing' };
     case 'peerProfile':
-      return { name: 'thread', peerId: route.peerId, from: route.from };
+      // A room member's profile pops back to the room it was opened
+      // from; one opened from a thread pops to that thread.
+      return route.via
+        ? { name: 'groupProfile', groupId: route.via.groupId, from: route.from }
+        : { name: 'thread', peerId: route.peerId, from: route.from };
     case 'groupProfile':
       return { name: 'thread', peerId: route.groupId, from: route.from };
     case 'photoViewer':
@@ -2797,9 +2945,16 @@ const styles = StyleSheet.create({
   loading: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   leadingEdge: { position: 'absolute', left: 0, top: 0, bottom: 0 },
   captureCoverLine: { marginTop: 16, textAlign: 'center' },
-  /** The in-call Add picker sits on the paper ground over the call's dark
-   * one; the scrim is what keeps the two surfaces from reading as one. */
-  addScrim: { justifyContent: 'flex-end', backgroundColor: 'rgba(6,8,7,0.72)' },
+  /**
+   * The in-call Add picker sits on an OPAQUE paper sheet over the call's dark
+   * surface — no translucent scrims anywhere (the emoji rail's precedent);
+   * the hairline seam above the picker is what keeps the two surfaces from
+   * reading as one. This is the LAYER, not the sheet: it is transparent, and
+   * only pins the sheet to the bottom edge (and swallows taps aimed at the
+   * call behind it). The paper token and the seam are on the sheet itself, at
+   * the call site, so the call stays visible around it — an opaque element
+   * seamed to its host, exactly as the rail does. */
+  addScrim: { justifyContent: 'flex-end' },
   /** The gone sheet holds prose, not a single line: keep it off the edges. */
   gone: { paddingHorizontal: 32 },
   goneTitle: { marginTop: 24, textAlign: 'center' },

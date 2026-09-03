@@ -163,12 +163,23 @@ function runApprovalSql(
   if (/^CREATE TABLE/i.test(flat)) return { rows: [] };
   const sql = bind(flat);
 
-  const insert = /^INSERT INTO approvals \(([^)]*)\) VALUES \((.*)\) ON CONFLICT\(([^)]*)\) DO NOTHING$/i.exec(
-    sql,
-  );
+  // Two shapes: the plain VALUES insert, and the guarded
+  // `SELECT <values> WHERE (SELECT COUNT(*) FROM approvals WHERE <cond>) < N`.
+  // The guard is EVALUATED (the condition against every stored row, the cap
+  // literal read off the statement), so a stripped condition or a changed
+  // number changes what the model admits.
+  const insert =
+    /^INSERT INTO approvals \(([^)]*)\) (?:VALUES \((.*)\)|SELECT (.*?) WHERE \(SELECT COUNT\(\*\) FROM approvals WHERE (.*)\) < (\d+)) ON CONFLICT\(([^)]*)\) DO NOTHING$/i.exec(
+      sql,
+    );
   if (insert) {
     const cols = insert[1]!.split(',').map(x => x.trim());
-    const values = splitTop(insert[2]!, ',').map(v => evalExpr(v, null, params));
+    const valueList = insert[2] ?? insert[3]!;
+    if (insert[4] !== undefined) {
+      const live = table.filter(row => evalCond(insert[4]!, row, params)).length;
+      if (!(live < Number(insert[5]))) return { rows: [], rowsAffected: 0 };
+    }
+    const values = splitTop(valueList, ',').map(v => evalExpr(v, null, params));
     if (cols.length !== values.length) {
       throw new Error('approvals model: column/value count mismatch');
     }
@@ -176,7 +187,7 @@ function runApprovalSql(
     cols.forEach((col, i) => {
       row[col] = values[i] === undefined ? null : values[i]!;
     });
-    const target = insert[3]!.split(',').map(x => x.trim());
+    const target = insert[6]!.split(',').map(x => x.trim());
     const clash = table.some(r => target.every(col => r[col] === row[col]));
     // DO NOTHING is the single-use rule at rest: the model inserts ONLY
     // when the conflict target finds no existing row.
@@ -468,5 +479,55 @@ describe('read-time maintenance — the moving clock', () => {
 describe('the wipe list', () => {
   test('approvals is in DB_TABLES — sign-out wipes it and the decoy never inherits a machine\'s command lines', () => {
     expect(db.DB_TABLES).toContain('approvals');
+  });
+});
+
+describe('the live-pending cap', () => {
+  const q = (n: number) => `01J8MEAPPR0VAQ4X2C6TK${String(n).padStart(5, '0')}`;
+
+  async function askUpToCap(arrivedAt = T0): Promise<void> {
+    for (let n = 1; n <= db.PENDING_APPROVALS_PER_PEER_CAP; n++) {
+      expect(await db.insertApproval({ ...ASK, q: q(n), ts: arrivedAt, arrivedAt })).toBe(true);
+    }
+    expect(table.filter(r => r.peerId === PEER)).toHaveLength(db.PENDING_APPROVALS_PER_PEER_CAP);
+  }
+
+  test('the next ask past the cap is refused — false back, no row, the frame still acked by the caller', async () => {
+    await askUpToCap();
+    expect(await db.insertApproval({ ...ASK, q: q(999) })).toBe(false);
+    expect(table.filter(r => r.peerId === PEER)).toHaveLength(db.PENDING_APPROVALS_PER_PEER_CAP);
+    // A replay of a stored id is still the DO NOTHING it was, not a refusal
+    // that reads differently.
+    expect(await db.insertApproval({ ...ASK, q: q(1) })).toBe(false);
+  });
+
+  test('an ask past its own deadline stops counting BEFORE any read marks it lapsed', async () => {
+    await askUpToCap();
+    // Nobody opened the thread: every row still says 'pending' on disk…
+    expect(table.every(r => r.state === 'pending')).toBe(true);
+    // …but the machine's next ask, arriving after those deadlines, is live
+    // against zero live rows.
+    const later = DEADLINE + 1;
+    expect(await db.insertApproval({ ...ASK, q: q(999), ts: later, arrivedAt: later })).toBe(true);
+  });
+
+  test('a settled ask stops counting', async () => {
+    await askUpToCap();
+    expect(await db.settleApproval(PEER, q(1), 'approve', T0 + 5_000)).toBe(true);
+    expect(await db.insertApproval({ ...ASK, q: q(999), ts: T0 + 6_000, arrivedAt: T0 + 6_000 })).toBe(true);
+  });
+
+  test('the cap is per conversation: another machine’s asks are its own', async () => {
+    await askUpToCap();
+    expect(await db.insertApproval({ ...ASK, peerId: OTHER_PEER, q: q(999) })).toBe(true);
+  });
+
+  test('the retention rule runs from the sweep too — a thread never opened does not keep command lines', async () => {
+    expect(await db.insertApproval(ASK)).toBe(true);
+    // One millisecond short: kept, whether or not anyone reads the thread.
+    await db.sweepExpired(T0 + db.APPROVAL_RETAIN_MS - 1);
+    expect(table).toHaveLength(1);
+    await db.sweepExpired(T0 + db.APPROVAL_RETAIN_MS);
+    expect(table).toHaveLength(0);
   });
 });

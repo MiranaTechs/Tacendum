@@ -961,3 +961,228 @@ describe('losing ICE actually starts the recovery', () => {
     expect(envelopeTcms(effects)).not.toContain('call.restart');
   });
 });
+
+describe('the ring outlives the connect timer', () => {
+  it('a ringing callee is never cut off at 45 s: connectTimeout after ringingReceived does nothing', () => {
+    // The 45 s connect timer armed at placeCall was never cancelled when the
+    // callee started ringing, so every unanswered call died as failed_ice at
+    // 45 s — "failed to connect" on both logs, and never a missed row.
+    const { state, effects } = drive(idleState(), [
+      place,
+      { type: 'ringingReceived', cid: CID_A },
+    ]);
+    expect(state.name).toBe('outgoing_ringing');
+    expect(effects).toContainEqual({ type: 'cancelTimer', timer: 'connect' });
+    expect(effects).toContainEqual(
+      expect.objectContaining({ type: 'startTimer', timer: 'ring' }),
+    );
+
+    const late = callReducer(state, { type: 'connectTimeout' }, NOW + 45_000);
+    expect(late.state).toEqual(state);
+    expect(late.effects).toHaveLength(0);
+  });
+
+  it('a ring that times out ends with `timeout`, so the callee logs a missed call', () => {
+    const { state, effects } = drive(idleState(), [
+      place,
+      { type: 'ringingReceived', cid: CID_A },
+      { type: 'ringTimeout' },
+    ]);
+    expect(state.name).toBe('ending');
+    const end = sent(effects)[0] as { envelope: { r: string } };
+    expect(end.envelope.r).toBe('timeout');
+    expect(effects.find(e => e.type === 'writeLog')).toMatchObject({
+      reason: 'timeout',
+      direction: 'out',
+    });
+  });
+
+  it('the answer re-arms the connect timer: "answered but ICE never connected" starts then', () => {
+    const { effects } = drive(idleState(), [
+      place,
+      { type: 'ringingReceived', cid: CID_A },
+      { type: 'answerReceived', cid: CID_A, sdp: 'v=0', video: true },
+    ]);
+    expect(effects).toContainEqual({ type: 'cancelTimer', timer: 'ring' });
+    expect(effects).toContainEqual(
+      expect.objectContaining({ type: 'startTimer', timer: 'connect' }),
+    );
+  });
+
+  it('a restart answer while reconnecting re-arms nothing — the reconnect window owns that clock', () => {
+    const { state: dropped } = drive(idleState(), [
+      place,
+      { type: 'answerReceived', cid: CID_A, sdp: 'v=0', video: true },
+      { type: 'iceStateChanged', cid: CID_A, ice: 'connected' },
+      { type: 'iceStateChanged', cid: CID_A, ice: 'disconnected' },
+    ]);
+    const { effects } = drive(dropped, [
+      { type: 'answerReceived', cid: CID_A, sdp: 'v=0/restart', video: true },
+    ]);
+    expect(effects.some(e => e.type === 'startTimer')).toBe(false);
+  });
+});
+
+describe('a callee who hangs up before connecting DECLINED', () => {
+  it('callKitEnded while ringing is a decline: the caller hears decline, the row is not missed', () => {
+    // After the placeholder rebind the lock-screen red button is a
+    // CXEndCallAction → callKitEnded, which the reducer mapped to `cancelled`
+    // — a MISSED row for a call the person had just declined.
+    const { state, effects } = drive(idleState(), [offer(), { type: 'callKitEnded' }]);
+    expect(state.name).toBe('ending');
+    const end = sent(effects)[0] as { envelope: { tcm: string; r: string } };
+    expect(end.envelope).toMatchObject({ tcm: 'call.end', r: 'decline' });
+    expect(effects.find(e => e.type === 'writeLog')).toMatchObject({
+      direction: 'in',
+      reason: 'decline',
+      missed: false,
+    });
+  });
+
+  it('hanging up while "Connecting…" on an answered incoming call is a decline too', () => {
+    const { effects } = drive(idleState(), [
+      offer(),
+      { type: 'localAccept' },
+      { type: 'localHangup' },
+    ]);
+    const end = sent(effects)[0] as { envelope: { r: string } };
+    expect(end.envelope.r).toBe('decline');
+    expect(effects.find(e => e.type === 'writeLog')).toMatchObject({
+      reason: 'decline',
+      missed: false,
+    });
+  });
+
+  it('the caller hanging up before the answer is still a cancellation', () => {
+    const { effects } = drive(idleState(), [place, { type: 'callKitEnded' }]);
+    const end = sent(effects)[0] as { envelope: { r: string } };
+    expect(end.envelope.r).toBe('cancelled');
+  });
+
+  it('hanging up a CONNECTED incoming call is a hangup, not a decline', () => {
+    const { effects } = drive(idleState(), [
+      offer(),
+      { type: 'localAccept' },
+      { type: 'iceStateChanged', cid: CID_A, ice: 'connected' },
+      { type: 'callKitEnded' },
+    ]);
+    const end = sent(effects)[0] as { envelope: { r: string } };
+    expect(end.envelope.r).toBe('hangup');
+  });
+});
+
+describe('a call refused as busy leaves a row', () => {
+  it('the busy refusal writes a MISSED row for the caller who could not get through', () => {
+    const { effects } = drive(idleState(), [offer(CID_A), offer(CID_B)], NOW + 5_000);
+    const log = effects.find(e => e.type === 'writeLog');
+    expect(log).toMatchObject({
+      cid: CID_B,
+      peerId: PEER,
+      direction: 'in',
+      reason: 'busy',
+      missed: true,
+      connectedAt: null,
+    });
+    // And the refusal itself still goes out.
+    const end = sent(effects)[0] as { envelope: { cid: string; r: string } };
+    expect(end.envelope).toMatchObject({ cid: CID_B, r: 'busy' });
+  });
+
+  it('dates the busy row at the offer, not at the refusal', () => {
+    const late = { ...offer(CID_B), serverTs: NOW - 20_000 };
+    const { effects } = drive(idleState(), [offer(CID_A), late]);
+    expect(effects.find(e => e.type === 'writeLog')).toMatchObject({
+      startedAt: NOW - 20_000,
+      endedAt: NOW,
+    });
+  });
+
+  it('a busy answered to the CALLER is not a missed call on their side', () => {
+    const { effects } = drive(idleState(), [
+      place,
+      { type: 'endReceived', cid: CID_A, reason: 'busy' },
+    ]);
+    expect(effects.find(e => e.type === 'writeLog')).toMatchObject({
+      direction: 'out',
+      reason: 'busy',
+      missed: false,
+    });
+  });
+});
+
+describe('an expired offer is dated at the call', () => {
+  it('writes the missed row at the server receipt time, not at processing time', () => {
+    // A phone off for hours drains an old offer; "Missed call · just now"
+    // for a call made hours ago is a lie about when it happened.
+    const hoursAgo = NOW - 3 * 3_600_000;
+    const { state, effects } = drive(idleState(), [offer(CID_A, hoursAgo + 60_000, hoursAgo)]);
+    expect(state.name).toBe('idle');
+    expect(effects.find(e => e.type === 'writeLog')).toMatchObject({
+      reason: 'expired',
+      missed: true,
+      startedAt: hoursAgo,
+      endedAt: NOW,
+    });
+  });
+});
+
+describe('the restart answer survives ICE healing first', () => {
+  function connectedCaller(): CallState {
+    return drive(idleState(), [
+      place,
+      { type: 'answerReceived', cid: CID_A, sdp: 'v=0/answer', video: true },
+      { type: 'iceStateChanged', cid: CID_A, ice: 'connected' },
+    ]).state;
+  }
+
+  it('applies the restart answer in `connected` while the restart is in flight, and clears the flag', () => {
+    // ICE reconnects on its own before the callee's answer lands; the answer
+    // used to be dropped, leaving the caller's peer connection in
+    // have-local-offer with a stale restart until the next real disconnect.
+    const { state: healed } = drive(connectedCaller(), [
+      { type: 'iceStateChanged', cid: CID_A, ice: 'disconnected' },
+      { type: 'iceStateChanged', cid: CID_A, ice: 'connected' },
+    ]);
+    expect(healed.name).toBe('connected');
+    expect(healed.call?.restartInFlight).toBe(true);
+
+    const { state, effects } = drive(healed, [
+      { type: 'answerReceived', cid: CID_A, sdp: 'v=0/restarted', video: true },
+    ]);
+    expect(effects.find(e => e.type === 'setRemoteAnswer')).toMatchObject({
+      cid: CID_A,
+      sdp: 'v=0/restarted',
+    });
+    expect(state.name).toBe('connected');
+    expect(state.call?.restartInFlight).toBe(false);
+    // It was a restart answer: the camera record is untouched (§7.6).
+    expect(state.call?.peerVideo).toBe(true);
+  });
+
+  it('still ignores an unsolicited answer on a healthy call with no restart pending', () => {
+    const { state, effects } = drive(connectedCaller(), [
+      { type: 'answerReceived', cid: CID_A, sdp: 'v=0/again', video: true },
+    ]);
+    expect(effectTypes(effects)).not.toContain('setRemoteAnswer');
+    expect(state.call?.restartInFlight).toBe(false);
+  });
+
+  it('the answer applied while still reconnecting clears the flag as well', () => {
+    const { state } = drive(connectedCaller(), [
+      { type: 'iceStateChanged', cid: CID_A, ice: 'disconnected' },
+      { type: 'answerReceived', cid: CID_A, sdp: 'v=0/restarted', video: true },
+    ]);
+    expect(state.name).toBe('reconnecting');
+    expect(state.call?.restartInFlight).toBe(false);
+  });
+
+  it('the callee never has a restart in flight', () => {
+    const { state } = drive(idleState(), [
+      offer(),
+      { type: 'localAccept' },
+      { type: 'iceStateChanged', cid: CID_A, ice: 'connected' },
+      { type: 'iceStateChanged', cid: CID_A, ice: 'disconnected' },
+    ]);
+    expect(state.call?.restartInFlight).toBe(false);
+  });
+});

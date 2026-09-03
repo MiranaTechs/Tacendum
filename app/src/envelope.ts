@@ -1071,6 +1071,17 @@ export function rewriteBody(currentBody: string, newText: string): string {
   return newText;
 }
 
+/** What the chat list says for a conversation whose last message was
+ * retracted. The thread says the same thing in its own words. Here rather
+ * than in messaging.ts so the store can apply the same rule when a delete
+ * moves a chat's line without importing the service. */
+export const DELETED_PREVIEW = 'Message deleted';
+
+/** How far back to look for the newest VISIBLE row when recomputing a chat
+ * preview — carriers (edits, retractions, reactions, cards) can stack on top
+ * of the real last message. */
+export const PREVIEW_SCAN = 20;
+
 /** Chat-list / notification preview line for a stored message body. */
 export function previewFor(
   body: string,

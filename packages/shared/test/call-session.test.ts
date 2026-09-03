@@ -173,11 +173,14 @@ describe('authoritative group metric lifecycle', () => {
   });
 
   it('discards authoritative glare before its release teardown', () => {
+    // ANA, a member of the session we started, whose own start crossed ours
+    // in flight — glare is between the people on the call; a stranger's
+    // lower sid is busy and discards nothing.
     const step = rcv(started().state, {
       type: 'ginviteReceived',
-      from: CARA,
+      from: ANA,
       selfId: STARTER,
-      invite: invite({ sid: SID_LOWER, cid: CID_GLARE, r: [CARA, STARTER] }),
+      invite: invite({ sid: SID_LOWER, cid: CID_GLARE, r: [ANA, STARTER] }),
       serverTs: NOW,
     });
     expect(ofType(step.effects, 'discardGroupCallMetric')).toEqual([
@@ -279,7 +282,10 @@ describe('R2 — ring once; held offers are never rung and never answered before
 
   it('a second same-sid invite while ringing is admitted but HELD: no ring, no answer, no dial', () => {
     const step = held();
-    expect(step.effects).toEqual([]); // nothing — not a ring, not an answer
+    // Nothing but the persist — not a ring, not an answer, not a dial. This
+    // pinned `` and was rewritten deliberately: an ADMITTED offer is now
+    // persisted by the reducer's own effect, and a held one is admitted.
+    expect(step.effects.map(e => e.type)).toEqual(['persistOffer']);
     expect(step.state?.heldOffers[BEN]?.invite.cid).toBe(CID_HELD);
     // The forged roster in BEN's envelope bought nothing: the roster held
     // from the starter is untouched.
@@ -712,7 +718,15 @@ describe("R8 — starter-out ends the session for everyone; a member's forgery e
   });
 
   it('local arm: the starter\'s hangup fans ends to every live leg and broadcasts the authority gleave at se+1', () => {
-    const step = rcv(started().state, { type: 'localHangup' });
+    // Both legs CONNECTED first: a hangup is what a leg the peer answered
+    // gets. The legs of a starter who hangs up before anyone answers are
+    // CANCELLED — a missed call on their side — which the block below
+    // holds; this test used to pin `hangup` for still-inviting
+    // legs and was rewritten deliberately.
+    let live = started();
+    live = rcv(live.state, { type: 'legStateChanged', peerId: ANA, cid: CID_A, name: 'connected' });
+    live = rcv(live.state, { type: 'legStateChanged', peerId: BEN, cid: CID_B, name: 'connected' });
+    const step = rcv(live.state, { type: 'localHangup' });
     expect(step.state).toBeNull();
     const closes = ofType(step.effects, 'closeLeg');
     expect(closes.map(c => c.peerId).sort()).toEqual([ANA, BEN].sort());
@@ -767,11 +781,14 @@ describe("R8 — starter-out ends the session for everyone; a member's forgery e
  * ========================================================================== */
 describe('R9 — session glare: the loser abandons every leg, releases, then rings the winner fresh', () => {
   it('supersede closes legs, held offers and the ring itself with glare_lost, in loser-first order', () => {
+    // ANA is in the roster held from the starter, so her lower-sid invite can
+    // be glare; a stranger's cannot, whatever sid they mint — see the block
+    // at the end of this file.
     const step = rcv(held().state, {
       type: 'ginviteReceived',
-      from: CARA,
+      from: ANA,
       selfId: ME,
-      invite: invite({ sid: SID_LOWER, cid: CID_GLARE, r: [CARA, ME] }),
+      invite: invite({ sid: SID_LOWER, cid: CID_GLARE, r: [ANA, ME] }),
       serverTs: NOW,
     });
     const closes = ofType(step.effects, 'closeLeg');
@@ -795,7 +812,7 @@ describe('R9 — session glare: the loser abandons every leg, releases, then rin
     expect(ofType(step.effects, 'closeSessionRow')).toEqual([
       { type: 'closeSessionRow', sid: SID },
     ]);
-    expect(step.state).toMatchObject({ sid: SID_LOWER, starterId: CARA, phase: 'ringing' });
+    expect(step.state).toMatchObject({ sid: SID_LOWER, starterId: ANA, phase: 'ringing' });
   });
 
   it('busy: a higher-sid invite gets call.end{busy} on its cid and the live session is untouched', () => {
@@ -817,15 +834,15 @@ describe('R9 — session glare: the loser abandons every leg, releases, then rin
     const live = answered();
     const step = rcv(live.state, {
       type: 'ginviteReceived',
-      from: CARA,
+      from: ANA,
       selfId: ME,
-      invite: invite({ sid: SID_LOWER, cid: CID_GLARE, r: [CARA, ME], exp: NOW - 120_000 }),
+      invite: invite({ sid: SID_LOWER, cid: CID_GLARE, r: [ANA, ME], exp: NOW - 120_000 }),
       serverTs: NOW - 120_000,
     });
     // The live call is untouched — but the stale winner's own VoIP push rang
     // a placeholder on the way in, and this refusal sends no frame that could
     // clear it. The dismissal is the ONE thing this path emits.
-    expect(step.effects).toEqual([{ type: 'dismissRing', peerId: CARA }]);
+    expect(step.effects).toEqual([{ type: 'dismissRing', peerId: ANA }]);
     expect(step.state).toEqual(live.state);
   });
 
@@ -1130,7 +1147,11 @@ describe('CallKit aggregate — one report, one connect, one release across a wh
 
     expect(ofType(all, 'reportGroupIncoming')).toHaveLength(1);
     expect(ofType(all, 'reportGroupOutgoing')).toHaveLength(0);
-    expect(ofType(all, 'reportGroupConnected')).toHaveLength(1);
+    // An INCOMING session's CXCall was connected by its answer: the connect
+    // report is `reportOutgoingCall(with:connectedAt:)`, the starter's
+    // alone. This test pinned 1 and was rewritten deliberately; the
+    // aggregate's own connect latch is asserted below.
+    expect(ofType(all, 'reportGroupConnected')).toHaveLength(0);
     expect(ofType(all, 'releaseGroupCall')).toHaveLength(1);
     expect(state).toBeNull();
   });
@@ -1350,5 +1371,381 @@ describe('delegation, held at the source level', () => {
     expect(src).toMatch(/admitGroupCallRosterDelta\(/);
     expect(src).toMatch(/groupCallInviteIsRingable\(/);
     expect(src).toMatch(/assertComposableGroupCallRoster\(/);
+  });
+});
+
+/* ========================================================================== *
+ *  The group-call behaviours this reducer owns. Each block names the one it *
+ *  holds; each test went red against the reducer that preceded it.          *
+ * ========================================================================== */
+describe('"lower sid wins" is a tie-break between the people on a call, never a way in', () => {
+  /** A CONNECTED 3-way we started: both legs carry media. */
+  function connected() {
+    let live = started();
+    live = rcv(live.state, { type: 'legStateChanged', peerId: ANA, cid: CID_A, name: 'connected' });
+    live = rcv(live.state, { type: 'legStateChanged', peerId: BEN, cid: CID_B, name: 'connected' });
+    return live;
+  }
+  const busy = (peerId: string): SessionEffect => ({
+    type: 'closeLeg',
+    peerId,
+    cid: CID_GLARE,
+    reason: 'busy',
+    announce: true,
+  });
+
+  it("a stranger's lower sid into a CONNECTED session is only busy — no teardown, no release, no ring", () => {
+    // The repro: a ULID's leading characters are a timestamp, so a forged
+    // `sid: '0000…'` always sorted first and tore the live call down.
+    const live = connected();
+    const step = rcv(live.state, {
+      type: 'ginviteReceived',
+      from: STRANGER,
+      selfId: STARTER,
+      invite: invite({ sid: SID_LOWER, cid: CID_GLARE, r: [STRANGER, STARTER], vid: false }),
+      serverTs: NOW,
+    });
+    expect(step.effects).toEqual([busy(STRANGER)]);
+    expect(step.state).toEqual(live.state);
+  });
+
+  it("a stranger's lower sid into a session still forming is busy too — they are not on the call", () => {
+    const live = started();
+    const step = rcv(live.state, {
+      type: 'ginviteReceived',
+      from: STRANGER,
+      selfId: STARTER,
+      invite: invite({ sid: SID_LOWER, cid: CID_GLARE, r: [STRANGER, STARTER], vid: false }),
+      serverTs: NOW,
+    });
+    expect(step.effects).toEqual([busy(STRANGER)]);
+    expect(step.state).toEqual(live.state);
+  });
+
+  it("a MEMBER's lower sid into a CONNECTED session is busy — a call already carrying media crossed nothing", () => {
+    const live = connected();
+    const step = rcv(live.state, {
+      type: 'ginviteReceived',
+      from: ANA,
+      selfId: STARTER,
+      invite: invite({ sid: SID_LOWER, cid: CID_GLARE, r: [ANA, STARTER], vid: false }),
+      serverTs: NOW,
+    });
+    expect(step.effects).toEqual([busy(ANA)]);
+    expect(step.state).toEqual(live.state);
+  });
+
+  it("the same member's lower sid while the session is still forming IS glare, and supersedes", () => {
+    const step = rcv(started().state, {
+      type: 'ginviteReceived',
+      from: ANA,
+      selfId: STARTER,
+      invite: invite({ sid: SID_LOWER, cid: CID_GLARE, r: [ANA, STARTER], vid: false }),
+      serverTs: NOW,
+    });
+    expect(ofType(step.effects, 'releaseGroupCall')).toEqual([
+      { type: 'releaseGroupCall', sid: SID, reason: 'glare_lost' },
+    ]);
+    expect(step.state).toMatchObject({ sid: SID_LOWER, starterId: ANA, phase: 'ringing' });
+  });
+});
+
+describe('a member added mid-call starts at the epoch the starter is at', () => {
+  const lateInvite = () => invite({ se: 2 });
+
+  it('seeds the session epoch from the invite, and 0 for an invite that predates the field', () => {
+    const late = rcv(null, {
+      type: 'ginviteReceived',
+      from: STARTER,
+      selfId: ME,
+      invite: lateInvite(),
+      serverTs: NOW,
+    });
+    expect(late.state?.se).toBe(2);
+    expect(ringing().state?.se).toBe(0);
+  });
+
+  it("a late-added member applies the starter's NEXT deltas — Add, Remove, starter-out — instead of holding them forever", () => {
+    // Added at epoch 2; the starter then adds CARA (3), removes BEN (4) and
+    // hangs up (5). Every one applies at exactly se+1.
+    const ring = rcv(null, {
+      type: 'ginviteReceived',
+      from: STARTER,
+      selfId: ME,
+      invite: lateInvite(),
+      serverTs: NOW,
+    });
+    const live = rcv(ring.state, { type: 'localAnswer', cids: { [ANA]: CID_ANA } });
+    const add = rcv(live.state, {
+      type: 'gjoinReceived',
+      from: STARTER,
+      delta: { tcm: 'call.gjoin', sid: SID, m: CARA, se: 3 },
+    });
+    expect(add.state?.held).toBeNull();
+    expect(add.state?.roster).toEqual([...ROSTER4, CARA]);
+    expect(add.state?.se).toBe(3);
+    const remove = rcv(add.state, {
+      type: 'gleaveReceived',
+      from: STARTER,
+      delta: { tcm: 'call.gleave', sid: SID, m: BEN, se: 4 },
+    });
+    expect(remove.state?.held).toBeNull();
+    expect(remove.state?.roster).not.toContain(BEN);
+    expect(remove.state?.se).toBe(4);
+    const out = rcv(remove.state, {
+      type: 'gleaveReceived',
+      from: STARTER,
+      delta: { tcm: 'call.gleave', sid: SID, m: STARTER, se: 5 },
+    });
+    expect(out.state).toBeNull();
+    expect(ofType(out.effects, 'releaseGroupCall')).toEqual([
+      { type: 'releaseGroupCall', sid: SID, reason: 'hangup' },
+    ]);
+  });
+
+  it('REPRO of the defect: the same member seeded at 0 holds every one of those deltas, and the call never ends', () => {
+    // With no epoch on the wire the member seeds 0, the starter's se-3 Add is
+    // "from the future" and is held — and so is the starter-out behind it.
+    const live = rcv(ringing().state, { type: 'localAnswer', cids: { [ANA]: CID_ANA } });
+    const add = rcv(live.state, {
+      type: 'gjoinReceived',
+      from: STARTER,
+      delta: { tcm: 'call.gjoin', sid: SID, m: CARA, se: 3 },
+    });
+    expect(add.state?.held).toMatchObject({ m: CARA, se: 3 });
+    expect(add.state?.roster).toEqual(ROSTER4);
+    const out = rcv(add.state, {
+      type: 'gleaveReceived',
+      from: STARTER,
+      delta: { tcm: 'call.gleave', sid: SID, m: STARTER, se: 5 },
+    });
+    expect(out.state).not.toBeNull();
+    expect(ofType(out.effects, 'releaseGroupCall')).toHaveLength(0);
+  });
+});
+
+describe('a leg the peer never answered is CANCELLED, not hung up on', () => {
+  it("the starter's hangup before anyone answered cancels every leg — a missed call on each callee", () => {
+    const step = rcv(started().state, { type: 'localHangup' });
+    const closes = ofType(step.effects, 'closeLeg');
+    expect(closes.map(c => c.reason)).toEqual(['cancelled', 'cancelled']);
+    expect(closes.every(c => c.announce)).toBe(true);
+    // The starter's OWN aggregate still releases as a hangup: they hung up.
+    expect(ofType(step.effects, 'releaseGroupCall')).toEqual([
+      { type: 'releaseGroupCall', sid: SID, reason: 'hangup' },
+    ]);
+  });
+
+  it('per leg: ringing and unreachable are cancelled; connected and reconnecting are hung up', () => {
+    let live = started();
+    live = rcv(live.state, { type: 'legStateChanged', peerId: ANA, cid: CID_A, name: 'outgoing_ringing' });
+    live = rcv(live.state, { type: 'legStateChanged', peerId: BEN, cid: CID_B, name: 'connected' });
+    const ringing = rcv(live.state, { type: 'localHangup' });
+    expect(
+      Object.fromEntries(ofType(ringing.effects, 'closeLeg').map(c => [c.peerId, c.reason])),
+    ).toEqual({ [ANA]: 'cancelled', [BEN]: 'hangup' });
+
+    let other = started();
+    other = rcv(other.state, { type: 'legPushMirrorEmpty', peerId: ANA });
+    other = rcv(other.state, { type: 'legStateChanged', peerId: BEN, cid: CID_B, name: 'connected' });
+    other = rcv(other.state, { type: 'legStateChanged', peerId: BEN, cid: CID_B, name: 'reconnecting' });
+    const unreachable = rcv(other.state, { type: 'localHangup' });
+    expect(
+      Object.fromEntries(ofType(unreachable.effects, 'closeLeg').map(c => [c.peerId, c.reason])),
+    ).toEqual({ [ANA]: 'cancelled', [BEN]: 'hangup' });
+  });
+
+  it("the starter's Remove of a member we were still dialling is cancelled; of one we were connected to, a hangup", () => {
+    const live = answered(); // our leg to ANA is 'inviting'
+    const remove = {
+      type: 'gleaveReceived' as const,
+      from: STARTER,
+      delta: { tcm: 'call.gleave' as const, sid: SID, m: ANA, se: 1 },
+    };
+    expect(ofType(rcv(live.state, remove).effects, 'closeLeg')).toEqual([
+      { type: 'closeLeg', peerId: ANA, cid: CID_ANA, reason: 'cancelled', announce: true },
+    ]);
+    const connected = rcv(live.state, {
+      type: 'legStateChanged',
+      peerId: ANA,
+      cid: CID_ANA,
+      name: 'connected',
+    });
+    expect(ofType(rcv(connected.state, remove).effects, 'closeLeg')).toEqual([
+      { type: 'closeLeg', peerId: ANA, cid: CID_ANA, reason: 'hangup', announce: true },
+    ]);
+  });
+});
+
+describe('a starter cannot hold a phone ringing by re-offering the ring leg', () => {
+  const reoffer = (state: GroupSessionState | null, cid: string, at: number) =>
+    rcv(
+      state,
+      {
+        type: 'ginviteReceived',
+        from: STARTER,
+        selfId: ME,
+        invite: invite({ cid, exp: at + 60_000 }),
+        serverTs: at,
+      },
+      at,
+    );
+
+  it('ONE swap within the original ring; every later re-offer is busy and re-arms nothing', () => {
+    // Three re-offers at 55 s intervals: the first swaps the ring leg (the
+    // starter's own ack may have been lost), and from then on the ring runs
+    // out on its own clock — nothing a starter sends re-arms it again.
+    const ring = ringing();
+    const first = reoffer(ring.state, CID_B2, NOW + 55_000);
+    expect(ofType(first.effects, 'openLegRinging').map(e => e.cid)).toEqual([CID_B2]);
+    expect(ofType(first.effects, 'reportGroupIncoming')).toHaveLength(0); // still ONE CXCall
+    expect(first.state?.starterOffer?.invite.cid).toBe(CID_B2);
+
+    const second = reoffer(first.state, CID_B3, NOW + 110_000);
+    expect(second.effects).toEqual([
+      { type: 'closeLeg', peerId: STARTER, cid: CID_B3, reason: 'busy', announce: true },
+    ]);
+    expect(second.state).toEqual(first.state);
+
+    const third = reoffer(second.state, CID_GLARE, NOW + 165_000);
+    expect(third.effects).toEqual([
+      { type: 'closeLeg', peerId: STARTER, cid: CID_GLARE, reason: 'busy', announce: true },
+    ]);
+    expect(third.state).toEqual(first.state);
+  });
+
+  it('a first re-offer that arrives after the original ring deadline swaps nothing', () => {
+    const late = reoffer(ringing().state, CID_B2, NOW + 61_000);
+    expect(late.effects).toEqual([
+      { type: 'closeLeg', peerId: STARTER, cid: CID_B2, reason: 'busy', announce: true },
+    ]);
+    expect(late.state?.starterOffer?.invite.cid).toBe(CID_RING);
+  });
+});
+
+describe('a leg the peer ANSWERED that fails before its first connect is repaired', () => {
+  it("a joiner's out-leg to an incumbent who answered but never announced arms R6 on the connect timeout", () => {
+    // ME answered; our leg to ANA (R1: we offer) rang and ANA answered — the
+    // `answeredAt` on the report — but no `gjoin` from ANA ever reached us:
+    // incumbents announce once, at their own answer, before we existed.
+    const live = answered();
+    expect(live.state?.announced).not.toContain(ANA);
+    const rang = rcv(live.state, {
+      type: 'legStateChanged',
+      peerId: ANA,
+      cid: CID_ANA,
+      name: 'outgoing_ringing',
+    });
+    expect(rang.state?.legs[ANA]?.phase).toBe('ringing'); // the summary never says 'connecting'
+    const failed = rcv(
+      rang.state,
+      {
+        type: 'legStateChanged',
+        peerId: ANA,
+        cid: CID_ANA,
+        name: 'ending',
+        reason: 'failed_ice',
+        answeredAt: NOW + 1,
+      },
+      NOW + 45_000,
+    );
+    expect(failed.state?.announced).toContain(ANA);
+    expect(ofType(failed.effects, 'startReofferTimer')).toEqual([
+      { type: 'startReofferTimer', peerId: ANA, ms: 2_000 },
+    ]);
+  });
+
+  it('an out-leg that failed UNANSWERED toward an unannounced peer still re-rings nobody (R6 unchanged)', () => {
+    const failed = rcv(
+      answered().state,
+      { type: 'legStateChanged', peerId: ANA, cid: CID_ANA, name: 'ending', reason: 'failed_ice' },
+      NOW + 45_000,
+    );
+    expect(ofType(failed.effects, 'startReofferTimer')).toHaveLength(0);
+  });
+});
+
+/* ========================================================================== *
+ *  `persistOffer`: the reducer names which invites reach `call_offers`.      *
+ *  The coordinator used to persist every ringable invite BEFORE the          *
+ *  verdict, so a stranger's SDP sat on disk for a call answered busy.        *
+ *  Now only an invite the reducer rang, held, swapped or auto-accepted       *
+ *  is persisted — and first in its step, ahead of the session row and        *
+ *  the CallKit report.                                                       *
+ * ========================================================================== */
+describe('persistOffer is emitted only for an admitted invite, and first', () => {
+  it('a fresh ring persists its offer before the session row and the report', () => {
+    const { effects } = ringing();
+    const types = effects.map(e => e.type);
+    expect(types.indexOf('persistOffer')).toBe(0);
+    expect(types.indexOf('persistOffer')).toBeLessThan(types.indexOf('writeSessionRow'));
+    expect(types.indexOf('persistOffer')).toBeLessThan(types.indexOf('reportGroupIncoming'));
+    expect(ofType(effects, 'persistOffer')[0]?.offer).toEqual({
+      from: STARTER,
+      invite: invite(),
+      serverTs: NOW,
+    });
+  });
+
+  it('a busy-refused invite into the live session persists nothing', () => {
+    const ring = ringing();
+    const busy = rcv(ring.state, {
+      type: 'ginviteReceived',
+      from: STRANGER,
+      selfId: ME,
+      invite: invite({ cid: CID_HELD, r: [STRANGER, ME] }),
+      serverTs: NOW,
+    });
+    expect(ofType(busy.effects, 'closeLeg').map(e => e.reason)).toEqual(['busy']);
+    expect(ofType(busy.effects, 'persistOffer')).toHaveLength(0);
+  });
+
+  it('a redelivered frame persists nothing twice', () => {
+    const ring = ringing();
+    const again = rcv(ring.state, {
+      type: 'ginviteReceived',
+      from: STARTER,
+      selfId: ME,
+      invite: invite(),
+      serverTs: NOW,
+    });
+    expect(again.effects).toEqual([]);
+  });
+
+  it("the starter's one swap persists the fresh offer; the refused second swap does not", () => {
+    const ring = ringing();
+    const swapped = rcv(ring.state, {
+      type: 'ginviteReceived',
+      from: STARTER,
+      selfId: ME,
+      invite: invite({ cid: CID_A }),
+      serverTs: NOW + 1_000,
+    }, NOW + 1_000);
+    expect(swapped.effects.map(e => e.type)).toEqual(['persistOffer', 'closeLeg', 'openLegRinging']);
+    expect(ofType(swapped.effects, 'persistOffer')[0]?.offer.invite.cid).toBe(CID_A);
+
+    const refused = rcv(swapped.state, {
+      type: 'ginviteReceived',
+      from: STARTER,
+      selfId: ME,
+      invite: invite({ cid: CID_HELD }),
+      serverTs: NOW + 2_000,
+    }, NOW + 2_000);
+    expect(ofType(refused.effects, 'closeLeg').map(e => e.reason)).toEqual(['busy']);
+    expect(ofType(refused.effects, 'persistOffer')).toHaveLength(0);
+  });
+
+  it('an auto-accepted leg into the answered session is persisted before it is answered', () => {
+    const answered = rcv(ringing().state, { type: 'localAnswer', cids: { [ANA]: CID_A } });
+    const joined = rcv(answered.state, {
+      type: 'ginviteReceived',
+      from: BEN,
+      selfId: ME,
+      invite: invite({ cid: CID_HELD }),
+      serverTs: NOW,
+    });
+    const types = joined.effects.map(e => e.type);
+    expect(types.indexOf('persistOffer')).toBeGreaterThanOrEqual(0);
+    expect(types.indexOf('persistOffer')).toBeLessThan(types.indexOf('openLegAnswer'));
   });
 });

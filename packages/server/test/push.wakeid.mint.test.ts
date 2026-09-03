@@ -5,7 +5,7 @@ import WebSocket from 'ws';
 import type { SendFrame, ServerFrame } from '@tacendum/shared';
 import { wsDefaultHandler, type WsDeps } from '../src/handlers/ws.js';
 import { startWsServer } from '../src/local/ws.js';
-import { sessionTokenDigest, type DataLayer } from '../src/db/data.js';
+import { sessionTokenDigest, type TestOnlyDataLayer } from '../src/db/data.js';
 import { makeMemoryDb, makeTestDeps, testIdentityKey, type TestDeps } from './helpers.js';
 
 /**
@@ -62,7 +62,7 @@ function makeFakeSender() {
 }
 
 describe('the wake id mint', () => {
-  let db: DataLayer;
+  let db: TestOnlyDataLayer;
   let deps: TestDeps;
   let wsDeps: WsDeps;
   /** Every schedule this run, in order, exactly as `wakeRecipient` handed it
@@ -170,7 +170,7 @@ describe('the wake id mint', () => {
  * a ring out of.
  */
 describe('the local host', () => {
-  let db: DataLayer;
+  let db: TestOnlyDataLayer;
   let deps: TestDeps;
   let server: Server;
   let wsUrl: string;

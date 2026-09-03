@@ -85,6 +85,7 @@ jest.mock('../src/db', () => ({
   listChats: jest.fn(),
   listMessages: jest.fn(),
   listAttachments: jest.fn(),
+  listAttachmentMeta: jest.fn(),
   listRecentMessages: jest.fn(),
   listHeldRevisions: jest.fn(),
   takeHeldRevision: jest.fn(),
@@ -189,6 +190,7 @@ function resetDb(): void {
     ['listChats', []],
     ['listMessages', []],
     ['listAttachments', []],
+    ['listAttachmentMeta', []],
     ['listRecentMessages', []],
     ['listHeldRevisions', []],
     ['takeHeldRevision', null],
@@ -558,6 +560,10 @@ describe('a send racing the running flush', () => {
   test('a row committed mid-pass is sent by a latched re-run, without a reconnect', async () => {
     const ROW2 = '01SECONDROWZ3NDEKTSV4RRFF6';
     await startMessaging();
+    // The bump this test suspends inside happens only on a socket that has
+    // produced a frame — put one on record before the first send.
+    ws.handlers.frame?.({ type: 'receipt', msgId: '01UNRELATEDRECEIPT0000000', state: 'sent' });
+    await flush();
 
     // First pass: one row, and the flush suspends inside bumpOutboxAttempt
     // right after its ws.send — one of the multi-await windows the retry
@@ -593,6 +599,56 @@ describe('a send racing the running flush', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// attempts count only on a socket that has proved it carries traffic both
+// ways. A half-open socket reads OPEN, takes every send, answers nothing —
+// and used to walk a good message to 'error' in ten silent sends while the
+// screen said "Connected".
+// ---------------------------------------------------------------------------
+
+describe('a socket that has produced no frame burns no attempts', () => {
+  test('sends and retries into a silent socket leave `attempts` alone; the first server frame turns counting on', async () => {
+    jest.useFakeTimers();
+    try {
+      await startMessaging();
+      // The socket opened (a fresh transport has proved nothing yet).
+      ws.handlers.state?.('open');
+      await flush();
+      ws.calls.send.mockClear();
+
+      db.listOutbox!.mockResolvedValue([outboxRow(ROW, FRIEND)]);
+      await messaging.sendText(FRIEND, 'anyone there?');
+      await flush();
+      expect(framesFor(ROW)).toHaveLength(1);
+      // Sent, and still retried on the ordinary schedule — but not counted.
+      expect(db.bumpOutboxAttempt).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(TICK);
+      await flush();
+      expect(framesFor(ROW)).toHaveLength(2);
+      expect(db.bumpOutboxAttempt).not.toHaveBeenCalled();
+
+      // The far end shows up — ANY frame is proof of life, here a receipt for
+      // some other row — and from here on every send is an attempt.
+      ws.handlers.frame?.({ type: 'receipt', msgId: '01UNRELATEDRECEIPT0000000', state: 'sent' });
+      await flush();
+      await jest.advanceTimersByTimeAsync(TICK);
+      await flush();
+      expect(framesFor(ROW)).toHaveLength(3);
+      expect(db.bumpOutboxAttempt).toHaveBeenCalledTimes(1);
+      expect(db.bumpOutboxAttempt).toHaveBeenCalledWith(ROW);
+
+      // A reconnect is a fresh socket with nothing proved: counting is off
+      // again until it produces a frame of its own.
+      ws.handlers.state?.('open');
+      await flush();
+      expect(framesFor(ROW)).toHaveLength(4);
+      expect(db.bumpOutboxAttempt).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
 describe('reconnect', () => {
   test('a fresh socket re-sends immediately, whatever the accumulated backoff', async () => {
     await startMessaging();
@@ -607,4 +663,152 @@ describe('reconnect', () => {
 
     expect(framesFor(ROW)).toHaveLength(2);
   }, 10_000);
+});
+
+// ---------------------------------------------------------------------------
+// Accepting a changed safety number re-pins the ROSTER row. `resetPeer`
+// clears the native TOFU pin; `peer_devices` kept the superseded key, and
+// that row is what verifies every signed x.acct.notice from the contact — so
+// every later notice failed silently.
+// ---------------------------------------------------------------------------
+
+describe('accepting an identity change re-pins the roster row', () => {
+  const OLD_KEY = 'T0xES0VZ';
+  const NEW_KEY = 'TkVXS0VZ';
+  type Row = {
+    userId: string;
+    anchorId: string;
+    class: string;
+    state: string;
+    identityKeyPub: string;
+    certsJson: string;
+    updatedAt: number;
+  };
+  let rows: Map<string, Row>;
+
+  /** A peer_devices table the mocks read AND write, so the empty-key path
+   * (recordPeerIdentity seeing the unpinned row) is exercised for real. */
+  function seedRoster(): void {
+    rows = new Map([
+      [
+        FRIEND,
+        {
+          userId: FRIEND,
+          anchorId: FRIEND,
+          class: 'unknown',
+          state: 'linked',
+          identityKeyPub: OLD_KEY,
+          certsJson: '',
+          updatedAt: 1,
+        },
+      ],
+    ]);
+    db.getPeerDevice!.mockImplementation(async (id: string) => rows.get(id) ?? null);
+    db.listPeerDevices!.mockImplementation(async (anchorId: string) =>
+      [...rows.values()].filter(r => r.anchorId === anchorId),
+    );
+    db.upsertPeerDevice!.mockImplementation(async (row: Row) => {
+      rows.set(row.userId, { ...row });
+    });
+  }
+
+  beforeEach(() => {
+    // The roster mocks and resetPeer are not on resetDb's list, so their
+    // call logs would otherwise carry an earlier test's acceptance into
+    // the ordering assertion below.
+    for (const fn of [db.getPeerDevice!, db.listPeerDevices!, db.upsertPeerDevice!, crypto.resetPeer!]) {
+      fn.mockClear();
+    }
+    seedRoster();
+    db.listIdentityChanged!.mockResolvedValue([FRIEND]);
+  });
+
+  test('unpins the retired key BEFORE the native reset, then re-pins the served key', async () => {
+    api.apiGetPrekeyBundle!.mockResolvedValue({ userId: FRIEND, identityKey: NEW_KEY });
+    await startMessaging();
+    expect(messaging.isPeerBlocked(FRIEND)).toBe(true);
+
+    await messaging.acceptIdentityChange(FRIEND);
+
+    const upserts = db.upsertPeerDevice!.mock.calls.map(c => c[0] as Row);
+    // First the unpin — in the findings group, before resetPeer — then the
+    // served key, on the row that keeps its place in the device set.
+    expect(upserts[0]).toMatchObject({ userId: FRIEND, identityKeyPub: '' });
+    expect(upserts[1]).toMatchObject({
+      userId: FRIEND,
+      anchorId: FRIEND,
+      state: 'linked',
+      identityKeyPub: NEW_KEY,
+    });
+    expect(db.upsertPeerDevice!.mock.invocationCallOrder[0]).toBeLessThan(
+      crypto.resetPeer!.mock.invocationCallOrder[0]!,
+    );
+    expect(rows.get(FRIEND)?.identityKeyPub).toBe(NEW_KEY);
+    expect(api.apiGetPrekeyBundle).toHaveBeenCalledWith('tok', FRIEND);
+    expect(messaging.isPeerBlocked(FRIEND)).toBe(false);
+  });
+
+  test('offline: the unpin stands, the acceptance stands, and the next send re-pins', async () => {
+    api.apiGetPrekeyBundle!.mockRejectedValue(new TypeError('Network request failed'));
+    await startMessaging();
+
+    await messaging.acceptIdentityChange(FRIEND);
+
+    // The acceptance is not held hostage by the network…
+    expect(messaging.isPeerBlocked(FRIEND)).toBe(false);
+    // …and the retired key is gone either way: an unpinned row vouches for
+    // nothing, which is the safe direction while the network is away.
+    expect(rows.get(FRIEND)?.identityKeyPub).toBe('');
+    expect(rows.get(FRIEND)?.state).toBe('linked');
+
+    // The next send's bundle fetch — the ordinary first-contact call, no
+    // force anywhere — re-pins through recordPeerIdentity's empty-key path.
+    api.apiGetPrekeyBundle!.mockResolvedValue({ userId: FRIEND, identityKey: NEW_KEY });
+    await messaging.sendText(FRIEND, 'back online');
+    expect(rows.get(FRIEND)?.identityKeyPub).toBe(NEW_KEY);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The server ahead of this build on the send path: a prekey bundle that no
+// longer parses is not a connection problem and not this contact — it is
+// "update Tacendum", retryable once they have, and the thread can say so.
+// ---------------------------------------------------------------------------
+
+describe('a bundle that no longer parses', () => {
+  const ahead = () =>
+    Object.assign(
+      new Error('update Tacendum: the server answered PrekeyBundle in a shape this version cannot read'),
+      { name: 'ServerAheadError' },
+    );
+
+  test('the send fails by its own name, enqueues nothing, and raises the serverAhead state', async () => {
+    api.apiGetPrekeyBundle!.mockRejectedValue(ahead());
+    await startMessaging();
+    const seen: boolean[] = [];
+    const unsubscribe = messaging.subscribe(() => seen.push(messaging.serverAhead));
+
+    await expect(messaging.sendText(FRIEND, 'hello')).rejects.toMatchObject({
+      name: 'ServerAheadError',
+      message: expect.stringContaining('update Tacendum'),
+    });
+    unsubscribe();
+
+    // Nothing advanced and nothing queued: the words are still theirs to
+    // send again after the update.
+    expect(crypto.encryptText).not.toHaveBeenCalled();
+    expect(db.enqueueOutgoing).not.toHaveBeenCalled();
+    expect(messaging.serverAhead).toBe(true);
+    expect(seen).toContain(true);
+  });
+
+  test('the next bundle that parses clears it', async () => {
+    api.apiGetPrekeyBundle!.mockRejectedValueOnce(ahead()).mockResolvedValue({ userId: FRIEND, identityKey: 'S0VZ' });
+    await startMessaging();
+    await messaging.sendText(FRIEND, 'hello').catch(() => undefined);
+    expect(messaging.serverAhead).toBe(true);
+    await messaging.sendText(FRIEND, 'hello again');
+    expect(messaging.serverAhead).toBe(false);
+    expect(db.enqueueOutgoing).toHaveBeenCalledTimes(1);
+  });
 });

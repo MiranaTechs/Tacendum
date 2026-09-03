@@ -83,6 +83,9 @@ export async function buildDeviceLegs(
     body: string;
     msgId: string;
     ts: number;
+    /** The row's disappearing deadline, if the chat has a timer — carried
+     * on the sibling transcript so the copy expires with the original. */
+    expiresAt?: number | null;
   },
   deps: DeviceFanoutDeps,
 ): Promise<DeviceLeg[]> {
@@ -128,6 +131,7 @@ export async function buildDeviceLegs(
         msgId: args.msgId,
         body: args.body,
         ts: args.ts,
+        ...(args.expiresAt ? { expiresAt: args.expiresAt } : {}),
       }),
     );
     for (const to of siblings) {

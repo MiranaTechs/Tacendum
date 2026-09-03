@@ -4,7 +4,7 @@ import type { ServerFrame } from '@tacendum/shared';
 import { URGENT_ACK_GRACE_MS, wsDefaultHandler, type WsDeps } from '../src/handlers/ws.js';
 import { deliverPushWake } from '../src/handlers/push-worker.js';
 import { LIMITS } from '../src/ratelimit.js';
-import type { DataLayer } from '../src/db/data.js';
+import type { TestOnlyDataLayer } from '../src/db/data.js';
 import { allQueued, makeMemoryDb, makeTestDeps, type TestDeps } from './helpers.js';
 
 /** Fake transport: every post succeeds; these tests are about push, not
@@ -42,7 +42,7 @@ const SENDER = '0000000000000000000SENDER1';
 const RECIPIENT = '0000000000000000000RECPT02';
 const MSG = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: TestDeps;
 let wsDeps: WsDeps;
 /** What handleSend asked the scheduler for — kind and probe, per wake. */

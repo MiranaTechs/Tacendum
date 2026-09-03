@@ -195,6 +195,23 @@ export function endCall(cid: string, reason: string): Promise<void> {
   return NativeTacendumCall.endCall(cid, reason);
 }
 
+/** Answer a reported incoming call from the app's own UI — see the spec. A
+ * session passes its sid, which is what its one CXCall is keyed by. */
+export function answerReportedCall(cid: string): Promise<void> {
+  return NativeTacendumCall.answerReportedCall(cid);
+}
+
+// --- missed-call notifications -----------------------------------------------
+
+export function postMissedCall(peerId: string, displayName: string): Promise<void> {
+  return NativeTacendumCall.postMissedCall(peerId, displayName);
+}
+
+/** `peerId` empty clears every missed-call notice. */
+export function clearMissedCall(peerId: string): Promise<void> {
+  return NativeTacendumCall.clearMissedCall(peerId);
+}
+
 // --- PushKit ----------------------------------------------------------------
 
 export function getVoipToken(): Promise<string> {

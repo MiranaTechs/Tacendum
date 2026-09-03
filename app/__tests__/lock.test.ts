@@ -123,12 +123,36 @@ describe('verify', () => {
 
   test('cooldown state lives in the Keychain, so a relaunch cannot reset it', async () => {
     for (let i = 0; i < 5; i++) await lock.verify('999999');
-    // The module keeps no state: everything a relaunch must remember is in
-    // the Keychain. (lock.ts has no module-level variables to lose.)
+    // Everything a relaunch must remember is in the Keychain. (The one
+    // module-level variable, the monotonic cooldown shadow,
+    // only ever ADDS hold and is bound to the Keychain deadline it shadows —
+    // losing it loses nothing a relaunch needs.)
     expect(keychain.get('lock.failCount')).toBe('5');
     expect(Number(keychain.get('lock.lockedUntil'))).toBeGreaterThan(
       Date.now(),
     );
+  });
+
+  test('a forward wall-clock jump does not end an in-process cooldown early', async () => {
+    for (let i = 0; i < 5; i++) await lock.verify('999999');
+    // The wall clock leaps a minute ahead while NO time passes — a network
+    // time correction, a manual change — so `lockedUntil > Date.now()` is
+    // false. The monotonic clock has not moved, and the cooldown holds.
+    jest.setSystemTime(1_700_000_000_000 + 60_000);
+    expect((await lock.verify('123456')).verdict).toBe('cooldown');
+    expect(await lock.cooldownRemainingMs()).toBe(30_000);
+    // Real time passes (both clocks, in lock-step): the cooldown ends on
+    // schedule, and the correct code opens.
+    jest.advanceTimersByTime(30_000);
+    expect(await lock.cooldownRemainingMs()).toBe(0);
+    expect((await lock.verify('123456')).verdict).toBe('real');
+  });
+
+  test('a backward wall-clock jump keeps the cooldown (fail closed)', async () => {
+    for (let i = 0; i < 5; i++) await lock.verify('999999');
+    jest.setSystemTime(1_700_000_000_000 - 60_000);
+    expect((await lock.verify('123456')).verdict).toBe('cooldown');
+    expect(await lock.cooldownRemainingMs()).toBeGreaterThanOrEqual(30_000);
   });
 
   test('a real unlock resets the failure count', async () => {

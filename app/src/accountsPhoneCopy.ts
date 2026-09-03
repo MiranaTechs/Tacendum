@@ -42,6 +42,9 @@ export const ACCOUNTS_PHONE_COPY = {
     'That is not a complete phone number. Start with the country code, like +15555550100 — a number without its + is refused rather than guessed.',
   numberRequest: 'Text me a code',
   numberRequestAgain: 'Send another code',
+  /** The per-number resend minute, counted down on the button — the email
+   * deck's sentence BY REFERENCE: one source, no drift. */
+  numberRequestAgainIn: ACCOUNTS_COPY.requestAgainIn,
   /** THE SMS CONSENT SENTENCE (the US toll-free registration's DIGITAL_FORM
    * opt-in) — a SEPARATE, UNCHECKED checkbox carries it on the attach form:
    * a typed number alone is not consent, so the send affordance stays
@@ -83,6 +86,10 @@ export const ACCOUNTS_PHONE_COPY = {
   numberVerify: 'Verify',
   numberRefused:
     'That did not work. The code may be wrong or expired, or this number may already be linked elsewhere — the server deliberately does not say which. Request a fresh code to try again.',
+  /** A TRANSPORT failure, said as what it is (the email deck's sentence,
+   * byte-for-byte — see ACCOUNTS_COPY.failed for why the refusal sentence
+   * above must never stand in for it). */
+  failed: 'Could not reach Tacendum. Check your connection and try again.',
   numberVerified: (number: string) => `${number} is linked to your account.`,
   numberUnlink: 'Remove this phone number',
   /** The unlink confirm's keep verb, IN the deck: a

@@ -711,6 +711,52 @@ describe('silencing unknown callers is ENFORCED, not merely decided', () => {
     await h.controller.whenIdle();
     expect(h.native.reportIncomingCall).toHaveBeenCalled();
   });
+
+  it('marks the silenced row so the missed-call notice stays quiet too', async () => {
+    // The missed-call notice is audible and lock-screen visible. Keyed on
+    // `missed` alone it fired for this row — the one the device writes on a
+    // stranger's behalf — and handed back the interrupt §10.6 closes, once
+    // per offer. The verdict rides on the row so the poster can tell.
+    const h = harness({ mayRing: async () => ({ ring: false, reason: 'unknown_caller' }) });
+    await h.controller.start();
+    h.deliver('P1', offer(cidFor(860), h.clock + 60_000));
+    await h.controller.whenIdle();
+
+    expect(h.logs).toEqual([
+      expect.objectContaining({ direction: 'in', reason: 'decline', missed: true, silenced: true }),
+    ]);
+  });
+
+  it('a stale offer from a silenced caller leaves a silenced row and rings nothing', async () => {
+    // `exp` is the caller's own field: an offer that is already expired
+    // reaches the reducer's expired row — a missed row — without ever
+    // meeting the ring gate, and would post the notice a silenced caller
+    // must not be able to trigger.
+    const h = harness({ mayRing: async () => ({ ring: false, reason: 'unknown_caller' }) });
+    await h.controller.start();
+    h.deliver('P1', offer(cidFor(861), h.clock - 120_000));
+    await h.controller.whenIdle();
+
+    expect(h.controller.state.name).toBe('idle');
+    expect(h.native.reportIncomingCall).not.toHaveBeenCalled();
+    expect(h.turnCalls()).toBe(0);
+    expect(h.logs).toEqual([
+      expect.objectContaining({ direction: 'in', reason: 'expired', missed: true, silenced: true }),
+    ]);
+  });
+
+  it("a stale offer from a caller the policy allows keeps the reducer's ordinary expired row", async () => {
+    // The control: the expired row for someone with history is the
+    // reducer's, and it still posts.
+    const h = harness({ mayRing: async () => ({ ring: true }) });
+    await h.controller.start();
+    h.deliver('P1', offer(cidFor(862), h.clock - 120_000));
+    await h.controller.whenIdle();
+
+    expect(h.controller.state.name).toBe('idle');
+    expect(h.logs).toEqual([expect.objectContaining({ reason: 'expired', missed: true })]);
+    expect(h.logs[0]!.silenced).toBeFalsy();
+  });
 });
 
 describe('a ring bomb (V7 item 4)', () => {
@@ -4012,5 +4058,192 @@ describe('sendMedia and the addressee it never used to check', () => {
         urgent: false,
       },
     ]);
+  });
+});
+
+describe('a refused second offer does not orphan the live call\'s row', () => {
+  it('drops the refused offer\'s row inline and still drops the live one at idle', async () => {
+    const dropped: string[] = [];
+    const h = harness({
+      saveOffer: async () => undefined,
+      dropOffer: async cid => void dropped.push(cid),
+    });
+    await h.controller.start();
+    const live = cidFor(150);
+    const refused = cidFor(151);
+    h.deliver('P1', offer(live, h.clock + 60_000));
+    await h.controller.whenIdle();
+    expect(h.controller.state.name).toBe('incoming_ringing');
+
+    h.deliver('P2', offer(refused, h.clock + 60_000));
+    await h.controller.whenIdle();
+    // The busy-refused offer was persisted before the verdict and is dropped
+    // the moment the reducer refuses it; the live call is untouched.
+    expect(dropped).toEqual([refused]);
+    expect(h.controller.state.call?.cid).toBe(live);
+
+    h.deliver('P1', { tcm: 'call.end', cid: live, r: 'hangup' });
+    await h.controller.whenIdle();
+    expect(h.controller.state.name).toBe('idle');
+    // …and the live call's own row goes at idle, exactly as before.
+    expect(dropped).toEqual([refused, live]);
+  });
+});
+
+describe('a call refused as busy on the session\'s behalf leaves a row (R11)', () => {
+  it('writes a missed row dated at the offer', async () => {
+    const router = {
+      handles: () => false,
+      handle: async () => false,
+      liveSessionBusy: () => true,
+    };
+    const h = harness({ groupRouter: router });
+    await h.controller.start();
+    const cid = cidFor(152);
+    const at = h.clock - 3_000;
+    h.deliver('P1', offer(cid, h.clock + 60_000), at);
+    await h.controller.whenIdle();
+
+    expect(h.sent.map(f => f.envelope)).toContainEqual({ tcm: 'call.end', cid, r: 'busy' });
+    expect(h.logs).toEqual([
+      expect.objectContaining({
+        cid,
+        peerId: 'P1',
+        direction: 'in',
+        reason: 'busy',
+        missed: true,
+        startedAt: at,
+        connectedAt: null,
+      }),
+    ]);
+    expect(h.native.reportIncomingCall).not.toHaveBeenCalled();
+    // Someone the ring gate would have let through: the row may post its
+    // notice (the control for the silenced case below).
+    expect(h.logs[0]!.silenced).toBe(false);
+  });
+
+  it('marks the row silenced when the caller could not have rung anyway', async () => {
+    // This refusal sits ABOVE the ring gate — busy is answered before the
+    // policy is consulted — so the row it writes carried no verdict, and
+    // the missed-call notice fired for a stranger during every group call.
+    const router = {
+      handles: () => false,
+      handle: async () => false,
+      liveSessionBusy: () => true,
+    };
+    const h = harness({
+      groupRouter: router,
+      mayRing: async () => ({ ring: false, reason: 'unknown_caller' }),
+    });
+    await h.controller.start();
+    const cid = cidFor(863);
+    h.deliver('P1', offer(cid, h.clock + 60_000));
+    await h.controller.whenIdle();
+
+    expect(h.sent.map(f => f.envelope)).toContainEqual({ tcm: 'call.end', cid, r: 'busy' });
+    expect(h.logs).toEqual([
+      expect.objectContaining({ cid, reason: 'busy', missed: true, silenced: true }),
+    ]);
+    expect(h.native.reportIncomingCall).not.toHaveBeenCalled();
+  });
+});
+
+describe('a live call.end tombstones the offer draining behind it', () => {
+  it('endReceived(cid) then offerReceived(cid) rings nothing and writes nothing', async () => {
+    // The caller hung up while this phone was dead; the server drained the
+    // cancellation and the offer together, cancel first.
+    const h = harness();
+    await h.controller.start();
+    const cid = cidFor(153);
+    h.deliver('P1', { tcm: 'call.end', cid, r: 'cancelled' });
+    await h.controller.whenIdle();
+    h.deliver('P1', offer(cid, h.clock + 60_000));
+    await h.controller.whenIdle();
+
+    expect(h.controller.state.name).toBe('idle');
+    expect(h.native.reportIncomingCall).not.toHaveBeenCalled();
+    expect(h.logs).toEqual([]);
+    expect(h.sent).toEqual([]);
+  });
+
+  it('still rings an offer for a DIFFERENT cid from the same peer', async () => {
+    const h = harness();
+    await h.controller.start();
+    h.deliver('P1', { tcm: 'call.end', cid: cidFor(154), r: 'cancelled' });
+    await h.controller.whenIdle();
+    h.deliver('P1', offer(cidFor(155), h.clock + 60_000));
+    await h.controller.whenIdle();
+    expect(h.controller.state.name).toBe('incoming_ringing');
+  });
+
+  it('the tombstone lapses once no ringable copy of the offer can still arrive', async () => {
+    const h = harness();
+    await h.controller.start();
+    const cid = cidFor(156);
+    h.deliver('P1', { tcm: 'call.end', cid, r: 'cancelled' });
+    await h.controller.whenIdle();
+    await jest.advanceTimersByTimeAsync(121_000);
+    // A copy this old is refused by the ring rule anyway (expired row) —
+    // what matters is that the tombstone did not grow without bound and the
+    // ordinary path decides.
+    h.deliver('P1', offer(cid, Date.now() + 60_000));
+    await h.controller.whenIdle();
+    expect(h.controller.state.name).toBe('incoming_ringing');
+  });
+});
+
+describe('a call starts on a credential that can carry it', () => {
+  it('reuses a credential with hours of life left, refreshes one about to lapse', async () => {
+    const h = harness();
+    await h.controller.start();
+    await h.controller.placeCall('P1', cidFor(157), false);
+    expect(h.turnCalls()).toBe(1);
+    await h.controller.hangup();
+    await h.controller.whenIdle();
+
+    // 12 h TTL refreshed at 80 % ⇒ 9.6 h of cache life. 3.6 h in: six hours
+    // left, a whole call's worth and more — reused.
+    await jest.advanceTimersByTimeAsync(3.6 * 3_600_000);
+    await h.controller.placeCall('P1', cidFor(158), false);
+    expect(h.turnCalls()).toBe(1);
+    await h.controller.hangup();
+    await h.controller.whenIdle();
+
+    // 7.6 h in: two hours left. A relayed call placed now could outlive its
+    // credential and lose media with nothing to say why — refreshed first.
+    await jest.advanceTimersByTimeAsync(4 * 3_600_000);
+    await h.controller.placeCall('P1', cidFor(159), false);
+    expect(h.turnCalls()).toBe(2);
+    await h.controller.hangup();
+    await h.controller.whenIdle();
+  });
+
+  it('a warm-up asks for nothing beyond the cache rule', async () => {
+    const h = harness();
+    await h.controller.ensureCredentials();
+    await jest.advanceTimersByTimeAsync(7.6 * 3_600_000);
+    await h.controller.ensureCredentials();
+    expect(h.turnCalls()).toBe(1);
+  });
+});
+
+describe('a local candidate for a foreign cid is dropped', () => {
+  it('queues only candidates gathered by the live call\'s own peer connection', async () => {
+    const h = harness();
+    await h.controller.start();
+    const cid = cidFor(160);
+    await h.controller.placeCall('P1', cid, false);
+    h.controller.onLocalIceCandidate(
+      { cand: 'candidate:9 1 udp 1 10.0.0.9 1 typ host', mid: '0', idx: 0 },
+      cidFor(161),
+    );
+    h.controller.onLocalIceCandidate(
+      { cand: 'candidate:1 1 udp 1 10.0.0.1 1 typ host', mid: '0', idx: 0 },
+      cid,
+    );
+    await jest.advanceTimersByTimeAsync(500);
+    const ice = h.sent.filter(f => f.envelope.tcm === 'call.ice');
+    expect(ice).toHaveLength(1);
+    expect(ice[0]!.envelope.tcm === 'call.ice' && ice[0]!.envelope.c).toHaveLength(1);
   });
 });

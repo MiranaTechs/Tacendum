@@ -8,7 +8,7 @@ import {
 import { TABLES } from '@tacendum/shared';
 import { makeDocClient, makeDynamoClient } from '../src/db/client.js';
 import { TABLES as SERVER_TABLES } from '../src/db/tables.js';
-import { LINK_OFFER_KEY_PREFIX, groupRowKey, makeDataLayer, type DataLayer } from '../src/db/data.js';
+import { LINK_OFFER_KEY_PREFIX, groupRowKey, makeTestOnlyDataLayer, type TestOnlyDataLayer } from '../src/db/data.js';
 import { emailClaimKey, identifierClaimHash } from '../src/opaque-ref.js';
 import { emailUnlinkRoute, emailVerifyRoute, emailRequestCodeRoute } from '../src/handlers/identifiers.js';
 import { wsDefaultHandler, type WsDeps } from '../src/handlers/ws.js';
@@ -60,8 +60,8 @@ import { allQueued, makeTestDeps, type TestDeps } from './helpers.js';
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
 let doc: DynamoDBDocumentClient;
-let base: DataLayer;
-let db: DataLayer;
+let base: TestOnlyDataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 
 // '78' is this file's discriminator (the accounts-link parallel-fork lesson).
@@ -75,7 +75,7 @@ const TEST_KID = 'test-identifier-hmac-key';
 
 beforeAll(async () => {
   const client = makeDynamoClient();
-  base = makeDataLayer(makeDocClient(client));
+  base = makeTestOnlyDataLayer(makeDocClient(client));
   doc = makeDocClient(client);
   db = { ...base, isAccountsFeatureEnabled: async () => true };
   try {

@@ -17,7 +17,9 @@
  */
 
 import React from 'react';
+import { StyleSheet, Text } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
+import { DISAPPEAR_OPTIONS } from '../src/blocking';
 import * as db from '../src/db';
 import { encodeEnvelope } from '../src/envelope';
 import { messaging } from '../src/messaging';
@@ -28,6 +30,11 @@ import {
   worstSafetyState,
 } from '../src/screens/GroupProfileScreen';
 import type { SafetyState } from '../src/safety';
+import { themeTokens } from '../src/theme';
+import { Avatar } from '../src/ui/Avatar';
+import { RoomMark } from '../src/ui/RoomMark';
+
+const theme = themeTokens();
 
 interface FakeDb {
   name: string;
@@ -440,14 +447,39 @@ test('Leave writes my own sovereign out — writer me, member me — through the
   // read back off the real engine in GroupProfile.send.test.tsx.
 });
 
-test('the owner’s Remove writes the member out on the owner’s lane', async () => {
+/** The roster write a Remove produces, or undefined while none has. */
+function rosterWrite(instance: FakeDb) {
+  return writesSeen(instance).find(w =>
+    w.sql.includes('INSERT OR REPLACE INTO group_members'),
+  );
+}
+
+// Rewritten: Remove used to write on the first tap. It is as social and as
+// announced as Leave and both deletes, so it now asks inline the way they
+// do — one tap opens the question, the confirm writes, cancel writes
+// nothing.
+test('the owner’s Remove asks first: one tap writes nothing, the confirm writes the member out on the owner’s lane', async () => {
   const instance = installRoomDb();
   const tree = await renderProfile(ANA);
   await press(tree, `member-remove-${BEN}`);
 
-  const slotWrite = writesSeen(instance).find(w =>
-    w.sql.includes('INSERT OR REPLACE INTO group_members'),
-  );
+  // The inline confirm, in the Leave/Delete shape: the question names the
+  // person; the body says everyone's device is told and that Add re-invites
+  // rather than restores.
+  const asked = renderedText(tree);
+  expect(asked).toContain(ROOM_COPY.removeConfirmTitle('Ben'));
+  expect(asked).toContain(ROOM_COPY.removeConfirmBody);
+  expect(has(tree, `member-remove-confirm-${BEN}`)).toBe(true);
+  expect(rosterWrite(instance)).toBeUndefined();
+
+  // Cancel closes the question and still writes nothing.
+  await press(tree, `member-remove-cancel-${BEN}`);
+  expect(has(tree, `member-remove-confirm-${BEN}`)).toBe(false);
+  expect(rosterWrite(instance)).toBeUndefined();
+
+  await press(tree, `member-remove-${BEN}`);
+  await press(tree, `member-remove-confirm-${BEN}`);
+  const slotWrite = rosterWrite(instance);
   expect(slotWrite).toBeDefined();
   expect(slotWrite!.params[1]).toBe(BEN); // member acted on
   expect(slotWrite!.params[2]).toBe(ANA); // the owner's lane
@@ -468,6 +500,7 @@ test('a send that fails AFTER the local apply shows the honest sendFailed line, 
   );
   const tree = await renderProfile(ANA);
   await press(tree, `member-remove-${BEN}`);
+  await press(tree, `member-remove-confirm-${BEN}`);
 
   const text = renderedText(tree);
   expect(text).toContain(ROOM_COPY.sendFailed);
@@ -613,4 +646,65 @@ test('the deleted machinery is absent from the SOURCE, not merely unrendered', (
     // or a held-write table is the pending apparatus growing back.
     expect(code).not.toMatch(/\bterm\b|group_owners|group_slots_held|held[-_]?write/i);
   }
+});
+
+// ---------------------------------------------------------------------------
+// the room drawn as a room, and chips that say they are off.
+// ---------------------------------------------------------------------------
+
+/** The chip element itself — the composite carrying accessibilityState. */
+function chip(tree: ReactTestRenderer.ReactTestRenderer, testID: string) {
+  return tree.root.findAll(
+    n => n.props?.testID === testID && n.props?.accessibilityState !== undefined,
+  )[0]!;
+}
+
+test('the hero is the RoomMark at hero size — a walled square, never a person’s disc', async () => {
+  installRoomDb();
+  const tree = await renderProfile(BEN);
+  const mark = tree.root.findByType(RoomMark);
+  expect(mark.props.roomId).toBe(ROOM);
+  expect(mark.props.name).toBe('Kitchen');
+  expect(mark.props.size).toBe(theme.layout.avatar.hero);
+  // The discs on this screen are the members'; none of them is the room.
+  expect(tree.root.findAllByType(Avatar).map(a => a.props.peerId)).not.toContain(
+    ROOM,
+  );
+});
+
+test('after leaving, the timer chips are disabled for VoiceOver and the eye, and one line says why', async () => {
+  // Ben left on his own lane: a self `out` is sovereign over the owner's `in`.
+  installRoomDb({
+    memberSlots: [
+      ...DEFAULT_SLOTS,
+      { memberId: BEN, writerId: BEN, seq: 2, state: 'out' },
+    ],
+  });
+  const tree = await renderProfile(BEN);
+  expect(has(tree, 'room-left-note')).toBe(true); // the fixture reached `out`
+
+  for (const option of DISAPPEAR_OPTIONS) {
+    const c = chip(tree, `room-timer-${option.seconds}`);
+    expect(c.props.disabled).toBe(true);
+    expect(c.props.accessibilityState.disabled).toBe(true);
+    // A recessed surface with muted ink — never opacity, never a chip that
+    // looks live and does nothing.
+    const style = StyleSheet.flatten(c.props.style({ pressed: false }));
+    expect(style.backgroundColor).toBe(theme.color.paperInset);
+    expect(style.borderColor).toBe(theme.color.lineSoft);
+    const label = c.findByType(Text);
+    expect(StyleSheet.flatten(label.props.style).color).toBe(theme.color.inkMuted);
+  }
+  expect(has(tree, 'room-timer-locked')).toBe(true);
+  expect(renderedText(tree)).toContain(ROOM_COPY.timerLeft);
+});
+
+test('while in the room the chips are live and the leaving line is absent', async () => {
+  installRoomDb();
+  const tree = await renderProfile(BEN);
+  const c = chip(tree, 'room-timer-0');
+  expect(c.props.disabled).toBe(false);
+  expect(c.props.accessibilityState).toEqual({ selected: true, disabled: false });
+  expect(has(tree, 'room-timer-locked')).toBe(false);
+  expect(renderedText(tree)).not.toContain(ROOM_COPY.timerLeft);
 });

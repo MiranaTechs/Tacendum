@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { deliverPushWake } from '../src/handlers/push-worker.js';
 import { registerPushTokenHandler } from '../src/handlers/push.js';
 import type { AuthContext, HttpEvent } from '../src/handlers/http.js';
-import type { DataLayer } from '../src/db/data.js';
+import type { TestOnlyDataLayer } from '../src/db/data.js';
 import { makeMemoryDb, makeTestDeps, type TestDeps } from './helpers.js';
 
 /**
@@ -37,7 +37,7 @@ function put(body: unknown): HttpEvent {
 const BASE = { env: 'sandbox' as const, bundleId: 'com.miranatechnologies.tacendum' };
 
 /** Count calls to `listQueuedMessages` by wrapping it in place. */
-function jest_fn_listQueued(target: DataLayer): { calls: number } {
+function jest_fn_listQueued(target: TestOnlyDataLayer): { calls: number } {
   const counter = { calls: 0 };
   const original = target.listQueuedMessages.bind(target);
   // Plain pass-through, not `async`: the method returns an AsyncIterable of
@@ -49,7 +49,7 @@ function jest_fn_listQueued(target: DataLayer): { calls: number } {
   return counter;
 }
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: TestDeps;
 beforeEach(() => {
   db = makeMemoryDb();

@@ -324,6 +324,33 @@ function installVaultModel(name = REAL) {
       }
       if (!s.includes('vault_items')) return { rows: [] };
 
+      // --- the merge's creation cap, read off the guard ----------
+      // `mergeVaultSlot` carries its bound INSIDE the statement: `SELECT
+      // <values> WHERE (<this writer's slot count> < N OR <this slot
+      // exists>)`. The model evaluates exactly that guard — the cap literal
+      // is read from the SQL, so a changed number changes what the model
+      // admits — and then hands the statement on in its VALUES shape, so the
+      // column list, conflict target and merge WHERE are read as before.
+      let effectiveParams = params;
+      const guarded =
+        /^INSERT INTO vault_items\s*\(([^)]*)\)\s*SELECT\s+([\s\S]*?)\s+WHERE\s+\(\(SELECT COUNT\(\*\) FROM vault_items WHERE peerId = \? AND writerId = \?\) < (\d+)\s+OR EXISTS \(SELECT 1 FROM vault_items WHERE peerId = \? AND id = \? AND writerId = \?\)\)\s*(ON CONFLICT[\s\S]*)$/i.exec(
+          s.trim(),
+        );
+      if (guarded) {
+        const [, columnList, valueList, capLiteral, tail] = guarded;
+        const nValues = (valueList.match(/\?/g) ?? []).length;
+        const [gPeer, gWriter, ePeer, eId, eWriter] = params.slice(nValues, nValues + 5) as string[];
+        const held = [...rows.values()].filter(
+          r => r.peerId === gPeer && r.writerId === gWriter,
+        ).length;
+        const exists = rows.has(key(ePeer, eId, eWriter));
+        if (!(held < Number(capLiteral) || exists)) {
+          return { rows: [], rowsAffected: 0 };
+        }
+        s = `INSERT INTO vault_items (${columnList}) VALUES (${valueList}) ${tail}`;
+        effectiveParams = [...params.slice(0, nValues), ...params.slice(nValues + 5)];
+      }
+
       // --- every INSERT, read from its own column list ---------------------
       // reserveVaultSeq, mergeVaultSlot and the migration's carry-over all land
       // here. Nothing about which of them it is matters: the column list, the
@@ -337,7 +364,7 @@ function installVaultModel(name = REAL) {
         const [, orClause, columnList, valueList, conflictTarget, setList, whereClause, returning] =
           insert;
         let cursor = 0;
-        const next = () => params[cursor++];
+        const next = () => effectiveParams[cursor++];
         const columns = splitArgs(columnList);
         const values = splitArgs(valueList);
         expect(values.length).toBe(columns.length); // a real driver would error
@@ -1484,6 +1511,73 @@ describe('disappearing messages cannot reach the vault', () => {
     expect(sql.filter(s => s.includes('vault_items'))).toEqual([]);
     expect((await db.getVaultItem(BOB, ITEM))?.body).toBe('4417');
     expect(model.rows.size).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE CREATION CAP: a peer is a writer, and a writer can create slots at
+// their send-quota rate forever. The merge now refuses a NEW slot past
+// VAULT_SLOTS_PER_WRITER_CAP for that (conversation, writer) — inside the
+// statement, so a burst cannot overshoot — while an existing slot converges
+// past the cap exactly as before.
+// ---------------------------------------------------------------------------
+
+describe('a writer’s slot count is bounded', () => {
+  const id = (n: number) => `0${String(n).padStart(25, '0')}`;
+
+  async function fillToCap(model: ReturnType<typeof installVaultModel>) {
+    for (let n = 1; n <= db.VAULT_SLOTS_PER_WRITER_CAP; n++) {
+      expect(
+        await db.mergeVaultSlot({
+          peerId: BOB, id: id(n), writerId: BOB, seq: 1, ackSeq: 0,
+          title: `t${n}`, body: `b${n}`, updatedAt: AT, deleted: 0,
+        }),
+      ).toBe(true);
+    }
+    expect(model.rows.size).toBe(db.VAULT_SLOTS_PER_WRITER_CAP);
+  }
+
+  it('the writer’s next NEW slot is refused — false back, nothing stored', async () => {
+    const model = await init();
+    await fillToCap(model);
+    expect(
+      await db.mergeVaultSlot({
+        peerId: BOB, id: id(db.VAULT_SLOTS_PER_WRITER_CAP + 1), writerId: BOB, seq: 1, ackSeq: 0,
+        title: 'one too many', body: 'x', updatedAt: AT, deleted: 0,
+      }),
+    ).toBe(false);
+    expect(model.rows.size).toBe(db.VAULT_SLOTS_PER_WRITER_CAP);
+  });
+
+  it('an EXISTING slot still merges at the cap — the bound is on creation, not convergence', async () => {
+    const model = await init();
+    await fillToCap(model);
+    expect(
+      await db.mergeVaultSlot({
+        peerId: BOB, id: id(1), writerId: BOB, seq: 2, ackSeq: 0,
+        title: 't1', body: 'rotated', updatedAt: AT, deleted: 0,
+      }),
+    ).toBe(true);
+    expect((await db.getVaultItem(BOB, id(1)))?.body).toBe('rotated');
+    // …and a replayed older frame is still the arithmetic no-op it was.
+    expect(
+      await db.mergeVaultSlot({
+        peerId: BOB, id: id(1), writerId: BOB, seq: 1, ackSeq: 0,
+        title: 't1', body: 'b1', updatedAt: AT, deleted: 0,
+      }),
+    ).toBe(false);
+  });
+
+  it('the cap is per WRITER: the other side’s slots neither count nor are counted', async () => {
+    const model = await init();
+    await fillToCap(model);
+    expect(
+      await db.mergeVaultSlot({
+        peerId: BOB, id: id(db.VAULT_SLOTS_PER_WRITER_CAP + 1), writerId: ALICE, seq: 1, ackSeq: 0,
+        title: 'mine', body: 'y', updatedAt: AT, deleted: 0,
+      }),
+    ).toBe(true);
+    expect(model.rows.size).toBe(db.VAULT_SLOTS_PER_WRITER_CAP + 1);
   });
 });
 

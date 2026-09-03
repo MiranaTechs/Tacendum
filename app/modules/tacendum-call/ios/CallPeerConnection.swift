@@ -338,6 +338,11 @@ final class CallPeerConnection: NSObject {
     return true
   }
 
+  // / Whether this connection took the camera — a local video track exists.
+  // / What the proximity rule reads: a call negotiated with video is / one
+  // the person is looking at, whatever the camera is doing right now.
+  var hasLocalVideo: Bool { videoTrack != nil }
+
   /// The camera's half of the same contract. A video track that cannot be
   /// stopped is a camera the person believes is off.
   @discardableResult

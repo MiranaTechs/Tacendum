@@ -16,8 +16,8 @@ import {
   LINK_OFFER_KEY_PREFIX,
   groupRowKey,
   isClaimKey,
-  makeDataLayer,
-  type DataLayer,
+  makeTestOnlyDataLayer,
+  type TestOnlyDataLayer,
   type DeviceClass,
   type LinkOfferRecord,
 } from '../src/db/data.js';
@@ -49,7 +49,7 @@ import {
 
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let doc: DynamoDBDocumentClient;
 let available = false;
 
@@ -104,7 +104,7 @@ function mkOffer(o: {
 /** Put the offer, then run the link transaction that consumes it. */
 async function offerAndLink(
   o: Parameters<typeof mkOffer>[0],
-): Promise<{ offer: LinkOfferRecord; result: Awaited<ReturnType<DataLayer['linkDeviceToGroup']>> }> {
+): Promise<{ offer: LinkOfferRecord; result: Awaited<ReturnType<TestOnlyDataLayer['linkDeviceToGroup']>> }> {
   const offer = mkOffer(o);
   expect(await db.putLinkOffer(offer)).toBe('created');
   const result = await db.linkDeviceToGroup({
@@ -153,7 +153,7 @@ async function nonceSetOf(userId: string): Promise<Set<string>> {
 beforeAll(async () => {
   const client = makeDynamoClient();
   doc = makeDocClient(client);
-  db = makeDataLayer(doc);
+  db = makeTestOnlyDataLayer(doc);
   try {
     const { TableNames = [] } = await client.send(new ListTablesCommand({}));
     available = TableNames.includes(TABLES.users);
@@ -923,7 +923,7 @@ describe('contention — the ConditionExpressions, not the prechecks, are the en
 
 describe('feature#accounts flag row', () => {
   gated('absent = OFF, operator-written {enabled: true} = ON, deleted again = OFF, malformed = OFF', async () => {
-    // The flag row is operator-written — there is deliberately NO DataLayer
+    // The flag row is operator-written — there is deliberately NO TestOnlyDataLayer
     // write method for it; these direct writes ARE the operator's console
     // write. Deleting it is the kill switch.
     await doc.send(

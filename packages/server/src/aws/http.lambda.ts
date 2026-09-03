@@ -1,5 +1,5 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { deleteAccountHandler } from '../handlers/account.js';
+import { deleteAccountRoute } from '../handlers/account.js';
 import { createReportHandler } from '../handlers/report.js';
 import { requireAuth } from '../handlers/auth.js';
 import { turnCredentialsHandler } from '../handlers/turn.js';
@@ -89,7 +89,10 @@ export const routes: Record<string, Handler> = {
   'PUT /v1/push-token': requireAuth(registerPushTokenHandler),
   'DELETE /v1/push-token': requireAuth(deletePushTokenHandler),
   'GET /v1/me': requireAuth(async (_e, _d, auth) => json(200, auth)),
-  'DELETE /v1/account': requireAuth(deleteAccountHandler),
+  // The deletion route's own wrapper: the ONE entry that admits a session
+  // whose user row is already gone, so a sweep that crashed after its row
+  // delete can be retried (handlers/account.ts).
+  'DELETE /v1/account': deleteAccountRoute,
   'POST /v1/reports': requireAuth(createReportHandler),
   'POST /v1/call-metrics': requireAuth(callMetricsHandler),
   'DELETE /v1/session': requireAuth(deleteSessionHandler),

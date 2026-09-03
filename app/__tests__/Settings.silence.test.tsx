@@ -147,6 +147,15 @@ afterEach(async () => {
   await db.close();
 });
 
+/** Open a row's ⓘ: the testID lands on the disclosure composite first, so
+ * the press names the node that actually carries onPress. */
+async function openInfo(tree: ReactTestRenderer.ReactTestRenderer, testID: string): Promise<void> {
+  const node = tree.root.findAllByProps({ testID }).find(n => n.props.onPress !== undefined)!;
+  await ReactTestRenderer.act(async () => {
+    node.props.onPress();
+  });
+}
+
 async function render(): Promise<ReactTestRenderer.ReactTestRenderer> {
   let tree!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(async () => {
@@ -225,8 +234,10 @@ describe('Settings → CALLS → silence unknown callers', () => {
     // here, and someone who reads this row as a stranger-detector will turn it
     // off to fix a problem it does not have.
     const tree = await render();
-    const note = tree.root.findByProps({ testID: 'settings-silence-note' }).props
-      .children as string;
+    // Behind the row's ⓘ: closed until opened, under its row.
+    expect(JSON.stringify(tree.toJSON())).not.toMatch(/never exchanged a message/);
+    await openInfo(tree, 'settings-silence-info');
+    const note = JSON.stringify(tree.toJSON());
 
     expect(note).toMatch(/never exchanged a message/);
     expect(note).toMatch(/missed call you can return/);

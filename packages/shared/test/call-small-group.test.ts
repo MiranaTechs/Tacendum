@@ -312,12 +312,37 @@ describe('invite admission — late join, strangers, and session glare (§9.4)',
   });
 
   it('session glare: the lower sid wins on every device, with no coordination', () => {
-    expect(admitGroupCallInvite(session(), CARA, ginvite({ sid: SID_LOWER }))).toEqual({
+    // Between the PEOPLE ON THE CALL: ANA is in the roster held from the
+    // starter, so her crossing invite can be glare. (This test used CARA, a
+    // non-member, and pinned `supersede` for her — the crossing-invite hole;
+    // rewritten deliberately.)
+    expect(admitGroupCallInvite(session(), ANA, ginvite({ sid: SID_LOWER }))).toEqual({
       verdict: 'supersede',
     });
-    expect(admitGroupCallInvite(session(), CARA, ginvite({ sid: SID_HIGHER }))).toEqual({
+    expect(admitGroupCallInvite(session(), ANA, ginvite({ sid: SID_HIGHER }))).toEqual({
       verdict: 'busy',
     });
+  });
+
+  it('a lower sid is only glare when glare is possible — else busy', () => {
+    // A ULID's leading characters are a timestamp, so a forged `sid: '0000…'`
+    // always sorts first. Two gates keep that from ending a call:
+    //  - the sender must be in the roster held from the starter. A stranger
+    //    is busy, whatever roster their envelope asserts;
+    expect(
+      admitGroupCallInvite(session(), CARA, ginvite({ sid: SID_LOWER, r: [CARA, STARTER, ANA, BEN] })),
+    ).toEqual({ verdict: 'busy' });
+    //  - the live session must not have connected: a call already carrying
+    //    media crossed nothing, so a member's lower sid into it is busy too.
+    expect(
+      admitGroupCallInvite(session({ connected: true }), ANA, ginvite({ sid: SID_LOWER })),
+    ).toEqual({ verdict: 'busy' });
+    // An absent `connected` reads as false — the only value a view built
+    // before the field existed could hold — and a member's crossing invite
+    // into a session still forming supersedes exactly as before.
+    expect(
+      admitGroupCallInvite(session({ connected: false }), ANA, ginvite({ sid: SID_LOWER })),
+    ).toEqual({ verdict: 'supersede' });
   });
 });
 

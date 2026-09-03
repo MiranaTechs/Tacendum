@@ -3,7 +3,7 @@ import { ListTablesCommand } from '@aws-sdk/client-dynamodb';
 import { PrivateKey } from '@signalapp/libsignal-client';
 import { authSignedBytes, TABLES } from '@tacendum/shared';
 import { makeDocClient, makeDynamoClient } from '../src/db/client.js';
-import { makeDataLayer, type DataLayer } from '../src/db/data.js';
+import { makeTestOnlyDataLayer, type TestOnlyDataLayer } from '../src/db/data.js';
 import { authChallengeHandler, authHandler } from '../src/handlers/auth-account.js';
 import type { HttpEvent } from '../src/handlers/http.js';
 import { makeTestDeps, parseBody, type TestDeps } from './helpers.js';
@@ -27,7 +27,7 @@ import { makeTestDeps, parseBody, type TestDeps } from './helpers.js';
 
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 let deps: TestDeps;
 
@@ -133,7 +133,7 @@ async function mkGroupedOwner(): Promise<{ phone: string; tablet: string }> {
 
 beforeAll(async () => {
   const client = makeDynamoClient();
-  const base = makeDataLayer(makeDocClient(client));
+  const base = makeTestOnlyDataLayer(makeDocClient(client));
   db = { ...base, isAccountsFeatureEnabled: async () => true };
   try {
     const { TableNames = [] } = await client.send(new ListTablesCommand({}));

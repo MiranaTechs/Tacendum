@@ -24,8 +24,8 @@ import { TABLES as SERVER_TABLES } from '../src/db/tables.js';
 import {
   groupRowKey,
   IDKEY_CLAIM_PREFIX,
-  makeDataLayer,
-  type DataLayer,
+  makeTestOnlyDataLayer,
+  type TestOnlyDataLayer,
   type DeviceClass,
 } from '../src/db/data.js';
 import { ownerGroupAdmits, wsDefaultHandler, type WsDeps, type WsResult } from '../src/handlers/ws.js';
@@ -60,7 +60,7 @@ import { allQueued, makeTestDeps, type TestDeps } from './helpers.js';
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
 let doc: DynamoDBDocumentClient;
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 /** Process-local flag override (the accounts-link rule: the real row is a
  * store-wide singleton other suites toggle). Mutable so the kill-switch case
@@ -298,7 +298,7 @@ async function consentFresh(member: Acct): Promise<boolean> {
 beforeAll(async () => {
   const client = makeDynamoClient();
   doc = makeDocClient(client);
-  const base = makeDataLayer(doc);
+  const base = makeTestOnlyDataLayer(doc);
   db = { ...base, isAccountsFeatureEnabled: async () => flagOn };
   try {
     const { TableNames = [] } = await client.send(new ListTablesCommand({}));
@@ -867,7 +867,7 @@ describe('group reach is pinned to DELIVERY', () => {
     // enqueue. Both user rows stay live, so only the transaction's
     // group-row membership pin can refuse.
     let fired = false;
-    const raceDb: DataLayer = {
+    const raceDb: TestOnlyDataLayer = {
       ...db,
       async enqueueMessage(msg, opts) {
         if (!fired) {
@@ -904,7 +904,7 @@ describe('group reach is pinned to DELIVERY', () => {
     expect(await db.bindIntegrationOwner(agent.userId, a.userId)).toBe('bound');
 
     let fired = false;
-    const raceDb: DataLayer = {
+    const raceDb: TestOnlyDataLayer = {
       ...db,
       async enqueueMessage(msg, opts) {
         if (!fired) {
@@ -1126,7 +1126,7 @@ describe('the merged-cap PIN is what refuses under the race', () => {
         );
       },
     } as unknown as DynamoDBDocumentClient;
-    const trapDb = makeDataLayer(trapDoc);
+    const trapDb = makeTestOnlyDataLayer(trapDoc);
     expect(
       await trapDb.linkDeviceToGroup({
         offerNonce: nonce,

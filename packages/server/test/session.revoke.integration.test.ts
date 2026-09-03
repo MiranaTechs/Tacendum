@@ -72,9 +72,11 @@ async function issue(userId: string): Promise<string> {
   return token;
 }
 
-describe.runIf(!REQUIRE_DDB || true)('deleteSessionsForUser against DynamoDB', () => {
-  it('finds and deletes a user’s sessions through the index, sparing the caller', async () => {
-    if (!available || !indexPresent) return;
+// Every case skips itself (ctx.skip) when DynamoDB Local or the index is
+// absent — a visible skip, never a silent pass.
+describe('deleteSessionsForUser against DynamoDB', () => {
+  it('finds and deletes a user’s sessions through the index, sparing the caller', async (ctx) => {
+    if (!available || !indexPresent) return ctx.skip();
     const user = ulid();
     const keep = await issue(user);
     const a = await issue(user);
@@ -88,8 +90,8 @@ describe.runIf(!REQUIRE_DDB || true)('deleteSessionsForUser against DynamoDB', (
     expect(await db.getSession(keep)).toBeDefined();
   });
 
-  it('deletes all of them when no token is spared (account deletion)', async () => {
-    if (!available || !indexPresent) return;
+  it('deletes all of them when no token is spared (account deletion)', async (ctx) => {
+    if (!available || !indexPresent) return ctx.skip();
     const user = ulid();
     const a = await issue(user);
     const b = await issue(user);
@@ -101,8 +103,8 @@ describe.runIf(!REQUIRE_DDB || true)('deleteSessionsForUser against DynamoDB', (
     expect(await db.getSession(b)).toBeUndefined();
   });
 
-  it('never reaches another user’s sessions', async () => {
-    if (!available || !indexPresent) return;
+  it('never reaches another user’s sessions', async (ctx) => {
+    if (!available || !indexPresent) return ctx.skip();
     const mine = ulid();
     const theirs = ulid();
     await issue(mine);
@@ -113,8 +115,8 @@ describe.runIf(!REQUIRE_DDB || true)('deleteSessionsForUser against DynamoDB', (
     expect(await db.getSession(survivor)).toBeDefined();
   });
 
-  it('leaves pending auth-challenge rows in the same table untouched', async () => {
-    if (!available || !indexPresent) return;
+  it('leaves pending auth-challenge rows in the same table untouched', async (ctx) => {
+    if (!available || !indexPresent) return ctx.skip();
     // Auth challenges live in the sessions table keyed chal#<digest of
     // (identityKey, nonce)> and deliberately carry NO userId, so DynamoDB
     // leaves them out of the user-index entirely. That omission is load-bearing rather than
@@ -140,8 +142,8 @@ describe.runIf(!REQUIRE_DDB || true)('deleteSessionsForUser against DynamoDB', (
     await db.consumeAuthChallengeIfMatches(identityKey, challenge);
   });
 
-  it('is idempotent — a second sweep finds nothing and reports zero', async () => {
-    if (!available || !indexPresent) return;
+  it('is idempotent — a second sweep finds nothing and reports zero', async (ctx) => {
+    if (!available || !indexPresent) return ctx.skip();
     const user = ulid();
     await issue(user);
     expect(await db.deleteSessionsForUser(user)).toBe(1);

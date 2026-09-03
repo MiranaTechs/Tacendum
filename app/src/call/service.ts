@@ -60,6 +60,17 @@ export interface CallLogRow {
   connectedAt: number | null;
   endedAt: number;
   missed: boolean;
+  /**
+   * The row is evidence the person may read, NOT a notice the phone should
+   * make. Set by the controller on the missed rows it writes on a silenced
+   * caller's behalf (§10.6) — the busy, expired and silenced refusals of a
+   * caller the ring policy refused — so the missed-call poster
+   * (`index.ts`) can stay quiet for them: the notice is audible and on the
+   * lock screen, and keyed on `missed` alone it let a stranger chime the
+   * phone the policy keeps silent, once per offer. The reducer
+   * never sets it — its rows are for calls the gate let through — so
+   * absent reads as "may post". */
+  silenced?: boolean;
 }
 
 export interface CallTransport {
@@ -165,6 +176,20 @@ export class CallService {
   private pendingSdp: string | null = null;
   private iceBuffer: IceCandidate[] = [];
   private iceFlush: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Whether this call's local description has been handed to the transport.
+   *
+   * Native gathers candidates the moment `setLocalDescription` completes —
+   * before `createOffer`'s promise is even consumed — while the offer
+   * envelope is composed only after `reportOutgoingCall` (an async name read
+   * and a bridge hop). A ten-candidate burst, or a slow read, put `call.ice`
+   * on the ratchet AHEAD of `call.offer`, and the callee's idle reducer
+   * dropped the batch on the floor. Candidates are therefore held until the
+   * frame they describe (`call.offer`, `call.answer`, or the restart) has
+   * gone out, then flushed at once. Reset with the rest of the per-call
+   * scratch.
+   */
+  private descriptionSent = false;
 
   constructor(private readonly deps: CallServiceDeps) {}
 
@@ -221,6 +246,7 @@ export class CallService {
       this.pendingSdp = null;
       this.iceBuffer = [];
       this.iceSentThisCall = 0;
+      this.descriptionSent = false;
     }
 
     this.deps.onStateChange?.(state);
@@ -299,6 +325,7 @@ export class CallService {
       // under the NEXT call's cid.
       this.iceBuffer = [];
       this.iceSentThisCall = 0;
+      this.descriptionSent = false;
       await this.dispatch({ type: 'teardownComplete' });
     }
 
@@ -362,7 +389,9 @@ export class CallService {
     const run = this.iceSending.then(async () => {
       for (;;) {
         const call = this.state.call;
-        if (!call || this.iceBuffer.length === 0) return;
+        // Nothing goes out ahead of the description it belongs to (see
+        // `descriptionSent`); the send of that frame flushes this buffer.
+        if (!call || !this.descriptionSent || this.iceBuffer.length === 0) return;
         const batch = this.iceBuffer.splice(0, MAX_ICE_CANDIDATES_PER_ENVELOPE);
         this.iceSentThisCall += batch.length;
         await this.deps.transport.sendCallEnvelope(
@@ -448,6 +477,12 @@ export class CallService {
         }
         try {
           await transport.sendCallEnvelope(effect.peerId, envelope, { urgent: effect.urgent });
+          if (FATAL_TO_SEND.has(envelope.tcm)) {
+            // The description is on the wire: candidates gathered while it
+            // was being composed may follow it now, in order.
+            this.descriptionSent = true;
+            if (this.iceBuffer.length > 0) void this.flushIce();
+          }
         } catch (err) {
           // A send can be REFUSED rather than merely fail: a duress session is
           // network-silent and a blocked peer must never

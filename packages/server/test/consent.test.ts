@@ -4,7 +4,7 @@ import { consentDeleteHandler, consentWriteHandler } from '../src/handlers/conse
 import { deleteAccountHandler } from '../src/handlers/account.js';
 import { routes as httpLambdaRoutes } from '../src/aws/http.lambda.js';
 import type { AuthContext, HttpEvent, HttpResult } from '../src/handlers/http.js';
-import type { DataLayer } from '../src/db/data.js';
+import type { TestOnlyDataLayer } from '../src/db/data.js';
 import { makeMemoryDb, makeTestDeps, testIdentityKey, type TestDeps } from './helpers.js';
 
 /**
@@ -28,7 +28,7 @@ const HUMAN = '0000000000000000000PERSN01';
 const AGENT = '0000000000000000000AGENT01';
 const IDENTITY_KEY = testIdentityKey(0x31);
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: TestDeps;
 const auth: AuthContext = { userId: HUMAN };
 
@@ -214,7 +214,7 @@ describe('no consent enumeration, anywhere', () => {
     ).toBe(false);
   });
 
-  it('the DataLayer exposes no listing over edges — the only reads are the point predicate and the destructive purge', async () => {
+  it('the TestOnlyDataLayer exposes no listing over edges — the only reads are the point predicate and the destructive purge', async () => {
     // Structural pin: a future `listConsentEdges` must consciously break
     // this, not slip in beside the four methods budgeted.
     const consentMethods = Object.keys(db).filter((k) => k.toLowerCase().includes('consent'));

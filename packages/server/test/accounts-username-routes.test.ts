@@ -25,8 +25,8 @@ import { makeDocClient, makeDynamoClient } from '../src/db/client.js';
 import {
   EMAIL_CLAIM_KEY_PREFIX,
   USERNAME_CLAIM_KEY_PREFIX,
-  makeDataLayer,
-  type DataLayer,
+  makeTestOnlyDataLayer,
+  type TestOnlyDataLayer,
   type IdentifierClaimRecord,
 } from '../src/db/data.js';
 import { activeNameskelClaimKeys, activeUsernameClaimKeys } from '../src/opaque-ref.js';
@@ -50,7 +50,7 @@ import { makeMemoryDb, makeTestDeps, type TestDeps } from './helpers.js';
  * (part B) — THE ROUTES: the claim gate, the refusal
  * discipline, the budgets, the flag, driven through the REAL wrapped routes
  * against the memory twin AND DynamoDB Local (heavy project; the twin runs
- * unconditionally, the store is gated on:8000 exactly as the accounts-*
+ * unconditionally, the store is gated on :8000 exactly as the accounts-*
  * suites gate — TACENDUM_REQUIRE_DDB=1 turns the skip into a failure). One
  * scenario list, two DataLayers (the accounts-username-claims discipline),
  * so the twin can never drift more permissive than the store.
@@ -97,7 +97,7 @@ const canaries = new Set<string>();
 const allLogs: TestDeps['logs'][] = [];
 
 interface Store {
-  db: DataLayer;
+  db: TestOnlyDataLayer;
   setMaster(on: boolean): void;
   setUsername(on: boolean): void;
 }
@@ -112,7 +112,7 @@ interface Acct {
  * `refuse` lets a case force one bucket's refusal without spending 2,000
  * takes. */
 type RoutesDeps = TestDeps & { takes: string[]; refuse: Set<string> };
-function freshDeps(db: DataLayer): RoutesDeps {
+function freshDeps(db: TestOnlyDataLayer): RoutesDeps {
   const deps = makeTestDeps(db) as RoutesDeps;
   allLogs.push(deps.logs);
   const inner: RateLimiter = deps.rateLimit;
@@ -138,7 +138,7 @@ function post(token: string | undefined, body: unknown): HttpEvent {
   };
 }
 
-async function mkAcct(db: DataLayer, deps: TestDeps): Promise<Acct> {
+async function mkAcct(db: TestOnlyDataLayer, deps: TestDeps): Promise<Acct> {
   const userId = uid();
   canaries.add(userId);
   const res = await db.getOrCreateUserByIdentityKey(`idkey-un-${userId}`, userId, deps.now());
@@ -165,7 +165,7 @@ async function attachEmail(deps: TestDeps, acct: Acct, email: string): Promise<v
 }
 
 /** A grouped, verified account — the claimant admits. */
-async function verifiedAcct(db: DataLayer, deps: TestDeps): Promise<Acct & { groupId: string }> {
+async function verifiedAcct(db: TestOnlyDataLayer, deps: TestDeps): Promise<Acct & { groupId: string }> {
   const acct = await mkAcct(db, deps);
   await attachEmail(deps, acct, `${acct.userId}@example.test`);
   const groupId = (await db.getUserById(acct.userId))!.groupId!;
@@ -215,7 +215,7 @@ const eventsOf = (deps: TestDeps, event: string): number =>
   deps.logs.filter((l) => l.event === event).length;
 
 /**
- * THE SCENARIO LIST, over either DataLayer.
+ * THE SCENARIO LIST, over either TestOnlyDataLayer.
  */
 function routesSuite(
   label: string,
@@ -338,6 +338,39 @@ function routesSuite(
       // And the rename spelling of the verb answers the same one bit.
       deps.advanceMs(7_000);
       expectTaken(await claim(deps, b, f('alice'), true, usernameRenameRoute));
+    });
+
+    gated('THE AFFIX RULE: an operator/brand word as the first or last `_`-separated segment — exact or by skeleton — answers the same frozen `taken` and reaches no row; an ordinary two-part name still claims', async () => {
+      const { db } = on();
+      const deps = freshDeps(db);
+      const f = family();
+      const a = await verifiedAcct(db, deps);
+      const b = await verifiedAcct(db, deps);
+      deps.advanceMs(DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000);
+      const affixed = [
+        'tacendum_support',
+        'mirana_official',
+        'admin_alice',
+        'security_team',
+        'bob_tacendum',
+        'adm1n_bob', // the i→l fold: skeleton-vs-skeleton on the segment
+        'rnirana_help', // rn→m
+        'staff__alice', // a doubled separator is still a separator
+      ];
+      for (const name of affixed) {
+        deps.advanceMs(7_000);
+        expectTaken(await claim(deps, a, name));
+      }
+      const nowS = Math.floor(deps.now() / 1000);
+      for (const name of affixed) {
+        expect(await db.getUsernameClaim(keysFor(name).claimKeys[0]!, nowS)).toBeUndefined();
+      }
+      // The rule is affix-shaped, not substring-shaped: an ordinary two-part
+      // name, and a name that merely CONTAINS an operator word, both claim.
+      deps.advanceMs(7_000);
+      expect((await claim(deps, a, f('alice_smith'))).statusCode).toBe(200);
+      deps.advanceMs(7_000);
+      expect((await claim(deps, b, f('teamster'))).statusCode).toBe(200);
     });
 
     gated('a MALFORMED body — rider field, missing consent bit, a name outside USERNAME_STRICT, non-JSON — is the frozen refusal and charges NO claim budget (parse before spend)', async () => {
@@ -624,7 +657,7 @@ const RATE_TABLE = `tacendum_rate_buckets_uh2_${process.pid}_${randomBytes(4).to
 const PREV_TABLE_ENV = process.env[TABLE_ENV_VARS.rateBuckets];
 let client: DynamoDBClient;
 let doc: DynamoDBDocumentClient;
-let ddb: DataLayer;
+let ddb: TestOnlyDataLayer;
 let available = false;
 let flagOn = true;
 let usernameFlagOn = true;
@@ -632,7 +665,7 @@ let usernameFlagOn = true;
 beforeAll(async () => {
   client = makeDynamoClient();
   doc = makeDocClient(client);
-  const base = makeDataLayer(doc);
+  const base = makeTestOnlyDataLayer(doc);
   ddb = {
     ...base,
     isAccountsFeatureEnabled: async () => flagOn,

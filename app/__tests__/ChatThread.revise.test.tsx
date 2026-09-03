@@ -238,7 +238,10 @@ function quoteText(
   msgId: string,
 ): string {
   const box = byId(tree, `quote-${msgId}`)[0];
-  const node = box.findAllByType(Text)[0];
+  // The quoted WORDS are the box's last text: the
+  // author's name stands above them.
+  const texts = box.findAllByType(Text);
+  const node = texts[texts.length - 1]!;
   return Array.isArray(node.props.children)
     ? node.props.children.join('')
     : String(node.props.children ?? '');

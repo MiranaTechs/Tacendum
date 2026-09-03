@@ -48,10 +48,13 @@ import { MESSAGE_SOUND_FILE } from '../src/messageSound';
 
 describe('the message notification carries a sound', () => {
   it('the server\'s alert aps sets sound: default — the sound the extension inherits', () => {
-    // The alert arm's `aps` block: from its opening brace to the `t:`
-    // member that follows it (the payload the extension decrypts).
+    // The alert arm's `aps` block: from its opening brace to the `t`
+    // member that follows it (the payload the extension decrypts). The
+    // member is written shorthand (`t,`); the old `t: payload` marker
+    // matched nothing, which silently sliced the block to the empty
+    // string.
     const start = apns.indexOf('aps: {');
-    const end = apns.indexOf('t: payload', start);
+    const end = apns.indexOf('\n          t,\n', start);
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
     const alert = apns.slice(start, end);

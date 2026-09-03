@@ -214,11 +214,17 @@ export function ApprovalCard({
         // THE FEATURE: the exact bytes, monospace, selectable, scrolling
         // INSIDE the block — no markdown pass, no trimming, no ellipsis.
         <ScrollView
-          style={styles.payloadBox}
+          style={[styles.payloadBox, settled && styles.payloadSettled]}
           nestedScrollEnabled
           testID={testID ? `${testID}-payload` : undefined}
         >
-          <Text selectable style={[t.type.utilityData, { color: t.color.inkBody }]}>
+          <Text
+            selectable
+            style={[
+              t.type.utilityData,
+              { color: settled ? t.color.inkMuted : t.color.inkBody },
+            ]}
+          >
             {approval.payload}
           </Text>
         </ScrollView>
@@ -302,9 +308,13 @@ function makeStyles(t: Theme) {
       borderColor: t.color.lineSoft,
       backgroundColor: t.color.paperLayer,
     },
-    /** Settled reads quieter than live — and never colour alone: the
-     * settled line says the word (the CallTile rule). */
-    settled: { opacity: 0.66 },
+    /** Settled reads quieter than live — and never colour alone: the settled
+     * line says the word (the CallTile rule). The quiet is the PAYLOAD box
+     * receding (soft edge, muted ink, see `payloadSettled`), not a card-wide
+     * opacity: 0.66 put the settled line at ≈2.8:1, under the 4.5:1 AA
+     * floor, and primitives.tsx's rule is "a recessed surface, never
+     * opacity". */
+    settled: {},
     header: {
       flexDirection: 'row',
       alignItems: 'center',
@@ -329,6 +339,9 @@ function makeStyles(t: Theme) {
       borderColor: t.color.lineStrong,
       backgroundColor: t.color.paperInset,
     },
+    /** A settled card's payload: the same recessed surface with its edge
+     * softened — the command it showed is no longer the thing to act on. */
+    payloadSettled: { borderColor: t.color.lineSoft },
     /**
      * The button row, on the call-actions anatomy (IncomingCallScreen):
      * a row with a gap, children stretched to one shared height, and every

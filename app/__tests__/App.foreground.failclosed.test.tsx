@@ -411,3 +411,65 @@ test('a foreground lock.status() rejection invalidates an opening still on the l
   expect(resumeSpy).not.toHaveBeenCalled();
   expect(ws.__ws.calls.start).not.toHaveBeenCalled();
 });
+
+test('a clock moved BACKWARDS while backgrounded relocks, never resumes', async () => {
+  // `away` is wall-clock arithmetic (Date.now() on the way in minus the
+  // stamp taken on the way out). A clock set back while the app was in the
+  // background makes it NEGATIVE — which `away >= autolock` read as a short
+  // trip and resumed the workspace past any autolock owed. The lock fails
+  // closed on the clock: a negative distance relocks.
+  //
+  // Only Date is faked — every timer family stays real — so the stamp and
+  // the return read the same (moved) clock and nothing else in the relock
+  // path is frozen. Nothing advances: this is one jump, not a duration.
+  const stopSpy = jest.spyOn(messaging, 'stop');
+  const resumeSpy = jest.spyOn(messaging, 'resume');
+
+  const tree = await renderApp();
+  expect(currentRoute()).toBe('locked');
+  for (const key of ['1', '2', '3', '4', '5', '6']) {
+    await press(tree, `pin-key-${key}`);
+  }
+  await press(tree, 'pin-submit');
+  await ReactTestRenderer.act(flush);
+  expect(currentRoute()).toBe('chats');
+
+  stopSpy.mockClear();
+  resumeSpy.mockClear();
+  const wentToBackgroundAt = Date.now();
+  jest.useFakeTimers({
+    now: wentToBackgroundAt,
+    doNotFake: [
+      'hrtime',
+      'nextTick',
+      'performance',
+      'queueMicrotask',
+      'requestAnimationFrame',
+      'cancelAnimationFrame',
+      'requestIdleCallback',
+      'cancelIdleCallback',
+      'setImmediate',
+      'clearImmediate',
+      'setInterval',
+      'clearInterval',
+      'setTimeout',
+      'clearTimeout',
+    ],
+  });
+  try {
+    await transition('background');
+    // The clock is a minute EARLIER when the app comes back.
+    jest.setSystemTime(wentToBackgroundAt - 60_000);
+    await transition('active');
+    await ReactTestRenderer.act(flush);
+
+    expect(currentRoute()).toBe('locked');
+    expect(
+      tree.root.findAllByProps({ testID: 'lock-screen' }).length,
+    ).toBeGreaterThan(0);
+    expect(stopSpy).toHaveBeenCalled();
+    expect(resumeSpy).not.toHaveBeenCalled();
+  } finally {
+    jest.useRealTimers();
+  }
+});

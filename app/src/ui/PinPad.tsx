@@ -29,9 +29,13 @@ interface Props {
   onChange: (next: string) => void;
   onSubmit: () => void;
   disabled?: boolean;
+  /** What the ⏎ key does, for VoiceOver — "Unlock" on the lock screen; a
+   * pad that guards another verb (the account delete) names that verb
+   * instead. */
+  submitLabel?: string;
 }
 
-export function PinPad({ value, onChange, onSubmit, disabled }: Props) {
+export function PinPad({ value, onChange, onSubmit, disabled, submitLabel }: Props) {
   const t = useTheme();
   const dotCount = Math.max(4, value.length);
   const canSubmit = !disabled && value.length >= 4;
@@ -74,7 +78,7 @@ export function PinPad({ value, onChange, onSubmit, disabled }: Props) {
                 testID={isDelete ? 'pin-del' : isSubmit ? 'pin-submit' : `pin-key-${key}`}
                 accessibilityRole="button"
                 accessibilityLabel={
-                  isDelete ? 'Delete digit' : isSubmit ? 'Unlock' : key
+                  isDelete ? 'Delete digit' : isSubmit ? (submitLabel ?? 'Unlock') : key
                 }
                 accessibilityState={{ disabled: keyDisabled }}
                 disabled={keyDisabled}

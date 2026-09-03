@@ -32,6 +32,15 @@ interface Props {
 
 const STROKE = 1.9;
 
+/**
+ * The handset's outline in the 24-unit box — one continuous stroke: the ear
+ * piece, the curve of the body, the mouth piece. Exported so the Calls tab
+ * (TabBar) can draw the SAME handset with its own mark beside it, rather
+ * than a second, slightly different phone.
+ */
+export const HANDSET_PATH =
+  'M7.4 3.6c.6-.35 1.36-.17 1.74.41l1.72 2.6c.36.55.23 1.29-.3 1.68l-1.2.9a.9.9 0 0 0-.28 1.1 11.2 11.2 0 0 0 4.63 4.63.9.9 0 0 0 1.1-.28l.9-1.2c.39-.53 1.13-.66 1.68-.3l2.6 1.72c.58.38.76 1.14.41 1.74l-1 1.73a2.6 2.6 0 0 1-2.9 1.22C11.6 19.9 4.1 12.4 2.45 5.5a2.6 2.6 0 0 1 1.22-2.9l1.73-1Z';
+
 /** A camcorder: rounded body, lens horn on the right. */
 export function VideoGlyph({ size = 20, color }: Props): React.JSX.Element {
   return (
@@ -77,7 +86,7 @@ export function PhoneGlyph({ size = 20, color }: Props): React.JSX.Element {
       importantForAccessibility="no-hide-descendants"
     >
       <Path
-        d="M7.4 3.6c.6-.35 1.36-.17 1.74.41l1.72 2.6c.36.55.23 1.29-.3 1.68l-1.2.9a.9.9 0 0 0-.28 1.1 11.2 11.2 0 0 0 4.63 4.63.9.9 0 0 0 1.1-.28l.9-1.2c.39-.53 1.13-.66 1.68-.3l2.6 1.72c.58.38.76 1.14.41 1.74l-1 1.73a2.6 2.6 0 0 1-2.9 1.22C11.6 19.9 4.1 12.4 2.45 5.5a2.6 2.6 0 0 1 1.22-2.9l1.73-1Z"
+        d={HANDSET_PATH}
         stroke={color}
         strokeWidth={STROKE}
         strokeLinejoin="round"

@@ -5,7 +5,15 @@ import {
   type DeviceClass,
 } from '@tacendum/shared';
 import { prepareDatabaseDirectory } from 'tacendum-crypto';
+import {
+  DELETED_PREVIEW,
+  PREVIEW_SCAN,
+  isCarrierEnvelope,
+  mentionWho,
+  previewFor,
+} from './envelope';
 import { publishGroupNames, publishPeerNames } from './nse';
+import { personName } from './person';
 
 /**
  * Plain SQLite (no SQLCipher: at-rest protection is iOS Data
@@ -105,7 +113,15 @@ export interface ChatRow {
 }
 
 export type MessageStatus =
-  'pending' | 'sent' | 'delivered' | 'received' | 'error';
+  | 'pending'
+  | 'sent'
+  | 'delivered'
+  /** The peer's read receipt landed (`markRead`) — the filled second tick.
+   * Written since read receipts shipped; named here so the thread need
+   * not cast for it. */
+  | 'read'
+  | 'received'
+  | 'error';
 
 export interface MessageRow {
   msgId: string;
@@ -1114,6 +1130,14 @@ export async function initSchema(d: Handle): Promise<void> {
       msgId TEXT PRIMARY KEY,
       ts INTEGER NOT NULL
     )`);
+  // `markSeen`'s prune keeps the 5000 most RECENTLY SEEN rows, ordered by
+  // `ts` (this device's clock at processing time) with msgId as the
+  // tiebreak — so the ORDER BY has an index to walk instead of a sort per
+  // inbound frame. Additive: CREATE INDEX IF NOT EXISTS is the whole
+  // migration for a file that predates it.
+  await d.execute(
+    `CREATE INDEX IF NOT EXISTS idx_seen_ts ON seen (ts, msgId)`,
+  );
   // Decrypted attachment blobs, keyed by their message. `state` tracks the
   // download lifecycle for inbound images ('pending' -> 'ready'/'failed');
   // outbound images are written 'ready' at send time. dataB64 is the plain
@@ -1242,6 +1266,16 @@ export async function initSchema(d: Handle): Promise<void> {
     // `COALESCE(seq, 0)` in `listOutbox` is what makes the migration
     // byte-identical for everything already queued.
     ['seq', 'seq INTEGER'],
+    // `localMsgId` now doubles as the PURGE KEY
+    // for every extra envelope of a device fan-out — sibling transcript
+    // copies included, which used to ride with it NULL and so outlived the
+    // message they copied when it expired or was retracted before the
+    // flush. `ledger` says whether the row is a DELIVERY leg (1: counted in
+    // "Not delivered to N of M", settled through the LEG_* sentinels) or
+    // transport only (0: the sibling copy, best-effort like a 1:1 carrier).
+    // DEFAULT 1, so every row written before the column existed — room
+    // legs, peer-device extras — keeps its place in the ledger.
+    ['ledger', 'ledger INTEGER NOT NULL DEFAULT 1'],
   ] as const) {
     if (!outboxColumns.includes(column)) {
       await d.execute(`ALTER TABLE outbox ADD COLUMN ${ddl}`);
@@ -2637,7 +2671,15 @@ export async function insertMessage(message: MessageRow): Promise<void> {
 }
 
 /** Persist an outgoing message row and its wire envelope atomically, so a
- * crash can never strand a 'pending' message with no envelope to flush. */
+ * crash can never strand a 'pending' message with no envelope to flush.
+ *
+ * `seq` is allocated here too, inside the same transaction and by the same
+ * MAX(seq)+1 rule the fan-out enqueues use. It used to be left NULL, which
+ * `listOutbox`'s `COALESCE(seq, 0)` reads as 0 — so every plain 1:1 send
+ * sorted AHEAD of every seq'd fan-out and room leg regardless of age, and
+ * the flush order stopped meaning enqueue order the moment a phone had both
+ * kinds queued. The ratchet tolerated it (skipped message keys are cached);
+ * the contract did not. */
 export async function enqueueOutgoing(
   message: MessageRow,
   envelope: {
@@ -2669,10 +2711,16 @@ export async function enqueueOutgoing(
           message.expiresAt ?? null,
         ],
       );
+      const base = Number(
+        (
+          (await d.execute(`SELECT COALESCE(MAX(seq), 0) AS base FROM outbox`))
+            .rows[0] as { base?: number } | undefined
+        )?.base ?? 0,
+      );
       await d.execute(
         `INSERT OR IGNORE INTO outbox
-           (msgId, peerId, msgType, payload, attempts, priority, urgent, notify)
-         VALUES (?, ?, ?, ?, 0, ?, ?, ?)`,
+           (msgId, peerId, msgType, payload, attempts, priority, urgent, notify, seq)
+         VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)`,
         [
           message.msgId,
           message.peerId,
@@ -2681,6 +2729,7 @@ export async function enqueueOutgoing(
           envelope.priority ?? 0,
           envelope.urgent ? 1 : 0,
           envelope.notify === false ? 0 : 1,
+          base + 1,
         ],
       );
       await d.execute('COMMIT');
@@ -2811,22 +2860,20 @@ export async function enqueueOutgoingFanout(
 }
 
 /**
- * Persist ONE 1:1 message and ALL of its DEVICE legs atomically
- * — enqueueOutgoing's shape widened the
- * way enqueueOutgoingFanout widened it for rooms: exactly one `messages`
- * row (the ordinary 1:1 row — no authorId, no sq, so every existing thread
- * render is untouched), plus one PRIMARY outbox envelope carrying the
- * row's own msgId (receipts flow exactly as today: the anchor's ack is the
- * delivery), plus N EXTRA envelopes with their own wire msgIds. PEER-device
- * extras carry `localMsgId` pointing at the message row: they join the fan-out leg LEDGER, so a member leg written
- * off at the retry cap is a durable LEG_FAILED row behind "Not delivered
- * to N of M" — never a silently deleted envelope — while the message
- * row's own bubble stays the primary leg's receipts (aggregateFanoutStatus
- * folds status for ROOM rows only). SIBLING sync extras stay bare
- * (localMsgId NULL): a transcript copy is convenience, not delivery, and
- * must never count in the member ledger.
- * One transaction, so a crash leaves either the whole send or none of it.
- */
+ * Persist ONE 1:1 message and ALL of its DEVICE legs atomically — enqueueOutgoing's
+ * shape widened the way enqueueOutgoingFanout widened it for rooms: exactly one
+ * `messages` row (the ordinary 1:1 row — no authorId, no sq, so every existing thread
+ * render is untouched), plus one PRIMARY outbox envelope carrying the row's own msgId
+ * (receipts flow exactly as today: the anchor's ack is the delivery), plus N EXTRA
+ * envelopes with their own wire msgIds. PEER-device extras carry `localMsgId` pointing
+ * at the message row: they join the fan-out leg LEDGER, so a member leg written off at
+ * the retry cap is a durable LEG_FAILED row behind "Not delivered to N of M" — never a
+ * silently deleted envelope — while the message row's own bubble stays the primary
+ * leg's receipts (aggregateFanoutStatus folds status for ROOM rows only). SIBLING sync
+ * extras carry the same `localMsgId` — it is the PURGE KEY sweepExpired/deleteMessage
+ * reach the row by — but `ledger = 0`: a transcript copy is convenience, not delivery,
+ * and must never count in the member ledger. One transaction, so a crash leaves either
+ * the whole send or none of it. */
 export async function enqueueOutgoingDeviceFanout(
   message: MessageRow,
   primary: {
@@ -2886,8 +2933,8 @@ export async function enqueueOutgoingDeviceFanout(
         await d.execute(
           `INSERT INTO outbox
              (msgId, peerId, msgType, payload, attempts, priority, urgent, notify,
-              localMsgId, seq)
-           VALUES (?, ?, ?, ?, 0, ?, 0, ?, ?, ?)`,
+              localMsgId, seq, ledger)
+           VALUES (?, ?, ?, ?, 0, ?, 0, ?, ?, ?, ?)`,
           [
             leg.msgId,
             leg.to,
@@ -2895,8 +2942,9 @@ export async function enqueueOutgoingDeviceFanout(
             leg.payload,
             opts.priority ?? 0,
             primary.notify === false ? 0 : 1,
-            leg.ledger ? message.msgId : null,
+            message.msgId,
             base + 2 + i,
+            leg.ledger ? 1 : 0,
           ],
         );
       }
@@ -2950,9 +2998,12 @@ export async function enqueueEnvelopeOnly(env: {
  * reads it directly, and the thread renders the whole thread.
  */
 export async function listMessages(peerId: string): Promise<MessageRow[]> {
+  // `arrivedAt` rides along for the thread's unread divider: "new since
+  // last open" is THIS phone's arrival clock, the same column the chat
+  // list's unread count reads, never the sender's ts.
   const res = await conn().execute(
     `SELECT msgId, peerId, direction, body, ts, status, editedAt, deletedAt,
-            expiresAt, authorId, sq, outsider, sharedBy, ai
+            expiresAt, authorId, sq, outsider, sharedBy, ai, arrivedAt
      FROM messages WHERE peerId = ? ORDER BY ts, msgId`,
     [peerId],
   );
@@ -2988,6 +3039,40 @@ export async function getMessage(
  * slot, is never taken for A's row (takeHeldRevision matches the writer to
  * the target's author), and suppresses nothing.
  */
+/**
+ * THE PEER-WRITABLE BOUNDS. Four tables take rows on a peer's say-so and
+ * were reaped only by `deleteChat` and by their target's expiry: a held
+ * revision whose target never arrives, a reaction whose target never
+ * arrives, a vault slot, an approval. An unblocked contact could grow each
+ * at their send-quota rate, indefinitely. Two instruments, chosen per table:
+ *
+ *  - AGE. A revision or reaction still waiting for its target after the
+ *    server's 30-day queue TTL is waiting for a message that can no longer
+ *    be delivered — `sweepExpired` reaps it (the same hook that reaps
+ *    expired messages, on the same clock). Approvals already had a
+ *    retention rule at read time; the sweep now applies it whether or not
+ *    the thread is ever opened.
+ *  - A CAP, refused IN the write statement so a burst of concurrent frames
+ *    cannot overshoot it: held revisions per conversation, vault slots per
+ *    (conversation, writer), LIVE pending approvals per conversation. A
+ *    refused write returns false and the frame is acked exactly as an
+ *    applied one — a bound that stranded frames un-acked would be a
+ *    redelivery loop, and the ratchet key is spent either way.
+ *
+ * Every cap admits an UPDATE of a row that already exists (the conflict
+ * target's row): the bound is on how many rows a peer may create, never on
+ * whether they may revise their own. The numbers are generous for any honest
+ * use (a thread does not hold two hundred edits awaiting two hundred
+ * messages) and small enough that the tables stay a few kilobytes per
+ * contact under abuse. */
+export const HELD_REVISION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const HELD_REVISIONS_PER_PEER_CAP = 200;
+
+/**
+ * Returns whether the revision is now held (inserted or its slot updated).
+ * False means the per-conversation cap refused a NEW slot; a slot that
+ * already exists is always eligible for the newest-wins update.
+ */
 export async function holdRevision(rev: {
   peerId: string;
   targetMsgId: string;
@@ -2996,11 +3081,14 @@ export async function holdRevision(rev: {
   kind: 'edit' | 'del';
   text: string;
   ts: number;
-}): Promise<void> {
-  await conn().execute(
+}): Promise<boolean> {
+  const res = await conn().execute(
     `INSERT INTO pending_revisions
        (peerId, targetMsgId, targetDirection, writerId, kind, text, ts)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+     SELECT ?, ?, ?, ?, ?, ?, ?
+     WHERE (SELECT COUNT(*) FROM pending_revisions WHERE peerId = ?) < ${HELD_REVISIONS_PER_PEER_CAP}
+        OR EXISTS (SELECT 1 FROM pending_revisions
+                   WHERE targetMsgId = ? AND targetDirection = ? AND writerId = ?)
      ON CONFLICT(targetMsgId, targetDirection, writerId) DO UPDATE SET
        peerId = excluded.peerId,
        kind = excluded.kind,
@@ -3016,8 +3104,13 @@ export async function holdRevision(rev: {
       rev.kind,
       rev.text,
       rev.ts,
+      rev.peerId,
+      rev.targetMsgId,
+      rev.targetDirection,
+      rev.writerId,
     ],
   );
+  return (res.rowsAffected ?? 0) > 0;
 }
 
 /** A parked revision for this row FROM THIS WRITER, if one is waiting. The
@@ -3324,6 +3417,17 @@ export async function deleteMessage(
   await runExclusive(async () => {
     await d.execute('BEGIN IMMEDIATE');
     try {
+      // Whose line this row may be holding:
+      // read before the deletes, so the chat's preview can be recomputed
+      // for the right conversation once the row is gone. `ts` rides along
+      // because WHETHER it held the line is decided by comparing it with
+      // the chat's current sort key — see recomputeChatPreviewInTx.
+      const owner = (
+        await d.execute(
+          `SELECT peerId, ts FROM messages WHERE msgId = ? AND direction = ?`,
+          [msgId, direction],
+        )
+      ).rows[0] as unknown as { peerId: string; ts: number } | undefined;
       await d.execute(
         `DELETE FROM reactions WHERE targetMsgId = ? AND targetDirection = ?`,
         [msgId, direction],
@@ -3353,12 +3457,119 @@ export async function deleteMessage(
         `DELETE FROM messages WHERE msgId = ? AND direction = ?`,
         [msgId, direction],
       );
+      // The chat's line follows the row: both callers refresh only the
+      // thread, so without this the list kept previewing the deleted
+      // words, sorted under the deleted message's timestamp.
+      if (owner) await recomputeChatPreviewInTx(d, owner.peerId, owner.ts);
       await d.execute('COMMIT');
     } catch (err) {
       await d.execute('ROLLBACK');
       throw err;
     }
   });
+}
+
+/**
+ * Recompute one chat's line from what is left of its messages, inside the
+ * caller's transaction. The rule messaging.refreshPreview applies from
+ * outside, applied here from inside: the newest row that is retracted or not
+ * a carrier wins — a retraction previews DELETED_PREVIEW, anything else its
+ * preview line — and nothing left clears BOTH columns, the `previewNone`
+ * state the list renders as "No messages yet" (never '' under a live
+ * timestamp).
+ *
+ * WHAT THIS MAY NEVER DO is hand the line to a row the RECEIVE path refused
+ * to line. `lastMessageAt` is the chat list's sort key, and refreshPreview —
+ * whose rule this mirrors — never writes it at all; here a local "Delete for
+ * me" does, so three kinds of row that are stored deliberately without a
+ * touchChat have to be kept out of the candidate scan, or deleting any
+ * message hands them the bump the protocol denied them:
+ *
+ *  - relayed history (`sharedBy`): a relayer's ACCOUNT of a message, under a
+ *    timestamp the relayer chose — "history must not reorder their chat list
+ *    to today" (messaging.ts, the grp.hist apply);
+ *  - a row that arrived from OUTSIDE the room (`outsider`): "a declined
+ *    attempt must not let an outsider reorder anyone's chat list";
+ *  - a DECLINED announcement or roster attempt, which no column marks — only
+ *    its missing touchChat does. That one is caught by never moving the sort
+ *    key FORWARD: candidates are bounded to `ts <= the line's own timestamp`,
+ *    so a row that is newer than the line and never lined the chat cannot
+ *    become the line by way of somebody else's delete.
+ *
+ * And the recompute only runs at all when the deleted row could have BEEN the
+ * line: older than the current sort key, it held nothing, and rewriting the
+ * line from underneath it could only move it. A chat with no sort key
+ * (`lastMessageAt IS NULL`) is left alone for the same reason — the list
+ * renders it "No messages yet" and ignores the text entirely, so a delete
+ * must not be what gives it a position. */
+async function recomputeChatPreviewInTx(
+  d: Handle,
+  peerId: string,
+  deletedTs: number,
+): Promise<void> {
+  const chat = (
+    await d.execute(`SELECT lastMessageAt FROM chats WHERE peerId = ?`, [peerId])
+  ).rows[0] as unknown as { lastMessageAt: number | null } | undefined;
+  const lineAt = chat?.lastMessageAt ?? null;
+  if (lineAt === null || deletedTs < lineAt) return;
+  const rows = (
+    await d.execute(
+      `SELECT body, ts, deletedAt FROM messages
+       WHERE peerId = ? AND ts <= ?
+         AND sharedBy IS NULL AND COALESCE(outsider, 0) = 0
+       ORDER BY ts DESC, msgId DESC LIMIT ?`,
+      [peerId, lineAt, PREVIEW_SCAN],
+    )
+  ).rows as unknown as { body: string; ts: number; deletedAt: number | null }[];
+  const latest = rows.find(r => r.deletedAt || !isCarrierEnvelope(r.body));
+  if (!latest) {
+    await d.execute(
+      `UPDATE chats SET lastMessageAt = NULL, lastMessageText = NULL WHERE peerId = ?`,
+      [peerId],
+    );
+    return;
+  }
+  await d.execute(
+    `UPDATE chats SET lastMessageAt = ?, lastMessageText = ? WHERE peerId = ?`,
+    [
+      latest.ts,
+      latest.deletedAt ? DELETED_PREVIEW : await previewInTx(d, latest.body),
+      peerId,
+    ],
+  );
+}
+
+/**
+ * previewFor with this phone's OWN names for a mention body, from the
+ * store's own rows — messaging.previewWithNames minus the service, because a
+ * resolver-less recompute rewrites "@Cara lunch?" to " lunch?" (the
+ * resolver-must-name rule). Self renders as 'you'; anyone else as personName
+ * (localName ∥ displayName ∥ id-fragment — the renderer treats an id-fragment
+ * echo as "cannot name" and keeps the words, G7).
+ */
+async function previewInTx(d: Handle, body: string): Promise<string> {
+  const who = mentionWho(body);
+  if (who.length === 0) return previewFor(body);
+  const self = (
+    await d.execute(`SELECT value FROM profile WHERE key = 'userId'`)
+  ).rows[0] as unknown as { value: string } | undefined;
+  const names = new Map<string, string>();
+  for (const id of new Set(who)) {
+    if (id === self?.value) {
+      names.set(id, 'you');
+      continue;
+    }
+    const chat = (
+      await d.execute(
+        `SELECT displayName, localName FROM chats WHERE peerId = ?`,
+        [id],
+      )
+    ).rows[0] as unknown as
+      | { displayName: string | null; localName: string | null }
+      | undefined;
+    if (chat) names.set(id, personName(id, chat.displayName, chat.localName));
+  }
+  return previewFor(body, id => names.get(id) ?? null);
 }
 
 /**
@@ -3992,6 +4203,33 @@ export async function armExpiry(
 export async function sweepExpired(now: number): Promise<number> {
   const d = conn();
   return runExclusive(async () => {
+    // The age reaps run on every sweep, expiring messages or not, and
+    // outside the transaction below: they answer no render decision and
+    // touch nothing the transaction's whole-key cascades reach.
+    //
+    // A held revision or a reaction whose target has not arrived inside the
+    // server's queue TTL is waiting for a frame that can no longer be
+    // delivered. `ts` is the sender's stamp — clamped on the way in for
+    // revisions (reviseStamp), server-stamped for a delivered frame — so a
+    // future-dated one is reaped at most a day late, never never.
+    await d.execute(`DELETE FROM pending_revisions WHERE ts <= ?`, [
+      now - HELD_REVISION_TTL_MS,
+    ]);
+    await d.execute(
+      `DELETE FROM reactions WHERE ts <= ? AND NOT EXISTS (
+         SELECT 1 FROM messages m
+         WHERE m.msgId = reactions.targetMsgId
+           AND m.direction = reactions.targetDirection)`,
+      [now - HELD_REVISION_TTL_MS],
+    );
+    // The approvals retention rule, as listApprovals applies it — here for
+    // every conversation, so a thread never opened cannot keep a machine's
+    // command lines past the CLI journal's own retention.
+    await d.execute(
+      `DELETE FROM approvals
+       WHERE ? - COALESCE(settledAt, arrivedAt) >= ${APPROVAL_RETAIN_MS}`,
+      [now],
+    );
     const doomed = (
       await d.execute(
         `SELECT msgId FROM messages WHERE expiresAt IS NOT NULL AND expiresAt <= ?`,
@@ -4085,17 +4323,18 @@ export async function sweepExpired(now: number): Promise<number> {
  * window is `arrivedAt` too, falling back to `seen.ts` (also this device's
  * clock, stamped when the frame was processed) only for rows predating the
  * arrivedAt column — those keep counting instead of degrading. The fallback
- * must never be the PRIMARY window: markSeen prunes `seen` to the
- * msgId-DESC newest 5000 on every call, and a room fan-out leg's wire id is
- * pure CSPRNG, most of which sort above any time-ordered 1:1 ULID — so
- * ordinary room traffic preferentially evicts exactly the 1:1 seen rows,
- * and a window read from seen alone silently cleared an unread chat's dot
- * and the app badge. The branches must not fall through to each other,
- * either: an inbound announcement row (grp.new, grp.roster) is keyed by its
- * WIRE id, which `seen` DOES match — a room count that borrowed the seen
- * window would call being added to a room "unread", and the announcement
- * insert deliberately leaves `arrivedAt` NULL (an event, not a message), so
- * the room branch's COALESCE keeps it out.
+ * must never be the PRIMARY window: markSeen prunes `seen` to the 5000 most
+ * recently seen rows on every call (by `ts` — it used to be by
+ * msgId, and a room fan-out leg's wire id is pure CSPRNG, most of which sort
+ * above any time-ordered 1:1 ULID, so ordinary room traffic preferentially
+ * evicted exactly the 1:1 seen rows), and a window read from seen alone
+ * silently cleared an unread chat's dot and the app badge once a row aged
+ * out. The branches must not fall through to each other, either: an inbound
+ * announcement row (grp.new, grp.roster) is keyed by its WIRE id, which
+ * `seen` DOES match — a room count that borrowed the seen window would call
+ * being added to a room "unread", and the announcement insert deliberately
+ * leaves `arrivedAt` NULL (an event, not a message), so the room branch's
+ * COALESCE keeps it out.
  *
  * `sharedBy IS NULL`: a newcomer handed 200 relayed history rows must not
  * see 200 unread — the same rule that keeps relays out of touchChat and
@@ -4103,9 +4342,8 @@ export async function sweepExpired(now: number): Promise<number> {
  * count (they were seen under the old broken behaviour anyway) — honest
  * degrade, no false unread storm on upgrade. `direction = 'in'` keeps a
  * sender-chosen msgId that collides with one of my own sent ids from
- * counting, and carrier envelopes never insert a messages row so they
- * cannot count at all.
- */
+ * counting, and carrier envelopes never insert a messages row so they cannot
+ * count at all. */
 export async function unreadCounts(): Promise<Record<string, number>> {
   const res = await conn().execute(
     // NO BACKTICKS IN THIS COMMENT, deliberately: scripts/prove-db.mjs pulls
@@ -4189,15 +4427,19 @@ export async function applyReceipt(
   state: 'sent' | 'delivered',
 ): Promise<void> {
   const rank = state === 'delivered' ? 3 : 2;
+  // `read` outranks every receipt: now that a `sent` row can reach `read`
+  // (markRead), a receipt the socket redelivers after the peer's read
+  // must not pull the filled tick back to a hollow one.
   await conn().execute(
     `UPDATE messages SET status = ?
      WHERE msgId = ? AND direction = 'out'
-       AND (CASE status WHEN 'delivered' THEN 3 WHEN 'sent' THEN 2 WHEN 'pending' THEN 1 ELSE 0 END) < ?`,
+       AND (CASE status WHEN 'read' THEN 4 WHEN 'delivered' THEN 3 WHEN 'sent' THEN 2 WHEN 'pending' THEN 1 ELSE 0 END) < ?`,
     [state, msgId, rank],
   );
   const leg = (
     await conn().execute(
-      `SELECT localMsgId FROM outbox WHERE msgId = ? AND localMsgId IS NOT NULL`,
+      `SELECT localMsgId FROM outbox
+       WHERE msgId = ? AND localMsgId IS NOT NULL AND ledger = 1`,
       [msgId],
     )
   ).rows[0] as { localMsgId: string } | undefined;
@@ -4212,7 +4454,7 @@ export async function applyReceipt(
          WHEN attempts = ${LEG_DELIVERED} OR ? = 'delivered' THEN ${LEG_DELIVERED}
          ELSE ${LEG_SENT}
        END
-     WHERE msgId = ? AND localMsgId IS NOT NULL`,
+     WHERE msgId = ? AND localMsgId IS NOT NULL AND ledger = 1`,
     [state, msgId],
   );
   await aggregateFanoutStatus(leg.localMsgId);
@@ -4239,14 +4481,15 @@ export async function markOutgoingError(msgId: string): Promise<void> {
 export async function markLegFailed(msgId: string): Promise<void> {
   const leg = (
     await conn().execute(
-      `SELECT localMsgId FROM outbox WHERE msgId = ? AND localMsgId IS NOT NULL`,
+      `SELECT localMsgId FROM outbox
+       WHERE msgId = ? AND localMsgId IS NOT NULL AND ledger = 1`,
       [msgId],
     )
   ).rows[0] as { localMsgId: string } | undefined;
   if (!leg) return;
   await conn().execute(
     `UPDATE outbox SET payload = '', attempts = ${LEG_FAILED}
-     WHERE msgId = ? AND localMsgId IS NOT NULL AND attempts >= 0`,
+     WHERE msgId = ? AND localMsgId IS NOT NULL AND ledger = 1 AND attempts >= 0`,
     [msgId],
   );
   await aggregateFanoutStatus(leg.localMsgId);
@@ -4278,7 +4521,7 @@ export async function fanoutDeliveryState(
               COALESCE(SUM(CASE WHEN attempts = ${LEG_SENT} THEN 1 ELSE 0 END), 0) AS sent,
               COALESCE(SUM(CASE WHEN attempts = ${LEG_DELIVERED} THEN 1 ELSE 0 END), 0) AS delivered,
               COALESCE(SUM(CASE WHEN attempts = ${LEG_FAILED} THEN 1 ELSE 0 END), 0) AS failed
-       FROM outbox WHERE localMsgId = ?`,
+       FROM outbox WHERE localMsgId = ? AND ledger = 1`,
       [localMsgId],
     )
   ).rows[0] as
@@ -4287,7 +4530,7 @@ export async function fanoutDeliveryState(
   const failedPeers = (
     await conn().execute(
       `SELECT peerId FROM outbox
-       WHERE localMsgId = ? AND attempts = ${LEG_FAILED} ORDER BY peerId`,
+       WHERE localMsgId = ? AND ledger = 1 AND attempts = ${LEG_FAILED} ORDER BY peerId`,
       [localMsgId],
     )
   ).rows as { peerId: string }[];
@@ -4332,7 +4575,7 @@ export async function listFanoutFailures(
               SUM(CASE WHEN o.attempts = ${LEG_FAILED} THEN 1 ELSE 0 END) AS failed
        FROM outbox o
        JOIN messages m ON m.msgId = o.localMsgId AND m.direction = 'out'
-       WHERE m.peerId = ? AND o.localMsgId IS NOT NULL
+       WHERE m.peerId = ? AND o.localMsgId IS NOT NULL AND o.ledger = 1
        GROUP BY o.localMsgId
        HAVING SUM(CASE WHEN o.attempts = ${LEG_FAILED} THEN 1 ELSE 0 END) > 0`,
       [threadPeerId],
@@ -4475,12 +4718,15 @@ export async function blockPeer(peerId: string, at: number): Promise<void> {
       const legs = (
         await d.execute(
           `SELECT msgId FROM outbox
-           WHERE peerId = ? AND localMsgId IS NOT NULL AND attempts >= 0`,
+           WHERE peerId = ? AND localMsgId IS NOT NULL AND ledger = 1 AND attempts >= 0`,
           [peerId],
         )
       ).rows as { msgId: string }[];
+      // Transport rows to the blocked id go the way 1:1 envelopes do — the
+      // `ledger = 0` arm is a sibling transcript copy, which carries a purge
+      // key but is not a delivery leg to be written into the ledger.
       await d.execute(
-        `DELETE FROM outbox WHERE peerId = ? AND localMsgId IS NULL`,
+        `DELETE FROM outbox WHERE peerId = ? AND (localMsgId IS NULL OR ledger = 0)`,
         [peerId],
       );
       for (const leg of legs) {
@@ -4610,9 +4856,16 @@ export interface OutboxRow {
    * conversation. See the `notify` column comment on the migration. */
   notify: number;
   /** The group row this fan-out leg belongs to (`messages.msgId`), or
-   * null/undefined for a 1:1 envelope. The flush reads
-   * this to route a leg through the pacing bucket and the leg ledger. */
+   * null/undefined for a 1:1 envelope. The flush reads this to route a leg
+   * through the pacing bucket and the leg ledger. It is also
+   * the PURGE KEY of a sibling transcript copy — see `ledger` for which of
+   * the two a row is. */
   localMsgId?: string | null;
+  /**
+   * 1 (the default, and every row predating the column) when the row is a
+   * DELIVERY leg counted in the ledger; 0 for a sibling transcript copy
+   * that carries `localMsgId` only so the sweep can reach it. */
+  ledger?: number;
 }
 
 // --- call log --------------------------------------------
@@ -5406,7 +5659,7 @@ export async function setPeerRelayPref(
  */
 export async function listOutbox(): Promise<OutboxRow[]> {
   const res = await conn().execute(
-    `SELECT msgId, peerId, msgType, payload, attempts, priority, urgent, notify, localMsgId
+    `SELECT msgId, peerId, msgType, payload, attempts, priority, urgent, notify, localMsgId, ledger
      FROM outbox ORDER BY priority DESC, COALESCE(seq, 0) ASC, msgId ASC`,
   );
   // Settled fan-out legs (attempts < 0 — the LEG_* ledger) are bookkeeping,
@@ -6001,11 +6254,19 @@ export async function commitVaultSlot(slot: VaultSlotRow): Promise<boolean> {
  * announcing a change that did not happen is worse than no row — it lets one
  * replayed envelope become an endless stream of notices.
  */
+/** How many slots ONE writer may hold in one conversation — the bound on
+ * what a peer can create here, refused inside the merge statement so a
+ * burst cannot overshoot it. A writer's EXISTING slot merges past the cap
+ * as ever: the number is on creation, never on convergence. */
+export const VAULT_SLOTS_PER_WRITER_CAP = 500;
+
 export async function mergeVaultSlot(slot: VaultSlotRow): Promise<boolean> {
   const res = await conn().execute(
     `INSERT INTO vault_items
        (peerId, id, writerId, seq, ackSeq, title, body, updatedAt, deleted)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+     WHERE ((SELECT COUNT(*) FROM vault_items WHERE peerId = ? AND writerId = ?) < ${VAULT_SLOTS_PER_WRITER_CAP}
+        OR EXISTS (SELECT 1 FROM vault_items WHERE peerId = ? AND id = ? AND writerId = ?))
      ON CONFLICT(peerId, id, writerId) DO UPDATE SET
        seq = excluded.seq,
        ackSeq = excluded.ackSeq,
@@ -6024,6 +6285,11 @@ export async function mergeVaultSlot(slot: VaultSlotRow): Promise<boolean> {
       slot.body,
       slot.updatedAt,
       slot.deleted,
+      slot.peerId,
+      slot.writerId,
+      slot.peerId,
+      slot.id,
+      slot.writerId,
     ],
   );
   const applied = (res.rowsAffected ?? 0) > 0;
@@ -6192,6 +6458,14 @@ export async function listVaultItems(peerId: string): Promise<VaultItemRow[]> {
  */
 export const APPROVAL_REDACT_AFTER_MS = 24 * 60 * 60 * 1000;
 export const APPROVAL_RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
+/**
+ * How many LIVE pending asks one machine may hold open in one conversation:
+ * a request past its own local deadline no longer counts, whether or not a
+ * read has marked it lapsed yet, so a machine whose asks all timed out is
+ * not locked out until the thread is opened. Refused inside the insert
+ * (false back, frame acked) — a hundred unanswered questions is not a
+ * workflow, it is a flood. */
+export const PENDING_APPROVALS_PER_PEER_CAP = 100;
 
 /** The request families the schema names. A row can only hold what the
  * shared schema's `.catch('other')` admitted, but the read coerces anyway so
@@ -6256,7 +6530,10 @@ function utf8ByteLength(s: string): number {
  * frame, or a hostile re-bind of a known `q` to a second payload, changes
  * nothing — what this phone shows for `q` is what it stored first, exactly
  * as the CLI's append-once journal holds what it will execute.
- */
+ *
+ * Returns whether a row was stored. False for the replay above AND for the
+ * PENDING_APPROVALS_PER_PEER_CAP refusal; the caller acks either way, as it
+ * always did. */
 export async function insertApproval(approval: {
   peerId: string;
   q: string;
@@ -6268,12 +6545,15 @@ export async function insertApproval(approval: {
   verbs: string[];
   ts: number;
   arrivedAt: number;
-}): Promise<void> {
-  await conn().execute(
+}): Promise<boolean> {
+  const res = await conn().execute(
     `INSERT INTO approvals
        (peerId, q, wireMsgId, kind, payload, payloadBytes, ttlSec,
         sessionTag, verbs, ts, arrivedAt, state)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending'
+     WHERE (SELECT COUNT(*) FROM approvals
+            WHERE peerId = ? AND state = 'pending' AND arrivedAt + ttlSec * 1000 > ?)
+           < ${PENDING_APPROVALS_PER_PEER_CAP}
      ON CONFLICT(peerId, q) DO NOTHING`,
     [
       approval.peerId,
@@ -6287,8 +6567,11 @@ export async function insertApproval(approval: {
       JSON.stringify(approval.verbs),
       approval.ts,
       approval.arrivedAt,
+      approval.peerId,
+      approval.arrivedAt,
     ],
   );
+  return (res.rowsAffected ?? 0) > 0;
 }
 
 /**
@@ -6536,12 +6819,22 @@ export async function hasSeen(msgId: string): Promise<boolean> {
  *   - `direction = 'out'` — a peer can only report having read MY messages,
  *     never rewrite the status of their own;
  *   - `peerId = ?` — an id from one conversation cannot reach into another;
- *   - `status = 'delivered'` — read only ever follows delivery, so a receipt
- *     cannot resurrect a failed send or overwrite an error row.
+ *   - `status IN ('sent','delivered')` — read follows a send the server
+ *     took, so a receipt cannot resurrect a failed send, overwrite an error
+ *     row, or claim a message this device never got out of its outbox.
+ *
+ * `sent` is admitted on purpose. The server posts exactly ONE receipt per
+ * send — `delivered` if the recipient had a live socket at that instant,
+ * `sent` otherwise — and nothing at drain or ack time, so a message queued
+ * while they were offline (on iOS: whenever the app was backgrounded) stays
+ * `sent` forever. The old `= 'delivered'` guard therefore matched zero rows
+ * for most messages, and the peer's read envelope was consumed and acked
+ * with nothing to show for it. A peer proving they read a message is
+ * stronger evidence of delivery than any server receipt; the two
+ * anti-forgery guards above are what keep the proof honest.
  *
  * Returns how many rows actually moved, so the caller can skip a re-render
- * for a replayed receipt.
- */
+ * for a replayed receipt. */
 export async function markRead(
   peerId: string,
   msgIds: string[],
@@ -6551,7 +6844,7 @@ export async function markRead(
   const holes = msgIds.map(() => '?').join(',');
   const res = await conn().execute(
     `UPDATE messages SET status = 'read', readAt = ?
-     WHERE peerId = ? AND direction = 'out' AND status = 'delivered'
+     WHERE peerId = ? AND direction = 'out' AND status IN ('sent', 'delivered')
        AND msgId IN (${holes})`,
     [at, peerId, ...msgIds],
   );
@@ -6589,9 +6882,20 @@ export async function markSeen(msgId: string, ts: number): Promise<void> {
     msgId,
     ts,
   ]);
-  // Bounded: the server queue TTL is 30 days; keep the newest 5000 ids.
+  // Bounded: the server queue TTL is 30 days; keep the 5000 most RECENTLY
+  // SEEN ids — by `ts`, which every caller stamps with this device's clock
+  // at processing time, and NEVER by msgId order. Room legs, device fan-out
+  // extras and every `x.acct.*` carrier ride pure-CSPRNG wire ids
+  // (`randomMsgId`: first char '0'–'7', the rest uniform Crockford), ~99 %
+  // of which sort above any time-ordered ULID; an id-ordered prune therefore
+  // evicted every 1:1 row — including the one this very call had just
+  // inserted — once 5000 random ids existed, which switched 1:1 redelivery
+  // dedup off and re-imported the NSE spool on every launch. Ordered by
+  // insertion time the row just written is always the newest, whatever its
+  // id looks like. msgId is the tiebreak only.
   await d.execute(
-    `DELETE FROM seen WHERE msgId NOT IN (SELECT msgId FROM seen ORDER BY msgId DESC LIMIT 5000)`,
+    `DELETE FROM seen WHERE msgId NOT IN
+       (SELECT msgId FROM seen ORDER BY ts DESC, msgId DESC LIMIT 5000)`,
   );
 }
 

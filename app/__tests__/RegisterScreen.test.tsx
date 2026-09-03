@@ -20,6 +20,7 @@ import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
 import {
   AccessibilityInfo,
+  BackHandler,
   Dimensions,
   Linking,
   ScrollView,
@@ -656,5 +657,67 @@ describe('motion honours Reduce Motion', () => {
     await openSheet();
     const sheet = StyleSheet.flatten(propOf('register-sheet', 'style'));
     expect(sheet.transform).toBeDefined();
+  });
+});
+
+describe('hardware back while the create call is in flight', () => {
+  /** Capture the screen's own hardwareBackPress subscription: RN invokes
+   * the most recent subscriber first and stops at the first `true`, so a
+   * screen subscription answers before the app router's. */
+  function captureBack() {
+    const handlers: Array<() => boolean> = [];
+    const remove = jest.fn();
+    const spy = jest
+      .spyOn(BackHandler, 'addEventListener')
+      .mockImplementation((_event, handler) => {
+        handlers.push(handler as () => boolean);
+        return { remove };
+      });
+    return { handlers, remove, spy };
+  }
+
+  it('is swallowed while busy, yielded to the router otherwise, and leaves with the screen', async () => {
+    const { handlers, remove } = captureBack();
+    reg.createOrRestoreAccount.mockReturnValueOnce(new Promise(() => {}));
+    await render();
+    expect(handlers.length).toBeGreaterThan(0);
+    const back = handlers[handlers.length - 1];
+
+    // Idle: the app's own router answers (register pops to landing).
+    expect(back()).toBe(false);
+    await openSheet();
+    expect(back()).toBe(false);
+
+    // Mid-flight there is nothing safe to walk away to — the sheet already
+    // refuses its scrim and "Not yet"; the system button refuses the same.
+    await press('register-sheet-confirm');
+    expect(stateOf('register-sheet-confirm').busy).toBe(true);
+    expect(back()).toBe(true);
+    expect(has('register-sheet')).toBe(true);
+
+    // Inside act: the passive-effect cleanup that removes the subscription
+    // is what is being asserted.
+    await ReactTestRenderer.act(async () => {
+      tree.unmount();
+    });
+    expect(remove).toHaveBeenCalled();
+  });
+
+  it('a failure landing after the screen is gone is dropped, and hands nobody on', async () => {
+    captureBack();
+    let reject!: (err: Error) => void;
+    reg.createOrRestoreAccount.mockReturnValueOnce(
+      new Promise<never>((_resolve, r) => {
+        reject = r;
+      }),
+    );
+    await render();
+    await openSheet();
+    await press('register-sheet-confirm');
+    tree.unmount();
+    await ReactTestRenderer.act(async () => {
+      reject(new Error('offline'));
+    });
+    expect(onRegistered).not.toHaveBeenCalled();
   });
 });

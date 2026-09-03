@@ -34,7 +34,9 @@ import {
   applyPeerMutationNotice,
   applyServedRoster,
   fanoutDeviceSet,
+  forgetPeerIdentity,
   inboundGateFor,
+  recordPeerIdentity,
   type PeerDeviceRow,
   type PeerDevicesDeps,
 } from '../src/peerDevices';
@@ -51,6 +53,9 @@ const NOW = 1_756_000_000_000;
 const ANCHOR_KEY = 'QU5DSE9SS0VZ'; // the key we pinned at first contact
 const TABLET_KEY = 'VEFCTEVUS0VZ';
 const STRANGER_KEY = 'U1RSQU5HRVI=';
+/** The contact's NEW identity — what their bundle serves after a key change
+ * the human accepted. */
+const ANCHOR_KEY_2 = 'QU5DSE9SS0VZMg==';
 
 /** The deterministic fake signature scheme the fake verify checks: a
  * signature is valid iff it names the op, the SIGNER's key, the subject key
@@ -428,5 +433,113 @@ describe('a dissolve notice', () => {
     );
     expect(outcome).toBe('dropped');
     expect(state.rows.get(TABLET)?.anchorId).toBe(ANCHOR);
+  });
+});
+
+/* ── 5. an accepted identity change re-pins the roster row ── */
+
+describe('an accepted identity change', () => {
+  /** The contact with a cross-signed tablet, as before the key change. */
+  async function groupedPair(deps: PeerDevicesDeps): Promise<void> {
+    await pinAnchor(deps);
+    await applyServedRoster(
+      {
+        anchorId: ANCHOR,
+        siblings: [
+          { userId: TABLET, class: 'tablet', certs: tabletCerts(ANCHOR_KEY), identityKeyPub: TABLET_KEY },
+        ],
+      },
+      deps,
+    );
+  }
+
+  /** A revoke of the tablet, signed by the anchor under `signerKey`. */
+  function revokeNotice(signerKey: string) {
+    const tuple: LinkOpTuple = {
+      groupId: GROUP,
+      offererUserId: ANCHOR,
+      acceptorUserId: TABLET,
+      subjectIdentityPubKey: TABLET_KEY,
+      class: 'tablet',
+      rosterEpoch: 2,
+      offerNonce: NONCE,
+      expiresAt: Math.floor(NOW / 1000) + 300,
+    };
+    return {
+      senderDeviceId: ANCHOR,
+      op: 'revoke' as const,
+      tuple,
+      signature: mintSig('revoke', signerKey, tuple),
+    };
+  }
+
+  it('unpins the retired key: a notice signed under it is dropped, and the row keeps its place in the set', async () => {
+    const { deps, state } = fakeDeps();
+    await groupedPair(deps);
+    await forgetPeerIdentity(ANCHOR, deps);
+    const row = state.rows.get(ANCHOR)!;
+    expect(row.identityKeyPub).toBe('');
+    expect(row).toMatchObject({ anchorId: ANCHOR, state: 'linked', class: 'unknown' });
+    // The key the human retired vouches for nothing any more.
+    expect(await applyPeerMutationNotice(revokeNotice(ANCHOR_KEY), deps)).toBe('dropped');
+    expect(state.rows.get(TABLET)?.state).toBe('linked');
+  });
+
+  it('the next served bundle re-pins through the empty-key path, and a notice under the NEW key verifies', async () => {
+    const { deps, state } = fakeDeps();
+    await groupedPair(deps);
+    await forgetPeerIdentity(ANCHOR, deps);
+    // What the next bundle fetch does — recordPeerIdentity with no force: the
+    // ordinary first-contact call, admitted because the row is unpinned.
+    await recordPeerIdentity(ANCHOR, ANCHOR_KEY_2, deps);
+    expect(state.rows.get(ANCHOR)).toMatchObject({
+      identityKeyPub: ANCHOR_KEY_2,
+      anchorId: ANCHOR,
+      state: 'linked',
+      updatedAt: NOW,
+    });
+    // THE DEFECT: before the fix the row still held ANCHOR_KEY, so this
+    // genuine notice under the accepted key failed silently, forever.
+    expect(await applyPeerMutationNotice(revokeNotice(ANCHOR_KEY_2), deps)).toBe('applied');
+    expect(state.rows.get(TABLET)?.state).toBe('revoked');
+  });
+
+  it('a forgery under the OLD key still fails after the re-pin', async () => {
+    const { deps, state } = fakeDeps();
+    await groupedPair(deps);
+    await forgetPeerIdentity(ANCHOR, deps);
+    await recordPeerIdentity(ANCHOR, ANCHOR_KEY_2, deps);
+    expect(await applyPeerMutationNotice(revokeNotice(ANCHOR_KEY), deps)).toBe('dropped');
+    expect(state.rows.get(TABLET)?.state).toBe('linked');
+  });
+
+  it('a standing key is never overwritten by a plain record — only by force', async () => {
+    const { deps, state } = fakeDeps();
+    await groupedPair(deps);
+    // The long-standing rule, kept: a different key for the same ULID
+    // arriving on an ordinary fetch is the identityChanged path's business.
+    await recordPeerIdentity(ANCHOR, STRANGER_KEY, deps);
+    expect(state.rows.get(ANCHOR)?.identityKeyPub).toBe(ANCHOR_KEY);
+    // The acceptance path's own re-pin: forced, and the row keeps its
+    // anchor, class, state and certs — only the key moves.
+    const before = state.rows.get(ANCHOR)!;
+    await recordPeerIdentity(ANCHOR, ANCHOR_KEY_2, deps, { force: true });
+    expect(state.rows.get(ANCHOR)).toEqual({
+      ...before,
+      identityKeyPub: ANCHOR_KEY_2,
+      updatedAt: NOW,
+    });
+    expect(await applyPeerMutationNotice(revokeNotice(ANCHOR_KEY_2), deps)).toBe('applied');
+  });
+
+  it('forgetting an unknown contact, or one already unpinned, writes nothing', async () => {
+    const { deps, state } = fakeDeps();
+    await forgetPeerIdentity(ANCHOR, deps);
+    expect(state.rows.size).toBe(0);
+    await pinAnchor(deps);
+    await forgetPeerIdentity(ANCHOR, deps);
+    const once = { ...state.rows.get(ANCHOR)! };
+    await forgetPeerIdentity(ANCHOR, deps);
+    expect(state.rows.get(ANCHOR)).toEqual(once);
   });
 });

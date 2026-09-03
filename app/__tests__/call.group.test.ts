@@ -179,6 +179,10 @@ interface Options {
   /** Held inside `closeSessionRow`, which runs immediately AFTER
    * `releaseGroupCall`: the other side of the same window. */
   beforeDeleteSession?: () => Promise<void>;
+  /** Held inside a LEG's history-row write — the last effect of a leg
+   * service's teardown, after its peer connection is already closed. A leg
+   * parked here is one the session already counts as `left`. */
+  beforeWriteLog?: () => Promise<void>;
   /** Held inside the NATIVE offer creation — i.e. inside a leg
    * `CallService`'s own effect loop, one layer below the coordinator's fence. */
   beforeCreateOffer?: () => Promise<void>;
@@ -255,28 +259,46 @@ function harness(opts: Options = {}): Harness {
       return result;
     });
 
+  /**
+   * THE PEER CONNECTIONS THAT EXIST, by cid — born in `createOffer` /
+   * `createAnswer`, gone at `close`. The shipped native answers `false` to a
+   * track change on a cid it holds no connection for (`call(cid)?… ?? false`),
+   * and the fake used to answer `true` for ANY cid, which is exactly how a
+   * mute during a paced dial closing not-yet-opened legs stayed invisible
+   * here. */
+  const liveCids = new Set<string>();
   const native = {
     configure: nativeFn('configure'),
     createOffer: jest.fn(async (cid: string, withVideo: boolean) => {
       trace.push(`createOffer(${JSON.stringify(cid)},${JSON.stringify(withVideo)})`);
       await opts.beforeCreateOffer?.();
+      liveCids.add(cid);
       return SDP;
     }),
-    createAnswer: nativeFn('createAnswer', ANSWER_SDP),
+    createAnswer: jest.fn(async (...args: unknown[]) => {
+      trace.push(`createAnswer(${args.map(a => JSON.stringify(a)).join(',')})`);
+      liveCids.add(String(args[0]));
+      return ANSWER_SDP;
+    }),
     setRemoteAnswer: nativeFn('setRemoteAnswer'),
     addIceCandidates: nativeFn('addIceCandidates'),
     restartIce: nativeFn('restartIce', SDP),
-    close: nativeFn('close'),
+    close: jest.fn(async (cid: string) => {
+      trace.push(`close(${JSON.stringify(cid)})`);
+      liveCids.delete(cid);
+    }),
     reportOutgoingCall: nativeFn('reportOutgoingCall'),
     reportOutgoingConnected: nativeFn('reportOutgoingConnected'),
     reportIncomingCall: nativeFn('reportIncomingCall'),
     endCall: nativeFn('endCall'),
     dismissPendingIncomingCall: nativeFn('dismissPendingIncomingCall'),
+    answerReportedCall: nativeFn('answerReportedCall'),
     setAudioEnabled: jest.fn(async (cid: string, on: boolean) => {
       trace.push(`setAudioEnabled(${cid},${on})`);
+      if (!liveCids.has(cid)) return false;
       return opts.audioApply ? opts.audioApply(cid) : true;
     }),
-    setVideoEnabled: jest.fn(async () => true),
+    setVideoEnabled: jest.fn(async (cid: string) => liveCids.has(cid)),
     // Resolves void, exactly as the bridge does: there is no applied verdict
     // for an output route, so a test that could assert one would be asserting
     // against a fiction. `speakerRejects` is how a failure is expressed.
@@ -333,6 +355,7 @@ function harness(opts: Options = {}): Harness {
       for (const o of [...offerRows.values()]) if (o.sid === sid) offerRows.delete(o.cid);
     },
     writeLog: async row => {
+      await opts.beforeWriteLog?.();
       trace.push(`log(${row.peerId},${row.reason},${row.sessionId ?? 'null'})`);
       logs.push(row);
     },
@@ -1052,10 +1075,14 @@ describe('the local pushSend mirror', () => {
             await teardownGate.held;
             return;
           }
-          if (glareEnds === 2) {
+          if (glareEnds === 3) {
             // `send` made A's empty-mirror verdict before entering transport.
             // Refill only now so B's own ginvite has an honest mirror token and
-            // cannot make the final phase ambiguous.
+            // cannot make the final phase ambiguous. THE THIRD end, not the
+            // second: A now has two legs (see below), so the chain runs
+            // [teardown-1 (held), timeout-STARTER, timeout-C, teardown-2] —
+            // the C timeout, whose verdict is the one B re-dials into, is the
+            // third.
             h.advance(60_000);
           }
         },
@@ -1077,7 +1104,12 @@ describe('the local pushSend mirror', () => {
 
       // A owns a live dial timer. The lower sid wins glare and publishes B at
       // the top of the coordinator step, before A's teardown effects settle.
-      const sidA = await h.co.startGroupCall([C], false);
+      //
+      // STARTER is on A's roster: glare is between the people on a call, so
+      // only a member's crossing invite can supersede. This test used to
+      // start A with C alone and let a stranger's lower sid win it;
+      // rewritten deliberately.
+      const sidA = await h.co.startGroupCall([STARTER, C], false);
       await h.co.whenIdle();
       const cidA = dialledCid(h, C);
       const sidB = ulid('AAAA');
@@ -3209,7 +3241,11 @@ describe('when a lower sid supersedes the session we started', () => {
     const h = harness();
     const loserSid = await h.co.startGroupCall([B], false);
     await h.co.whenIdle();
-    await connectLeg(h, B);
+    // NOT connected: glare is two invites crossing in flight, and a session
+    // already carrying media crossed nothing — B's lower sid into a connected
+    // call is busy, not a supersede (this test used to connect the leg first
+    // and was rewritten deliberately). The dialled leg's media exists, so the
+    // mute below still reaches it.
     await h.co.setMuted(true);
     await h.co.whenIdle();
     expect(h.co.view!.muted).toBe(true);
@@ -5281,5 +5317,513 @@ describe('a CallKit press suspended in session classification', () => {
     // A claimed group press has exactly one owner; the 1:1 fallback must not
     // also release the native aggregate after the group acted on it.
     expect(nativeModule.endCall).not.toHaveBeenCalledWith(ulid('SEAMS'), fallbackReason);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The group-call defects the coordinator owns. Each block names the behaviour
+// it holds; each test went red against the coordinator that preceded it.
+// ---------------------------------------------------------------------------
+
+describe("an unknown account's crossing invite is judged even while a session is live", () => {
+  /** A sid that sorts BELOW anything `mintId` produces — the forged
+   * `sid: '0000…'` of the defect, which always won "lower sid wins". */
+  const LOWER_SID = ulid('0');
+
+  it('a DIFFERENT sid from an unknown account into a live session is silenced — never rung, never superseding', async () => {
+    // The gate ran only when nothing was live, so the one invite the reducer
+    // can answer with `supersede` — tear the call down and RING — was the one
+    // invite never judged. FALSIFIER: restore `this.state === null` around
+    // the gate; `ringChecks` comes back empty and a busy frame goes out.
+    const h = harness({ silenceUnknown: true, known: new Set([B]) });
+    const sid = await h.co.startGroupCall([B], false);
+    await h.co.whenIdle();
+    h.ringChecks.length = 0;
+    h.sent.length = 0;
+
+    await h.deliver(STRANGER, ginvite({ sid: LOWER_SID, cid: ulid('CG1'), r: [STRANGER, SELF] }));
+
+    expect(h.ringChecks).toEqual([STRANGER]);
+    // The live call is untouched: same sid, no release, no second ring.
+    expect(h.co.view!.sid).toBe(sid);
+    expect(h.native.endCall).not.toHaveBeenCalled();
+    expect(h.native.reportIncomingCall).not.toHaveBeenCalled();
+    // Silenced exactly as a fresh ring is: nothing back, a decline row, the
+    // placeholder the push already rang dismissed.
+    expect(h.sent.filter(f => f.peerId === STRANGER)).toEqual([]);
+    expect(h.logs.map(r => r.reason)).toEqual(['decline']);
+    expect(h.native.dismissPendingIncomingCall).toHaveBeenCalledWith(STRANGER, 'declined', '');
+  });
+
+  it("a MEMBER's crossing invite from a known account passes the gate, and the reducer decides glare", async () => {
+    const h = harness({ silenceUnknown: true, known: new Set([B]) });
+    await h.co.startGroupCall([B], false);
+    await h.co.whenIdle();
+    h.ringChecks.length = 0;
+
+    await h.deliver(B, ginvite({ sid: LOWER_SID, cid: ulid('CG2'), r: [B, SELF] }));
+
+    expect(h.ringChecks).toEqual([B]);
+    expect(h.co.view!.sid).toBe(LOWER_SID); // B's lower sid won a session still forming
+  });
+
+  it("a STRANGER's lower sid into a live session is busy when the gate is off — the reducer's own gate (never supersede)", async () => {
+    const h = harness();
+    const sid = await h.co.startGroupCall([B], false);
+    await h.co.whenIdle();
+    await connectLeg(h, B);
+
+    await h.deliver(STRANGER, ginvite({ sid: LOWER_SID, cid: ulid('CG3'), r: [STRANGER, SELF] }));
+
+    expect(h.co.view!.sid).toBe(sid);
+    expect(h.co.view!.legs.find(l => l.peerId === B)!.phase).toBe('connected');
+    expect(
+      h.sent.filter(f => f.peerId === STRANGER && f.envelope.tcm === 'call.end' && f.envelope.r === 'busy'),
+    ).toHaveLength(1);
+    expect(h.native.endCall).not.toHaveBeenCalled();
+  });
+});
+
+describe('the ginvite carries the epoch this device holds', () => {
+  it("the starter's invite to a member added mid-call names the epoch that Add minted", async () => {
+    const h = harness();
+    await h.co.startGroupCall([B], false);
+    await h.co.whenIdle();
+    expect(h.frames('call.ginvite').map(f => f.envelope.se)).toEqual([0]);
+
+    await h.co.addParticipant(C);
+    await h.co.whenIdle();
+    const toC = h.sent.find(f => f.peerId === C && f.envelope.tcm === 'call.ginvite')!;
+    expect(toC.envelope.se).toBe(1);
+    expect(toC.envelope.r).toEqual([SELF, B, C]);
+  });
+});
+
+describe('the in-app Answer requests the CallKit answer for the SESSION', () => {
+  it('asks native to answer the reported call by its sid, once, before the starter leg is answered', async () => {
+    // The CXCall is keyed by the sid; the native `createAnswer` funnel keys
+    // its CXAnswerCallAction by the LEG cid, which CallKit never heard of.
+    // FALSIFIER: drop the `answerReportedCall` call from `openLegAnswer` —
+    // the count below reads 0, which is the dead-audio call this pins.
+    const h = harness();
+    const sid = ulid('SA1');
+    await h.deliver(STARTER, ginvite({ sid, cid: ulid('CA1'), r: [STARTER, SELF, B] }));
+    await h.deliver(B, ginvite({ sid, cid: ulid('CA2'), r: [STARTER, SELF, B] }));
+    expect(h.native.answerReportedCall).not.toHaveBeenCalled();
+
+    await h.co.answer();
+    await h.co.whenIdle();
+
+    expect(h.native.answerReportedCall).toHaveBeenCalledTimes(1);
+    expect(h.native.answerReportedCall).toHaveBeenCalledWith(sid);
+    // Before the media, as the 1:1 funnel orders it: activation first.
+    const at = (prefix: string) => h.trace.findIndex(t => t.startsWith(prefix));
+    expect(at('answerReportedCall(')).toBeGreaterThanOrEqual(0);
+    expect(at('answerReportedCall(')).toBeLessThan(at('createAnswer('));
+    // Both legs are still answered, exactly once each.
+    expect(h.native.createAnswer).toHaveBeenCalledTimes(2);
+  });
+
+  it('never asks for an OUTGOING session — its CXCall was reported outgoing and connects on the first leg', async () => {
+    const h = harness();
+    await h.co.startGroupCall([B], false);
+    await h.co.whenIdle();
+    await connectLeg(h, B);
+    expect(h.native.answerReportedCall).not.toHaveBeenCalled();
+    expect(h.native.reportOutgoingConnected).toHaveBeenCalledTimes(1);
+  });
+
+  it('is a no-op on a native that predates the method — the answer still goes through', async () => {
+    const h = harness();
+    delete (h.native as unknown as Record<string, unknown>).answerReportedCall;
+    await h.deliver(STARTER, ginvite({ sid: ulid('SA2'), cid: ulid('CA3'), r: [STARTER, SELF] }));
+    await h.co.answer();
+    await h.co.whenIdle();
+    expect(h.native.createAnswer).toHaveBeenCalledTimes(1);
+    expect(h.co.view!.phase).toBe('joining');
+  });
+});
+
+describe("a starter's pre-answer hangup is a MISSED call on the phone that rang", () => {
+  it('the ring leg closed with `cancelled` writes a missed row and ends the CXCall as unanswered', async () => {
+    // The starter's session-level hangup used to close a still-ringing leg
+    // with `hangup`, which this side's leg machine logs as a completed call
+    // — no missed row, no badge, CallKit `.remoteEnded`. The reducer now
+    // cancels a leg nobody answered (`legEndReason`); this is the other end
+    // of that frame, on the phone that was ringing. FALSIFIER: deliver
+    // `r: 'hangup'` instead — the row's `missed` flips to false.
+    const h = harness();
+    const sid = ulid('S5C');
+    const cid = ulid('C5C');
+    await h.deliver(STARTER, ginvite({ sid, cid, r: [STARTER, SELF, B] }));
+    expect(h.co.view!.phase).toBe('ringing');
+    expect(h.native.reportIncomingCall).toHaveBeenCalledTimes(1);
+
+    await h.deliver(STARTER, { tcm: 'call.end', cid, r: 'cancelled' });
+
+    expect(h.co.view).toBeNull();
+    expect(h.native.endCall).toHaveBeenCalledWith(sid, 'cancelled');
+    // ONE row, the leg's own. The leg reports `ending` before it runs its
+    // effects and its row is the last of them, so the release the report
+    // triggers used to find `legLogRows === 0` and write the aggregate as
+    // well — two missed rows, two badge counts, for one cancelled ring.
+    const rows = h.logs.filter(r => r.peerId === STARTER && r.sessionId === sid);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ cid, direction: 'in', reason: 'cancelled', missed: true });
+  });
+
+  it('still writes the one missed row when the session ends while the leg is parked in its teardown', async () => {
+    // The row is the LAST effect of the leg's teardown, behind the peer
+    // connection close. The session release disposes the leg's service, and
+    // a disposal stops the effect loop at its next checkpoint — so a leg
+    // still standing at `close` when the release ran never wrote its row,
+    // and because it had been counted, the aggregate did not either: a
+    // missed call with no evidence anywhere. The coordinator now writes what
+    // the leg promised before it disposes it. FALSIFIER: remove the
+    // `flushPendingLegRows` call from `resetSessionScratch` — zero rows.
+    const h = harness();
+    const sid = ulid('S5D');
+    const cid = ulid('C5D');
+    await h.deliver(STARTER, ginvite({ sid, cid, r: [STARTER, SELF, B] }));
+    expect(h.co.view!.phase).toBe('ringing');
+
+    // The bridge never answers this close: the leg's loop parks there, its
+    // row still queued behind it, while the coordinator ends the session.
+    h.native.close.mockImplementationOnce(() => new Promise<void>(() => undefined));
+    void h.deliver(STARTER, { tcm: 'call.end', cid, r: 'cancelled' });
+    await h.co.whenIdle();
+
+    expect(h.co.view).toBeNull();
+    expect(h.native.endCall).toHaveBeenCalledWith(sid, 'cancelled');
+    const rows = h.logs.filter(r => r.peerId === STARTER && r.sessionId === sid);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ cid, direction: 'in', reason: 'cancelled', missed: true });
+  });
+});
+
+describe('a mute fans only over legs whose media exists, and never over a departed one', () => {
+  it('a mute during the paced dial of a 6-way closes nothing — legs still dialling are bound at their dial', async () => {
+    // `state.legs` lists every leg from the first step while the dials run
+    // one at a time behind the pacer; native answers `false` for a cid with
+    // no peer connection, and §5 closed each of them: an urgent call.end to
+    // a peer not yet invited, "X was dropped" over a dial that then went on.
+    // FALSIFIER: drop the `mediaBound` check from `fanTrack` — with the fake
+    // native now honest about unknown cids, four call.end frames go out.
+    const entered = latch();
+    const gate = latch();
+    let held = false;
+    const h = harness({
+      beforeCreateOffer: async () => {
+        if (held) return;
+        held = true;
+        entered.release();
+        await gate.held;
+      },
+    });
+    const started = h.co.startGroupCall([B, C, D, E, F], false);
+    await entered.held;
+    // The first dial is suspended inside createOffer; four more have not
+    // begun. Every leg is already in the view.
+    expect(h.co.view!.legs).toHaveLength(5);
+
+    const outcomes = await h.co.setMuted(true);
+    expect(outcomes).toEqual([]);
+    expect(h.co.view!.muted).toBe(true);
+
+    gate.release();
+    await started;
+    await h.co.whenIdle();
+
+    // Nobody was closed, nobody was told anything but the invite…
+    expect(h.frames('call.end')).toEqual([]);
+    for (const peer of [B, C, D, E, F]) {
+      expect(['inviting', 'ringing']).toContain(h.co.view!.legs.find(l => l.peerId === peer)!.phase);
+      // …and every leg was muted the moment its media existed.
+      expect(h.native.setAudioEnabled).toHaveBeenCalledWith(dialledCid(h, peer), false);
+    }
+    // No leg's mute failed: the first apply on each cid was the bind's.
+    expect(h.native.setAudioEnabled.mock.results.every(r => r.value instanceof Promise)).toBe(true);
+    for (const call of h.native.setAudioEnabled.mock.calls) {
+      expect([B, C, D, E, F].map(p => dialledCid(h, p))).toContain(call[0]);
+    }
+  });
+
+  it('re-sends no call.end to a peer who LEFT while their service is still winding down', async () => {
+    // A sovereign leave closes the leaver's leg WITHOUT announcing (their
+    // ends are en route from their own hangup). The leg is `left` while its
+    // service tears down — peer connection closed, history row pending — and
+    // a fan that reached it got `false` from native and announced a
+    // `failed_media` end to someone who had already hung up.
+    const entered = latch();
+    const gate = latch();
+    let hold = false;
+    const h = harness({
+      beforeWriteLog: async () => {
+        if (!hold) return;
+        hold = false;
+        entered.release();
+        await gate.held;
+      },
+    });
+    const sid = await h.co.startGroupCall([B, C], false);
+    await h.co.whenIdle();
+    await connectLeg(h, B);
+    await connectLeg(h, C);
+
+    hold = true;
+    void h.co.handle(B, { tcm: 'call.gleave', sid, m: B, se: 1 }, { msgId: 'm', ts: h.now() });
+    await entered.held;
+    expect(h.co.view!.legs.find(l => l.peerId === B)!.phase).toBe('left');
+    const before = h.frames('call.end').length;
+
+    const outcomes = await h.co.setMuted(true);
+    expect(outcomes).toEqual([{ peerId: C, cid: dialledCid(h, C), applied: true, closed: false }]);
+    expect(h.frames('call.end')).toHaveLength(before);
+    expect(h.sent.some(f => f.peerId === B && f.envelope.tcm === 'call.end')).toBe(false);
+
+    gate.release();
+    await h.co.whenIdle();
+    expect(h.co.view!.muted).toBe(true);
+    expect(h.co.view!.legs.find(l => l.peerId === C)!.phase).toBe('connected');
+  });
+});
+
+describe('a re-offer into a leg still tearing down gets a fresh service', () => {
+  it('the +2 s re-offer dials the fresh cid while the dead leg\'s call.end is still parked in the pacer', async () => {
+    // The reducer marks the leg `failed` when its service publishes `ending`
+    // — before the teardown has run. With the announce parked in the pacer,
+    // the same service was still `ending` when the re-offer's `placeCall`
+    // reached it: `reportBusy`, a no-op. Nothing dialled the new cid; the
+    // tile read "Calling…" for the rest of the call. FALSIFIER: reuse the
+    // winding-down service in `openLegDial` — one ginvite reaches B, ever.
+    jest.useFakeTimers();
+    try {
+      const gate = latch();
+      let hold = false;
+      const h = harness({
+        beforeSend: async tcm => {
+          if (tcm === 'call.end' && hold) await gate.held;
+        },
+      });
+      const sid = await h.co.startGroupCall([B, C], false);
+      await h.co.whenIdle();
+      await connectLeg(h, C); // the session outlives B's failure on its own merits
+      // B is present: their sovereign announce arms R6 toward them.
+      await h.deliver(B, { tcm: 'call.gjoin', sid, m: B, se: 1 });
+      const cidB1 = dialledCid(h, B);
+      const ginvitesToB = (): number =>
+        h.sent.filter(f => f.peerId === B && f.envelope.tcm === 'call.ginvite').length;
+      expect(ginvitesToB()).toBe(1);
+
+      // B never connects: the 45 s connect timeout fails the leg, and its
+      // announced call.end parks in the transport.
+      hold = true;
+      jest.advanceTimersByTime(CALL_CONNECT_TIMEOUT_MS);
+      await flush();
+      expect(h.co.view!.legs.find(l => l.peerId === B)!.phase).toBe('failed');
+
+      // The repair fires while that call.end is still parked.
+      jest.advanceTimersByTime(GINVITE_REOFFER_DELAYS_MS[0]);
+      await flush();
+      await flush();
+      expect(h.co.view!.legs.find(l => l.peerId === B)!.phase).toBe('inviting');
+
+      // The pacer drains: the parked end leaves, and the FRESH dial behind it.
+      hold = false;
+      gate.release();
+      await flush();
+      await h.co.whenIdle();
+      expect(ginvitesToB()).toBe(2);
+      const cidB2 = dialledCid(h, B);
+      expect(cidB2).not.toBe(cidB1);
+      expect(h.native.createOffer).toHaveBeenCalledWith(cidB2, false);
+      // The dead attempt's end went out under ITS cid; the fresh leg lives.
+      expect(
+        h.sent.some(f => f.peerId === B && f.envelope.tcm === 'call.end' && f.envelope.cid === cidB1),
+      ).toBe(true);
+      expect(h.co.view!.legs.find(l => l.peerId === B)!.phase).toBe('inviting');
+
+      // …and the tile leaves "Calling…" the moment B acks the new cid.
+      await h.deliver(B, { tcm: 'call.ringing', cid: cidB2 });
+      expect(h.co.view!.legs.find(l => l.peerId === B)!.phase).toBe('ringing');
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
+describe("a blocked member's leg into a LIVE session", () => {
+  /** An answered incoming session [STARTER, SELF, B] under `sid`. */
+  async function joined(h: Harness, sid: string): Promise<void> {
+    await h.deliver(STARTER, ginvite({ sid, cid: ulid('CB1'), r: [STARTER, SELF, B] }));
+    await h.co.answer();
+    await h.co.whenIdle();
+    expect(h.co.view!.phase).toBe('joining');
+  }
+
+  it('is refused as a LEG — call.end{busy}, no row under the live sid, and the tile names the skip', async () => {
+    // Blocked mid-call: the starter added C by authority (no blocked check
+    // sits on a roster delta), and this phone blocked C before C's leg
+    // offer arrived. The whole-session refusal dismissed nothing that was
+    // ringing, wrote a `blocked` row keyed by the LIVE sid and returned with
+    // no verdict — so the tile read "Calling…" for the rest of the call.
+    const blocked = new Set<string>();
+    const h = harness({ blocked });
+    const sid = ulid('SB1');
+    await joined(h, sid);
+    await h.deliver(STARTER, { tcm: 'call.gjoin', sid, m: C, se: 1 });
+    expect(h.co.view!.roster).toContain(C);
+    blocked.add(C);
+    const rows = h.logs.length;
+    const cidC = ulid('CB2');
+
+    await h.deliver(C, ginvite({ sid, cid: cidC, r: [STARTER, SELF, B, C] }));
+
+    expect(
+      h.sent.filter(f => f.peerId === C && f.envelope.tcm === 'call.end' && f.envelope.r === 'busy'),
+    ).toHaveLength(1);
+    expect(h.logs).toHaveLength(rows);
+    expect(h.native.createAnswer).toHaveBeenCalledTimes(1); // the starter's leg only
+    expect(h.co.view!.sid).toBe(sid);
+    expect(h.co.view!.legs.find(l => l.peerId === C)!.skipped).toBe('blocked');
+    expect(h.native.dismissPendingIncomingCall).toHaveBeenCalledWith(C, 'declined', '');
+  });
+
+  it("an asserted `r` naming a blocked account does not refuse a MEMBER's leg — the roster is payload", async () => {
+    // Only the dial path scans whom this device will open media to; a join
+    // leg is judged on its authenticated sender. B's envelope names someone
+    // this phone blocked who is not on the call at all.
+    const h = harness({ blocked: new Set([STRANGER]) });
+    const sid = ulid('SB2');
+    await joined(h, sid);
+    const rows = h.logs.length;
+    const cidB = ulid('CB3');
+
+    await h.deliver(B, ginvite({ sid, cid: cidB, r: [STARTER, SELF, B, STRANGER] }));
+
+    expect(h.native.createAnswer).toHaveBeenCalledWith(cidB, SDP, false);
+    expect(h.logs).toHaveLength(rows);
+    expect(h.co.view!.legs.find(l => l.peerId === B)!.skipped).toBeNull();
+    expect(h.sent.some(f => f.peerId === B && f.envelope.tcm === 'call.end')).toBe(false);
+  });
+
+  it('a blocked INVITER with a different sid is still the whole-session refusal, row and all', async () => {
+    const h = harness({ blocked: new Set([STRANGER]) });
+    const sid = ulid('SB3');
+    await joined(h, sid);
+    await h.deliver(STRANGER, ginvite({ sid: ulid('SB4'), cid: ulid('CB4'), r: [STRANGER, SELF] }));
+    expect(h.logs.map(r => r.reason)).toEqual(['blocked']);
+    expect(h.co.view!.sid).toBe(sid);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `call_offers` holds only what the reducer ADMITTED. The persist used to run
+// for every ringable invite BEFORE the verdict, so a stranger's SDP —
+// fingerprint and candidate addresses — sat on disk for a call this device
+// refused busy, until the session's own close. The persist now rides the
+// effect list, first, so the persist-before-ring ordering the session row
+// already keeps is kept for the offer too.
+// ---------------------------------------------------------------------------
+
+describe('only an admitted invite reaches call_offers', () => {
+  const saved = (h: Harness, cid: string) => h.trace.filter(t => t === `saveOffer(${cid})`);
+
+  it("a stranger's ginvite into a live session is answered busy and NOT persisted", async () => {
+    const h = harness();
+    const sid = await h.co.startGroupCall([B, C], false);
+    await h.co.whenIdle();
+    const strangerCid = ulid('G14S');
+
+    await h.deliver(STRANGER, ginvite({ sid, cid: strangerCid, r: [STRANGER, SELF] }));
+
+    expect(
+      h.sent.filter(
+        f => f.peerId === STRANGER && f.envelope.tcm === 'call.end' && f.envelope.r === 'busy',
+      ),
+    ).toHaveLength(1);
+    expect(saved(h, strangerCid)).toHaveLength(0);
+    expect(h.co.view!.sid).toBe(sid);
+  });
+
+  it('a fresh ring is persisted, once, and before the CallKit report', async () => {
+    const h = harness();
+    const sid = ulid('G14R');
+    const cid = ulid('G14C');
+    await h.deliver(STARTER, ginvite({ sid, cid, r: [STARTER, SELF, B] }));
+
+    const save = h.trace.indexOf(`saveOffer(${cid})`);
+    const report = h.trace.findIndex(t => t.startsWith('reportIncomingCall('));
+    expect(save).toBeGreaterThanOrEqual(0);
+    expect(report).toBeGreaterThan(save);
+
+    // A redelivered frame is normal (§5.6) and persists nothing twice.
+    await h.deliver(STARTER, ginvite({ sid, cid, r: [STARTER, SELF, B] }));
+    expect(saved(h, cid)).toHaveLength(1);
+  });
+
+  it("a member's leg offer into the ringing session is held AND persisted", async () => {
+    const h = harness();
+    const sid = ulid('G14H');
+    await h.deliver(STARTER, ginvite({ sid, cid: ulid('G14C1'), r: [STARTER, SELF, B] }));
+    const cidB = ulid('G14CB');
+
+    await h.deliver(B, ginvite({ sid, cid: cidB, r: [STARTER, SELF, B] }));
+
+    expect(h.native.createAnswer).not.toHaveBeenCalled(); // held, not answered (R2)
+    expect(saved(h, cidB)).toHaveLength(1);
+  });
+
+  it("the starter's one re-offer swap is persisted; the refused second one is not", async () => {
+    const h = harness();
+    const sid = ulid('G14W');
+    const first = ulid('G14W1');
+    const second = ulid('G14W2');
+    const third = ulid('G14W3');
+    await h.deliver(STARTER, ginvite({ sid, cid: first, r: [STARTER, SELF] }));
+    await h.deliver(STARTER, ginvite({ sid, cid: second, r: [STARTER, SELF] }));
+    expect(saved(h, second)).toHaveLength(1);
+
+    await h.deliver(STARTER, ginvite({ sid, cid: third, r: [STARTER, SELF] }));
+
+    expect(
+      h.sent.filter(
+        f =>
+          f.peerId === STARTER &&
+          f.envelope.tcm === 'call.end' &&
+          f.envelope.cid === third &&
+          f.envelope.r === 'busy',
+      ),
+    ).toHaveLength(1);
+    expect(saved(h, third)).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the CallKit CONNECT report is the starter's. `reportOutgoingConnected` is
+// `reportOutgoingCall(with:connectedAt:)`, a fact about an OUTGOING call; an
+// incoming session's CXCall was connected by its answer, and filing the
+// outgoing transition against it was wrong by contract. The reducer's guard
+// is `starterId === selfId`; this is the coordinator-level half, against the
+// native fake.
+// ---------------------------------------------------------------------------
+
+describe('no outgoing-connected report for an incoming session', () => {
+  it("an answered incoming session's first connected leg reports nothing to CallKit, and still latches", async () => {
+    const h = harness();
+    const sid = ulid('G16S');
+    const cid = ulid('G16C');
+    await h.deliver(STARTER, ginvite({ sid, cid, r: [STARTER, SELF] }));
+    expect(h.native.reportIncomingCall).toHaveBeenCalledTimes(1);
+    await h.co.answer();
+    await h.co.whenIdle();
+
+    await h.co.onIceStateChanged(cid, 'connected');
+    await h.co.whenIdle();
+
+    expect(h.co.view!.legs.find(l => l.peerId === STARTER)!.phase).toBe('connected');
+    expect(h.co.view!.connectedAt).not.toBeNull(); // the aggregate's own latch is unchanged
+    expect(h.native.reportOutgoingConnected).not.toHaveBeenCalled();
+    expect(h.native.reportOutgoingCall).not.toHaveBeenCalled();
   });
 });

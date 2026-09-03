@@ -2089,3 +2089,148 @@ beforeEach(() => {
 afterEach(() => {
   jest.useRealTimers();
 });
+
+describe('the header while the call is being repaired, and who it is with', () => {
+  it('says "Reconnecting…", not "Ending…", while every failed leg has a re-offer pending', () => {
+    // All legs failed with R6 repairs armed is a call that is alive and
+    // about to re-dial; the fold read "Ending…" for it. The flag is the
+    // coordinator's (its timers), published on the view.
+    const failed = [leg(ANA, 'failed'), leg(BEN, 'failed')];
+    expect(sessionStatusLabel(view({ legs: failed, repairing: true }))).toBe('Reconnecting…');
+    expect(sessionStatusLabel(view({ legs: failed }))).toBe('Ending…');
+    expect(sessionStatusLabel(view({ legs: failed, repairing: false }))).toBe('Ending…');
+
+    const { tree } = render({ view: view({ legs: failed, repairing: true }) });
+    const text = renderedText(tree);
+    expect(text).toContain('Reconnecting…');
+    expect(text).not.toContain('Ending…');
+  });
+
+  it('a live leg still outranks the repair flag', () => {
+    expect(
+      sessionStatusLabel(view({ legs: [leg(ANA, 'connected'), leg(BEN, 'failed')], repairing: true })),
+    ).toBe('Connected');
+  });
+
+  it('names only the people still on the call in the title', () => {
+    // After two of three left, "Ana and 2 others" named a call that no longer
+    // existed; the departed keep their tiles, not their seat in the title.
+    const gone = render({
+      view: view({
+        roster: [ME, ANA, BEN, CARA],
+        legs: [leg(ANA, 'connected'), leg(BEN, 'left'), leg(CARA, 'gone')],
+      }),
+    });
+    expect(renderedText(gone.tree)).not.toMatch(/others?\b/);
+
+    const two = render({
+      view: view({
+        roster: [ME, ANA, BEN, CARA],
+        legs: [leg(ANA, 'connected'), leg(BEN, 'connected'), leg(CARA, 'declined')],
+      }),
+    });
+    expect(renderedText(two.tree)).toContain('Ana and Ben');
+    expect(renderedText(two.tree)).not.toContain('Ana and 2 others');
+
+    // A room's name still outranks the listing.
+    const room = render({
+      roomName: 'Kitchen',
+      view: view({
+        roomId: ROOM,
+        roster: [ME, ANA, BEN],
+        legs: [leg(ANA, 'connected'), leg(BEN, 'left')],
+      }),
+    });
+    expect(renderedText(room.tree)).toContain('Kitchen');
+  });
+});
+
+describe('horizontal safe-area insets, and a grid that reads the width', () => {
+  const P5 = ulid('GC15P5');
+  const P6 = ulid('GC15P6');
+  const six = () =>
+    view({
+      roster: [ME, ANA, BEN, CARA, P5, P6],
+      legs: [
+        leg(ANA, 'connected'),
+        leg(BEN, 'connected'),
+        leg(CARA, 'connected'),
+        leg(P5, 'connected'),
+        leg(P6, 'connected'),
+      ],
+    });
+
+  function renderIn(
+    metrics: {
+      frame: { x: number; y: number; width: number; height: number };
+      insets: { top: number; left: number; right: number; bottom: number };
+    },
+    v: GroupCallView,
+  ) {
+    let tree!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      tree = ReactTestRenderer.create(
+        <SafeAreaProvider initialMetrics={metrics}>
+          <Harness
+            initial={v}
+            nameFor={(id: string) => NAMES[id] ?? null}
+            onToggleMute={jest.fn()}
+            onToggleSpeaker={jest.fn()}
+            onEnd={jest.fn()}
+            now={() => T}
+          />
+        </SafeAreaProvider>,
+      );
+    });
+    mounted.push(tree);
+    const root = tree.root.findByProps({ accessibilityLabel: 'Group call' });
+    const grid = tree.root.findByProps({ testID: 'group-call-grid' });
+    const bases = grid
+      .findAll(n => n.type === View && StyleSheet.flatten(n.props.style)?.flexBasis !== undefined)
+      .map(n => StyleSheet.flatten(n.props.style).flexBasis);
+    return { tree, rootStyle: StyleSheet.flatten(root.props.style), bases };
+  }
+
+  const LANDSCAPE = {
+    frame: { x: 0, y: 0, width: 844, height: 390 },
+    insets: { top: 0, left: 47, right: 47, bottom: 21 },
+  };
+  const PORTRAIT = {
+    frame: { x: 0, y: 0, width: 390, height: 844 },
+    insets: { top: 47, left: 0, right: 0, bottom: 34 },
+  };
+
+  it('pads the root by the horizontal insets, so nothing runs under the sensor housing sideways', () => {
+    const { rootStyle } = renderIn(LANDSCAPE, six());
+    expect(rootStyle.paddingLeft).toBe(47);
+    expect(rootStyle.paddingRight).toBe(47);
+    const portrait = renderIn(PORTRAIT, six());
+    expect(portrait.rootStyle.paddingLeft).toBe(0);
+    expect(portrait.rootStyle.paddingRight).toBe(0);
+  });
+
+  it('lays a six-way call out in one row of five sideways, and two columns upright', () => {
+    // 844 − 2×47 = 750 of width: five tiles fit in one row instead of the
+    // portrait grid's tall, narrow 2×3.
+    expect(renderIn(LANDSCAPE, six()).bases).toEqual(Array(5).fill(`${100 / 5}%`));
+    expect(renderIn(PORTRAIT, six()).bases).toEqual(Array(5).fill('50%'));
+  });
+
+  it('derives the column count from the width it has, upright shapes unchanged', () => {
+    const wide = { width: 750, height: 390 };
+    const narrow = { width: 568, height: 320 };
+    const upright = { width: 390, height: 844 };
+    expect(gridColumns(2, wide)).toBe(1); // still the 1:1 layout
+    expect(gridColumns(3, wide)).toBe(2);
+    expect(gridColumns(4, wide)).toBe(3);
+    expect(gridColumns(6, wide)).toBe(5);
+    expect(gridRows(6, wide)).toBe(1);
+    expect(gridColumns(6, narrow)).toBe(4);
+    expect(gridRows(6, narrow)).toBe(2);
+    expect(gridColumns(4, upright)).toBe(2);
+    expect(gridColumns(6, upright)).toBe(2);
+    expect(gridRows(6, upright)).toBe(3);
+    // A tablet upright is upright: the §9 shape, not a width-driven sprawl.
+    expect(gridColumns(6, { width: 820, height: 1180 })).toBe(2);
+  });
+});

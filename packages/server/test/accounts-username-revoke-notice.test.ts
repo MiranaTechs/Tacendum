@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { AccountsNotice, normalizeUsernameIdentifier, usernameSkeleton } from '@tacendum/shared';
-import { USERNAME_CLAIM_KEY_PREFIX, type DataLayer } from '../src/db/data.js';
+import { USERNAME_CLAIM_KEY_PREFIX, type TestOnlyDataLayer } from '../src/db/data.js';
 import { activeNameskelClaimKeys, activeUsernameClaimKeys } from '../src/opaque-ref.js';
 import { notifyUsernameRevoked, revokeUsernameAndNotify } from '../src/handlers/username.js';
 import { allQueued, makeMemoryDb, makeTestDeps, type TestDeps } from './helpers.js';
@@ -38,7 +38,7 @@ interface Acct {
   userId: string;
 }
 
-async function mkAcct(db: DataLayer, deps: TestDeps): Promise<Acct> {
+async function mkAcct(db: TestOnlyDataLayer, deps: TestDeps): Promise<Acct> {
   const userId = uid();
   const born = await db.getOrCreateUserByIdentityKey(`idkey-rv-${userId}`, userId, deps.now());
   expect(born.kind).toBe('ok');
@@ -49,7 +49,7 @@ async function mkAcct(db: DataLayer, deps: TestDeps): Promise<Acct> {
  * accounts-recovery seeding), holding `name` through the real claim
  * transaction (the data layer's own CAS — the handler's gate is the business, not this suite's). */
 async function mkHolderGroup(
-  db: DataLayer,
+  db: TestOnlyDataLayer,
   deps: TestDeps,
   name: string,
 ): Promise<{ phone: Acct; tablet: Acct; groupId: string; claimKeys: string[] }> {
@@ -99,7 +99,7 @@ async function mkHolderGroup(
   return { phone, tablet, groupId, claimKeys };
 }
 
-async function noticesFor(db: DataLayer, userId: string): Promise<AccountsNotice[]> {
+async function noticesFor(db: TestOnlyDataLayer, userId: string): Promise<AccountsNotice[]> {
   return (await allQueued(db, userId))
     .filter((m) => m.type === 'accounts')
     .map((m) => AccountsNotice.parse(JSON.parse(Buffer.from(m.payload, 'base64').toString())));
@@ -186,7 +186,7 @@ describe('revokeUsernameAndNotify — the ops twin', () => {
     const db = makeMemoryDb();
     const deps = makeTestDeps(db);
     const holder = await mkHolderGroup(db, deps, `dave${SUFFIX}d`);
-    const failing: DataLayer = {
+    const failing: TestOnlyDataLayer = {
       ...db,
       enqueueMessage: async (msg, opts) => {
         if (msg.recipientId === holder.tablet.userId) throw new Error('injected enqueue failure');
@@ -209,7 +209,7 @@ describe('revokeUsernameAndNotify — the ops twin', () => {
     const holder = await mkHolderGroup(db, deps, `frank${SUFFIX}f`);
     deps.advanceMs(3_600_000);
     let revokeCommitted = false;
-    const failing: DataLayer = {
+    const failing: TestOnlyDataLayer = {
       ...db,
       revokeUsername: async (input) => {
         const result = await db.revokeUsername(input);

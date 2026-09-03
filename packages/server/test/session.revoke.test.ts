@@ -57,8 +57,13 @@ async function stillWorks(token: string): Promise<boolean> {
   return (await authenticate(del('/v1/me', token), deps)) !== null;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   deps = makeTestDeps(makeMemoryDb());
+  // Both accounts EXIST: bearer validation now requires the row, so a
+  // session is only ever issued here for an account that is there to hold
+  // it.
+  await deps.db.createUser({ userId: USER, createdAt: deps.now() });
+  await deps.db.createUser({ userId: OTHER, createdAt: deps.now() });
 });
 
 describe('DELETE /v1/session — sign out', () => {
@@ -204,5 +209,28 @@ describe('POST /v1/auth — a new sign-in supersedes the old ones', () => {
 
     expect(await stillWorks(stale)).toBe(false);
     expect(await stillWorks(authToken)).toBe(true);
+  });
+});
+
+/**
+ * Bearer validation refused a TOMBSTONED row but answered "fine" for an ABSENT
+ * one, so a session that survived a racy delete — or any session of a revoked
+ * integration, whose row is deleted rather than tombstoned — kept working for up
+ * to 30 days on every route that never reads the user row: attachment mints,
+ * TURN credentials, WS tickets, reports, /v1/me. No row, no account, no session.
+ */
+describe('bearer validation requires the account row', () => {
+  it('a session whose user row is ABSENT does not authenticate', async () => {
+    const ghost = '01GH0STGH0STGH0STGH0STGH0S';
+    const token = await issue(ghost, 'tok-ghost');
+    expect(await deps.db.getUserById(ghost)).toBeUndefined();
+    expect(await stillWorks(token)).toBe(false);
+  });
+
+  it('a freshly created account authenticates on its very first request', async () => {
+    const fresh = '01FRESHFRESHFRESHFRESHFRES';
+    await deps.db.createUser({ userId: fresh, createdAt: deps.now() });
+    const token = await issue(fresh, 'tok-fresh');
+    expect(await stillWorks(token)).toBe(true);
   });
 });

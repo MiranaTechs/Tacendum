@@ -5,7 +5,7 @@ import { makeDocClient } from '../db/client.js';
 import { makeDataLayer } from '../db/data.js';
 import { log } from '../log.js';
 import { makeRateLimiter } from '../ratelimit.js';
-import { deleteAccountHandler } from '../handlers/account.js';
+import { deleteAccountRoute } from '../handlers/account.js';
 import { createReportHandler } from '../handlers/report.js';
 import { requireAuth } from '../handlers/auth.js';
 import { turnCredentialsHandler } from '../handlers/turn.js';
@@ -269,7 +269,9 @@ const routes: Route[] = [
   { method: 'POST', pattern: '/v1/auth', handler: authHandler },
   { method: 'PUT', pattern: '/v1/keys', handler: requireAuth(uploadKeysHandler) },
   { method: 'GET', pattern: '/v1/keys/:userId', handler: requireAuth(getPrekeyBundleHandler) },
-  { method: 'DELETE', pattern: '/v1/account', handler: requireAuth(deleteAccountHandler) },
+  // The deletion route's own wrapper (admits an absent-row session so a sweep
+  // that crashed after its row delete can be retried).
+  { method: 'DELETE', pattern: '/v1/account', handler: deleteAccountRoute },
   { method: 'POST', pattern: '/v1/reports', handler: requireAuth(createReportHandler) },
   { method: 'POST', pattern: '/v1/call-metrics', handler: requireAuth(callMetricsHandler) },
   { method: 'DELETE', pattern: '/v1/session', handler: requireAuth(deleteSessionHandler) },

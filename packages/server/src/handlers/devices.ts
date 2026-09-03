@@ -180,6 +180,17 @@ export const linkOfferInitHandler: AuthedHandler = async (event, deps, auth) => 
   // raceable classes are refused by the link transaction's
   // attribute_not_exists(groupId) condition.
   if (!ceremonyEligible(acceptor) || acceptor.groupId !== undefined) return accountsRefusal();
+  // THE RECIPIENT-KEYED CEILING: ceremonies aimed at THIS acceptor, taken
+  // here and again at submit. The offerer's bucket above bounds one
+  // attacker; this bounds what N free identities can do to one victim's row.
+  // Collapsed refusal, never a 429 — the key is not the caller's own
+  // (LIMITS.linkOfferRecipient).
+  if (
+    (await deps.rateLimit.take(`linkoffer-rcpt:${acceptorUserId}`, LIMITS.linkOfferRecipient)) >
+    0
+  ) {
+    return accountsRefusal();
+  }
 
   let groupId: string;
   let rosterEpoch: number;
@@ -208,17 +219,21 @@ export const linkOfferInitHandler: AuthedHandler = async (event, deps, auth) => 
   }
 
   const offerNonce = ulid();
-  const expiresAt = Math.floor(deps.now() / 1000) + LINK_OFFER_TTL_SECONDS;
-  const put = await deps.db.putLinkOfferInit({
-    offerNonce,
-    groupId,
-    offererUserId: auth.userId,
-    acceptorUserId,
-    acceptorClass,
-    ...(declaredOffererClass !== undefined ? { offererClass: declaredOffererClass } : {}),
-    rosterEpoch,
-    expiresAt,
-  });
+  const nowSeconds = Math.floor(deps.now() / 1000);
+  const expiresAt = nowSeconds + LINK_OFFER_TTL_SECONDS;
+  const put = await deps.db.putLinkOfferInit(
+    {
+      offerNonce,
+      groupId,
+      offererUserId: auth.userId,
+      acceptorUserId,
+      acceptorClass,
+      ...(declaredOffererClass !== undefined ? { offererClass: declaredOffererClass } : {}),
+      rosterEpoch,
+      expiresAt,
+    },
+    nowSeconds,
+  );
   if (put !== 'created') return accountsRefusal();
 
   // Opaque ref only — no ULID and no groupId reaches the retained log.

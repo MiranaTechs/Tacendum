@@ -19,8 +19,9 @@ import {
   IDKEY_CLAIM_PREFIX,
   LINK_INIT_KEY_PREFIX,
   LINK_OFFER_KEY_PREFIX,
-  makeDataLayer,
-  type DataLayer,
+  LINK_OFFER_POINTER_CAP,
+  makeTestOnlyDataLayer,
+  type TestOnlyDataLayer,
 } from '../src/db/data.js';
 import {
   authChallengeHandler,
@@ -59,7 +60,7 @@ import { allQueued, makeTestDeps, parseBody, type LogEntry, type TestDeps } from
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
 let doc: DynamoDBDocumentClient;
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 
 // Digits only (valid Crockford base32). The trailing '31' is a per-FILE
@@ -204,7 +205,7 @@ async function linkPair(deps: TestDeps, a: Acct, b: Acct): Promise<LinkOfferInit
 beforeAll(async () => {
   const client = makeDynamoClient();
   doc = makeDocClient(client);
-  const base = makeDataLayer(doc);
+  const base = makeTestOnlyDataLayer(doc);
   // Process-local flag override (see header): every OTHER method is the real
   // store. The routes under test read the flag through this exact call.
   db = { ...base, isAccountsFeatureEnabled: async () => true };
@@ -973,6 +974,131 @@ describe('revoke-with-tombstone', () => {
     const bRow = await rawRow(SERVER_TABLES.users, { userId: b.userId });
     expect(bRow?.tombstoned).toBe(true);
     expect(bRow?.formerGroupId).toBe(init.groupId);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The acceptor's reverse pointer is written on
+// the OFFERER's signature — and A is the caller — so any account that knew a
+// solo user's ULID could grow that user's row 10×/hour per free identity until
+// the 400 KB item cap bricked it, and nothing ever removed the pointer of an
+// offer B never accepted. Three layers, each driven against the real store.
+// ---------------------------------------------------------------------------
+
+describe('reverse-pointer growth is bounded', () => {
+  const submitFor = (deps: TestDeps, a: Acct, b: Acct, init: LinkOfferInitResponse) =>
+    linkOfferSubmitRoute(
+      post(a.token, {
+        offerNonce: init.offerNonce,
+        signature: sign('offer', offerTuple(init, a, b), a.key),
+      }),
+      deps,
+    );
+  const pointers = async (userId: string): Promise<Set<string>> =>
+    ((await rawRow(SERVER_TABLES.users, { userId }))?.linkOfferNonces as Set<string> | undefined) ??
+    new Set();
+
+  gated('LAYER 1 — a RECIPIENT-keyed budget bounds ceremonies aimed at one account: Sybil offerers exhaust `linkoffer-rcpt:<B>`, the refusal is the collapsed one, B\'s row holds only the admitted pointers, and the window refills on its own clock', async () => {
+    const deps = freshDeps();
+    const b = await mkAcct(deps);
+    const sybils = [await mkAcct(deps), await mkAcct(deps), await mkAcct(deps)];
+    // Init AND submit each charge B's window (capacity 5): two whole
+    // ceremonies fit, the third Sybil's submit is the sixth take — refused
+    // collapsed, through the one exit, with its OWN offerer budget untouched.
+    for (const a of sybils.slice(0, 2)) {
+      expect((await submitFor(deps, a, b, await initOffer(deps, a, b))).statusCode).toBe(200);
+    }
+    const third = await initOffer(deps, sybils[2]!, b);
+    expectRefused(await submitFor(deps, sybils[2]!, b, third));
+    expect((await pointers(b.userId)).size).toBe(2);
+    // An hour on the window has refilled (10/hour) and a fresh ceremony lands.
+    deps.advanceMs(3600 * 1000);
+    const fourth = await mkAcct(deps);
+    expect((await submitFor(deps, fourth, b, await initOffer(deps, fourth, b))).statusCode).toBe(200);
+    expect((await pointers(b.userId)).size).toBe(3);
+  });
+
+  gated('LAYER 2 — the pointer set is CAPPED at LINK_OFFER_POINTER_CAP as a transaction condition, and a FULL set self-heals: the refusing write reaps every nonce whose rows are gone or expired, then lands', async () => {
+    const deps = freshDeps();
+    const b = await mkAcct(deps);
+    const nowS = Math.floor(deps.now() / 1000);
+    // One offerer per ceremony, so only B's set — the row the caller does
+    // NOT own — approaches the cap.
+    const offerer = async (): Promise<string> => {
+      const id = uid();
+      canaries.add(id);
+      expect((await db.getOrCreateUserByIdentityKey(`idkey-${id}`, id, deps.now())).kind).toBe('ok');
+      return id;
+    };
+    const promote = async (expiresAt: number, at: number) => {
+      const offerNonce = uid();
+      expect(
+        await db.putLinkOfferInit(
+          {
+            offerNonce,
+            groupId: uid(),
+            offererUserId: await offerer(),
+            acceptorUserId: b.userId,
+            acceptorClass: 'tablet',
+            offererClass: 'phone',
+            rosterEpoch: 0,
+            expiresAt,
+          },
+          at,
+        ),
+      ).toBe('created');
+      return db.promoteLinkOfferInit(offerNonce, 'c2ln', at);
+    };
+    for (let i = 0; i < LINK_OFFER_POINTER_CAP; i++) {
+      expect(await promote(nowS + LINK_OFFER_TTL_SECONDS, nowS)).toBe('promoted');
+    }
+    expect((await pointers(b.userId)).size).toBe(LINK_OFFER_POINTER_CAP);
+    // One more while every earlier offer is still LIVE: refused at the
+    // condition — the row cannot grow past the cap however many push on it.
+    expect(await promote(nowS + LINK_OFFER_TTL_SECONDS, nowS)).toBe('pointer_cap');
+    expect((await pointers(b.userId)).size).toBe(LINK_OFFER_POINTER_CAP);
+    // Past every earlier expiry — rows physically present, DynamoDB Local
+    // reaps nothing — the refusing write reaps the dead pointers and lands.
+    const later = nowS + LINK_OFFER_TTL_SECONDS + 1;
+    expect(await promote(later + LINK_OFFER_TTL_SECONDS, later)).toBe('promoted');
+    expect((await pointers(b.userId)).size).toBe(1);
+  });
+
+  gated('LAYER 3 — an EXPIRED offer met at the refusing read reaps BOTH parties\' pointers; an expired INIT met at submit reaps the offerer\'s — the rows themselves stay for the TTL, refused at every read', async () => {
+    const deps = freshDeps();
+    const a = await mkAcct(deps);
+    const b = await mkAcct(deps);
+    const init = await initOffer(deps, a, b);
+    expect((await submitFor(deps, a, b, init)).statusCode).toBe(200);
+    expect((await pointers(a.userId)).has(init.offerNonce)).toBe(true);
+    expect((await pointers(b.userId)).has(init.offerNonce)).toBe(true);
+    deps.advanceMs((LINK_OFFER_TTL_SECONDS + 1) * 1000);
+    expectRefused(
+      await linkAcceptRoute(
+        post(b.token, {
+          offerNonce: init.offerNonce,
+          signature: sign('accept', { ...offerTuple(init, a, b), subjectIdentityPubKey: a.pub }, b.key),
+        }),
+        deps,
+      ),
+    );
+    expect((await pointers(a.userId)).has(init.offerNonce)).toBe(false);
+    expect((await pointers(b.userId)).has(init.offerNonce)).toBe(false);
+    // Pointer-only: the expired row is still physically present (DynamoDB
+    // Local reaps nothing) and still refused — every reader classifies it
+    // on its own terms, exactly as before.
+    expect(
+      await rawRow(SERVER_TABLES.sessions, { token: `${LINK_OFFER_KEY_PREFIX}${init.offerNonce}` }),
+    ).toBeDefined();
+    // The init-only half: opened, never submitted in time.
+    const stale = await initOffer(deps, a, b);
+    expect((await pointers(a.userId)).has(stale.offerNonce)).toBe(true);
+    deps.advanceMs((LINK_OFFER_TTL_SECONDS + 1) * 1000);
+    expectRefused(await submitFor(deps, a, b, stale));
+    expect((await pointers(a.userId)).has(stale.offerNonce)).toBe(false);
+    expect(
+      await rawRow(SERVER_TABLES.sessions, { token: `${LINK_INIT_KEY_PREFIX}${stale.offerNonce}` }),
+    ).toBeDefined();
   });
 });
 

@@ -32,21 +32,36 @@ interface Received {
 }
 
 /** A stand-in for api.push.apple.com that records requests and replies with
- * whatever the current test asks for. */
+ * whatever the current test asks for. `reply` may be a function of the
+ * request's index so a test can script a SEQUENCE (first 403, then 200);
+ * `'hang'` never answers, which is how an attempt is made to time out. */
+type Reply = { status: number; body?: string } | 'hang';
 let server: http2.Http2Server;
 let origin: string;
 let received: Received[] = [];
-let reply: { status: number; body?: string } = { status: 200 };
+let reply: Reply | ((index: number) => Reply) = { status: 200 };
+/** HTTP/2 sessions the stand-in has accepted — one per client dial. */
+let sessionsOpened = 0;
+/** Live server-side sessions, destroyed at teardown so a deliberately hung
+ * stream cannot hold `server.close()` open past the hook timeout. */
+const openSessions = new Set<http2.ServerHttp2Session>();
 
 beforeAll(async () => {
   server = http2.createServer();
+  server.on('session', session => {
+    sessionsOpened += 1;
+    openSessions.add(session);
+    session.on('close', () => openSessions.delete(session));
+  });
   server.on('stream', (stream, headers) => {
     let body = '';
     stream.on('data', chunk => (body += chunk));
     stream.on('end', () => {
-      received.push({ headers, body });
-      stream.respond({ ':status': reply.status });
-      stream.end(reply.body ?? '');
+      const index = received.push({ headers, body }) - 1;
+      const r = typeof reply === 'function' ? reply(index) : reply;
+      if (r === 'hang') return;
+      stream.respond({ ':status': r.status });
+      stream.end(r.body ?? '');
     });
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -54,12 +69,14 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  for (const session of openSessions) session.destroy();
   await new Promise<void>(resolve => server.close(() => resolve()));
 });
 
 beforeEach(() => {
   received = [];
   reply = { status: 200 };
+  sessionsOpened = 0;
 });
 
 const TOKEN = 'a'.repeat(64);
@@ -342,6 +359,214 @@ describe('an alert push for a message', () => {
     // The sender id is metadata the server already routes on; nothing else
     // legible may appear.
     expect(raw).not.toMatch(/ciphertext(?!")/i);
+    await client.close();
+  });
+});
+
+/**
+ * Apple refuses an ALERT payload over
+ * 4096 bytes with 413 PayloadTooLarge, and the alert used to embed the whole
+ * queued ciphertext (the frame schema allows 30 000 base64 chars). Any
+ * message over ~3.7 KB of ciphertext therefore raised NO banner at all — not
+ * even the generic one. The client trims the ciphertext out of an oversized
+ * body; the extension then takes its documented degraded path (an empty
+ * `t.payload` decodes, decrypts to nothing, and the generic body shows with
+ * the badge and collapse counters intact — NotificationService.swift). */
+describe('an alert that would exceed the 4 KB APNs cap', () => {
+  const BIG = {
+    from: '01ARZ3NDEKTSV4RRFFQ69G5SND',
+    ts: 1_700_000_000_000,
+    msgId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+    msgType: 'ciphertext',
+    // Schema-max ciphertext: MAX_PAYLOAD_B64_LENGTH in shared/frames.ts.
+    payload: 'A'.repeat(30_000),
+  };
+
+  it('ships without the ciphertext, under the cap, and still reports sent', async () => {
+    const logs: string[] = [];
+    const client = makeApnsClient({
+      credentials: CREDENTIALS,
+      origin,
+      log: event => logs.push(event),
+    });
+    const result = await client.sendAlert(TOKEN, BIG);
+
+    expect(result).toMatchObject({ outcome: 'sent' });
+    expect(received).toHaveLength(1);
+    const raw = received[0]!.body;
+    expect(Buffer.byteLength(raw)).toBeLessThanOrEqual(4096);
+    const body = JSON.parse(raw) as {
+      aps: Record<string, unknown>;
+      t: { from: string; ts: number; msgId: string; msgType: string; payload: string };
+    };
+    // The routing facts survive — the extension still runs its blocked-sender
+    // check and its badge/collapse bookkeeping off them — and `payload` is
+    // present but EMPTY, because the extension's decoder requires the field.
+    expect(body.t).toEqual({ ...BIG, payload: '' });
+    // `aps` is byte-identical to a small alert's.
+    expect(body.aps).toEqual({
+      alert: { title: 'Tacendum', body: 'New message' },
+      sound: 'default',
+      'mutable-content': 1,
+      'thread-id': BIG.from,
+    });
+    expect(received[0]!.headers['content-length']).toBe(String(Buffer.byteLength(raw)));
+    // Loud, and with no payload bytes in it.
+    expect(logs).toEqual(['apns_alert_payload_trimmed']);
+    await client.close();
+  });
+
+  it('leaves a small alert untouched and logs nothing', async () => {
+    const logs: string[] = [];
+    const client = makeApnsClient({
+      credentials: CREDENTIALS,
+      origin,
+      log: event => logs.push(event),
+    });
+    const small = { ...BIG, payload: 'Y2lwaGVydGV4dA==' };
+    await client.sendAlert(TOKEN, small);
+
+    const body = JSON.parse(received[0]!.body) as { t: typeof small };
+    expect(body.t.payload).toBe(small.payload);
+    expect(logs).toEqual([]);
+    await client.close();
+  });
+
+  it('retries a 413 exactly once without the ciphertext — Apple is the authority on its own cap', async () => {
+    // A body under our threshold that Apple still refuses (the cap has moved,
+    // or is measured differently): the second attempt drops the ciphertext.
+    reply = index =>
+      index === 0
+        ? { status: 413, body: JSON.stringify({ reason: 'PayloadTooLarge' }) }
+        : { status: 200 };
+    const client = makeApnsClient({ credentials: CREDENTIALS, origin });
+    const modest = { ...BIG, payload: 'A'.repeat(3_000) };
+    const result = await client.sendAlert(TOKEN, modest);
+
+    expect(result).toMatchObject({ outcome: 'sent' });
+    expect(received).toHaveLength(2);
+    expect((JSON.parse(received[0]!.body) as { t: typeof modest }).t.payload).toBe(modest.payload);
+    expect((JSON.parse(received[1]!.body) as { t: typeof modest }).t.payload).toBe('');
+    await client.close();
+  });
+
+  it('gives up after one trimmed retry if Apple still says 413', async () => {
+    reply = { status: 413, body: JSON.stringify({ reason: 'PayloadTooLarge' }) };
+    const client = makeApnsClient({ credentials: CREDENTIALS, origin });
+    const result = await client.sendAlert(TOKEN, BIG);
+
+    expect(result).toMatchObject({ outcome: 'failed', status: 413 });
+    expect(received).toHaveLength(1); // already trimmed: nothing left to drop
+    await client.close();
+  });
+});
+
+/**
+ * The per-attempt deadline used to cancel the
+ * STREAM and leave the session in place, so a warm container thawed with a
+ * TCP connection the peer had silently dropped kept reusing that dead session
+ * for every later wake until the kernel's retransmit timeout — minutes of
+ * calls to locked phones not ringing. The deadline now tears the session down
+ * so the next attempt dials fresh. */
+describe('a stalled session is not reused', () => {
+  it('dials a fresh session after an attempt times out', async () => {
+    reply = index => (index === 0 ? 'hang' : { status: 200 });
+    const client = makeApnsClient({
+      credentials: CREDENTIALS,
+      origin,
+      attemptTimeoutMs: 100,
+    });
+    const first = await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
+    expect(first).toMatchObject({ outcome: 'failed' });
+    expect(sessionsOpened).toBe(1);
+
+    const second = await client.sendVoip(TOKEN, { from: 'u', ts: 2 });
+    expect(second).toMatchObject({ outcome: 'sent' });
+    // The proof: a SECOND session, not a second stream on the first.
+    expect(sessionsOpened).toBe(2);
+    await client.close();
+  });
+
+  it('keeps reusing a healthy session between successful sends', async () => {
+    const client = makeApnsClient({ credentials: CREDENTIALS, origin });
+    await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
+    await client.sendVoip(TOKEN, { from: 'u', ts: 2 });
+    expect(received).toHaveLength(2);
+    expect(sessionsOpened).toBe(1);
+    await client.close();
+  });
+});
+
+/**
+ * A 403 ExpiredProviderToken / InvalidProviderToken / MissingProviderToken was
+ * classified `failed` and the cached JWT kept being served until
+ * TOKEN_REFRESH_MS — up to 50 minutes of every wake from that container failing
+ * on a token Apple had already rejected. Those three reasons now drop the cache
+ * and retry once with a fresh JWT. */
+describe('a provider-token 403 re-mints the JWT', () => {
+  /** A clock that moves a second per read, so a re-minted JWT carries a new
+   * `iat` and is distinguishable from the rejected one by more than the
+   * signature's randomness. */
+  function tickingClock() {
+    let t = 1_700_000_000_000;
+    return () => (t += 1000);
+  }
+
+  it('retries once with a fresh token on ExpiredProviderToken and succeeds', async () => {
+    reply = index =>
+      index === 0
+        ? { status: 403, body: JSON.stringify({ reason: 'ExpiredProviderToken' }) }
+        : { status: 200 };
+    const client = makeApnsClient({ credentials: CREDENTIALS, origin, now: tickingClock() });
+    const result = await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
+
+    expect(result).toMatchObject({ outcome: 'sent' });
+    expect(received).toHaveLength(2);
+    const [rejected, fresh] = received.map(r => String(r.headers.authorization));
+    expect(fresh).not.toBe(rejected);
+    expect(decodeJwt(fresh!.slice('bearer '.length)).payload.iat).toBeGreaterThan(
+      decodeJwt(rejected!.slice('bearer '.length)).payload.iat,
+    );
+    // The fresh token is the one now cached: the next send reuses it.
+    await client.sendVoip(TOKEN, { from: 'u', ts: 2 });
+    expect(String(received[2]!.headers.authorization)).toBe(fresh);
+    await client.close();
+  });
+
+  it('does the same on the alert arm', async () => {
+    reply = index =>
+      index === 0
+        ? { status: 403, body: JSON.stringify({ reason: 'InvalidProviderToken' }) }
+        : { status: 200 };
+    const client = makeApnsClient({ credentials: CREDENTIALS, origin, now: tickingClock() });
+    const result = await client.sendAlert(TOKEN, {
+      from: 'u',
+      ts: 1,
+      msgId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      msgType: 'ciphertext',
+      payload: 'Y2lwaGVydGV4dA==',
+    });
+    expect(result).toMatchObject({ outcome: 'sent' });
+    expect(received).toHaveLength(2);
+    expect(received[1]!.headers.authorization).not.toBe(received[0]!.headers.authorization);
+    await client.close();
+  });
+
+  it('does NOT retry a 403 for any other reason — a new token would not fix it', async () => {
+    reply = { status: 403, body: JSON.stringify({ reason: 'TopicDisallowed' }) };
+    const client = makeApnsClient({ credentials: CREDENTIALS, origin, now: tickingClock() });
+    const result = await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
+    expect(result).toMatchObject({ outcome: 'failed', status: 403, reason: 'TopicDisallowed' });
+    expect(received).toHaveLength(1);
+    await client.close();
+  });
+
+  it('gives up after one re-mint if Apple rejects the fresh token too', async () => {
+    reply = { status: 403, body: JSON.stringify({ reason: 'ExpiredProviderToken' }) };
+    const client = makeApnsClient({ credentials: CREDENTIALS, origin, now: tickingClock() });
+    const result = await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
+    expect(result).toMatchObject({ outcome: 'failed', status: 403 });
+    expect(received).toHaveLength(2);
     await client.close();
   });
 });

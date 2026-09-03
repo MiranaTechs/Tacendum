@@ -94,15 +94,18 @@ describe('rate limiting', () => {
   it('prekey fetch: per-(caller,target) limit; a different target resets', async () => {
     const db = makeMemoryDb();
     const deps = makeTestDeps(db);
-    await seedTarget(db, 'targetA');
-    await seedTarget(db, 'targetB');
+    // ULID-shaped targets (the path param is shape-validated).
+    const targetA = '01TARGETA00000000000000000';
+    const targetB = '01TARGETB00000000000000000';
+    await seedTarget(db, targetA);
+    await seedTarget(db, targetB);
     const caller: AuthContext = { userId: 'caller' };
     for (let i = 0; i < LIMITS.prekeyFetch.capacity; i++) {
-      expect((await getPrekeyBundleHandler(bundleEvent('targetA'), deps, caller)).statusCode).toBe(200);
+      expect((await getPrekeyBundleHandler(bundleEvent(targetA), deps, caller)).statusCode).toBe(200);
     }
-    expect((await getPrekeyBundleHandler(bundleEvent('targetA'), deps, caller)).statusCode).toBe(429);
+    expect((await getPrekeyBundleHandler(bundleEvent(targetA), deps, caller)).statusCode).toBe(429);
     // Same caller, different target -> separate bucket.
-    expect((await getPrekeyBundleHandler(bundleEvent('targetB'), deps, caller)).statusCode).toBe(200);
+    expect((await getPrekeyBundleHandler(bundleEvent(targetB), deps, caller)).statusCode).toBe(200);
   });
 });
 

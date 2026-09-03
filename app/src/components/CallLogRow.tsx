@@ -40,6 +40,15 @@ export function callLabel(row: CallLogRowData): string {
   const kind = row.kind === 'video' ? 'Video call' : 'Audio call';
   if (row.missed) return row.direction === 'in' ? `Missed ${kind.toLowerCase()}` : `${kind}, no answer`;
   switch (row.reason) {
+    // `missed` is only ever true for the RECEIVING side (`logRow` in the
+    // reducer), so the caller's rows arrive here with it false: an outgoing
+    // call that rang out, or that the caller gave up on, used to render as a
+    // bare "Outgoing audio call" with no duration — the "no answer" copy
+    // above was unreachable from this side. Branched on the reason instead.
+    case 'timeout':
+      return row.direction === 'out' ? `${kind}, no answer` : `Missed ${kind.toLowerCase()}`;
+    case 'cancelled':
+      return row.direction === 'out' ? `${kind}, cancelled` : `Missed ${kind.toLowerCase()}`;
     case 'decline':
       return row.direction === 'in' ? `${kind} declined` : `${kind} declined`;
     case 'busy':

@@ -20,6 +20,7 @@ import {
   type DataLayer,
   type GroupQuotaContext,
   type GroupReachPin,
+  type QueuedMessage,
   type UserRecord,
 } from '../db/data.js';
 import type { SessionGuard } from './session-guard.js';
@@ -800,6 +801,43 @@ export type DrainResult =
 export const DRAIN_SESSION_RECHECK_MS = 5_000;
 
 /**
+ * THE URGENT LANE of a fresh drain. The
+ * queue was walked strictly in msgId order at ~10 ms a post, 2 000 posts a
+ * slice, and an established pair may hold 5 000 rows: a callee reconnecting
+ * behind a backlog got the VoIP push, CallKit showed the placeholder, the
+ * app connected — and the `call.offer` arrived after the backlog, past the
+ * CallKit watchdog and past `offerIsRingable`. The push produced a "missed
+ * call" while the caller sat in "Calling…". The row never even recorded
+ * `urgent`, so the drain could not find the offer.
+ *
+ * Now a FRESH drain (no cursor) posts the partition's urgent rows first —
+ * call signalling, the only frames a client marks urgent — then runs the
+ * ordered walk, skipping what the lane posted. Two bounds keep the lane a
+ * lane: `maxItems` posts (a ringing phone needs one offer inside the first
+ * second, not fifty; anything past the cap arrives in order, exactly as
+ * before) and `maxScanned` rows the filtered Query may evaluate (a flooded
+ * partition must not turn the lane into a full scan). Continuations skip the
+ * lane: the fresh slice already posted those rows, and a continuation's
+ * ordered walk re-posting them is the same duplicate a re-drain is — clients
+ * dedupe by msgId, and the recipient's ack has usually deleted them by then.
+ */
+export const DRAIN_URGENT_LANE = {
+  maxItems: 50,
+  maxScanned: 5_000,
+} as const;
+
+/**
+ * Distinct SENDERS whose connection row one slice will look up for the
+ * delivered receipt. Each lookup is a
+ * strongly consistent GetItem (plus one session read on an enforcing host),
+ * cached for the rest of the slice; an honest backlog has a handful of
+ * correspondents, so the cap is never met — it exists so a fan-in of 2 000
+ * one-message strangers (the stranger aggregate admits 2 500) cannot double
+ * the slice's read cost. A sender past the cap gets no receipt THIS slice;
+ * their message still drains. */
+export const DRAIN_RECEIPT_LOOKUP_CAP = 64;
+
+/**
  * Replay queued messages for `userId` to `connectionId` in msgId
  * (chronological) order, from `afterMsgId` (exclusive) when resuming, under
  * `budget` when given. Queued rows are NOT deleted on drain; only a client
@@ -818,7 +856,10 @@ export const DRAIN_SESSION_RECHECK_MS = 5_000;
 export async function drainQueuedMessages(
   userId: string,
   connectionId: string,
-  deps: Pick<WsDeps, 'db' | 'sender' | 'now'>,
+  // `log` is optional so every existing caller stays valid: it carries only
+  // the drain's best-effort events (a receipt a sender's socket refused) —
+  // routing metadata, never an id or a payload (rule 4).
+  deps: Pick<WsDeps, 'db' | 'sender' | 'now'> & { log?: WsDeps['log'] },
   budget?: DrainBudget,
   afterMsgId?: string,
   session?: { guard: SessionGuard; digest: string },
@@ -871,6 +912,146 @@ export async function drainQueuedMessages(
     };
   };
   if (budgetBound()) return boundResult(); // before the FIRST fetch
+
+  /**
+   * The wire frame for a queued row. A server-minted accounts notice
+   * drains as its own frame type — never as a `msg` a client would feed to
+   * libsignal. Clients cannot enqueue one
+   * (SendFrame.msgType cannot spell it), so that branch serves only rows the
+   * ceremony/roster code wrote. Built field-by-field: the row's bookkeeping
+   * (qNonce, msgBytes, urgent) never reaches the wire.
+   */
+  const frameFor = (m: QueuedMessage): MsgFrame | AccountsNoticeFrame =>
+    m.type === 'accounts'
+      ? { type: 'accounts', from: m.senderId, msgId: m.msgId, payload: m.payload, ts: m.ts }
+      : {
+          type: 'msg',
+          from: m.senderId,
+          msgId: m.msgId,
+          msgType: m.type,
+          payload: m.payload,
+          ts: m.ts,
+        };
+  /**
+   * The in-slice cadence recheck (see DRAIN_SESSION_RECHECK_MS): a revoke
+   * landing mid-slice stops the feed before the next post. True when no
+   * recheck is due yet, or when the session is still live.
+   */
+  const sessionStillActive = async (): Promise<boolean> => {
+    if (session === undefined || deps.now() - lastSessionCheckMs < DRAIN_SESSION_RECHECK_MS) {
+      return true;
+    }
+    lastSessionCheckMs = deps.now();
+    return session.guard.active(session.digest, deps.now());
+  };
+  /**
+   * THE DELIVERED RECEIPT. The server posted exactly one receipt per send —
+   * `sent` when nobody was listening — and nothing at drain, so a message
+   * queued while the recipient was offline (on iOS: whenever the app was
+   * backgrounded) stayed `sent` on the sender's screen for good, and the
+   * client's read-receipt path, gated on `delivered`, threw the peer's read
+   * away. Each successful `msg` post now earns the ORIGINAL sender the same
+   * `delivered` receipt handleSend would have posted, on the sender's live
+   * socket.
+   *
+   * Best-effort in every direction, and never the drain's problem: the
+   * sender's socket is looked up once per distinct sender per slice (cached,
+   * and capped — DRAIN_RECEIPT_LOOKUP_CAP); an offline sender gets nothing; a
+   * Gone or faulting post silences that sender for the slice and is never a
+   * reason to reap — the drain deletes no rows, connection rows included, and
+   * a real send's Gone post reaps under its own grace rule. The gate live
+   * delivery applies (sessionAuthorizesDelivery) holds here too: on an
+   * enforcing host a digestless row fails closed and a revoked session
+   * receives nothing, a receipt included. Server-minted accounts notices earn
+   * no receipt — no client awaits one. The wall-clock cost of a receipt post
+   * is bound by the slice's deadline like every other post. */
+  const senderSockets = new Map<string, string | null>();
+  let senderLookups = 0;
+  const receiptToSender = async (m: QueuedMessage): Promise<void> => {
+    if (m.type === 'accounts') return;
+    let target = senderSockets.get(m.senderId);
+    if (target === undefined) {
+      if (senderLookups >= DRAIN_RECEIPT_LOOKUP_CAP) return;
+      senderLookups += 1;
+      target = null;
+      try {
+        const conn = await deps.db.getConnection(m.senderId);
+        if (
+          conn !== undefined &&
+          (session === undefined ||
+            (conn.sessionDigest !== undefined &&
+              (await session.guard.active(conn.sessionDigest, deps.now()))))
+        ) {
+          target = conn.connectionId;
+        }
+      } catch (err) {
+        // The error CLASS only (rule 4) — never the sender, the id, or the frame.
+        deps.log?.('ws_drain_receipt_lookup_failed', {
+          error: err instanceof Error ? err.name : 'unknown',
+        });
+      }
+      senderSockets.set(m.senderId, target);
+    }
+    if (target === null) return;
+    const receipt: ReceiptFrame = { type: 'receipt', msgId: m.msgId, state: 'delivered' };
+    try {
+      if (!(await deps.sender.post(target, receipt))) senderSockets.set(m.senderId, null);
+    } catch (err) {
+      senderSockets.set(m.senderId, null);
+      deps.log?.('ws_drain_receipt_post_failed', {
+        error: err instanceof Error ? err.name : 'unknown',
+      });
+    }
+  };
+
+  // THE URGENT LANE (see DRAIN_URGENT_LANE): a FRESH drain posts the
+  // partition's urgent rows before the ordered walk. Its posts count toward
+  // the slice's item and byte accounting like any other, but it takes no
+  // position in the ordered walk: `lastPosted`/`lastExamined` stay untouched,
+  // so a clock or scan bind mid-lane returns boundResult() with NO cursor — no
+  // progress claimed, the successor re-runs the lane with a full clock and
+  // re-posts at most `laneCap` frames clients dedupe by msgId. The ordered
+  // walk's first post stays unconditional (forward progress by construction),
+  // and it skips every id the lane posted.
+  const postedAhead = new Set<string>();
+  if (afterMsgId === undefined) {
+    const laneCap = Math.min(
+      DRAIN_URGENT_LANE.maxItems,
+      budget?.maxItems ?? DRAIN_URGENT_LANE.maxItems,
+    );
+    let laneDone = false;
+    for await (const page of deps.db.listUrgentQueuedMessages(
+      userId,
+      DRAIN_URGENT_LANE.maxScanned,
+    )) {
+      for (const m of page) {
+        if (postedAhead.size >= laneCap) {
+          laneDone = true;
+          break;
+        }
+        if (budgetBound()) return boundResult();
+        if (m.expiresAt <= nowSec) continue;
+        if (!(await sessionStillActive())) {
+          return { outcome: 'session_revoked', postedItems, postedBytes };
+        }
+        const size = Buffer.byteLength(m.payload, 'utf8');
+        // The byte budget binds the lane the way it binds the walk — but by
+        // STOPPING the lane, not the slice, so the walk's unconditional first
+        // post still moves the cursor.
+        if (budget !== undefined && postedItems > 0 && postedBytes + size > budget.maxBytes) {
+          laneDone = true;
+          break;
+        }
+        const posted = await deps.sender.post(connectionId, frameFor(m));
+        if (!posted) return { outcome: 'socket_gone', postedItems, postedBytes };
+        postedItems += 1;
+        postedBytes += size;
+        postedAhead.add(m.msgId);
+        await receiptToSender(m);
+      }
+      if (laneDone) break;
+    }
+  }
   // One page at a time, posted before the next page is fetched. The queue's
   // size is attacker-controlled, so the drain must never hold more than a page:
   // materialising the whole list first meant a flooded queue killed the drain
@@ -893,16 +1074,16 @@ export async function drainQueuedMessages(
       lastExamined = m.msgId;
       scanned += 1;
       if (m.expiresAt <= nowSec) continue;
+      if (postedAhead.has(m.msgId)) {
+        // Posted by the urgent lane this slice: no second post, and the
+        // cursor passes it exactly as if the walk had posted it.
+        lastPosted = m.msgId;
+        continue;
+      }
       // The in-slice cadence recheck (see DRAIN_SESSION_RECHECK_MS): a
       // revoke landing mid-slice stops the feed here, before the next post.
-      if (
-        session !== undefined &&
-        deps.now() - lastSessionCheckMs >= DRAIN_SESSION_RECHECK_MS
-      ) {
-        lastSessionCheckMs = deps.now();
-        if (!(await session.guard.active(session.digest, deps.now()))) {
-          return { outcome: 'session_revoked', postedItems, postedBytes };
-        }
+      if (!(await sessionStillActive())) {
+        return { outcome: 'session_revoked', postedItems, postedBytes };
       }
       const size = Buffer.byteLength(m.payload, 'utf8');
       // The item/byte budget binds POSTED work (the deadline moved to the
@@ -916,26 +1097,12 @@ export async function drainQueuedMessages(
           return { outcome: 'budget_exhausted', cursor: lastPosted, postedItems, postedBytes };
         }
       }
-      // A server-minted accounts notice drains as its
-      // own frame type — never as a `msg` a client would feed to libsignal.
-      // Clients cannot enqueue one (SendFrame.msgType cannot spell it), so
-      // this branch serves only rows the ceremony/roster code wrote.
-      const frame: MsgFrame | AccountsNoticeFrame =
-        m.type === 'accounts'
-          ? { type: 'accounts', from: m.senderId, msgId: m.msgId, payload: m.payload, ts: m.ts }
-          : {
-              type: 'msg',
-              from: m.senderId,
-              msgId: m.msgId,
-              msgType: m.type,
-              payload: m.payload,
-              ts: m.ts,
-            };
-      const posted = await deps.sender.post(connectionId, frame);
+      const posted = await deps.sender.post(connectionId, frameFor(m));
       if (!posted) return { outcome: 'socket_gone', postedItems, postedBytes };
       postedItems += 1;
       postedBytes += size;
       lastPosted = m.msgId;
+      await receiptToSender(m);
     }
     // Before the NEXT page fetch: a deadline that expired while
     // this page was being posted must not buy one more query.
@@ -1021,6 +1188,7 @@ export async function wsDefaultHandler(event: WsMessageEvent, deps: WsDeps): Pro
     raw = JSON.parse(event.body);
   } catch {
     await postError(event, deps, 'invalid_frame', 'frame must be valid JSON');
+    await chargeRefusedFrame(event, deps);
     return { statusCode: 400 };
   }
 
@@ -1029,6 +1197,7 @@ export async function wsDefaultHandler(event: WsMessageEvent, deps: WsDeps): Pro
     // Zod issues never include the payload value, only paths/messages.
     const detail = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
     await postError(event, deps, 'invalid_frame', detail);
+    await chargeRefusedFrame(event, deps);
     return { statusCode: 400 };
   }
 
@@ -1725,6 +1894,9 @@ async function handleSend(frame: SendFrame, event: WsMessageEvent, deps: WsDeps)
         payload: frame.payload,
         ts: nowMs,
         expiresAt: Math.floor(nowMs / 1000) + MESSAGE_TTL_SECONDS,
+        // The urgent bit rides the ROW: the reconnect drain posts urgent
+        // rows ahead of the backlog. Present-and-true or absent.
+        ...(frame.urgent === true ? { urgent: true as const } : {}),
       },
       {
         establishesCorrespondence,
@@ -1886,7 +2058,23 @@ async function handleSend(frame: SendFrame, event: WsMessageEvent, deps: WsDeps)
       payload: frame.payload,
       ts: nowMs,
     };
-    delivered = await deps.sender.post(conn.connectionId, msg);
+    // A NON-GONE fault on the post — a management-API throttle, a 5xx — is
+    // "not delivered", never a 500. It used to propagate: the row was
+    // already enqueued, the sender got neither a receipt nor an error frame,
+    // and its resend was an idempotent duplicate (`inserted:false`), which
+    // gated the banner wake off — the message drained later and never
+    // notified. Falling through to the wake/receipt logic below is the whole
+    // fix; `postFaulted` keeps the reap out of it, because a fault says
+    // nothing about whether the socket is alive.
+    let postFaulted = false;
+    try {
+      delivered = await deps.sender.post(conn.connectionId, msg);
+    } catch (err) {
+      postFaulted = true;
+      delivered = false;
+      // The error CLASS only (rule 4) — never the frame or an id.
+      deps.log('ws_live_post_failed', { error: err instanceof Error ? err.name : 'unknown' });
+    }
     if (delivered && frame.urgent === true) {
       // THE FROZEN-CALLEE HOLE (hardware testing). `post()`
       // resolving true means API Gateway took the bytes for a connection it
@@ -1920,7 +2108,7 @@ async function handleSend(frame: SendFrame, event: WsMessageEvent, deps: WsDeps)
       );
     }
     if (!delivered) {
-      if (conn.connectedAt <= nowMs - CONNECTION_REAP_GRACE_MS) {
+      if (!postFaulted && conn.connectedAt <= nowMs - CONNECTION_REAP_GRACE_MS) {
         // The recipient's socket is gone but $disconnect never fired for it.
         // Conditional on the exact connectionId we posted to: a reconnect
         // racing this send keeps its newer row. Rows younger than the grace
@@ -1967,8 +2155,15 @@ async function handleSend(frame: SendFrame, event: WsMessageEvent, deps: WsDeps)
         // suppressing on the row's existence alone can silence the ONLY wake
         // an urgent call offer gets. Posting is definitive either way — it
         // lands (delivered), or the newer socket is dead too and the wake
-        // decision below proceeds exactly as if no one were listening.
-        delivered = await deps.sender.post(fresh.connectionId, msg);
+        // decision below proceeds exactly as if no one were listening. A
+        // fault here reads as not-delivered for the same reason as above; no
+        // reap is armed on this branch either way.
+        try {
+          delivered = await deps.sender.post(fresh.connectionId, msg);
+        } catch (err) {
+          delivered = false;
+          deps.log('ws_live_post_failed', { error: err instanceof Error ? err.name : 'unknown' });
+        }
         // Same gate split as the no-connection branches above:
         // a replayed msgId aimed at a recipient with a dead-but-unreaped
         // connection row lands in THIS branch, not the no-connection one, so
@@ -2037,7 +2232,17 @@ async function handleSend(frame: SendFrame, event: WsMessageEvent, deps: WsDeps)
     msgId: frame.msgId,
     state: delivered ? 'delivered' : 'sent',
   };
-  const receiptPosted = await deps.sender.post(event.connectionId, receipt);
+  let receiptPosted: boolean;
+  try {
+    receiptPosted = await deps.sender.post(event.connectionId, receipt);
+  } catch (err) {
+    // The send itself succeeded (the row is durable, the wake decided); a
+    // faulted receipt post must not 500 it, and — a fault being no evidence
+    // of death — must not reap the sender's row. The client's resend draws
+    // the idempotent duplicate and a fresh receipt.
+    deps.log('ws_receipt_post_failed', { error: err instanceof Error ? err.name : 'unknown' });
+    return { statusCode: 200 };
+  }
   if (!receiptPosted) {
     // The sender's own socket died before the receipt landed: clear its stale
     // row (conditional; a newer reconnect row survives).
@@ -2048,8 +2253,53 @@ async function handleSend(frame: SendFrame, event: WsMessageEvent, deps: WsDeps)
 
 /** ack — the recipient confirms processing; delete the queued row. */
 async function handleAck(frame: AckFrame, event: WsMessageEvent, deps: WsDeps): Promise<WsResult> {
+  // Per-user bound on acks. Each ack below costs a strongly consistent
+  // GetItem and a TransactWrite, and until this bucket existed nothing
+  // per-user bounded them — one socket spraying acks burned WsFn/DDB at will
+  // and, through the AGGREGATE stage throttle, 429'd every other client's
+  // frames. The bucket is sized to the reconnect drain (two slices per fixed
+  // window — LIMITS.wsAck), so an honest backlog's acks pass; a refusal is
+  // the standard error frame and NOTHING MORE: it deliberately does NOT
+  // charge the refused-frame bound, because a slice has no minimum duration
+  // and a fast drain can post more than the window admits — a well-formed ack
+  // from a live client is not a malformed frame, and the hang-up lever must
+  // never reach an honest client draining a large backlog. The ack bucket
+  // alone bounds a sprayer's DDB cost. A refused ack deletes nothing: the row
+  // waits for the next drain, which the client dedupes and re-acks.
+  const retry = await deps.rateLimit.take(`ack:${event.senderUserId}`, LIMITS.wsAck);
+  if (retry > 0) {
+    await postError(event, deps, 'rate_limited', 'too many acks; slow down');
+    return { statusCode: 429 };
+  }
   await deps.db.deleteQueuedMessage(event.senderUserId, frame.msgId);
   return { statusCode: 200 };
+}
+
+/**
+ * Charge one REFUSED frame — unparseable or schema-rejected; NOT an ack over
+ * its bound, see handleAck — to the sender's `wsRefused` bucket and, when
+ * that bucket is empty, hang the socket up.
+ *
+ * Every refusal has already cost the session recheck and an error post, and
+ * API Gateway offers no per-connection throttle: the stage throttle is
+ * aggregate, so a socket that keeps sending frames the server refuses is
+ * spending everyone's ceiling. Server-side DeleteConnection is the ONLY
+ * per-client lever, and this is where it is pulled. The row delete is
+ * conditional on this connectionId (a reconnect's fresh row survives), the
+ * hang-up is best-effort exactly like the revoke path's, and the log line is
+ * routing metadata only — never the user or the connection (rule 4). An
+ * honest client never gets here: both shipped clients validate frames before
+ * sending, and an over-bound ack does not charge this bucket. */
+async function chargeRefusedFrame(event: WsMessageEvent, deps: WsDeps): Promise<void> {
+  const retry = await deps.rateLimit.take(`wsrefused:${event.senderUserId}`, LIMITS.wsRefused);
+  if (retry === 0) return;
+  await deps.db.deleteConnection(event.senderUserId, event.connectionId);
+  try {
+    await deps.disconnectSocket?.(event.connectionId);
+  } catch {
+    deps.log('ws_disconnect_on_refused_frames_failed');
+  }
+  deps.log('ws_socket_dropped_refused_frames');
 }
 
 /**
@@ -2241,8 +2491,13 @@ async function handleTyping(
     ts: deps.now(),
   };
   // A failed post is a stale row some real send will reap. Typing spends
-  // nothing on cleanup, wakes nothing, and drops on the floor.
-  await deps.sender.post(conn.connectionId, relay);
+  // nothing on cleanup, wakes nothing, and drops on the floor — a transport
+  // FAULT included: the answer stays uniform.
+  try {
+    await deps.sender.post(conn.connectionId, relay);
+  } catch (err) {
+    deps.log('ws_typing_post_failed', { error: err instanceof Error ? err.name : 'unknown' });
+  }
   return uniform;
 }
 
@@ -2252,7 +2507,16 @@ async function postError(
   code: string,
   detail: string,
 ): Promise<void> {
-  const posted = await deps.sender.post(event.connectionId, { type: 'error', code, detail });
+  let posted: boolean;
+  try {
+    posted = await deps.sender.post(event.connectionId, { type: 'error', code, detail });
+  } catch (err) {
+    // A transport fault on the error post must not turn a refusal into a
+    // 500: the caller still gets the refusal's status, and the row is spared
+    // — a fault is not evidence the socket is gone.
+    deps.log('ws_error_post_failed', { error: err instanceof Error ? err.name : 'unknown' });
+    return;
+  }
   if (!posted) {
     // The caller's socket is already gone: clear its stale row (conditional;
     // a newer reconnect row survives).

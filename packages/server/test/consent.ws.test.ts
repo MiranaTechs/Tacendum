@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { SendFrame, ServerFrame, TypingFrame } from '@tacendum/shared';
 import { wsDefaultHandler, type WsDeps, type WsResult } from '../src/handlers/ws.js';
-import type { DataLayer } from '../src/db/data.js';
+import type { TestOnlyDataLayer } from '../src/db/data.js';
 import { allQueued, makeMemoryDb, makeTestDeps, testIdentityKey, type TestDeps } from './helpers.js';
 
 /**
@@ -44,7 +44,7 @@ const FROZEN_INBOX_RESTRICTED = {
   detail: 'only the owner or a fellow crew member may message an integration',
 } as const;
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: TestDeps;
 let posted: Array<{ connectionId: string; frame: ServerFrame }>;
 let wsDeps: WsDeps;
@@ -336,7 +336,7 @@ describe('typing parity — never reaches whom a durable send could not', () => 
     // handleTyping's `recipient === undefined` arm drops the nonexistent
     // case to zero edge reads and this comparison fails.
     let edgeReads = 0;
-    const counting: DataLayer = {
+    const counting: TestOnlyDataLayer = {
       ...db,
       async hasConsentEdge(userId, agentId) {
         edgeReads += 1;

@@ -18,7 +18,7 @@ import {
 } from '@tacendum/shared';
 import { makeDocClient, makeDynamoClient } from '../src/db/client.js';
 import { TABLES as SERVER_TABLES } from '../src/db/tables.js';
-import { makeDataLayer, type DataLayer } from '../src/db/data.js';
+import { makeTestOnlyDataLayer, type TestOnlyDataLayer } from '../src/db/data.js';
 import { activePhoneClaimKeys } from '../src/opaque-ref.js';
 import { LIMITS, type RateLimiter } from '../src/ratelimit.js';
 import { makeDdbRateLimiter } from '../src/ratelimit-ddb.js';
@@ -78,7 +78,7 @@ const PREV_TABLE_ENV = process.env[TABLE_ENV_VARS.rateBuckets];
 
 let client: DynamoDBClient;
 let doc: DynamoDBDocumentClient;
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 
 // Digits only; '75' is this file's discriminator.
@@ -184,7 +184,7 @@ async function mkTargets(deps: TestDeps): Promise<{ email: string; number: strin
 beforeAll(async () => {
   client = makeDynamoClient();
   doc = makeDocClient(client);
-  const base = makeDataLayer(doc);
+  const base = makeTestOnlyDataLayer(doc);
   db = {
     ...base,
     isAccountsFeatureEnabled: async () => true,

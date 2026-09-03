@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import type { ServerFrame, TypingFrame } from '@tacendum/shared';
 import { wsDefaultHandler, type WsDeps, type WsResult } from '../src/handlers/ws.js';
 import { LIMITS } from '../src/ratelimit.js';
-import type { DataLayer } from '../src/db/data.js';
+import type { TestOnlyDataLayer } from '../src/db/data.js';
 import { allQueued, makeMemoryDb, makeTestDeps, type TestDeps } from './helpers.js';
 
 /**
@@ -32,7 +32,7 @@ function makeFakeSender() {
 const SENDER = '0000000000000000000SENDER1';
 const RECIPIENT = '0000000000000000000RECPT02';
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: TestDeps;
 let wsDeps: WsDeps & { sender: ReturnType<typeof makeFakeSender> };
 

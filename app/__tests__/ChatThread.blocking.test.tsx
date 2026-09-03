@@ -35,7 +35,6 @@ const sqlite = (
  * COPY of the namespace here, and a spy installed on the copy is not the
  * binding the screen calls.
  */
-// eslint-disable-next-line @typescript-eslint/no-var-requires
 const RN: typeof import('react-native') = require('react-native');
 
 const T0 = new Date('2026-07-25T12:00:00').getTime();

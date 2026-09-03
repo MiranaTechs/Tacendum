@@ -297,7 +297,7 @@ describe('the claim surface (pin ON): local pre-checks, consent-at-claim, the pr
     tree.unmount();
   });
 
-  it('a claim sends the box exactly as shown: checked → true; unchecked → false, said honestly as held-but-unfindable', async () => {
+  it('a claim sends the box exactly as shown: checked → true; unchecked → false, said honestly as a claim with findability off', async () => {
     stubRows({ email: EMAIL_ROW });
     const claim = jest.spyOn(accountsUsername, 'claimUsername').mockResolvedValue('claimed');
     const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
@@ -305,10 +305,13 @@ describe('the claim surface (pin ON): local pre-checks, consent-at-claim, the pr
     await press(tree, 'account-username-submit');
     expect(claim).toHaveBeenLastCalledWith('Alice_7', true);
     // Uncheck: the honest line appears beside the box, and the bit follows.
+    // On the CLAIM form that line speaks of a name not yet held (this test
+    // pinned the held sentence here before).
     await type(tree, 'account-username-input', 'bob');
     await press(tree, 'account-username-consent');
     expect(consentChecked(tree)).toBe(false);
-    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.heldUnfindable);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.claimUnfindable);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.heldUnfindable);
     await press(tree, 'account-username-submit');
     expect(claim).toHaveBeenLastCalledWith('bob', false);
     tree.unmount();
@@ -844,6 +847,80 @@ describe('Settings → ACCOUNT: the username row (pin ON) is labeled from the de
     await ReactTestRenderer.act(async () => {
       tree.unmount();
     });
+  });
+
+  it("App wiring: the claim form's 'Link an email' door lands on the email surface", async () => {
+    // The username surface renders only over a loaded profile, so this case
+    // boots a real workspace holding a finished account (back.android's
+    // fixture) instead of driving the router over an empty one.
+    const crypto = jest.requireMock('tacendum-crypto') as {
+      __keychain: Map<string, string>;
+      hasIdentity: jest.Mock;
+      identityPublicKey: jest.Mock;
+    };
+    messaging.stop();
+    await db.close();
+    sqlite.__sqlite.reset();
+    db.setWorkspace('real');
+    crypto.__keychain.clear();
+    crypto.__keychain.set('authToken', 'token-for-this-test');
+    crypto.hasIdentity.mockResolvedValue(true);
+    crypto.identityPublicKey.mockResolvedValue('BQ0IDENTITYKEYBASE64');
+    sqlite.__sqlite.instances.set('tacendum.sqlite', {
+      name: 'tacendum.sqlite',
+      execute: jest.fn(async (sql: string) => {
+        const s = String(sql);
+        if (s.includes('FROM profile')) {
+          return {
+            rows: [
+              { key: 'userId', value: ANCHOR },
+              { key: 'registrationId', value: '7' },
+              { key: 'displayName', value: 'Me' },
+              { key: 'about', value: '' },
+              { key: 'avatarB64', value: '' },
+              { key: 'profileVersion', value: '3' },
+            ],
+          };
+        }
+        if (s.includes('PRAGMA table_info(attachments')) return { rows: [{ name: 'direction' }] };
+        if (s.includes('PRAGMA table_info(reactions')) {
+          return { rows: [{ name: 'targetDirection' }, { name: 'reactorId' }] };
+        }
+        if (s.includes('PRAGMA table_info(pending_revisions')) return { rows: [{ name: 'writerId' }] };
+        return { rows: [] };
+      }),
+      close: jest.fn(),
+    });
+    // No verified identifier of either class: the sentence carries the door.
+    stubRows({});
+    let tree!: ReactTestRenderer.ReactTestRenderer;
+    try {
+      await ReactTestRenderer.act(async () => {
+        tree = ReactTestRenderer.create(<App />);
+      });
+      await ReactTestRenderer.act(async () => {
+        await flush();
+      });
+      expect(devRoute()).toBe('chats');
+      await ReactTestRenderer.act(async () => {
+        devNav()({ name: 'accountUsername' });
+        await flush();
+      });
+      expect(devRoute()).toBe('accountUsername');
+      expect(has(tree, 'account-username-link-email')).toBe(true);
+      await press(tree, 'account-username-link-email');
+      expect(devRoute()).toBe('accountEmail');
+      expect(has(tree, 'account-email-back')).toBe(true);
+    } finally {
+      await ReactTestRenderer.act(async () => {
+        tree?.unmount();
+      });
+      crypto.hasIdentity.mockResolvedValue(false);
+      crypto.identityPublicKey.mockResolvedValue(null);
+      crypto.__keychain.clear();
+      messaging.stop();
+      await db.close();
+    }
   });
 });
 

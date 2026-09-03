@@ -1,6 +1,6 @@
 import { PutMetricDataCommand, type PutMetricDataCommandInput } from '@aws-sdk/client-cloudwatch';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { DataLayer } from '../src/db/data.js';
+import type { TestOnlyDataLayer } from '../src/db/data.js';
 import type { PushWakeEvent } from '../src/handlers/push-worker.js';
 import { makeMemoryDb, makeTestDeps, type TestDeps } from './helpers.js';
 
@@ -53,7 +53,7 @@ beforeEach(async () => {
   cloudWatchConfigs.length = 0;
   cloudWatchSendMock.mockReset();
   cloudWatchSendMock.mockResolvedValue({});
-  const db: DataLayer = makeMemoryDb();
+  const db: TestOnlyDataLayer = makeMemoryDb();
   testDeps = makeTestDeps(db);
   await db.putPushToken({
     userId: EVENT.recipientId,

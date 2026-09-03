@@ -6,7 +6,7 @@ import React, {
   useState,
 } from 'react';
 import { StatusBar, StyleSheet, Text, View } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context';
 // The ceilings, asked for rather than transcribed (4 with video by
 // default, 5 the hard video cap, 6 audio-only). `smallGroupCallParticipantCap`
 // is the one place the audio/video split is decided, so this screen cannot
@@ -64,23 +64,47 @@ import { useReduceMotion } from '../useReduceMotion';
 export const CALL_CAP_COPY = 'Calls hold six people. For more, use the room.';
 
 /**
- * Tile columns for a roster of N: 2 people is the 1:1 layout — one tile,
- * full bleed, which is exactly what the last-departure degradation collapses into — 3-4 is
- * a 2×2 grid and 5-6 a 2×3.
+ * The narrowest a tile may be laid out at when the screen is WIDER than it
+ * is tall: a 64pt disc, a name and a status line with the tile's own
+ * horizontal padding around them. Landscape is the only shape that reads
+ * this — see `gridColumns`. */
+const MIN_TILE_WIDTH = 140;
+
+/**
+ * Tile columns for a roster of N: 2 people is the 1:1 layout — one tile, full bleed,
+ * which is exactly what the last-departure degradation collapses into — 3-4 is a 2×2
+ * grid and 5-6 a 2×3.
  *
- * Counts PARTICIPANTS, not tiles, because that is the number the layout rule
- * is written in and the number the caps are written in; the tile count is
- * always one less (this device has no tile of its own).
- */
-export function gridColumns(participants: number): number {
-  return participants <= 2 ? 1 : 2;
+ * THAT IS THE UPRIGHT SHAPE. Sideways — a frame wider than it is tall — the same two
+ * columns made tall, narrow cells stacked three deep under a short screen, so the count
+ * is read off the width the grid actually has: as many tiles across as `MIN_TILE_WIDTH`
+ * allows, never fewer than two and never more than there are tiles. A phone in
+ * landscape puts a six-way call in one row of five; a tablet held upright keeps §9's
+ * shape because upright is upright, whatever the width. Without a frame (a caller that
+ * has none to give) the answer is the upright one.
+ *
+ * Counts PARTICIPANTS, not tiles, because that is the number the layout rule is written
+ * in and the number the caps are written in; the tile count is always one less (this
+ * device has no tile of its own). */
+export function gridColumns(
+  participants: number,
+  frame?: { width: number; height: number },
+): number {
+  if (participants <= 2) return 1;
+  const tiles = participants - 1;
+  const sideways = frame !== undefined && frame.width > frame.height;
+  if (!sideways) return 2;
+  return Math.max(2, Math.min(tiles, Math.floor(frame.width / MIN_TILE_WIDTH)));
 }
 
 /** Rows the grid needs, for the same reason `gridColumns` exists: 2×2 and 2×3
  * are different shapes and the tile's height comes from this. */
-export function gridRows(participants: number): number {
+export function gridRows(
+  participants: number,
+  frame?: { width: number; height: number },
+): number {
   if (participants <= 2) return 1;
-  return Math.ceil((participants - 1) / gridColumns(participants));
+  return Math.ceil((participants - 1) / gridColumns(participants, frame));
 }
 
 /**
@@ -110,6 +134,11 @@ export function sessionStatusLabel(view: GroupCallView): string {
   if (phases.has('connecting')) return 'Connecting…';
   if (phases.has('ringing')) return 'Ringing…';
   if (phases.has('inviting')) return 'Calling…';
+  // Every leg failed, but a re-offer is armed: the session is alive and
+  // about to re-dial, which is what the reconnecting line already says.
+  // "Ending…" here told the person a call was over that the coordinator was
+  // still repairing.
+  if (view.repairing === true) return 'Reconnecting…';
   return 'Ending…';
 }
 
@@ -193,6 +222,10 @@ export function GroupCallScreen(props: GroupCallScreenProps): React.JSX.Element 
 
   const t = useTheme();
   const insets = useSafeAreaInsets();
+  // `useSafeAreaFrame`, as `CallScreen` reads it: this screen is an
+  // absolute-fill overlay inside the root provider, so the provider's frame
+  // IS the window, in the coordinate system the insets describe.
+  const frame = useSafeAreaFrame();
   const reduceMotion = useReduceMotion();
   const [tick, setTick] = useState(() => now());
   const styles = useMemo(() => makeStyles(t), [t]);
@@ -299,7 +332,13 @@ export function GroupCallScreen(props: GroupCallScreenProps): React.JSX.Element 
       .catch(() => undefined);
   };
 
-  const others = view.legs.map(l => tileName(l.peerId, nameFor(l.peerId)));
+  // Who the call is WITH: the people still on it. A member who left, declined
+  // or is gone keeps their tile (the state is theirs to show) but not a seat
+  // in the title — "Ana and 2 others" after two of them left named a call
+  // that no longer existed.
+  const others = view.legs
+    .filter(l => l.phase !== 'left' && l.phase !== 'declined' && l.phase !== 'gone')
+    .map(l => tileName(l.peerId, nameFor(l.peerId)));
   // A room's name outranks the roster listing, and is refused the header if
   // it is an id in disguise — no screen renders a room's id.
   const title =
@@ -315,13 +354,25 @@ export function GroupCallScreen(props: GroupCallScreenProps): React.JSX.Element 
   const cap = smallGroupCallParticipantCap(view.video);
   const atCap = participants >= cap;
   const isStarter = view.starterId === view.selfId;
-  const columns = gridColumns(participants);
+  // The width the grid HAS — the frame less the horizontal insets the root
+  // pads by — decides the column count sideways.
+  const columns = gridColumns(participants, {
+    width: frame.width - insets.left - insets.right,
+    height: frame.height,
+  });
 
   const droppedNames = dropped.map(peerId => tileName(peerId, nameFor(peerId)));
   const ringing = view.phase === 'ringing' && onAnswer !== undefined;
 
   return (
-    <View style={styles.root} accessibilityViewIsModal accessibilityLabel="Group call">
+    <View
+      // Top and bottom insets belong to the header and footer bands; the
+      // horizontal ones are the root's, so sideways the title, the tiles and
+      // the controls all clear the sensor housing at once.
+      style={[styles.root, { paddingLeft: insets.left, paddingRight: insets.right }]}
+      accessibilityViewIsModal
+      accessibilityLabel="Group call"
+    >
       <StatusBar barStyle="light-content" />
 
       <View style={[styles.header, { paddingTop: insets.top + 12 }]}>

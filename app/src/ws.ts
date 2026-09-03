@@ -1,4 +1,5 @@
 import { ServerFrame, type ClientFrame } from '@tacendum/shared';
+import { randomBytes } from 'tacendum-crypto';
 import { WS_URL } from './config';
 
 export type WsState = 'connecting' | 'open' | 'closed';
@@ -65,6 +66,50 @@ const HEALTHY_MS = 5_000;
  * mode that has no other exit (see `armDialWatchdog`).
  */
 const DIAL_TIMEOUT_MS = 20_000;
+
+/**
+ * THE RECEIVE-SILENCE WATCHDOG.
+ *
+ * There is no ping/pong on this transport, and `readyState === OPEN` is the
+ * kernel's opinion, not the far end's: after a NAT rebinding or a radio
+ * hand-off the socket reads open, every `send` succeeds into the local
+ * buffer, and nothing ever comes back — API Gateway's own idle close reaches
+ * this client only if its FIN does. Before this deadline existed the outbox
+ * retried 15/30/60/120 s into that dead socket, burned its ten attempts in
+ * about fifteen minutes, and marked the message failed while the screen
+ * still said "Connected".
+ *
+ * So a `send` frame — the one client frame the server ALWAYS answers, with a
+ * receipt or an error — arms a deadline, and any server frame at all clears
+ * it. Sixty seconds is four base receipt windows: nothing a live link was
+ * going to answer takes that long, and it bounds the one failure the state
+ * machine could not otherwise see. On expiry the socket is written off the
+ * way a stalled dial is (`failLive`), and the client re-dials at once —
+ * silence is evidence about the link, not the credential. */
+const LIVENESS_TIMEOUT_MS = 60_000;
+
+/**
+ * Backoff ceiling for the BASE delay. The delay actually armed is the base
+ * times a factor in [0.5, 1.5) drawn from the platform CSPRNG: every client
+ * that lost its socket in one server event used to re-dial on the identical
+ * 1→2→…→30 s schedule, each dial minting a ticket, so an outage came back as
+ * a synchronised wave against `/v1/ws-ticket`. Never `Math.random` — this
+ * file draws its entropy from the same source everything else in the app
+ * does. */
+const BACKOFF_CAP_MS = 30_000;
+const JITTER_MIN = 0.5;
+const JITTER_SPAN = 1.0;
+/** Bytes drawn per refill, and the level below which the next refill is
+ * asked for — small, because one byte is spent per reconnect. */
+const JITTER_POOL_BYTES = 16;
+const JITTER_POOL_LOW = 4;
+
+/** `api.ts`'s ServerAheadError, matched by name: this file does not import
+ * the REST client (the mint is injected), and a test's injected minter must
+ * be able to throw the same shape. */
+function isServerAhead(err: unknown): boolean {
+  return err instanceof Error && err.name === 'ServerAheadError';
+}
 
 /**
  * One attempt to get a socket up: from `connect` to whichever of `onopen`,
@@ -201,6 +246,25 @@ export class WsClient {
   /** When the live socket opened, or null if it never did — the input to the
    * "was this a refused upgrade?" question. */
   private openedAt: number | null = null;
+  /** The receive-silence deadline (see LIVENESS_TIMEOUT_MS), armed by a
+   * `send` frame and cleared by any server frame or by the transport going
+   * away. At most one is armed at a time. */
+  private liveness: WsWake | null = null;
+  /** When the live socket last produced a parsed server frame, or null if
+   * it has not yet. Exposed so the owner can tell a socket that has proved
+   * itself from one that has only ever been written to. */
+  private lastServerFrameAtMs: number | null = null;
+  /**
+   * CSPRNG bytes for the reconnect jitter, one spent per backoff. Filled
+   * asynchronously (the platform RNG is a bridge call), so the pool can be
+   * empty at the very first reconnect after construction — that one dials
+   * on the plain base delay, which is the schedule this had anyway.
+   */
+  private jitterPool: number[] = [];
+  private jitterRefill: Promise<void> | null = null;
+  /** The last ticket mint failed because its answer no longer parses on
+   * this build. Cleared by the next mint that succeeds. */
+  private serverAheadFlag = false;
 
   private frameHandlers = new Set<(frame: ServerFrame) => void>();
   private stateHandlers = new Set<(state: WsState) => void>();
@@ -231,6 +295,7 @@ export class WsClient {
     // eventually be held by a session that no longer exists, and the symptom
     // would be a socket that never dials again with nothing to point at.
     this.releaseDial();
+    this.refillJitter();
     this.connect();
   }
 
@@ -304,7 +369,8 @@ export class WsClient {
         let ticket: string | null;
         try {
           ticket = await this.mintTicket();
-        } catch {
+          this.serverAheadFlag = false;
+        } catch (err) {
           /*
            * A MINT FAILURE IS A FAILED DIAL, not a quiet downgrade.
            *
@@ -315,7 +381,25 @@ export class WsClient {
            * stayed up. The mint distinguishes the one benign case itself and
            * returns null for it; anything reaching here is a real failure and
            * the right answer is to back off and try the whole dial again.
+           *
+           * ONE failure is not a failed dial in the ordinary sense: the
+           * ticket answer no longer PARSES on this build — the server is
+           * ahead of the client, and no schedule of
+           * re-dials reaches it, only an update does. It still retries (the
+           * server may roll back; the app may be updated under a live
+           * process), but from the backoff ceiling rather than ramping up
+           * from one second, so a stale client is not a ticket-minting
+           * hammer, and it says so once, distinctly, by name only.
            */
+          if (isServerAhead(err)) {
+            if (!this.serverAheadFlag) {
+              this.serverAheadFlag = true;
+              console.warn(
+                '[ws] server ahead of client: the ticket answer no longer parses — update Tacendum',
+              );
+            }
+            this.backoffMs = BACKOFF_CAP_MS;
+          }
           this.endDial(dial);
           if (epoch === this.epoch) this.scheduleReconnect();
           return;
@@ -423,6 +507,7 @@ export class WsClient {
    * a decision that there should be no socket.
    */
   private releaseDial(): void {
+    this.clearLiveness();
     const dial = this.dial;
     if (dial !== null) {
       const socket = dial.socket;
@@ -482,6 +567,7 @@ export class WsClient {
     // definition one whose upgrade had not completed, which is exactly the case
     // React Native's `close()` cannot honour.
     if (socket) this.discardSocket(socket);
+    this.clearLiveness();
     // A dial the client had already moved past is simply dropped: the transport
     // it left behind is closed above, and announcing `closed` or queueing a
     // reconnect on behalf of a superseded dial would fight whatever replaced it.
@@ -505,6 +591,7 @@ export class WsClient {
       // `armHealthy` arms a timer of its own and the two must not be confused.
       this.endDial(dial);
       this.openedAt = Date.now();
+      this.lastServerFrameAtMs = null;
       // The backoff is NOT reset here, and that is the fix for a hot loop this
       // class can otherwise be driven into: on the local adapter the upgrade
       // COMPLETES and `close(4001)` follows milliseconds later, so resetting on
@@ -524,6 +611,11 @@ export class WsClient {
       }
       const frame = ServerFrame.safeParse(parsed);
       if (!frame.success) return;
+      // Proof of life: whatever the frame says, the far end is still there.
+      // Cleared BEFORE the handlers run, so a handler that sends (an ack, a
+      // flush) re-arms a fresh deadline rather than riding a spent one.
+      this.lastServerFrameAtMs = Date.now();
+      this.clearLiveness();
       for (const handler of this.frameHandlers) handler(frame.data);
     };
     socket.onerror = () => {
@@ -535,6 +627,7 @@ export class WsClient {
       // about it.
       this.endDial(dial);
       this.socket = null;
+      this.clearLiveness();
       const openedAt = this.openedAt;
       this.openedAt = null;
       this.clearHealthy();
@@ -757,22 +850,105 @@ export class WsClient {
     // for the measurement that made this a seam. It is read HERE rather than
     // captured once, so the Android implementation installed after the first
     // dial governs every backoff that follows it.
-    this.reconnectTimer = wakeScheduler.schedule(this.backoffMs, () => {
+    // Jittered: the BASE keeps its doubling and its 30 s cap; what is
+    // armed is base × [0.5, 1.5), one CSPRNG byte per dial.
+    const delayMs = Math.round(this.backoffMs * this.jitterFactor());
+    this.reconnectTimer = wakeScheduler.schedule(delayMs, () => {
       this.reconnectTimer = null;
       this.connect();
     });
-    this.backoffMs = Math.min(this.backoffMs * 2, 30_000);
+    this.backoffMs = Math.min(this.backoffMs * 2, BACKOFF_CAP_MS);
+  }
+
+  /** One factor in [0.5, 1.5) from the pool, or exactly 1 when no entropy
+   * has arrived yet (see the field). Never `Math.random`. */
+  private jitterFactor(): number {
+    const byte = this.jitterPool.shift();
+    if (this.jitterPool.length < JITTER_POOL_LOW) this.refillJitter();
+    if (byte === undefined) return 1;
+    return JITTER_MIN + (byte / 256) * JITTER_SPAN;
+  }
+
+  private refillJitter(): void {
+    if (this.jitterRefill) return;
+    this.jitterRefill = randomBytes(JITTER_POOL_BYTES)
+      .then(bytes => {
+        for (const byte of bytes) this.jitterPool.push(byte);
+      })
+      .catch(() => {
+        // No entropy this round: the next backoff dials un-jittered and asks
+        // again. A jitter source that fails must not stop the reconnect.
+      })
+      .finally(() => {
+        this.jitterRefill = null;
+      });
   }
 
   get isOpen(): boolean {
     return this.socket?.readyState === WebSocket.OPEN;
   }
 
+  /** Whether the socket is down because the server is ahead of this build
+   * — the state the chat list can name as "update Tacendum" instead of
+   * "Offline". */
+  get serverAhead(): boolean {
+    return this.serverAheadFlag;
+  }
+
+  /** When the live socket last produced a server frame (ms since epoch), or
+   * null while it has produced none — a socket that has only been written
+   * to has not yet proved it is connected to anything. */
+  get lastServerFrameAt(): number | null {
+    return this.lastServerFrameAtMs;
+  }
+
   /** Returns false when the socket is not open (caller keeps the message pending). */
   send(frame: ClientFrame): boolean {
     if (!this.isOpen || !this.socket) return false;
     this.socket.send(JSON.stringify(frame));
+    // Only a `send` expects an answer (receipt or error); acks and typing
+    // are fire-and-forget and must not put a healthy idle socket on a clock.
+    if (frame.type === 'send') this.armLiveness();
     return true;
+  }
+
+  /** Arm the receive-silence deadline for the socket that just took a
+   * `send`, unless one is already running for it. */
+  private armLiveness(): void {
+    if (this.liveness) return;
+    const socket = this.socket;
+    if (!socket) return;
+    this.liveness = wakeScheduler.schedule(LIVENESS_TIMEOUT_MS, () => {
+      this.liveness = null;
+      this.failLive(socket);
+    });
+  }
+
+  private clearLiveness(): void {
+    const wake = this.liveness;
+    this.liveness = null;
+    wake?.cancel();
+  }
+
+  /**
+   * The socket took a `send` and answered NOTHING for LIVENESS_TIMEOUT_MS:
+   * treat it as dead. Same teardown as a stalled dial (`failDial`) — the
+   * transport is detached and closed the one way this platform honours,
+   * `closed` is reported so the screen stops saying "Connected" over a
+   * socket nothing is reaching — and then an IMMEDIATE re-dial through the
+   * ordinary ticket path at the base delay. Silence is evidence about the
+   * LINK, not the credential, so no probe is spent; a link that is really
+   * down turns this into the ordinary backoff at the first failed mint.
+   */
+  private failLive(socket: WebSocket): void {
+    if (this.socket !== socket || this.closedByUser) return;
+    this.discardSocket(socket);
+    this.openedAt = null;
+    this.clearHealthy();
+    this.emitState('closed');
+    this.backoffMs = 1000;
+    this.cancelReconnect();
+    this.connect();
   }
 
   onFrame(handler: (frame: ServerFrame) => void): () => void {

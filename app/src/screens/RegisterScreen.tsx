@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   AccessibilityInfo,
   Animated,
+  BackHandler,
   findNodeHandle,
   Linking,
   Pressable,
@@ -363,6 +364,29 @@ export function RegisterScreen({ onRegistered, onBack }: Props) {
    * in the same event batch — both presses read busy=false before any flush —
    * so the ref is the guard and the state only drives the UI. */
   const busyRef = useRef(false);
+  /** Whether this screen is still in the tree: the create call can outlive
+   * it (an edge swipe mid-flight), and its answer must not touch the state
+   * of a screen that is gone. */
+  const mounted = useRef(true);
+  useEffect(() => {
+    // Hardware back (Android) while the create call is in flight: the sheet
+    // already refuses its scrim and "Not yet" mid-flight, and the system
+    // button has to refuse the same way — otherwise the app router pops to
+    // landing, the call resolves against a torn-down screen, and
+    // `onRegistered` teleports the person in from nowhere. RN asks the most
+    // recent subscriber first and stops at the first `true`, so this answers
+    // before the router's own handler; idle, it yields (`false`) and the
+    // router pops as it always did. The REF is read, not the state — a tap
+    // can land before the state has flushed.
+    const subscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      () => busyRef.current,
+    );
+    return () => {
+      mounted.current = false;
+      subscription.remove();
+    };
+  }, []);
   const create = async () => {
     // `agreed` is re-checked here, not only at presentation: if the consent
     // checkbox has been untoggled while the sheet is up (the VoiceOver-leak
@@ -380,11 +404,14 @@ export function RegisterScreen({ onRegistered, onBack }: Props) {
       // surfaces here as an ordinary failure, which is the whole idea.
       onRegistered(await createOrRestoreAccount());
     } catch (err) {
+      // A failure landing after the screen is gone has no surface to land
+      // on: the next visit starts clean.
+      if (!mounted.current) return;
       setError(failureMessage(err));
       setErrorSeq(seq => seq + 1);
     } finally {
       busyRef.current = false;
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   };
 

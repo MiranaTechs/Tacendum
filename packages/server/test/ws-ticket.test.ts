@@ -122,6 +122,22 @@ describe('the two credentials are not interchangeable', () => {
   });
 });
 
+describe('the server still emits the fields the client no longer requires', () => {
+  it('a minted ticket carries a numeric expiresAt in the future', async () => {
+    const res = await wsTicketHandler(
+      { method: 'POST', path: '/v1/ws-ticket', headers: {}, body: '{}' },
+      deps,
+      { userId: USER },
+    );
+    expect(res.statusCode).toBe(200);
+    const body = parseBody<{ ticket: string; expiresAt?: unknown }>(res.body);
+    expect(typeof body.expiresAt).toBe('number');
+    expect(body.expiresAt as number).toBeGreaterThan(Math.floor(deps.now() / 1000));
+    // And the DTO, optional or not, accepts exactly what was emitted.
+    expect(WsTicketResponse.parse(body).expiresAt).toBe(body.expiresAt);
+  });
+});
+
 describe('the minted ticket survives its own DTO', () => {
   /*
    * THE GAP THAT LET A DEAD FEATURE LOOK ALIVE.

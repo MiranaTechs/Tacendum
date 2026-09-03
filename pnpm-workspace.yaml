@@ -15,9 +15,10 @@ minimumReleaseAgeExclude:
   - '@signalapp/libsignal-client@0.100.0'
   - react-native-dotenv@4.1.1
 
-# Transitive advisories that are safe to force: every one of these is a
-# PATCH bump inside the major the tree already resolves, so nothing changes
-# API. The two remaining advisories (image-size, fast-xml-parser) need major
+# Transitive advisories that are safe to force: every one of these stays
+# inside the major the tree already resolves — a patch bump, or the minor the
+# maintainer published the fix in (qs 6.16.0) — so nothing changes API. The
+# two remaining advisories (image-size, fast-xml-parser) need major
 # bumps into Metro's asset pipeline and the React Native CLI; they are
 # build-time only and are accepted with reasoning in SECURITY.md rather than
 # forced here, because breaking the bundler to silence a DoS advisory about
@@ -25,7 +26,25 @@ minimumReleaseAgeExclude:
 overrides:
   brace-expansion@<1.1.18: '1.1.18'
   brace-expansion@>=5.0.0 <5.0.9: '5.0.9'
+  # GHSA-5jgf-p345-68v8 / -f65p-4m7j-42xc / -fph4-wmhf-6fwf / -jqff-g426-hqxp:
+  # host confusion and SSRF in URI normalisation. Reached only through the
+  # CLI's optional agent SDK -> MCP client -> ajv; a patch bump inside 3.1.x
+  # (it surfaced after the nanoid bump).
+  fast-uri@>=3.0.0 <3.1.6: '3.1.6'
+  # GHSA-px8p-9vwx-vf98: unzipSync spins forever on a malformed ZIP64 archive.
+  # In the SERVER's prod graph (@aws-sdk/client-cloudwatch -> @smithy/
+  # middleware-compression), which is why `pnpm audit --prod` sees it; esbuild
+  # tree-shakes it out of every Lambda bundle (verified: `fflate` appears in
+  # none of the eight, and bundle:verify stays byte-identical across this
+  # bump). Forced anyway — it is a patch inside 0.8.x and costs nothing.
+  fflate@>=0.8.0 <0.8.3: '0.8.3'
   js-yaml@<3.15.1: '3.15.1'
   js-yaml@>=4.0.0 <4.3.1: '4.3.1'
-  nanoid@<3.3.17: '3.3.17'
+  nanoid@<3.3.18: '3.3.18'
   postcss@<8.5.23: '8.5.23'
+  # GHSA-x5fp-wj9c-mxmx (array-limit bypass via bracket-key comma parsing) and
+  # GHSA-4mjr-xmp4-gh2g (DoS via attacker-controlled isBuffer). Reached only
+  # through the React Native dev server (@react-native-community/cli-server-api
+  # -> body-parser), never a shipped artifact; a bump inside the 6.x the tree
+  # already resolves.
+  qs@>=2.2.5 <6.16.0: '6.16.0'

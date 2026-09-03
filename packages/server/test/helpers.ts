@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { monotonicFactory } from 'ulid';
 import {
   ACCOUNT_GROUP_MAX_MEMBERS,
@@ -39,6 +40,7 @@ import {
   type AuthChallengeRecord,
   type ConnectionRecord,
   type DataLayer,
+  type TestOnlyDataLayer,
   type EmailCodeRecord,
   type IdentifierClaimRecord,
   type LinkOfferInitRecord,
@@ -51,6 +53,7 @@ import {
   type SessionRecord,
   type UserRecord,
   type UsernameTombstoneRecord,
+  LINK_OFFER_POINTER_CAP,
 } from '../src/db/data.js';
 import type { Deps, HttpEvent } from '../src/handlers/http.js';
 import type { LogFields } from '../src/log.js';
@@ -73,7 +76,7 @@ export function makeMemoryDb(
    * clocked path in the suites passes `nowMs` explicitly; this is the
    * landed call sites' fallback, exactly as in the store. */
   hooks: { nowMs?: () => number } = {},
-): DataLayer & {
+): TestOnlyDataLayer & {
   /** Twin-only operator seam for the `feature#accounts` flag row — the
    * production row is operator-written and the DataLayer deliberately has
    * no write method for it, so the twin's operator is the test. */
@@ -94,6 +97,9 @@ export function makeMemoryDb(
   const authChallenges = new Map<string, AuthChallengeRecord>();
   const sessions = new Map<string, SessionRecord>();
   const prekeys = new Map<string, OneTimePrekey[]>(); // userId -> sorted by keyId
+  // The pool generation on each user row, mirrored so a consume or count
+  // against a stale generation answers nothing here too.
+  const prekeyGens = new Map<string, string>();
   const connections = new Map<string, ConnectionRecord>(); // userId -> connection
   const queues = new Map<string, Map<string, QueuedMessage>>(); // recipientId -> msgId -> msg
   // The quota LEDGERS (S1), mirroring the real layer's `#quota#...` items:
@@ -352,6 +358,45 @@ export function makeMemoryDb(
     }
     return 'done';
   }
+
+  // --- Link-offer reverse pointers, the store's cap-with-reap mirrored so
+  // the twin can never drift more permissive: a pointer ADD refuses at
+  // LINK_OFFER_POINTER_CAP after reaping dead nonces; a refusing read of an
+  // expired row reaps that row's POINTERS (the row stays for the TTL, refused
+  // at every read, as in the store); a link deletes the winning nonce from
+  // both rows. An emptied set drops the attribute, exactly as DynamoDB's
+  // DELETE of the last element does.
+  const linkOfferNonceLive = (nonce: string, nowSeconds: number): boolean =>
+    (linkOffers.get(nonce)?.expiresAt ?? 0) > nowSeconds ||
+    (linkOfferInits.get(nonce)?.expiresAt ?? 0) > nowSeconds;
+  const dropLinkOfferPointer = (userId: string, nonce: string): void => {
+    const row = usersById.get(userId);
+    row?.linkOfferNonces?.delete(nonce);
+    if (row?.linkOfferNonces?.size === 0) delete row.linkOfferNonces;
+  };
+  const addLinkOfferPointer = (
+    userId: string,
+    nonce: string,
+    nowSeconds: number,
+  ): 'added' | 'pointer_cap' => {
+    const row = usersById.get(userId)!;
+    const set = (row.linkOfferNonces ??= new Set<string>());
+    if (set.size >= LINK_OFFER_POINTER_CAP) {
+      for (const held of [...set]) {
+        if (!linkOfferNonceLive(held, nowSeconds)) set.delete(held);
+      }
+      if (set.size >= LINK_OFFER_POINTER_CAP) return 'pointer_cap';
+    }
+    set.add(nonce);
+    return 'added';
+  };
+  const reapExpiredLinkOffer = (
+    kind: 'offer' | 'init',
+    rec: { offerNonce: string; offererUserId: string; acceptorUserId: string },
+  ): void => {
+    dropLinkOfferPointer(rec.offererUserId, rec.offerNonce);
+    if (kind === 'offer') dropLinkOfferPointer(rec.acceptorUserId, rec.offerNonce);
+  };
 
   return {
     async getUserById(userId, signal) {
@@ -665,6 +710,10 @@ export function makeMemoryDb(
       user.identityKeyPub = core.identityKeyPub;
       user.signedPrekey = core.signedPrekey;
       user.kyberPrekey = core.kyberPrekey;
+      // A fresh generation per upload, on the row and the pool.
+      const poolGen = randomUUID();
+      user.prekeyPoolGen = poolGen;
+      prekeyGens.set(userId, poolGen);
       // Match DynamoDB semantics: REPLACE the pool, and dedupe by keyId (a Put
       // overwrites same-key items). Prevents in-memory-only test divergence.
       const byKeyId = new Map<number, OneTimePrekey>();
@@ -675,11 +724,13 @@ export function makeMemoryDb(
       );
       return true;
     },
-    async consumeOneTimePrekey(userId) {
+    async consumeOneTimePrekey(userId, poolGen) {
+      if (poolGen !== undefined && prekeyGens.get(userId) !== poolGen) return undefined;
       const pool = prekeys.get(userId);
       return pool && pool.length > 0 ? pool.shift() : undefined;
     },
-    async countOneTimePrekeys(userId) {
+    async countOneTimePrekeys(userId, poolGen) {
+      if (poolGen !== undefined && prekeyGens.get(userId) !== poolGen) return 0;
       return prekeys.get(userId)?.length ?? 0;
     },
     async claimConnection(rec, expectedConnectionId) {
@@ -750,13 +801,6 @@ export function makeMemoryDb(
     },
     async deletePushToken(userId) {
       pushTokens.delete(userId);
-    },
-    async deletePushTokenIfMatches(userId, voipToken) {
-      // Mirrors the conditional delete: a row replaced by a racing
-      // re-registration survives.
-      if (pushTokens.get(userId)?.voipToken === voipToken) {
-        pushTokens.delete(userId);
-      }
     },
     async mergePushToken(rec) {
       // Mirror the store's Android branch: a whole-row replace, no merge —
@@ -1025,6 +1069,20 @@ export function makeMemoryDb(
         yield all.slice(i, i + MEMORY_QUEUE_PAGE_SIZE);
       }
     },
+    async *listUrgentQueuedMessages(recipientId, maxScanned) {
+      const q = queues.get(recipientId);
+      if (!q) return;
+      // Mirror the store: the scan bound counts EVALUATED rows in key order,
+      // BEFORE the urgent filter — an urgent row past it is not returned,
+      // exactly as DynamoDB's Limit-then-filter leaves it out.
+      const urgent = [...q.values()]
+        .sort((a, b) => (a.msgId < b.msgId ? -1 : 1))
+        .slice(0, Math.max(0, maxScanned))
+        .filter((m) => m.urgent === true);
+      for (let i = 0; i < urgent.length; i += MEMORY_QUEUE_PAGE_SIZE) {
+        yield urgent.slice(i, i + MEMORY_QUEUE_PAGE_SIZE);
+      }
+    },
     async getQueuedMessage(recipientId, msgId) {
       // The memory twin of the strongly-consistent point read: a Map is
       // always consistent with itself, so this is just the lookup.
@@ -1200,11 +1258,16 @@ export function makeMemoryDb(
     },
     async getLinkOffer(offerNonce, nowSeconds) {
       const rec = linkOffers.get(offerNonce);
-      // The clock decides, not the reaper (the store's rule, mirrored).
-      if (!rec || rec.expiresAt <= nowSeconds) return undefined;
+      if (!rec) return undefined;
+      // The clock decides, not the reaper (the store's rule, mirrored) —
+      // and the refusing read reaps.
+      if (rec.expiresAt <= nowSeconds) {
+        reapExpiredLinkOffer('offer', rec);
+        return undefined;
+      }
       return { ...rec };
     },
-    async putLinkOfferInit(rec) {
+    async putLinkOfferInit(rec, nowSeconds) {
       if ((rec.rosterEpoch === 0) !== (rec.offererClass !== undefined)) {
         throw new Error('link offer: offererClass present iff first link (rosterEpoch 0)');
       }
@@ -1218,31 +1281,56 @@ export function makeMemoryDb(
       if (!usersById.has(rec.offererUserId) || !usersById.has(rec.acceptorUserId)) {
         return 'unknown_member';
       }
+      // The offerer's own pointer, under the cap-with-reap.
+      if (addLinkOfferPointer(rec.offererUserId, rec.offerNonce, nowSeconds) === 'pointer_cap') {
+        return 'pointer_cap';
+      }
       linkOfferInits.set(rec.offerNonce, { ...rec });
       return 'created';
     },
     async getLinkOfferInit(offerNonce, nowSeconds) {
       const rec = linkOfferInits.get(offerNonce);
-      if (!rec || rec.expiresAt <= nowSeconds) return undefined;
+      if (!rec) return undefined;
+      if (rec.expiresAt <= nowSeconds) {
+        reapExpiredLinkOffer('init', rec);
+        return undefined;
+      }
       return { ...rec };
     },
     async promoteLinkOfferInit(offerNonce, offerSig, nowSeconds) {
       const rec = linkOfferInits.get(offerNonce);
       // Consumed, expired-but-unreaped, or never existed: one answer, the
-      // store's conditional-delete refusal mirrored.
-      if (!rec || rec.expiresAt <= nowSeconds) return 'gone';
+      // store's conditional-delete refusal mirrored (the expired row reaped
+      // at the refusing read, as the store's readLinkOfferInit does).
+      if (!rec) return 'gone';
+      if (rec.expiresAt <= nowSeconds) {
+        reapExpiredLinkOffer('init', rec);
+        return 'gone';
+      }
       if (linkOffers.has(offerNonce)) return 'gone';
+      // The acceptor's pointer — the row the caller does NOT own — under the
+      // same cap-with-reap; an acceptor deleted since init is the store's
+      // attribute_exists refusal ('gone').
+      if (!usersById.has(rec.acceptorUserId)) return 'gone';
+      if (addLinkOfferPointer(rec.acceptorUserId, offerNonce, nowSeconds) === 'pointer_cap') {
+        return 'pointer_cap';
+      }
       linkOfferInits.delete(offerNonce);
       linkOffers.set(offerNonce, { ...rec, offerSig });
       return 'promoted';
     },
-    async isUserTombstoned(userId) {
-      return usersById.get(userId)?.tombstoned === true;
+    async userAccountState(userId) {
+      const row = usersById.get(userId);
+      if (row === undefined) return 'absent';
+      return row.tombstoned === true ? 'tombstoned' : 'live';
     },
     async linkDeviceToGroup({ offerNonce, acceptSig, nowSeconds, linkedAtMs }) {
       const offer = linkOffers.get(offerNonce);
       if (!offer) return 'offer_consumed';
-      if (offer.expiresAt <= nowSeconds) return 'offer_expired';
+      if (offer.expiresAt <= nowSeconds) {
+        reapExpiredLinkOffer('offer', offer);
+        return 'offer_expired';
+      }
       const { groupId, offererUserId, acceptorUserId, acceptorClass, offererClass, rosterEpoch } =
         offer;
       if (acceptorClass === 'desktop' || offererClass === 'desktop') return 'desktop_reserved';
@@ -1337,8 +1425,11 @@ export function makeMemoryDb(
         acceptorRow.groupId = groupId;
       }
       // Consumed in the same synchronous step the roster committed in —
-      // the twin's offer-consume conditional delete.
+      // the twin's offer-consume conditional delete — and the winning nonce
+      // leaves both reverse sets, as the store's `DELETE linkOfferNonces` does.
       linkOffers.delete(offerNonce);
+      dropLinkOfferPointer(offererUserId, offerNonce);
+      dropLinkOfferPointer(acceptorUserId, offerNonce);
       return 'linked';
     },
     async unlinkDeviceFromGroup(input) {
@@ -2145,6 +2236,8 @@ export interface LogEntry {
 }
 
 export interface TestDeps extends Deps {
+  /** The twin, with its test-only planting primitives. */
+  db: TestOnlyDataLayer;
   /** Advance the injected clock by N milliseconds. */
   advanceMs(ms: number): void;
   /** Set the nonce the next auth-challenge call will issue. */
@@ -2181,7 +2274,7 @@ export function testAttachmentId(seq: number): string {
   return String(seq).padStart(43, 'A');
 }
 
-export function makeTestDeps(db: DataLayer, startMs = 1_700_000_000_000): TestDeps {
+export function makeTestDeps(db: TestOnlyDataLayer, startMs = 1_700_000_000_000): TestDeps {
   let nowMs = startMs;
   // UNIQUE per call, like the real 32 random bytes. A constant here would be
   // an unrealistic fake that quietly satisfies "the challenge is bound to the
@@ -2324,6 +2417,20 @@ export function makeTestDeps(db: DataLayer, startMs = 1_700_000_000_000): TestDe
     },
   };
 }
+
+/**
+ * libsignal-SIZED key material for PUT /v1/keys fixtures: the upload schema
+ * pins the byte lengths every shipped client produces — a Curve25519 public
+ * key serialized with its type byte (33), a 64-byte signature, an
+ * ML-KEM-1024 public key with its type byte (1569) — so a fixture must be
+ * the right SIZE even where it need not be a real key (nothing server-side
+ * verifies the bytes; that is the peer's job). Distinct fill bytes keep the
+ * three tellable apart in a dump. */
+export const KEY_FIXTURE = {
+  curvePub: Buffer.alloc(33, 0x05).toString('base64'),
+  sig: Buffer.alloc(64, 0x51).toString('base64'),
+  kyberPub: Buffer.alloc(1569, 0x08).toString('base64'),
+} as const;
 
 export function jsonPost(body: unknown, sourceIp = '127.0.0.1'): HttpEvent {
   return { method: 'POST', path: '/', headers: {}, body: JSON.stringify(body), sourceIp };

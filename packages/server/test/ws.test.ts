@@ -6,13 +6,15 @@ const ulid = monotonicFactory();
 import type { ServerFrame } from '@tacendum/shared';
 import {
   CONNECTION_REAP_GRACE_MS,
+  DRAIN_SLICE_BUDGET,
   drainQueuedMessages,
   wsConnectHandler,
   wsDefaultHandler,
   wsDisconnectHandler,
   type WsDeps,
 } from '../src/handlers/ws.js';
-import { IDKEY_CLAIM_PREFIX, type DataLayer } from '../src/db/data.js';
+import { IDKEY_CLAIM_PREFIX, type TestOnlyDataLayer } from '../src/db/data.js';
+import { LIMITS } from '../src/ratelimit.js';
 import { ACTIVITY_TOUCH_TIMEOUT_MS } from '../src/activity.js';
 import { activityActorRef } from '../src/opaque-ref.js';
 import { allQueued, makeMemoryDb, makeTestDeps, testIdentityKey, type TestDeps } from './helpers.js';
@@ -42,7 +44,7 @@ const UNREGISTERED_KEY = testIdentityKey(0x03);
 const INTEGRATION_KEY = testIdentityKey(0x04);
 
 describe('websocket handlers', () => {
-  let db: DataLayer;
+  let db: TestOnlyDataLayer;
   let deps: TestDeps;
   let sender: ReturnType<typeof makeFakeSender>;
   let wsDeps: WsDeps;
@@ -355,6 +357,66 @@ describe('websocket handlers', () => {
     expect(second.map((f) => (f.type === 'msg' ? f.msgId : ''))).toEqual([msgId]);
   });
 
+  /**
+   * The delivery receipt, server half. The server posted exactly one
+   * receipt per send — `sent` when nobody was listening — and nothing at
+   * drain, so a message queued while the recipient was offline (on iOS,
+   * whenever the app was backgrounded) stayed `sent` on the sender's screen
+   * for good, and the client's read-receipt path, gated on `delivered`, threw
+   * the peer's read away. The drain now posts the `delivered` receipt
+   * handleSend would have posted, to the sender's live socket. */
+  it('a message queued while the recipient was offline earns its sender a delivered receipt when the recipient drains', async () => {
+    await connect(aliceToken, 'conn-a');
+    const msgId = ulid();
+    await sendFrame(bobId, msgId, 'conn-a', aliceId);
+    const receipts = () => (sender.inbox.get('conn-a') ?? []).filter((f) => f.type === 'receipt');
+    expect(receipts()).toEqual([{ type: 'receipt', msgId, state: 'sent' }]);
+
+    await connect(bobToken, 'conn-b');
+    const bobFrames = (sender.inbox.get('conn-b') ?? []).filter((f) => f.type === 'msg');
+    expect(bobFrames.map((f) => (f.type === 'msg' ? f.msgId : ''))).toEqual([msgId]);
+    expect(receipts()).toEqual([
+      { type: 'receipt', msgId, state: 'sent' },
+      { type: 'receipt', msgId, state: 'delivered' },
+    ]);
+    // The receipt is not an ack: the row still waits for bob's.
+    expect(await allQueued(db, bobId)).toHaveLength(1);
+  });
+
+  /**
+   * The frame's `urgent` bit — already read by the server for the VoIP
+   * wake — now rides the queued ROW too, so the reconnect drain can post
+   * call signalling ahead of the backlog (ws.drain.test.ts).
+   * Present-and-true or absent, never false. */
+  it('an urgent send persists the urgent bit on the queued row; an ordinary send does not', async () => {
+    await connect(aliceToken, 'conn-a');
+    const offer = ulid();
+    const plain = ulid();
+    const res = await wsDefaultHandler(
+      {
+        routeKey: '$default',
+        connectionId: 'conn-a',
+        senderUserId: aliceId,
+        body: JSON.stringify({
+          type: 'send',
+          to: bobId,
+          msgId: offer,
+          msgType: 'ciphertext',
+          payload: B64,
+          urgent: true,
+        }),
+      },
+      wsDeps,
+    );
+    expect(res.statusCode).toBe(200);
+    await sendFrame(bobId, plain, 'conn-a', aliceId);
+    const queued = await allQueued(db, bobId);
+    expect(queued.map((m) => [m.msgId, m.urgent])).toEqual([
+      [offer, true],
+      [plain, undefined],
+    ]);
+  });
+
   it('drain skips queued messages at or before the TTL boundary (TTL deletion is eventual)', async () => {
     const nowSec = Math.floor(deps.now() / 1000);
     const [mBefore, mAt, mAbove] = [ulid(), ulid(), ulid()];
@@ -618,6 +680,255 @@ describe('websocket handlers', () => {
       const res = await sendFrame('01JNKJNKJNKJNKJNKJNKJNKJNK', ulid(), 'conn-a', aliceId);
       expect(res.statusCode).toBe(404);
       expect(await db.getConnection(aliceId)).toBeUndefined();
+    });
+  });
+
+  /**
+   * `ack` frames had no per-user bound and cost three DynamoDB round trips
+   * each; unparseable frames cost the session recheck plus an error post with
+   * no bound either. The only ceiling was the WS stage throttle, which is
+   * aggregate across every client — one socket spraying acks or garbage 429'd
+   * everyone else. Two buckets now: `wsAck` (sized to TWO drain slices per
+   * window, so an honest backlog's acks pass) and `wsRefused`, which is
+   * charged on every unparseable or schema-rejected frame and hangs the
+   * socket up when empty — server-side DeleteConnection being the only
+   * per-client lever API Gateway offers. An over-bound ack is refused but
+   * NEVER charges `wsRefused`: a drain slice has no minimum duration, so a
+   * fast drain can post more than one slice inside one fixed window, and the
+   * acks of an honest client draining a big backlog must never hang its
+   * socket up. */
+  describe('per-user bounds on ack and refused frames', () => {
+    function ack(connectionId: string, senderUserId: string, msgId = ulid()) {
+      return wsDefaultHandler(
+        {
+          routeKey: '$default',
+          connectionId,
+          senderUserId,
+          body: JSON.stringify({ type: 'ack', msgId }),
+        },
+        wsDeps,
+      );
+    }
+    function garbage(connectionId: string, senderUserId: string) {
+      return wsDefaultHandler(
+        { routeKey: '$default', connectionId, senderUserId, body: 'not json' },
+        wsDeps,
+      );
+    }
+
+    it('acks are bounded per user: the bucket passes, the next is refused with rate_limited', async () => {
+      await connect(bobToken, 'conn-b');
+      for (let i = 0; i < LIMITS.wsAck.capacity; i++) {
+        expect((await ack('conn-b', bobId)).statusCode).toBe(200);
+      }
+      const over = await ack('conn-b', bobId);
+      expect(over.statusCode).toBe(429);
+      const errors = (sender.inbox.get('conn-b') ?? []).filter((f) => f.type === 'error');
+      expect(errors).toEqual([
+        { type: 'error', code: 'rate_limited', detail: expect.any(String) },
+      ]);
+      // One refusal is not a teardown: the socket and its row survive.
+      expect(deps.disconnected).toEqual([]);
+      expect((await db.getConnection(bobId))?.connectionId).toBe('conn-b');
+      // Per USER: alice's acks draw their own bucket.
+      await connect(aliceToken, 'conn-a');
+      expect((await ack('conn-a', aliceId)).statusCode).toBe(200);
+    });
+
+    it('a refused ack deletes nothing — the queued row waits for a re-drain', async () => {
+      await connect(aliceToken, 'conn-a');
+      const msgId = ulid();
+      await sendFrame(bobId, msgId, 'conn-a', aliceId); // queued for offline bob
+      await connect(bobToken, 'conn-b');
+      for (let i = 0; i < LIMITS.wsAck.capacity; i++) await ack('conn-b', bobId);
+      expect((await ack('conn-b', bobId, msgId)).statusCode).toBe(429);
+      expect((await allQueued(db, bobId)).map((m) => m.msgId)).toEqual([msgId]);
+    });
+
+    it('unparseable frames past the refused-frame bound hang the socket up', async () => {
+      await connect(aliceToken, 'conn-a');
+      for (let i = 0; i < LIMITS.wsRefused.capacity; i++) {
+        expect((await garbage('conn-a', aliceId)).statusCode).toBe(400);
+      }
+      // Up to the bound: refused, told why, still connected.
+      expect(deps.disconnected).toEqual([]);
+      expect((await db.getConnection(aliceId))?.connectionId).toBe('conn-a');
+      const dropped = await garbage('conn-a', aliceId);
+      expect(dropped.statusCode).toBe(400);
+      expect(deps.disconnected).toEqual(['conn-a']);
+      expect(await db.getConnection(aliceId)).toBeUndefined();
+      const drops = deps.logs.filter((l) => l.event === 'ws_socket_dropped_refused_frames');
+      expect(drops).toHaveLength(1);
+      // Routing metadata only — never the user or the connection (rule 4).
+      expect(JSON.stringify(drops)).not.toContain(aliceId);
+      expect(JSON.stringify(drops)).not.toContain('conn-a');
+    });
+
+    it('schema-rejected frames charge the same bound as unparseable ones', async () => {
+      await connect(aliceToken, 'conn-a');
+      const bogus = () =>
+        wsDefaultHandler(
+          {
+            routeKey: '$default',
+            connectionId: 'conn-a',
+            senderUserId: aliceId,
+            body: JSON.stringify({ type: 'send', to: 'nope' }),
+          },
+          wsDeps,
+        );
+      for (let i = 0; i <= LIMITS.wsRefused.capacity; i++) await bogus();
+      expect(deps.disconnected).toEqual(['conn-a']);
+    });
+
+    it('two full drain slices of acks inside one window all pass — no refusal, no disconnect', async () => {
+      // A slice ends on maxItems and the drain Lambda self-invokes the next
+      // one at once, so at management-API pace one 30 s window carries more
+      // than a slice of posts — and as many acks. One slice's worth of bound
+      // refused the honest tail; the bucket now admits two per window.
+      await connect(bobToken, 'conn-b');
+      for (let i = 0; i < 2 * DRAIN_SLICE_BUDGET.maxItems; i++) {
+        expect((await ack('conn-b', bobId)).statusCode).toBe(200);
+      }
+      expect((sender.inbox.get('conn-b') ?? []).filter((f) => f.type === 'error')).toEqual([]);
+      expect(deps.disconnected).toEqual([]);
+      expect((await db.getConnection(bobId))?.connectionId).toBe('conn-b');
+    });
+
+    it('over-bound acks are refused but NEVER charge the refused-frame bound — the socket survives', async () => {
+      // REWRITTEN deliberately: this case used to pin the opposite ("refused
+      // acks count toward the refused-frame bound"), which is the hang-up an
+      // honest client draining a backlog larger than one window's bound could
+      // trigger — every refused ack charged `wsRefused`, the 21st dropped the
+      // socket, and the app ignores error frames, so the rows stayed queued
+      // until the next reconnect re-drained into the still-exhausted window.
+      await connect(bobToken, 'conn-b');
+      for (let i = 0; i < LIMITS.wsAck.capacity; i++) await ack('conn-b', bobId);
+      for (let i = 0; i <= LIMITS.wsRefused.capacity; i++) {
+        expect((await ack('conn-b', bobId)).statusCode).toBe(429);
+      }
+      expect(deps.disconnected).toEqual([]);
+      expect((await db.getConnection(bobId))?.connectionId).toBe('conn-b');
+      // And the refused-frame bucket is UNTOUCHED by those acks: garbage still
+      // has its whole allowance before the teardown lever is reached.
+      for (let i = 0; i < LIMITS.wsRefused.capacity; i++) await garbage('conn-b', bobId);
+      expect(deps.disconnected).toEqual([]);
+      await garbage('conn-b', bobId);
+      expect(deps.disconnected).toEqual(['conn-b']);
+      expect(await db.getConnection(bobId)).toBeUndefined();
+    });
+
+    it('the teardown never clobbers a newer connection row (conditional delete)', async () => {
+      await connect(aliceToken, 'conn-a');
+      // The old socket keeps spraying after a reconnect took the row.
+      sender.dead.add('conn-a');
+      await connect(aliceToken, 'conn-a2');
+      for (let i = 0; i <= LIMITS.wsRefused.capacity; i++) await garbage('conn-a', aliceId);
+      expect(deps.disconnected).toContain('conn-a');
+      expect((await db.getConnection(aliceId))?.connectionId).toBe('conn-a2');
+    });
+
+    it('the refused-frame bucket refills — a client that slows down keeps its socket', async () => {
+      await connect(aliceToken, 'conn-a');
+      for (let i = 0; i < LIMITS.wsRefused.capacity; i++) await garbage('conn-a', aliceId);
+      deps.advanceMs(60_000); // a minute of good behaviour refills the whole bucket
+      for (let i = 0; i < LIMITS.wsRefused.capacity; i++) await garbage('conn-a', aliceId);
+      expect(deps.disconnected).toEqual([]);
+    });
+  });
+
+  /**
+   * The transport maps only GoneException to `false`; a management-API
+   * throttle or 5xx THREW out of the live post, so handleSend 500'd with no
+   * receipt and no error frame while the row was already enqueued. The
+   * client's resend was then an idempotent duplicate (`inserted:false`),
+   * which gates the banner wake off — the message drained later but never
+   * notified. A fault is now "not delivered": the row is spared (a fault is
+   * not evidence the socket is dead), the wake decision runs, and the sender
+   * gets its `sent` receipt. */
+  describe('non-Gone transport faults on a live post', () => {
+    function throttled(): Error {
+      return Object.assign(new Error('rate exceeded'), { name: 'LimitExceededException' });
+    }
+
+    it('a throttled recipient post: sent receipt, row spared, banner wake still scheduled', async () => {
+      await connect(aliceToken, 'conn-a');
+      await connect(bobToken, 'conn-b');
+      deps.advanceMs(CONNECTION_REAP_GRACE_MS); // a Gone post here WOULD reap bob's row
+      const wakes: Array<{ recipientId: string; kind: string | undefined }> = [];
+      wsDeps.schedulePush = async (recipientId, _sender, kind) => {
+        wakes.push({ recipientId, kind });
+      };
+      const basePost = sender.post.bind(sender);
+      wsDeps.sender = {
+        post: async (connectionId, frame) => {
+          if (connectionId === 'conn-b') throw throttled();
+          return basePost(connectionId, frame);
+        },
+      };
+      const msgId = ulid();
+
+      const res = await sendFrame(bobId, msgId, 'conn-a', aliceId);
+
+      expect(res.statusCode).toBe(200);
+      expect(sender.inbox.get('conn-a')).toContainEqual({ type: 'receipt', msgId, state: 'sent' });
+      expect(await allQueued(db, bobId)).toHaveLength(1);
+      expect((await db.getConnection(bobId))?.connectionId).toBe('conn-b');
+      expect(wakes).toEqual([{ recipientId: bobId, kind: 'message' }]);
+      // The error CLASS only — never the frame, the ids, or the message.
+      expect(deps.logs.filter((l) => l.event === 'ws_live_post_failed')).toEqual([
+        { event: 'ws_live_post_failed', fields: { error: 'LimitExceededException' } },
+      ]);
+    });
+
+    it('a throttled receipt post neither fails the send nor reaps the sender row', async () => {
+      await connect(aliceToken, 'conn-a');
+      await connect(bobToken, 'conn-b');
+      const basePost = sender.post.bind(sender);
+      wsDeps.sender = {
+        post: async (connectionId, frame) => {
+          if (connectionId === 'conn-a' && frame.type === 'receipt') throw throttled();
+          return basePost(connectionId, frame);
+        },
+      };
+      const res = await sendFrame(bobId, ulid(), 'conn-a', aliceId);
+      expect(res.statusCode).toBe(200);
+      expect((sender.inbox.get('conn-b') ?? []).filter((f) => f.type === 'msg')).toHaveLength(1);
+      expect((await db.getConnection(aliceId))?.connectionId).toBe('conn-a');
+    });
+
+    it('a throttled error post still answers the refusal and spares the row', async () => {
+      await connect(aliceToken, 'conn-a');
+      wsDeps.sender = {
+        post: async () => {
+          throw throttled();
+        },
+      };
+      const res = await sendFrame('01JNKJNKJNKJNKJNKJNKJNKJNK', ulid(), 'conn-a', aliceId);
+      expect(res.statusCode).toBe(404);
+      expect((await db.getConnection(aliceId))?.connectionId).toBe('conn-a');
+    });
+
+    it('a throttled typing relay is dropped with the uniform answer', async () => {
+      await connect(aliceToken, 'conn-a');
+      await connect(bobToken, 'conn-b');
+      await sendFrame(bobId, ulid(), 'conn-a', aliceId); // establishes alice -> bob
+      const basePost = sender.post.bind(sender);
+      wsDeps.sender = {
+        post: async (connectionId, frame) => {
+          if (connectionId === 'conn-b' && frame.type === 'typing') throw throttled();
+          return basePost(connectionId, frame);
+        },
+      };
+      const res = await wsDefaultHandler(
+        {
+          routeKey: '$default',
+          connectionId: 'conn-a',
+          senderUserId: aliceId,
+          body: JSON.stringify({ type: 'typing', to: bobId, msgType: 'ciphertext', payload: B64 }),
+        },
+        wsDeps,
+      );
+      expect(res).toEqual({ statusCode: 200 });
     });
   });
 

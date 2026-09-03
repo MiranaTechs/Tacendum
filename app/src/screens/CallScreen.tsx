@@ -585,21 +585,31 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
           onPress={onToggleMute}
           theme={theme}
         />
-        <ControlButton
-          label={videoEnabled ? 'Turn camera off' : 'Turn camera on'}
-          glyph="camera"
-          active={!videoEnabled}
-          onPress={onToggleVideo}
-          theme={theme}
-        />
-        <ControlButton
-          label="Flip camera"
-          glyph="camera-flip"
-          active={false}
-          disabled={!videoEnabled}
-          onPress={onFlipCamera}
-          theme={theme}
-        />
+        {/* Offered only on a call that NEGOTIATED video (`call.video`): an
+            audio call — placed as one, or answered without video — has no
+            video m-line and no local video track, and there is no mid-call
+            renegotiation path to add one. The toggle on such a call lied
+            twice: a black preview here and `call.media{v:true}` to a peer
+            whose screen then went full black. No transceiver, no control. */}
+        {state.call?.video !== false && (
+          <>
+            <ControlButton
+              label={videoEnabled ? 'Turn camera off' : 'Turn camera on'}
+              glyph="camera"
+              active={!videoEnabled}
+              onPress={onToggleVideo}
+              theme={theme}
+            />
+            <ControlButton
+              label="Flip camera"
+              glyph="camera-flip"
+              active={false}
+              disabled={!videoEnabled}
+              onPress={onFlipCamera}
+              theme={theme}
+            />
+          </>
+        )}
         {/* Offered only where an earpiece exists to route away from
 . On an iPad every route lands on the
             loudspeaker — `.none` and `.defaultToSpeaker` alike — so the

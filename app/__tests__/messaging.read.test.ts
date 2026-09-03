@@ -253,21 +253,128 @@ describe('rooms send no read receipts', () => {
 });
 
 describe('the markRead query cannot be aimed', () => {
-  it('only touches MY delivered messages in THIS conversation', async () => {
+  it('only touches MY sent-or-delivered messages in THIS conversation', async () => {
     // `ids` arrives off the wire, so the SQL is the guard: direction 'out'
     // stops a peer rewriting their own rows, peerId stops one conversation
-    // reaching into another, and status 'delivered' stops a receipt
-    // resurrecting a failed send or overwriting an error row.
+    // reaching into another, and the status set stops a receipt
+    // resurrecting a failed send, overwriting an error row, or claiming a
+    // message still sitting in this device's outbox.
+    //
+    // `sent` IS admitted. This test used to pin `status = 'delivered'`, and
+    // that pinned the defect in: the server posts one receipt per send —
+    // `sent` whenever the recipient had no live socket, which on iOS is
+    // every backgrounded moment — and never upgrades it, so the old guard
+    // matched nothing for most messages and the peer's read envelope was
+    // acked away with no tick to show for it.
     await db.markRead(PEER, [THEIRS], 1_700_000_000_000);
     const sql = String(sqlFor(/UPDATE messages SET status = 'read'/)[0]?.[0] ?? '');
 
     expect(sql).toMatch(/direction = 'out'/);
     expect(sql).toMatch(/peerId = \?/);
-    expect(sql).toMatch(/status = 'delivered'/);
+    expect(sql).toMatch(/status IN \('sent', 'delivered'\)/);
+    expect(sql).not.toMatch(/'error'/);
+    expect(sql).not.toMatch(/'pending'/);
   });
 
   it('does no work at all for an empty list', async () => {
     expect(await db.markRead(PEER, [], 1)).toBe(0);
     expect(sqlFor(/UPDATE messages SET status = 'read'/)).toHaveLength(0);
+  });
+});
+
+/**
+ * The same guard, PROVED on Node's real SQLite engine (the db.consent.test.ts
+ * harness) rather than read off the SQL text: a `sent` row reaches `read`, a
+ * `delivered` row still does, and every row the guards exist for — error,
+ * pending, inbound, another conversation — stays exactly as it was.
+ */
+describe('markRead against real rows', () => {
+  type Row = Record<string, unknown>;
+  interface Engine {
+    prepare(sql: string): { all(...args: unknown[]): Row[] };
+    exec(sql: string): void;
+    close(): void;
+  }
+  const { DatabaseSync } = require('node:sqlite') as {
+    DatabaseSync: new (p: string) => Engine;
+  };
+  const opSqlite = jest.requireMock('@op-engineering/op-sqlite') as {
+    open: (o: { name: string }) => { execute: jest.Mock };
+  };
+  let engine: Engine;
+  const OTHER = '01OTHERZ3NDEKTSV4RRFFQ69G5';
+  const AT = 1_700_000_000_000;
+
+  beforeEach(async () => {
+    await db.close();
+    sqlite.reset();
+    engine = new DatabaseSync(':memory:');
+    opSqlite.open({ name: 'tacendum.sqlite' }).execute.mockImplementation(
+      async (sql: unknown, params?: unknown[]) => {
+        const args = (params ?? []).map(p => (p === undefined ? null : p));
+        const rows = engine.prepare(String(sql)).all(...args);
+        const changes = engine.prepare('SELECT changes() AS c').all()[0]!.c as number;
+        return { rows, rowsAffected: changes };
+      },
+    );
+    db.setWorkspace('real');
+    await db.initDb();
+  });
+
+  afterEach(async () => {
+    await db.close();
+    engine.close();
+  });
+
+  async function seed(msgId: string, status: db.MessageStatus, over: Partial<db.MessageRow> = {}) {
+    await db.insertMessage({
+      msgId,
+      peerId: PEER,
+      direction: 'out',
+      body: 'mine',
+      ts: AT,
+      status,
+      ...over,
+    } as db.MessageRow);
+  }
+  function statusOf(msgId: string, direction = 'out'): string {
+    return engine
+      .prepare('SELECT status FROM messages WHERE msgId = ? AND direction = ?')
+      .all(msgId, direction)[0]!.status as string;
+  }
+
+  it('a row the server receipted as `sent` reaches `read` when the peer says so', async () => {
+    await seed('01SENT', 'sent');
+    await seed('01DELIVERED', 'delivered');
+    expect(await db.markRead(PEER, ['01SENT', '01DELIVERED'], AT + 5)).toBe(2);
+    expect(statusOf('01SENT')).toBe('read');
+    expect(statusOf('01DELIVERED')).toBe('read');
+  });
+
+  it('never touches error, pending, inbound, or another conversation\'s rows', async () => {
+    await seed('01ERROR', 'error');
+    await seed('01PENDING', 'pending');
+    await seed('01THEIRS', 'received', { direction: 'in' });
+    await seed('01ELSEWHERE', 'sent', { peerId: OTHER });
+    const moved = await db.markRead(
+      PEER,
+      ['01ERROR', '01PENDING', '01THEIRS', '01ELSEWHERE'],
+      AT + 5,
+    );
+    expect(moved).toBe(0);
+    expect(statusOf('01ERROR')).toBe('error');
+    expect(statusOf('01PENDING')).toBe('pending');
+    expect(statusOf('01THEIRS', 'in')).toBe('received');
+    expect(statusOf('01ELSEWHERE')).toBe('sent');
+  });
+
+  it('a receipt arriving after the read never pulls the tick back', async () => {
+    // With `sent` rows now reaching `read`, a receipt the socket redelivers
+    // afterwards must rank below it — the filled tick is terminal.
+    await seed('01READ', 'sent');
+    await db.markRead(PEER, ['01READ'], AT + 5);
+    await db.applyReceipt('01READ', 'delivered');
+    await db.applyReceipt('01READ', 'sent');
+    expect(statusOf('01READ')).toBe('read');
   });
 });

@@ -14,6 +14,8 @@ exports[`a whole 1:1 call, traced (the group-call seam regression net) a refused
   "db.saveOffer({"cid":"01HQ000000000000000000000C","peerId":"01HQ0000000000000000000002","sdp":"v=0\\r\\na=fingerprint:sha-256 AA:BB\\r\\nOFFER","video":false,"exp":1800000060000,"serverTs":1800000000000})",
   "state("incoming_ringing", "01HQ000000000000000000000A")",
   "send("01HQ0000000000000000000002", {"tcm":"call.end","cid":"01HQ000000000000000000000C","r":"busy"}, {"urgent":false})",
+  "log({"cid":"01HQ000000000000000000000C","peerId":"01HQ0000000000000000000002","direction":"in","kind":"audio","reason":"busy","startedAt":1800000000000,"connectedAt":null,"endedAt":1800000000000,"missed":true})",
+  "db.dropOffer("01HQ000000000000000000000C")",
   "native.dismissPendingIncomingCall("01HQ0000000000000000000002", "declined", "")",
 ]
 `;

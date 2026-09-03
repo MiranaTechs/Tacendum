@@ -3,7 +3,7 @@ import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import {
   CONNECTION_ROW_TTL_SECONDS,
   connectionExpiresAt,
-  makeDataLayer,
+  makeTestOnlyDataLayer,
   type ConnectionRecord,
 } from '../src/db/data.js';
 import { TABLES } from '../src/db/tables.js';
@@ -14,7 +14,7 @@ import { TABLES } from '../src/db/tables.js';
  * against the request we make, because nothing else in this repository can
  * observe them. The gate suite runs on the memory twin, which stamps
  * `expiresAt` independently — so deleting the stamp from the REAL
- * `makeDataLayer` would leave every gate green while production wrote rows
+ * `makeTestOnlyDataLayer` would leave every gate green while production wrote rows
  * DynamoDB's reaper can never see. This file is where that mutant dies.
  *
  * THREE PROPERTIES, EACH LOAD-BEARING:
@@ -50,7 +50,7 @@ describe('the connection-row TTL backstop, on the wire', () => {
     };
     return {
       commands,
-      db: makeDataLayer(
+      db: makeTestOnlyDataLayer(
         { send } as unknown as DynamoDBDocumentClient,
         undefined,
         { nowMs: () => now },

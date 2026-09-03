@@ -395,3 +395,99 @@ describe('an expired invite', () => {
     expect(h.logs[0]!.reason).toBe('expired');
   });
 });
+
+describe('trickle ICE never overtakes the offer it belongs to', () => {
+  it('holds candidates gathered before the offer goes out, then sends them behind it', async () => {
+    // Native gathers the moment setLocalDescription completes; the offer is
+    // composed only after `reportOutgoingCall`, which awaits a name read.
+    // With that read slow, a burst of candidates used to reach the transport
+    // AHEAD of `call.offer` — and the callee's idle reducer dropped them.
+    let releaseName: () => void = () => undefined;
+    const held = new Promise<void>(resolve => {
+      releaseName = resolve;
+    });
+    const h = harness();
+    (h.service as unknown as { deps: { displayNameFor: (id: string) => Promise<string> } }).deps.displayNameFor =
+      async id => {
+        await held;
+        return `name:${id}`;
+      };
+
+    const dispatch = h.service.dispatch({
+      type: 'placeCall', cid: 'C1', peerId: 'P1', video: false, reportId: null,
+    });
+    // createOffer resolved (mock is immediate); the name read is now parked.
+    await Promise.resolve();
+    await Promise.resolve();
+    // A full envelope's worth, which flushes IMMEDIATELY by the batching rule…
+    for (let i = 0; i < MAX_ICE_CANDIDATES_PER_ENVELOPE; i++) h.service.queueLocalIce(candidate(i));
+    // …and the window elapsing besides.
+    await jest.advanceTimersByTimeAsync(500);
+    expect(h.sent.filter(s => s.envelope.tcm === 'call.ice')).toHaveLength(0);
+
+    releaseName();
+    await dispatch;
+    await jest.advanceTimersByTimeAsync(500);
+    await h.service.flushIce();
+
+    const tcms = h.sent.map(s => s.envelope.tcm);
+    expect(tcms.indexOf('call.offer')).toBeGreaterThanOrEqual(0);
+    expect(tcms.indexOf('call.ice')).toBeGreaterThan(tcms.indexOf('call.offer'));
+    const total = h.sent.reduce(
+      (n, s) => n + (s.envelope.tcm === 'call.ice' ? s.envelope.c.length : 0),
+      0,
+    );
+    expect(total).toBe(MAX_ICE_CANDIDATES_PER_ENVELOPE);
+  });
+
+  it('the callee holds its candidates until the answer has gone out', async () => {
+    let releaseSend: () => void = () => undefined;
+    const held = new Promise<void>(resolve => {
+      releaseSend = resolve;
+    });
+    const sent: { envelope: CallEnvelope }[] = [];
+    const native = {
+      configure: jest.fn().mockResolvedValue(undefined),
+      createOffer: jest.fn().mockResolvedValue(OFFER_SDP),
+      createAnswer: jest.fn().mockResolvedValue(ANSWER_SDP),
+      setRemoteAnswer: jest.fn().mockResolvedValue(undefined),
+      addIceCandidates: jest.fn().mockResolvedValue(undefined),
+      restartIce: jest.fn().mockResolvedValue(OFFER_SDP),
+      close: jest.fn().mockResolvedValue(undefined),
+      reportOutgoingCall: jest.fn().mockResolvedValue(undefined),
+      reportOutgoingConnected: jest.fn().mockResolvedValue(undefined),
+      reportIncomingCall: jest.fn().mockResolvedValue(undefined),
+      endCall: jest.fn().mockResolvedValue(undefined),
+    } as unknown as CallNative;
+    const service = new CallService({
+      native,
+      transport: {
+        sendCallEnvelope: async (_peerId, envelope) => {
+          if (envelope.tcm === 'call.answer') await held;
+          sent.push({ envelope });
+        },
+      },
+      writeLog: async () => undefined,
+      displayNameFor: async id => `name:${id}`,
+      now: () => Date.now(),
+    });
+    created.push(service);
+    await service.dispatch({
+      type: 'offerReceived', cid: 'C2', peerId: 'P1', sdp: OFFER_SDP, video: false,
+      exp: Date.now() + 60_000, serverTs: Date.now(),
+    });
+    const accept = service.dispatch({ type: 'localAccept' });
+    await Promise.resolve();
+    await Promise.resolve();
+    service.queueLocalIce(candidate(0));
+    await jest.advanceTimersByTimeAsync(500);
+    expect(sent.map(s => s.envelope.tcm)).not.toContain('call.ice');
+
+    releaseSend();
+    await accept;
+    await jest.advanceTimersByTimeAsync(500);
+    await service.flushIce();
+    const tcms = sent.map(s => s.envelope.tcm);
+    expect(tcms.indexOf('call.ice')).toBeGreaterThan(tcms.indexOf('call.answer'));
+  });
+});

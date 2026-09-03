@@ -103,8 +103,24 @@ const linkOfferSubmitHandler: AuthedHandler = async (event, deps, auth) => {
   });
   if (!verifyIdentitySignature(offererKey, preimage, signature)) return accountsRefusal();
 
+  // THE RECIPIENT-KEYED CEILING, submit half: this is the leg that writes
+  // the ACCEPTOR's reverse pointer, on A's signature — and A is the caller.
+  // Taken after the signature verifies so a forged submit spends nothing of
+  // B's window; refused collapsed, never a 429 (the key is B's, not the
+  // caller's).
+  if (
+    (await deps.rateLimit.take(
+      `linkoffer-rcpt:${init.acceptorUserId}`,
+      LIMITS.linkOfferRecipient,
+    )) > 0
+  ) {
+    return accountsRefusal();
+  }
+
   // Signature verified — NOW the pending-offer row may exist ('s
   // ordering), single-use-consuming the init row in the same transaction.
+  // 'pointer_cap' — B's reverse-pointer set is full of LIVE ceremonies —
+  // collapses with 'gone'.
   if ((await deps.db.promoteLinkOfferInit(offerNonce, signature, nowSeconds)) !== 'promoted') {
     return accountsRefusal();
   }

@@ -59,7 +59,10 @@ export function makeApnsPushSender(options: ApnsPushSenderOptions): PushSender {
     // One key serves both hosts only if it was created "Sandbox &
     // Production". An environment-scoped key simply fails against the other
     // host, which surfaces here as an ordinary failed push.
-    const client = makeApnsClient({ credentials, env });
+    // The client's log is this sender's: `apns_alert_payload_trimmed` (an
+    // alert over Apple's 4 KB cap shipped without its ciphertext) rides the
+    // same payload-free channel as `apns_refused`.
+    const client = makeApnsClient({ credentials, env, log: options.log });
     clients.set(env, client);
     return client;
   }

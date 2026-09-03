@@ -293,14 +293,82 @@ test('a relock mid-drain does NOT delete plaintext it never imported', async () 
     ts: 1_700_000_000_000,
     body: 'hello',
   });
-  // markSeen never fires: exactly the shape of an early return.
-  (db.markSeen as jest.Mock).mockImplementation(async () => {});
+  // The relock lands between the row write and the seen mark — the
+  // generation goes stale, the handler returns early, and nothing after the
+  // insert (markSeen included) runs. Modelled at the exact seam: a relock
+  // inside the persist, which is where a real `messaging.stop()` from the
+  // lock screen interleaves. (This used to be modelled as a no-op markSeen;
+  // the drain's proof is now its own witness of the write, so the early
+  // return has to be a real one.)
+  // Restored at the end: `clearAllMocks` in beforeEach keeps implementations,
+  // and a persist that relocks would poison every drain that follows.
+  const relocking = jest.spyOn(db, 'insertMessage').mockImplementation(async () => {
+    messaging.stop();
+  });
+  try {
+    await messaging.start(ME);
+    await settle();
+
+    expect(crypto.clearInboxEntry).not.toHaveBeenCalled();
+    expect(crypto.__inbox.size).toBe(1);
+  } finally {
+    relocking.mockRestore();
+  }
+});
+
+test('the spool entry is cleared on the IMPORT itself, even when `seen` has already evicted the row', async () => {
+  // The drain used to read `seen` back as its proof of import, and
+  // `markSeen`'s prune could evict the row it had just written (5000 CSPRNG
+  // wire ids sort above every ULID) — so a perfectly imported message was
+  // never cleared and was re-imported on every launch: the chat line
+  // regressed to the old preview, a ready photo flipped back to 'pending'
+  // and re-downloaded. The proof is now the handler's own witness of the
+  // write, which no prune can take back.
+  crypto.__inbox.set(MSG, {
+    msgId: MSG,
+    from: PEER,
+    ts: 1_700_000_000_000,
+    body: 'hello',
+  });
+  // The row is written (the witness fires) and then reads as gone.
+  jest.spyOn(db, 'hasSeen').mockResolvedValue(false);
 
   await messaging.start(ME);
   await settle();
 
-  expect(crypto.clearInboxEntry).not.toHaveBeenCalled();
-  expect(crypto.__inbox.size).toBe(1);
+  expect(order).toContain(`clear:${MSG}`);
+  expect(crypto.__inbox.size).toBe(0);
+});
+
+test('an entry imported on an EARLIER launch, still spooled, is cleared', async () => {
+  // The witness is in-memory, so it only ever proves an import that happened during THIS
+  // drain. An entry whose import finished on a previous launch but whose
+  // `clearInboxEntry` never landed — the app was killed, the workspace
+  // relocked, the clear threw — has no witness on any later launch, so a
+  // witness-only test left it in the spool forever. That is not a leak: once
+  // 5000 newer rows prune the id out of `seen`, the drain re-imports the
+  // spooled plaintext and the duplicate-import symptom comes back (the chat line
+  // regresses to the old preview, a ready attachment flips to 'pending', a
+  // deleted message is resurrected). A durable `seen` row IS proof the
+  // import already happened, so it clears too.
+  crypto.__inbox.set(MSG, {
+    msgId: MSG,
+    from: PEER,
+    ts: 1_700_000_000_000,
+    body: 'hello',
+  });
+  // Imported on a previous launch: the row survives in `seen`, and the
+  // handler will short-circuit on it without writing anything new.
+  seen.add(MSG);
+  const insertSpy = jest.spyOn(db, 'insertMessage');
+
+  await messaging.start(ME);
+  await settle();
+
+  expect(order).toContain(`clear:${MSG}`);
+  expect(crypto.__inbox.size).toBe(0);
+  // And nothing was re-imported on the way to clearing it.
+  expect(insertSpy).not.toHaveBeenCalled();
 });
 
 test('a redelivery whose key the extension spent is rescued from the spool', async () => {
@@ -706,4 +774,133 @@ test('a spool that cannot be read does not stop the app starting', async () => {
   await settle();
 
   expect(ws.calls.start).toHaveBeenCalled();
+});
+
+/**
+ * PER-SENDER ORDER UNDER A STORE-BUSY RETRY.
+ *
+ * The hazard: a `prekey` message — the one that ESTABLISHES the session —
+ * hits the extension's transient store lock and waits 1.5 s for its retry;
+ * the `ciphertext` right behind it, from the same sender, used to be handled
+ * concurrently, decrypt against a session that did not exist yet, and land
+ * in the generic tamper branch: error row, seen, ACKED. Permanent loss of a
+ * message that would have decrypted a moment later. Frames from one sender
+ * now run in arrival order, and the retry waits IN PLACE so the wait is
+ * part of the first frame's handling; other senders are not held. */
+describe('a sender\'s frames wait behind its store-busy retry', () => {
+  const PREKEY = '01ARZ3NDEKTSV4RRFFQ69G5FA1';
+  const CIPHER = '01ARZ3NDEKTSV4RRFFQ69G5FA2';
+  const OTHER_PEER = '01OTHERZ3NDEKTSV4RRFFQ69G5';
+  const OTHER = '01ARZ3NDEKTSV4RRFFQ69G5FA3';
+  const BUSY = 'store busy (test)';
+
+  function acks(): string[] {
+    return ws.calls.send.mock.calls
+      .map(c => c[0] as { type: string; msgId?: string })
+      .filter(f => f.type === 'ack')
+      .map(f => f.msgId!);
+  }
+
+  function msg(msgId: string, from: string, msgType: 'prekey' | 'ciphertext', ts: number): void {
+    ws.handlers.frame?.({ type: 'msg', from, msgId, msgType, payload: 'AAAA', ts });
+  }
+
+  test('a ciphertext behind a busy-delayed prekey message decrypts after the retry: no error row, no premature ack, both imported in order', async () => {
+    const busyMock = (crypto as unknown as { isStoreBusyError: jest.Mock }).isStoreBusyError;
+    // A pass-through spy on the REAL insert. An earlier test in this file
+    // leaves `insertMessage` rejecting ('db closed') and `clearAllMocks`
+    // keeps implementations, so the leaked spy is restored first.
+    jest.spyOn(db, 'insertMessage').mockRestore();
+    const inserted = jest.spyOn(db, 'insertMessage');
+    try {
+      busyMock.mockImplementation((e: unknown) => e instanceof Error && e.message === BUSY);
+      // The native store as the hazard sees it: PEER's session exists only
+      // once the prekey message has been processed; OTHER_PEER's already does.
+      let sessionEstablished = false;
+      let prekeyAttempts = 0;
+      crypto.decryptEnvelope.mockImplementation(
+        async (_self: string, from: string, msgType: string) => {
+          if (from !== PEER) return 'from someone else';
+          if (msgType === 'prekey') {
+            prekeyAttempts += 1;
+            if (prekeyAttempts === 1) throw new Error(BUSY);
+            sessionEstablished = true;
+            return 'hello (prekey)';
+          }
+          if (!sessionEstablished) throw new Error('SessionNotFound');
+          return 'hello again';
+        },
+      );
+
+      await messaging.start(ME);
+      await settle(400);
+      ws.state.open = true;
+      ws.calls.send.mockClear();
+
+      msg(PREKEY, PEER, 'prekey', 1_700_000_000_000);
+      await settle(400);
+      msg(CIPHER, PEER, 'ciphertext', 1_700_000_000_001);
+      await settle(400);
+      // Inside the wait: the ciphertext has NOT been tried against a session
+      // that is not there yet, and nothing is acked.
+      expect(prekeyAttempts).toBe(1);
+      expect(crypto.decryptEnvelope).toHaveBeenCalledTimes(1);
+      expect(acks()).toEqual([]);
+      expect(inserted).not.toHaveBeenCalled();
+
+      // Another sender is not held behind PEER's wait.
+      msg(OTHER, OTHER_PEER, 'ciphertext', 1_700_000_000_002);
+      await settle(400);
+      expect(acks()).toEqual([OTHER]);
+
+      // The retry lands the prekey message, and only then the ciphertext.
+      await new Promise<void>(resolve => setTimeout(resolve, 1_600));
+      await settle(400);
+      expect(prekeyAttempts).toBe(2);
+      const rows = inserted.mock.calls
+        .map(c => c[0] as { msgId: string; body: string; status: string })
+        .filter(r => r.msgId === PREKEY || r.msgId === CIPHER);
+      expect(rows.map(r => r.status)).not.toContain('error');
+      expect(rows.map(r => r.body)).toEqual(['hello (prekey)', 'hello again']);
+      expect(acks()).toEqual([OTHER, PREKEY, CIPHER]);
+    } finally {
+      inserted.mockRestore();
+      crypto.decryptEnvelope.mockReset();
+      busyMock.mockReset();
+      busyMock.mockReturnValue(false);
+    }
+  });
+
+  test('a relock during the wait releases the parked handler: nothing is written or acked afterwards', async () => {
+    const busyMock = (crypto as unknown as { isStoreBusyError: jest.Mock }).isStoreBusyError;
+    // A pass-through spy on the REAL insert. An earlier test in this file
+    // leaves `insertMessage` rejecting ('db closed') and `clearAllMocks`
+    // keeps implementations, so the leaked spy is restored first.
+    jest.spyOn(db, 'insertMessage').mockRestore();
+    const inserted = jest.spyOn(db, 'insertMessage');
+    try {
+      busyMock.mockImplementation((e: unknown) => e instanceof Error && e.message === BUSY);
+      crypto.decryptEnvelope.mockRejectedValueOnce(new Error(BUSY));
+      await messaging.start(ME);
+      await settle(400);
+      ws.state.open = true;
+      ws.calls.send.mockClear();
+      msg(PREKEY, PEER, 'prekey', 1_700_000_000_000);
+      await settle(400);
+      expect(crypto.decryptEnvelope).toHaveBeenCalledTimes(1);
+
+      messaging.stop();
+      await new Promise<void>(resolve => setTimeout(resolve, 1_700));
+      await settle(400);
+      // The wait was woken with "no": no second decrypt, no row, no ack.
+      expect(crypto.decryptEnvelope).toHaveBeenCalledTimes(1);
+      expect(inserted).not.toHaveBeenCalled();
+      expect(acks()).toEqual([]);
+    } finally {
+      inserted.mockRestore();
+      crypto.decryptEnvelope.mockReset();
+      busyMock.mockReset();
+      busyMock.mockReturnValue(false);
+    }
+  });
 });

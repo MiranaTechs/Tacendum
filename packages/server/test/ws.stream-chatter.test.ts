@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import type { ServerFrame, TypingFrame } from '@tacendum/shared';
 import { wsDefaultHandler, type WsDeps, type WsResult } from '../src/handlers/ws.js';
 import { LIMITS } from '../src/ratelimit.js';
-import type { DataLayer } from '../src/db/data.js';
+import type { TestOnlyDataLayer } from '../src/db/data.js';
 import { allQueued, makeMemoryDb, makeTestDeps, type TestDeps } from './helpers.js';
 
 /**
@@ -86,7 +86,7 @@ const SENDER = '0000000000000000000SENDER1'; // the streaming integration
 const OWNER = '00000000000000000000WNER03'; // its bound owner
 const STRANGER = '000000000000000000STRNGR04'; // everyone else
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: TestDeps;
 let wsDeps: WsDeps & { sender: ReturnType<typeof makeFakeSender> };
 

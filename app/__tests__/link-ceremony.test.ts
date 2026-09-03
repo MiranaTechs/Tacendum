@@ -46,6 +46,7 @@ import {
   NoVerificationCodeError,
   OffererCeremony,
   onPeerRosterNotice,
+  pendingOfferWaiting,
   reconcilePendingLink,
   redrivePendingMutations,
   type LinkingDeps,
@@ -871,6 +872,34 @@ describe('fail-closed ceremony refusals', () => {
   });
 });
 
+describe('a pending offer waiting to be shown (the home-surface re-read)', () => {
+  it('answers true for a live offer, without a bundle fetch or a pin', async () => {
+    const { deps, calls, state } = fakeDeps();
+    state.pendingOffer = {
+      offerNonce: NONCE,
+      noticeJson: JSON.stringify(offerNotice()),
+      receivedAt: NOW_MS,
+    };
+    expect(await pendingOfferWaiting(deps)).toBe(true);
+    expect(calls.bundles).toHaveLength(0); // a probe, not the ceremony
+    expect(state.pendingOffer).not.toBeNull();
+  });
+
+  it('answers false when nothing waits, and reaps an expired row on the way', async () => {
+    const { deps, state } = fakeDeps();
+    expect(await pendingOfferWaiting(deps)).toBe(false);
+    state.pendingOffer = {
+      offerNonce: NONCE,
+      noticeJson: JSON.stringify(
+        offerNotice({ expiresAt: Math.floor(NOW_MS / 1000) - 1 }),
+      ),
+      receivedAt: NOW_MS,
+    };
+    expect(await pendingOfferWaiting(deps)).toBe(false);
+    expect(state.pendingOffer).toBeNull(); // dead weight, reaped
+  });
+});
+
 /* ── 5. unsigned-notice hardening ──────────────────── */
 
 describe('unsigned-notice hardening: epoch monotonicity, no resurrection', () => {
@@ -1155,6 +1184,25 @@ describe("the offerer's durable pending record: the link survives the screen", (
       [SELF, OTHER].sort(),
     );
     expect(state.pendingCeremony).toBeNull(); // consumed
+  });
+
+  it('"Stop waiting" halts the probe from this object but KEEPS the row — the only path to a late acceptance', async () => {
+    const { deps, calls, state } = fakeDeps();
+    const ceremony = await OffererCeremony.begin(OTHER, deps);
+    await ceremony.confirm('tablet');
+    expect(state.pendingCeremony).not.toBeNull();
+    expect(ceremony.expiresAt).toBe(EXPIRES);
+    const fetched = calls.bundles.length;
+
+    ceremony.cancel();
+    expect(ceremony.phase).toBe('cancelled');
+    // A stopped screen spends no more of the joiner's prekeys…
+    expect(await ceremony.checkLinked()).toBe(false);
+    expect(calls.bundles.length).toBe(fetched);
+    // …and the durable record stays: the server has no withdrawal route, the
+    // offerer is excluded from the memberLinked fan-out, so deleting this row
+    // would let the new device join with this one none the wiser.
+    expect(state.pendingCeremony).not.toBeNull();
   });
 
   it('an expired pending record reaps instead of probing — no prekey spent on a dead offer', async () => {

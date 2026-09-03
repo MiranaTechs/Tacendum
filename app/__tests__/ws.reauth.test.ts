@@ -767,6 +767,82 @@ describe('the socket URL carries a ticket, never the bearer', () => {
     client.stop();
   });
 
+  test('a minter whose answer no longer PARSES retries from the backoff ceiling, not the base, and says so by name', async () => {
+    /*
+     * The server is ahead of this build: no schedule of re-dials reaches
+     * it. It must still retry — a server rollback or an update under a live
+     * process both heal it — but a stale client dialling every second is a
+     * ticket-minting hammer against `/v1/ws-ticket` with no possible
+     * success, so the next dial waits the ceiling (30 s × the jitter band),
+     * and the state is readable as the thing it is.
+     */
+    const before = FakeSocket.instances.length;
+    const client = new ws.WsClient();
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // When each mint was asked for, on the fake clock: the GAPS are the
+    // assertion, because the delay is jittered inside [0.5, 1.5) of the
+    // base — a count at a fixed instant would pass or fail on the draw.
+    const mints: number[] = [];
+    client.start(STALE, undefined, async () => {
+      mints.push(Date.now());
+      throw Object.assign(new Error('update Tacendum: the server answered WsTicketResponse in a shape this version cannot read'), {
+        name: 'ServerAheadError',
+      });
+    });
+    await settle();
+    expect(FakeSocket.instances.length).toBe(before);
+    expect(mints).toHaveLength(1);
+    expect(client.serverAhead).toBe(true);
+    // Said once, by name — no ticket, no bearer, no body in the line.
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]![0])).toContain('server ahead of client');
+    expect(String(warn.mock.calls[0]![0])).not.toContain(STALE);
+
+    // The ordinary schedule would have re-minted inside 1.5 s (base 1 s ×
+    // jitter < 1.5); the ceiling's band is [15 s, 45 s).
+    await jest.advanceTimersByTimeAsync(14_999);
+    await settle();
+    expect(mints).toHaveLength(1);
+    await jest.advanceTimersByTimeAsync(30_001);
+    await settle();
+    expect(mints.length).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < mints.length; i++) {
+      const gap = mints[i]! - mints[i - 1]!;
+      expect(gap).toBeGreaterThanOrEqual(15_000);
+      expect(gap).toBeLessThan(45_000);
+    }
+    // Still ahead, still said only once, still no socket.
+    expect(client.serverAhead).toBe(true);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(FakeSocket.instances.length).toBe(before);
+
+    warn.mockRestore();
+    client.stop();
+  });
+
+  test('a mint that parses again clears the server-ahead state', async () => {
+    const client = new ws.WsClient();
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    let calls = 0;
+    client.start(STALE, undefined, async () => {
+      calls++;
+      if (calls === 1) {
+        throw Object.assign(new Error('update Tacendum'), { name: 'ServerAheadError' });
+      }
+      return `tkt-${calls}`;
+    });
+    await settle();
+    expect(client.serverAhead).toBe(true);
+    const before = FakeSocket.instances.length;
+    await jest.advanceTimersByTimeAsync(45_001);
+    await settle();
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(client.serverAhead).toBe(false);
+    expect(FakeSocket.instances.slice(before).some(s => s.url.includes('ticket=tkt-2'))).toBe(true);
+    warn.mockRestore();
+    client.stop();
+  });
+
   test('a stop() during the mint does not produce a socket afterwards', async () => {
     // The mint is async and the dial happens in its continuation, so a relock
     // mid-mint must not be followed by a connection appearing a moment later.

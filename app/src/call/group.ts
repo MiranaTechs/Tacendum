@@ -173,6 +173,15 @@ export interface GroupCallNative extends CallNative {
    * no per-leg verdict to return because there is no per-leg effect.
    */
   setSpeaker(cid: string, on: boolean): Promise<void>;
+  /**
+   * The in-app Answer's CallKit half for a SESSION: a
+   * `CXAnswerCallAction` against the sid its one CXCall is
+   * keyed by, so the audio session activates and the WebRTC unit starts
+   * under §7.4's manual-audio rule. On Android the same call makes the
+   * Telecom connection ACTIVE, which is that platform's activation moment.
+   * Optional so a fake native predating it still satisfies the interface;
+   * the coordinator treats absence as a no-op. */
+  answerReportedCall?(sid: string): Promise<void>;
 }
 
 export interface GroupCallTransport {
@@ -492,6 +501,14 @@ export interface GroupCallView {
    * a report on a fan-out — see `setSpeakerEnabled` for why there is none.
    */
   speakerOn: boolean;
+  /**
+   * WHETHER A FAILED LEG IS ABOUT TO BE RE-OFFERED: true while any `failed`
+   * leg has an R6 re-offer timer armed. The header folds the legs into one
+   * status line and read "Ending…" for a session every leg of which had
+   * failed with repairs pending — a call that was alive and about to
+   * re-dial. Optional so a view built without it (a test fixture, an older
+   * caller) reads as "not repairing". */
+  repairing?: boolean;
 }
 
 /** Thrown by `startGroupCall` when the call may not begin, and by
@@ -592,6 +609,20 @@ export class GroupCallCoordinator implements GroupRouter {
   private readonly skipped = new Map<string, 'blocked' | 'identity_changed'>();
   private readonly reofferTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /**
+   * THE CIDS WHOSE MEDIA EXISTS — the legs a fan may reach. A leg's tracks
+   * are born inside `createOffer`/`createAnswer`,
+   * and `state.legs` lists every leg from the first step while the dials run
+   * sequentially behind the pacer (~260 ms each): a Mute in the first seconds
+   * of a 6-way met legs with no peer connection yet, native answered `false`
+   * for each, and §5's all-or-close-the-leg CLOSED them — an urgent
+   * `call.end` to a peer not yet invited, "X was dropped" over a dial that
+   * then proceeded. A leg enters here at the one site its media exists
+   * (`openLegDial`/`openLegAnswer`, right before `bindLegTracks`), which is
+   * also what covers it: a leg opened after the fan binds to `mutedIntent`.
+   * Keyed by cid because re-offers mint fresh ones; entries leave with the
+   * cid's close, its service's idle, and the session. */
+  private readonly mediaBound = new Set<string>();
+  /**
    * Armed the first time a departed leg is found still winding down; cleared
    * when it is released, whether that release was earned or forced, and when
    * the peer comes back (`ensureLeg`). See `DEPARTED_LEG_TEARDOWN_MS`.
@@ -691,6 +722,24 @@ export class GroupCallCoordinator implements GroupRouter {
    * row exists for the sessions that produced none — an invite that expired,
    * a ring nobody's leg ever logged — and must never duplicate one. */
   private legLogRows = 0;
+  /**
+   * THE ROWS LEGS HAVE EMITTED BUT NOT YET WRITTEN, by peer.
+   *
+   * A leg publishes its terminal state through `onStateChange` BEFORE it runs
+   * a single effect, and its row is the LAST of them (`endCall`,
+   * `call-machine.ts`). The reducer collapses a ringing session on that very
+   * report, so `releaseGroupCall` read `legLogRows === 0` while the leg's row
+   * was still queued behind its `closePeerConnection` — and wrote the
+   * aggregate as well: two missed rows for one cancelled ring. So the count
+   * is taken at `filterEffects`, which runs before the state is published,
+   * and this ledger remembers what was counted so a disposal that stops the
+   * loop before the leg's own write (`resetSessionScratch`) can still write
+   * it: the row is the person's evidence that a call happened, and a relock
+   * must not eat it. */
+  private readonly legRowPending = new Map<
+    string,
+    { row: CallLogRow; sessionId: string | null; roomId: string | null }
+  >();
 
   private readonly bucket = createPacingBucket(
     GROUP_SIGNAL_PACING.capacity,
@@ -930,6 +979,12 @@ export class GroupCallCoordinator implements GroupRouter {
       connectedAt: s.connectedAt,
       muted: this.muted,
       speakerOn: this.speakerOn,
+      // A failed leg with an R6 re-offer armed is a call being REPAIRED, not
+      // one ending: the timers are this coordinator's, so the fact is
+      // published from here rather than inferred by the screen.
+      repairing: [...this.reofferTimers.keys()].some(
+        peerId => s.legs[peerId]?.phase === 'failed',
+      ),
     };
   }
 
@@ -1050,13 +1105,36 @@ export class GroupCallCoordinator implements GroupRouter {
     // does not join — opening a media session to a blocked peer is worse than
     // messaging one, and skipping their leg silently is the omission-tell
     // rule 21 forbids, so the whole session is refused and a row says why.
-    const blocked =
-      this.deps.isBlockedLocally?.(from) === true ||
-      invite.r.some(id => id !== selfId && this.deps.isBlockedLocally?.(id) === true);
-    if (blocked) {
-      await this.dismissPlaceholder(from, 'declined');
-      await this.writeAggregateRow(invite.sid, from, 'in', 'blocked', invite.vid, false);
-      return;
+    //
+    // …FOR A SESSION THIS DEVICE IS NOT ALREADY IN. A `join_leg` invite — the
+    // live sid, from a member the starter admitted — is one LEG of a call the
+    // person already answered, not a session to refuse. Refusing it the
+    // whole-session way dismissed nothing that was ringing, wrote a row keyed
+    // by the live sid (colliding with the session's own), and returned
+    // without a verdict, so the blocked member's tile read "Calling…" for the
+    // rest of the call. Their leg is refused through the leg path —
+    // `call.end{busy}` on the offered cid, no row — and the skip is named so
+    // the tile resolves. The asserted `r` is not scanned here: it is payload,
+    // and only the dial path (`openLegDial`, through `mayCall`) decides whom
+    // this device will open media to.
+    const liveSameSession = this.state !== null && this.state.sid === invite.sid;
+    if (liveSameSession) {
+      if (this.deps.isBlockedLocally?.(from) === true) {
+        if (this.state?.roster.includes(from)) this.skipped.set(from, 'blocked');
+        await this.closeLeg(from, invite.cid, 'busy', true, gen);
+        if (this.stale(gen)) return;
+        this.notify();
+        return;
+      }
+    } else {
+      const blocked =
+        this.deps.isBlockedLocally?.(from) === true ||
+        invite.r.some(id => id !== selfId && this.deps.isBlockedLocally?.(id) === true);
+      if (blocked) {
+        await this.dismissPlaceholder(from, 'declined');
+        await this.writeAggregateRow(invite.sid, from, 'in', 'blocked', invite.vid, false);
+        return;
+      }
     }
 
     // A decline the person already made against the push placeholder, before
@@ -1108,14 +1186,23 @@ export class GroupCallCoordinator implements GroupRouter {
       // forgery has nowhere to go, and opening media to someone you blocked
       // is a different harm from being rung by someone you do not know.)
       //
-      // Only when nothing is live, the guard the push-decline and busy
-      // consults above already use. An invite arriving into a running session
-      // is a late joiner or a non-starter pair's offer or a
-      // re-offer; it rings nothing on its own, it comes from accounts the
-      // STARTER's roster admitted rather than from someone reaching you, and
-      // silencing it would break a call the person is already in — the
-      // friend-of-a-friend leg is exactly the one this must not cut.
-      if (this.state === null && this.deps.mayRing) {
+      // Never for an invite naming the LIVE sid. An invite arriving into a
+      // running session for that session is a late joiner or a non-starter
+      // pair's offer or a re-offer; it rings nothing on its own, it comes
+      // from accounts the STARTER's roster admitted rather than from someone
+      // reaching you, and silencing it would break a call the person is
+      // already in — the friend-of-a-friend leg is exactly the one this must
+      // not cut.
+      //
+      // BUT AN INVITE FOR A DIFFERENT SESSION IS SOMEONE REACHING YOU, live
+      // session or not. It is the one invite the reducer can answer with
+      // `supersede` — tear the live call down and RING the winner — and
+      // gating it on `this.state === null` alone meant the ring gate was
+      // skipped precisely when an unknown account's crossing invite could
+      // ring the phone full-screen. Judged exactly as a fresh ring is; a
+      // busy verdict past the gate stays the reducer's.
+      const reaching = (): boolean => this.state === null || this.state.sid !== invite.sid;
+      if (reaching() && this.deps.mayRing) {
         // A THROWN VERDICT IS A SILENT ONE. Every other fallback in this file
         // fails toward keeping the phone working; this one fails toward
         // quiet, for `loadSilenceUnknownCallers`'s reason: a wrongly silenced
@@ -1130,9 +1217,10 @@ export class GroupCallCoordinator implements GroupRouter {
         // The read is an await, so a relock can land inside it.
         if (this.stale(gen)) return;
         // …and so can a call the PERSON started. A session that went live
-        // under the read is the reducer's busy case, not this one — the 1:1
-        // path answers busy before it consults `mayRing` for the same reason.
-        if (!permission.ring && this.state === null) {
+        // under the read — for THIS sid — is the reducer's join case, not
+        // this one; the 1:1 path answers busy before it consults `mayRing`
+        // for the same reason.
+        if (!permission.ring && reaching()) {
           // THE PLACEHOLDER, WHICH HAS ALREADY RUNG. The VoIP push arrives
           // before anything can decrypt, so silencing here without dismissing
           // there means the unknown inviter rang the phone anyway and a
@@ -1159,17 +1247,15 @@ export class GroupCallCoordinator implements GroupRouter {
           return;
         }
       }
-      await this.deps.store
-        .saveOffer({
-          cid: invite.cid,
-          peerId: from,
-          sdp: invite.sdp,
-          video: invite.vid,
-          exp: invite.exp,
-          serverTs,
-          sid: invite.sid,
-        })
-        .catch(() => undefined);
+      // NOT PERSISTED HERE. The offer used to be written to `call_offers` at
+      // this point — for every ringable invite, before the reducer's verdict
+      // — so a stranger's SDP, fingerprint and candidate addresses sat on
+      // disk for a call answered busy. The write is now the reducer's
+      // `persistOffer` effect, emitted only for an invite it rang, held,
+      // swapped or auto-accepted, and first in its step so the offer is on
+      // disk before the session row and the CallKit report (the
+      // persist-before-ring ordering both already keep).
+      //
       // THE ANSWERING HALF — and its own place, below the ring gate.
       //
       // Answering gathers candidates exactly as dialling does, and this device
@@ -1878,29 +1964,29 @@ export class GroupCallCoordinator implements GroupRouter {
   /**
    * Rebuild the SESSION — not one leg — from SQLite.
    *
-   * The bug this exists against is precise: `takeOffer(cid)` restores exactly
-   * the offer whose cid CallKit happens to name, so a phone killed mid-ring in
-   * a three-way call and answered from the lock screen came back holding one
-   * leg and silently dropped the rest. The offers are taken BY SESSION, the
-   * state is rebuilt whole, and the answer flow then runs normally: the starter's leg is
-   * answered, every live held offer is answered, the sovereign `gjoin` goes
-   * out and the offers to lower-index incumbents are made.
+   * The bug this exists against is precise: `takeOffer(cid)` restores exactly the offer
+   * whose cid CallKit happens to name, so a phone killed mid-ring in a three-way call
+   * and answered from the lock screen came back holding one leg and silently dropped
+   * the rest. The offers are taken BY SESSION, the state is rebuilt whole, and the
+   * answer flow then runs normally: the starter's leg is answered, every live held
+   * offer is answered, the sovereign `gjoin` goes out and the offers to lower-index
+   * incumbents are made.
    *
-   * AND EVERY OFFER IS RE-ADMITTED HERE (the distributed-dialler class, one
-   * layer down). An invite is persisted as soon as it is ringable — before
-   * the reducer's verdict, because the SDP is what a cold answer needs and
-   * the ratchet consumed its message key on first decrypt — so the table
-   * holds invites this device REFUSED live as well as the ones it admitted.
-   * A non-rostered account that knows the sid was answered busy while the app
-   * ran and, without this, became an answered media leg the moment the phone
-   * was killed and the call answered from the lock screen. So the persisted
-   * roster goes back to the same judge (`admitGroupCallInvite`, never a
+   * AND EVERY OFFER IS RE-ADMITTED HERE (the distributed-dialler class, one layer
+   * down). An invite is persisted while the frame is in hand — the SDP is what a cold
+   * answer needs and the ratchet consumed its message key on first decrypt — but only
+   * once the reducer has ADMITTED it: the write is its `persistOffer` effect, so the
+   * table no longer holds invites this device refused live. It used to hold every
+   * ringable one, and a non-rostered account that knows the sid was answered busy while
+   * the app ran and became an answered media leg the moment the phone was killed and
+   * the call answered from the lock screen. The re-admission stays: the roster a row
+   * was admitted under can have moved on (a member removed by a later delta), so the
+   * persisted roster goes back to the same judge (`admitGroupCallInvite`, never a
    * roster check written here) and only `join_leg` is rebuilt.
    *
-   * A refused offer is DROPPED, not answered and not refused again: it was
-   * already told `busy` on the live path, and a restore that emitted fresh
-   * frames at an account the roster does not name would tell a stranger this
-   * phone came back.
+   * A refused offer is DROPPED, not answered and not refused again: it was already told
+   * `busy` on the live path, and a restore that emitted fresh frames at an account the
+   * roster does not name would tell a stranger this phone came back.
    *
    * SERIALIZED AGAINST ITSELF AND AGAINST `step`.
    * `flushPendingEvents` hands JS everything CallKit raised before the process
@@ -1914,14 +2000,13 @@ export class GroupCallCoordinator implements GroupRouter {
    * same rows; the body runs inside the coordinator's own queue, so a restore
    * can no longer interleave with a step either.
    *
-   * `ring: false` restores the state without opening the ringing leg, for the
-   * cold END path — see `onCallKitEnd`.
+   * `ring: false` restores the state without opening the ringing leg, for the cold END
+   * path — see `onCallKitEnd`.
    *
-   * `owned: false` says the caller cannot prove the named aggregate was ever
-   * this device's group call. It changes nothing when the row is here — the
-   * row is the provenance, and finding it is the whole job — and it is what
-   * keeps the no-row cleanup below from firing on somebody else's 1:1 call.
-   */
+   * `owned: false` says the caller cannot prove the named aggregate was ever this
+   * device's group call. It changes nothing when the row is here — the row is the
+   * provenance, and finding it is the whole job — and it is what keeps the no-row
+   * cleanup below from firing on somebody else's 1:1 call. */
   private restoring: Promise<GroupRestoreOutcome> | null = null;
 
   async restore(
@@ -2255,7 +2340,20 @@ export class GroupCallCoordinator implements GroupRouter {
     // putting a `call.end` for a dead call on B's wire.
     const sid = this.sessionSid();
     for (const leg of Object.values(s.legs)) {
-      if (leg.phase === 'gone' || leg.phase === 'failed' || leg.phase === 'declined') continue;
+      // Nobody who is gone, and nobody whose media does not exist yet: a
+      // `left` leg is a departed peer whose service is still winding
+      // down, and a fan that reached it re-sent a push-waking `call.end`
+      // to someone who already hung up; a leg with no peer connection is
+      // covered by `bindLegTracks` the moment it has one.
+      if (
+        leg.phase === 'gone' ||
+        leg.phase === 'failed' ||
+        leg.phase === 'declined' ||
+        leg.phase === 'left'
+      ) {
+        continue;
+      }
+      if (!this.mediaBound.has(leg.cid)) continue;
       if (this.stale(gen) || this.sessionSid() !== sid) return outcomes;
       const applied = await this.applyTrack(kind, leg.cid, on, gen);
       if (this.stale(gen) || this.sessionSid() !== sid) return outcomes;
@@ -2548,6 +2646,8 @@ export class GroupCallCoordinator implements GroupRouter {
   private releaseLeg(peerId: string): void {
     this.legs.get(peerId)?.dispose();
     this.legs.delete(peerId);
+    const last = this.legCid.get(peerId);
+    if (last) this.mediaBound.delete(last);
     this.legCid.delete(peerId);
     this.legEndReason.delete(peerId);
     this.skipped.delete(peerId);
@@ -2689,6 +2789,31 @@ export class GroupCallCoordinator implements GroupRouter {
       }
 
       case 'openLegAnswer': {
+        // THE IN-APP ANSWER'S CALLKIT HALF. The session's ONE CXCall is keyed
+        // by its sid (§4.3, departure 8), and the only `CXAnswerCallAction`
+        // the module requested by itself is the one the native `createAnswer`
+        // bridge keys by the LEG cid it is answering — an id CallKit never
+        // heard of. So an Answer taken on the app's own screen performed no
+        // CallKit answer: the audio session never activated, `didActivate`
+        // never fired, and under §7.4's manual-audio rule the WebRTC unit
+        // never started — dead audio both ways unless the call was answered
+        // from the system UI. Requested against the sid, for the starter's
+        // leg, while the aggregate is still merely reported; a no-op natively
+        // when the system UI already consumed the answer (and on Android,
+        // where the same call makes the Telecom connection ACTIVE — that
+        // platform's activation moment). Before `createAnswer`, as the 1:1
+        // funnel orders it. A fake native predating the method is a no-op
+        // too.
+        const s = this.state;
+        if (
+          s !== null &&
+          effect.peerId === s.starterId &&
+          s.callKit === 'reported' &&
+          typeof this.deps.native.answerReportedCall === 'function'
+        ) {
+          await this.deps.native.answerReportedCall(s.sid).catch(() => undefined);
+          if (this.stale(gen)) return;
+        }
         const service = this.ensureLeg(effect.peerId);
         if (service.current.call?.cid !== effect.cid) {
           await service.dispatch(this.offerEvent(effect.peerId, effect.offer));
@@ -2700,7 +2825,9 @@ export class GroupCallCoordinator implements GroupRouter {
         if (this.stale(gen)) return;
         // `createAnswer` is where this leg's media comes into existence, so
         // this is the first moment its tracks can be bound to a mute the
-        // session is already under.
+        // session is already under — and the first moment a fan may reach
+        // it (`mediaBound`).
+        if (service.current.call?.cid === effect.cid) this.mediaBound.add(effect.cid);
         await this.bindLegTracks(effect.peerId, effect.cid, gen);
         break;
       }
@@ -2847,6 +2974,23 @@ export class GroupCallCoordinator implements GroupRouter {
             );
           }
         }
+        break;
+
+      case 'persistOffer':
+        // An ADMITTED invite's offer, for the cold restore below.
+        // Best-effort as the session row is: a failed write costs a
+        // lock-screen answer after a kill, never the live call.
+        await this.deps.store
+          .saveOffer({
+            cid: effect.offer.invite.cid,
+            peerId: effect.offer.from,
+            sdp: effect.offer.invite.sdp,
+            video: effect.offer.invite.vid,
+            exp: effect.offer.invite.exp,
+            serverTs: effect.offer.serverTs,
+            sid: effect.offer.invite.sid,
+          })
+          .catch(() => undefined);
         break;
 
       case 'writeSessionRow': {
@@ -3014,6 +3158,24 @@ export class GroupCallCoordinator implements GroupRouter {
     // Two rows read per peer, and a relock lands in a database read as easily
     // as in the permission one above.
     if (this.stale(gen)) return;
+    // A FRESH SERVICE FOR A FRESH CID. The reducer marks a leg `failed` the
+    // moment its service publishes `ending` — BEFORE that service's teardown
+    // has run — and R6's +2 s re-offer can land while the old leg's
+    // `call.end` is still parked behind other frames in the pacer.
+    // `placeCall` on a machine that is not idle is `reportBusy`, a no-op
+    // here: nothing dialled the new cid, the tile read "Calling…" forever
+    // and, for the last non-terminal leg, the session never released. A
+    // service still winding down is disposed — `close` is idempotent
+    // natively, and the announce it was parked on still leaves through the
+    // pacer — and the dial gets one of its own. (What is lost is the dead
+    // attempt's own history row; the re-offer writes its own.)
+    const winding = this.legs.get(peerId);
+    if (winding && winding.current.name !== 'idle') {
+      const dead = winding.current.call?.cid;
+      winding.dispose();
+      this.legs.delete(peerId);
+      if (dead) this.mediaBound.delete(dead);
+    }
     const service = this.ensureLeg(peerId);
     await service.dispatch({
       type: 'placeCall',
@@ -3027,7 +3189,9 @@ export class GroupCallCoordinator implements GroupRouter {
     // born — enabled, whatever the session is currently under. Every dial
     // reaches here: `addParticipant`'s, answer-time offers, and the
     // re-offer. That is why the binding is at the dial site and not at the one
-    // place a participant happens to be added.
+    // place a participant happens to be added — and why a fan may reach the
+    // leg only from here (`mediaBound`).
+    if (service.current.call?.cid === cid) this.mediaBound.add(cid);
     await this.bindLegTracks(peerId, cid, gen);
   }
 
@@ -3078,6 +3242,7 @@ export class GroupCallCoordinator implements GroupRouter {
       // announcement — and still writes the leg's own history row.
       await service.dispatch({ type: 'endReceived', cid, reason });
     }
+    this.mediaBound.delete(cid);
     return true;
   }
 
@@ -3117,6 +3282,10 @@ export class GroupCallCoordinator implements GroupRouter {
      */
     const gen = this.generation;
     const tok = this.sessionSid();
+    // The leg's OWN session, for the row it may leave behind (`legRowPending`):
+    // `tok` is an opaque incarnation token, not a sid, and at the glare
+    // boundary `this.state` is already the winner while the row is the loser's.
+    const legSession = this.state ? { sid: this.state.sid, roomId: this.state.roomId } : null;
     const service = new CallService({
       native: this.deps.native,
       transport: {
@@ -3124,7 +3293,10 @@ export class GroupCallCoordinator implements GroupRouter {
           this.legSend(peerId, to, envelope, opts, gen, tok),
       },
       writeLog: async row => {
-        this.legLogRows += 1;
+        // Counted at emission, in `filterEffects` below — see `legRowPending`.
+        // Surrendered SYNCHRONOUSLY, before the first await, so the flush a
+        // disposal runs can never write the row this call is writing.
+        this.legRowPending.delete(peerId);
         const s = this.state ?? this.lastSession;
         await this.deps.store.writeLog({
           ...row,
@@ -3145,6 +3317,30 @@ export class GroupCallCoordinator implements GroupRouter {
       filterEffects: effects => {
         for (const effect of effects) {
           if (effect.type === 'endCallKit') this.legEndReason.set(peerId, effect.reason);
+          // The leg's row, counted HERE — before its terminal state reaches
+          // the reducer — so the release that state triggers never finds
+          // `legLogRows === 0` and adds an aggregate on top.
+          if (effect.type === 'writeLog') {
+            this.legLogRows += 1;
+            // The row the leg will write, field by field as `service.ts` copies
+            // it — the effect tag is not a column.
+            const row: CallLogRow = {
+              cid: effect.cid,
+              peerId: effect.peerId,
+              direction: effect.direction,
+              kind: effect.kind,
+              reason: effect.reason,
+              startedAt: effect.startedAt,
+              connectedAt: effect.connectedAt,
+              endedAt: effect.endedAt,
+              missed: effect.missed,
+            };
+            this.legRowPending.set(peerId, {
+              row,
+              sessionId: legSession?.sid ?? null,
+              roomId: legSession?.roomId ?? null,
+            });
+          }
         }
         return effects.filter(e => !CALLKIT_EFFECTS.has(e.type));
       },
@@ -3190,6 +3386,14 @@ export class GroupCallCoordinator implements GroupRouter {
           sdp: envelope.sdp,
           vid: envelope.vid,
           exp: envelope.exp,
+          // The epoch this device holds: a member the starter adds MID-CALL
+          // seeds their session from it rather than from 0, so the starter's
+          // later deltas — the next Add, a Remove, the starter's own hangup
+          // — apply instead of being held forever. Advisory from a
+          // non-starter; `ringFresh` reads it only off the starter's
+          // accepted invite. Additive on the wire: an old build's parser
+          // strips the key.
+          se: s.se,
         },
         true,
         peerId,
@@ -3205,6 +3409,8 @@ export class GroupCallCoordinator implements GroupRouter {
     const cid = state.call?.cid ?? this.legCid.get(peerId);
     if (state.call?.cid) this.legCid.set(peerId, state.call.cid);
     if (!cid) return;
+    // The teardown finished: whatever media this cid had is gone.
+    if (state.name === 'idle') this.mediaBound.delete(cid);
     const reason = state.name === 'ending' ? this.legEndReason.get(peerId) : undefined;
     void this.dispatch({
       type: 'legStateChanged',
@@ -3333,10 +3539,35 @@ export class GroupCallCoordinator implements GroupRouter {
       .catch(() => undefined);
   }
 
+  /**
+   * Write every row a leg emitted and never got to write (`legRowPending`).
+   *
+   * Fire-and-forget, as the aggregate row is: the callers are the synchronous
+   * teardown seams, and a row that cannot be written (a relock has closed the
+   * database) is the same swallowed failure the leg's own write would have
+   * been. Filed under the leg's OWN session (captured at `ensureLeg`), never
+   * the coordinator's current one — at the glare boundary `state` is already
+   * the winner while the rows are the loser's.
+   */
+  private flushPendingLegRows(): void {
+    for (const pending of this.legRowPending.values()) {
+      void this.deps.store
+        .writeLog({ ...pending.row, sessionId: pending.sessionId, roomId: pending.roomId })
+        .catch(() => undefined);
+    }
+    this.legRowPending.clear();
+  }
+
   private resetSessionScratch(): void {
+    // BEFORE the disposals: `dispose()` stops a leg's effect loop at its next
+    // checkpoint, and the row is the last effect of a teardown — a leg still
+    // standing at its `closePeerConnection` when the session ends would
+    // otherwise never write the row it already promised (`legRowPending`).
+    this.flushPendingLegRows();
     for (const service of this.legs.values()) service.dispose();
     this.legs.clear();
     this.legCid.clear();
+    this.mediaBound.clear();
     this.legEndReason.clear();
     this.skipped.clear();
     for (const timer of this.reofferTimers.values()) clearTimeout(timer);

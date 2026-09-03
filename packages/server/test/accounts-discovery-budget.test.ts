@@ -17,7 +17,7 @@ import {
   TABLE_ENV_VARS,
 } from '@tacendum/shared';
 import { makeDocClient, makeDynamoClient } from '../src/db/client.js';
-import { makeDataLayer, type DataLayer } from '../src/db/data.js';
+import { makeTestOnlyDataLayer, type TestOnlyDataLayer } from '../src/db/data.js';
 import { LIMITS } from '../src/ratelimit.js';
 import { makeDdbRateLimiter } from '../src/ratelimit-ddb.js';
 import { accountsRefusal } from '../src/handlers/devices.js';
@@ -25,7 +25,7 @@ import { discoveryLookupRoute, discoveryRefusal, setDiscoverableRoute } from '..
 import { emailRequestCodeRoute, emailVerifyRoute } from '../src/handlers/identifiers.js';
 import { getPrekeyBundleHandler, uploadKeysHandler } from '../src/handlers/keys.js';
 import type { HttpEvent, HttpResult } from '../src/handlers/http.js';
-import { makeTestDeps, type TestDeps } from './helpers.js';
+import { makeTestDeps, type TestDeps, KEY_FIXTURE } from './helpers.js';
 
 /**
  * The budget stack DRIVEN, not deep-equalled:
@@ -63,7 +63,7 @@ const PREV_TABLE_ENV = process.env[TABLE_ENV_VARS.rateBuckets];
 
 let client: DynamoDBClient;
 let doc: DynamoDBDocumentClient;
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 let flagOn = true;
 
@@ -113,7 +113,7 @@ async function attachEmail(
 beforeAll(async () => {
   client = makeDynamoClient();
   doc = makeDocClient(client);
-  const base = makeDataLayer(doc);
+  const base = makeTestOnlyDataLayer(doc);
   db = { ...base, isAccountsFeatureEnabled: async () => flagOn };
   try {
     const { TableNames = [] } = await client.send(new ListTablesCommand({}));
@@ -363,7 +363,7 @@ describe('the per-target aggregate one-time-prekey budget (release pin: 30/day a
     ).toBe('ok');
     const prekeys = Array.from({ length: PREKEY_TARGET_DAILY_FETCH_BUDGET + 10 }, (_, i) => ({
       keyId: i + 1,
-      pub: targetKey,
+      pub: KEY_FIXTURE.curvePub,
     }));
     const up = await uploadKeysHandler(
       {
@@ -373,8 +373,8 @@ describe('the per-target aggregate one-time-prekey budget (release pin: 30/day a
         body: JSON.stringify({
           registrationId: 7,
           identityKey: targetKey,
-          signedPrekey: { keyId: 900, pub: targetKey, sig: targetKey },
-          kyberPrekey: { keyId: 901, pub: targetKey, sig: targetKey },
+          signedPrekey: { keyId: 900, pub: KEY_FIXTURE.curvePub, sig: KEY_FIXTURE.sig },
+          kyberPrekey: { keyId: 901, pub: KEY_FIXTURE.kyberPub, sig: KEY_FIXTURE.sig },
           oneTimePrekeys: prekeys,
         }),
       },

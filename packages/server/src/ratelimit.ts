@@ -20,12 +20,15 @@ export interface RateLimiter {
   /**
    * Returns 0 if allowed (a token was consumed), else retry-after seconds.
    *
-   * Async since: the production limiter is DynamoDB-
-   * backed (ratelimit-ddb.ts) so limits mean something across Lambda
-   * containers, not per-container. The in-memory limiter below stays for the
-   * local adapter and unit tests, where one process IS the fleet.
-   */
-  take(bucket: string, opts: RateLimitOpts): Promise<number>;
+   * Async since: the production limiter is DynamoDB- backed
+   * (ratelimit-ddb.ts) so limits mean something across Lambda containers,
+   * not per-container. The in-memory limiter below stays for the local
+   * adapter and unit tests, where one process IS the fleet.
+   *
+   * `count` (default 1) charges N tokens in ONE take (the attachment byte
+   * window charges whole MiB per mint). A take that does not fit is refused
+   * whole, never partially admitted. */
+  take(bucket: string, opts: RateLimitOpts, count?: number): Promise<number>;
 }
 
 interface Bucket {
@@ -50,7 +53,7 @@ export function makeRateLimiter(now: () => number = () => Date.now()): RateLimit
   }
 
   return {
-    async take(bucket, opts) {
+    async take(bucket, opts, count = 1) {
       const t = now();
       sweep(t);
       const existing = buckets.get(bucket);
@@ -60,14 +63,14 @@ export function makeRateLimiter(now: () => number = () => Date.now()): RateLimit
         b.tokens = Math.min(opts.capacity, b.tokens + elapsedSec * opts.refillPerSec);
         b.updatedMs = t;
       }
-      if (b.tokens >= 1) {
-        b.tokens -= 1;
+      if (b.tokens >= count) {
+        b.tokens -= count;
         buckets.set(bucket, b);
         return 0;
       }
       buckets.set(bucket, b);
-      // Whole seconds until one token is available.
-      const deficit = 1 - b.tokens;
+      // Whole seconds until `count` tokens are available.
+      const deficit = count - b.tokens;
       return Math.max(1, Math.ceil(deficit / opts.refillPerSec));
     },
   };
@@ -90,6 +93,16 @@ export const LIMITS = {
   // ceiling was 10 × warm containers; 30/min enforced globally is both
   // stricter in aggregate and roomy enough for a CI fleet behind one NAT
   // (one sign-in costs TWO requests).
+  /**
+   * PUT /v1/keys, keyed by the uploading account. It was the only
+   * authenticated data-writing route with no budget, and each call REPLACES
+   * the whole one-time prekey pool — a pool Query, a batch delete, then up
+   * to ~80 BatchWrites for a 1 000-key body — so it was loopable at whatever
+   * the stage throttle admitted. Sized to honest replenishment with room to
+   * spare: one upload at registration, one a day on the schedule, and a
+   * handful of lowPrekeyCount-triggered top-ups (the client replenishment)
+   * all fit inside 5 burst / 10 per hour. */
+  keyUpload: { capacity: 5, refillPerSec: 10 / 3600 }, // 5 burst, 10/hour
   /** Prekey-bundle fetch, keyed by (caller, target) — throttles pool draining. */
   prekeyFetch: { capacity: 5, refillPerSec: 5 / 60 }, // 5 burst, 5/min per pair
   /**
@@ -130,9 +143,58 @@ export const LIMITS = {
    * 1:1; sustained refill sits under wsSend's 5/sec so typing can never
    * crowd out real messages even from a hostile client. */
   typing: { capacity: 15, refillPerSec: 3 }, // 15 burst, 3/sec sustained
+  /**
+   * `ack` frames, keyed by the acking userId. Each ack costs a strongly
+   * consistent session read, a strongly consistent message read and a
+   * TransactWrite, and until this bucket existed nothing per-user bounded it
+   * — the only ceiling was the WS stage throttle, which is AGGREGATE across
+   * every client, so one socket spraying acks 429'd everyone else's frames.
+   *
+   * SIZED TO THE DRAIN, not to a typing-shaped guess: a recipient acks every
+   * frame the server posts, and the reconnect drain posts up to
+   * DRAIN_SLICE_BUDGET.maxItems (2000, handlers/ws.ts) per slice, then
+   * continues. A bucket smaller than what the drain can post inside one
+   * limiter window would refuse the acks of an honest backlog — and a
+   * refused ack is not retried (error frames carry no msgId), so the row
+   * would linger until the next reconnect re-drained it.
+   *
+   * TWO slices per window: the production limiter is the
+   * DDB FIXED WINDOW of capacity / refillPerSec seconds (ratelimit-ddb.ts),
+   * and a slice has NO minimum duration — it ends on maxItems and the drain
+   * Lambda self-invokes the next at once — so at the ~10-20 ms per
+   * sequential post the management API costs, a 30 s window carries ~3000
+   * posts, past the one slice the bucket first admitted. Capacity is
+   * therefore two full slices with the window held at 30 s (the refill is
+   * two slices per 30 s); ratelimit.test.ts pins both relationships. A
+   * hostile socket is bounded at twice the server's own delivery ceiling
+   * instead of at nothing. An over-bound ack is refused with the standard
+   * error frame but does NOT charge `wsRefused` below: a well-formed ack
+   * from a live client is not a malformed frame, and the hang-up lever must
+   * never reach an honest client whose drain merely outran the window. */
+  wsAck: { capacity: 4000, refillPerSec: 4000 / 30 }, // two drain slices per 30 s window, ~133/sec sustained
+  /**
+   * REFUSED frames on one socket, keyed by userId: unparseable JSON or a
+   * frame the schema rejects — NOT an ack over `wsAck`, which is refused
+   * without charging this bucket (above). Every refusal still costs the
+   * session recheck plus an error post, and API Gateway offers no
+   * per-connection throttle — server-side DeleteConnection is the only
+   * per-client lever. When this bucket is empty the socket is hung up
+   * (`$default`, handlers/ws.ts) and the client redials on its own backoff.
+   * Twenty per minute is far past anything a shipped client emits (both
+   * clients validate frames before sending) and far below a spray. */
+  wsRefused: { capacity: 20, refillPerSec: 20 / 60 }, // 20 burst, 20/min sustained
   /** Attachment upload-URL mints, keyed by sender userId — bounds blob-store
    * write abuse (each mint is a ≤10 MiB S3 PUT capability). */
   attachmentCreate: { capacity: 10, refillPerSec: 10 / 60 }, // 10 burst, 10/min
+  /**
+   * Attachment upload BYTES per account per day, in whole-MiB tokens —
+   * taken beside `attachmentCreate`, charging ceil(contentLength / 1 MiB)
+   * per mint. The count bucket alone handed every free account ~144 GB/day
+   * of S3 PUT capability (10/min × 10 MiB, retained 30 days) with nothing
+   * recording who minted what. 2 GiB/day is ~200 full-size attachments or
+   * thousands of small ones: past any person's day, far under a dump.
+   * Caller-keyed, so refusal is the ordinary 429 + retry-after. */
+  attachmentBytesDaily: { capacity: 2048, refillPerSec: 2048 / 86400 }, // 2 GiB/day in MiB tokens
   /** Attachment download-URL fetches, keyed by caller userId. */
   attachmentFetch: { capacity: 30, refillPerSec: 30 / 60 }, // 30 burst, 30/min
   /** Account deletion, keyed by caller userId — idempotent, so retries are
@@ -168,6 +230,19 @@ export const LIMITS = {
   /** The acceptance leg, keyed by the ACCEPTOR — same human pacing, its own
    * bucket so a flooding offerer cannot starve the acceptor's one call. */
   linkAccept: { capacity: 5, refillPerSec: 10 / 3600 }, // 5 burst, 10/hour
+  /**
+   * Link ceremonies AIMED AT one account, keyed by the ACCEPTOR — taken at
+   * init and again at submit, beside the offerer's own bucket above. That
+   * bucket bounds one attacker; this bounds what N free identities can do to
+   * ONE victim: the submit leg writes the acceptor's reverse pointer on the
+   * OFFERER's signature, so without a recipient-side ceiling any account
+   * that knew a solo user's ULID could grow that user's row 10×/hour per
+   * Sybil. Sized as the acceptor's own accept budget (a person is offered a
+   * slot about as often as it accepts one). Refused through the COLLAPSED
+   * exit, never a 429: the key is not the caller's own, and a
+   * distinguishable refusal would disclose B's inbound ceremony traffic to
+   * whoever probes it. */
+  linkOfferRecipient: { capacity: 5, refillPerSec: 10 / 3600 }, // 5 burst, 10/hour per acceptor
   /** Roster mutations (unlink/revoke), keyed by the ACTING member. The
    * sessionRevoke shape and reasoning verbatim: revoking a lost phone is a
    * panic action, and the person hammering it must not be locked out of the

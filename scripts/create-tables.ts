@@ -1,5 +1,7 @@
 /**
- * Creates the Tacendum tables in DynamoDB Local.
+ * Creates every Tacendum table (the shared `TABLES` set plus the
+ * HttpFn-only call-metric dedupe table) in DynamoDB Local, with the same
+ * TTL attribute the deployed tables use.
  * Idempotent: skips tables that already exist. Run: `pnpm tables:create`.
  *
  * IDEMPOTENT MEANS IT NEVER RESHAPES A TABLE IT DID NOT JUST CREATE. A local
@@ -17,7 +19,12 @@ import {
   waitUntilTableExists,
   type CreateTableCommandInput,
 } from '@aws-sdk/client-dynamodb';
-import { ACTIVITY_DAY_INDEX, SESSIONS_USER_INDEX, TABLES } from '@tacendum/shared';
+import {
+  ACTIVITY_DAY_INDEX,
+  CALL_METRIC_DEDUPE_TABLE,
+  SESSIONS_USER_INDEX,
+  TABLES,
+} from '@tacendum/shared';
 
 const ENDPOINT = process.env.DDB_ENDPOINT ?? 'http://localhost:8000';
 const REGION = process.env.AWS_REGION ?? 'us-east-1';
@@ -31,14 +38,20 @@ const client = new DynamoDBClient({
 // PAY_PER_REQUEST mirrors on-demand DynamoDB and needs no throughput tuning.
 const BILLING = 'PAY_PER_REQUEST' as const;
 
-/** TTL attribute name per table (real TTL in AWS; swept manually locally). */
-const TTL_ATTR: Partial<Record<keyof typeof TABLES, string>> = {
-  sessions: 'expiresAt',
-  messages: 'expiresAt',
-  pushTokens: 'expiresAt',
-  rateBuckets: 'expiresAt',
-  activity: 'expiresAt',
-  reports: 'expiresAt',
+/** TTL attribute per table NAME (real TTL in AWS; swept manually locally) —
+ * one entry per `timeToLiveAttribute` the CDK stack declares, so the local
+ * shape matches the deployed one. */
+const TTL_ATTR: Record<string, string> = {
+  [TABLES.sessions]: 'expiresAt',
+  [TABLES.messages]: 'expiresAt',
+  // Connection rows expire in AWS (the 2026-08-28 incident backstop); the
+  // local table carried no TTL entry until this map gained one.
+  [TABLES.connections]: 'expiresAt',
+  [TABLES.pushTokens]: 'expiresAt',
+  [TABLES.rateBuckets]: 'expiresAt',
+  [TABLES.activity]: 'expiresAt',
+  [TABLES.reports]: 'expiresAt',
+  [CALL_METRIC_DEDUPE_TABLE.name]: CALL_METRIC_DEDUPE_TABLE.ttlAttribute,
 };
 
 const definitions: CreateTableCommandInput[] = [
@@ -141,6 +154,17 @@ const definitions: CreateTableCommandInput[] = [
     ],
   },
   {
+    // Call-metric batch dedupe claims (HttpFn only): the opaque dedupe
+    // key and a content digest, never a report body or a caller — same
+    // PK and TTL attribute as the stack's CallMetricDedupeTable.
+    TableName: CALL_METRIC_DEDUPE_TABLE.name,
+    BillingMode: BILLING,
+    AttributeDefinitions: [
+      { AttributeName: CALL_METRIC_DEDUPE_TABLE.partitionKey, AttributeType: 'S' },
+    ],
+    KeySchema: [{ AttributeName: CALL_METRIC_DEDUPE_TABLE.partitionKey, KeyType: 'HASH' }],
+  },
+  {
     // Fixed-window rate-limit counters: one row per
     // (bucket, window), atomic ADD, reaped by TTL.
     TableName: TABLES.rateBuckets,
@@ -184,10 +208,7 @@ async function main(): Promise<void> {
     await waitUntilTableExists({ client, maxWaitTime: 30 }, { TableName: name });
     console.log(`+ created  ${name}`);
 
-    const tableKey = (Object.keys(TABLES) as (keyof typeof TABLES)[]).find(
-      (k) => TABLES[k] === name,
-    );
-    const ttlAttr = tableKey ? TTL_ATTR[tableKey] : undefined;
+    const ttlAttr = TTL_ATTR[name];
     if (ttlAttr) {
       // DynamoDB Local accepts the call but does not enforce TTL (see sweep.ts).
       await client.send(

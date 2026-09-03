@@ -132,6 +132,23 @@ describe('http.lambda adapter', () => {
     expect(res.statusCode).toBe(401);
   });
 
+  it('DELETE /v1/account admits a bearer whose user row is already gone — the crashed-sweep retry — where every other route refuses it', async () => {
+    await seedSession();
+    // The state a sweep that died after its row delete leaves behind.
+    expect(await db.deleteUser(SESSION_USER, {})).toBe('deleted');
+    expect(await db.getSession(SESSION_TOKEN)).toBeDefined();
+
+    // The absent-row refusal stands on every other route.
+    const me = await invoke(httpEvent({ routeKey: 'GET /v1/me', headers: authed() }));
+    expect(me.statusCode).toBe(401);
+
+    // The DEPLOYED route table's deletion entry finishes the sweep with the
+    // same bearer — this is the wiring, not just the wrapper in isolation.
+    const res = await invoke(httpEvent({ routeKey: 'DELETE /v1/account', headers: authed() }));
+    expect(res.statusCode).toBe(200);
+    expect(await db.getSession(SESSION_TOKEN)).toBeUndefined();
+  });
+
   it('dispatches POST /v1/call-metrics behind auth and never publishes an anonymous request', async () => {
     await seedSession();
 

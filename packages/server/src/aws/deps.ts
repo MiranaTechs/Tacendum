@@ -85,6 +85,22 @@ function readApiOrigin(env: NodeJS.ProcessEnv = process.env): string {
 type TurnSecrets = Pick<TurnConfig, 'authSecret' | 'userSalt'>;
 
 /**
+ * The Secrets Manager clients' OWN timeouts. The SDK's default handler
+ * carries none, so a hung connection on a cold container used to hold the
+ * identifier lane — which AWAITS the K_id fetch (handlers/identifiers.ts
+ * `hmacKeys`) — for the full Lambda timeout and answer a 5xx. Connect in a
+ * second, answer in two; a fetch that cannot is a failed fetch (logged
+ * loudly, retried by the next read, exactly like any other failure), and the
+ * lane's own bounded wait (IDENTIFIER_KEY_WAIT_MS) answers the collapsed
+ * refusal long before any function's timeout. The SDK's request-handler
+ * shorthand: a plain options object builds the default Node handler with
+ * these bounds — no extra dependency. */
+export const SECRETS_MANAGER_REQUEST_TIMEOUTS = {
+  connectionTimeout: 1_000,
+  requestTimeout: 2_000,
+} as const;
+
+/**
  * Fetches the two coturn secrets and caches the RESULT for the container's
  * lifetime, so a cold start pays two Secrets Manager calls and every warm
  * invocation pays none. The loader is deliberately SYNCHRONOUS at the call
@@ -108,7 +124,7 @@ export function makeTurnSecretsLoader(
   return (authSecretArn, userSaltArn) => {
     if (secrets || inFlight) return secrets;
     if (!fetchImpl) {
-      const sm = new SecretsManagerClient({});
+      const sm = new SecretsManagerClient({ requestHandler: SECRETS_MANAGER_REQUEST_TIMEOUTS });
       fetchImpl = (arn) =>
         sm.send(new GetSecretValueCommand({ SecretId: arn })).then((res) => {
           // The ARN is configuration, not a secret; naming it here is what
@@ -224,7 +240,7 @@ export function makeUserRefSaltLoader(
   const read = (arn: string): string | undefined => {
     if (salt !== undefined || inFlight) return salt;
     if (!fetchImpl) {
-      const sm = new SecretsManagerClient({});
+      const sm = new SecretsManagerClient({ requestHandler: SECRETS_MANAGER_REQUEST_TIMEOUTS });
       fetchImpl = (secretArn) =>
         sm.send(new GetSecretValueCommand({ SecretId: secretArn })).then((res) => {
           if (!res.SecretString) throw new Error(`secret ${secretArn} holds no string value`);
@@ -382,9 +398,11 @@ const reconcileLambda = new LambdaClient({});
  * Failure posture: LOUD, then rethrown — and the data layer catches it, so
  * the sender still gets its 429, never a 500; the rethrow only clears the
  * container-local debounce so the next refusal retries the handoff.
- * `ledger_reconcile_unwired` means a deployment lost the env wiring on the
- * one function that enqueues (the WebSocket adapter) — the drifted ledger
- * then stays drifted (over-refusal, the pre-existing residual), which is why
+ * `ledger_reconcile_unwired` means a deployment lost the env wiring on a
+ * function that enqueues — the WebSocket adapter, the auth function, or
+ * (since the accounts notices landed) the HTTP function — and the drifted
+ * ledger then stays drifted (over-refusal, the pre-existing residual), which
+ * is why
  * the absence must be loud on every refusal rather than a silent downgrade.
  * Error class / variable name only, never an id.
  */
@@ -421,9 +439,13 @@ let cachedDeps: Deps | undefined;
 export function makeAwsDeps(): Deps {
   if (cachedDeps) return cachedDeps;
   const doc = makeDocClient();
-  // The durable scheduleReconcile hook rides every AWS-host data layer; only
-  // the WebSocket adapter (the sole enqueue path) is given the env target,
-  // and only a refusal ever calls it.
+  // The durable scheduleReconcile hook rides every AWS-host data layer, and
+  // only a refusal ever calls it. EVERY function that enqueues needs the env
+  // target (RECONCILE_FUNCTION_NAME) and the invoke grant: the WebSocket
+  // adapter, the auth function, and — since `deliverAccountsNotice` landed —
+  // the HTTP function too (the stack wired the first two; the third is the
+  // infra fix). Wrong here, the failure is loud, never silent — see
+  // `ledger_reconcile_unwired` above.
   const db = makeDataLayer(doc, undefined, { scheduleReconcile: makeReconcileScheduler() });
   const wsDisconnect = readWsDisconnector();
   // The CDK stack sets S3_ENDPOINT='' + the generated bucket name on every

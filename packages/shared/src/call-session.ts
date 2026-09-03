@@ -2,6 +2,7 @@ import {
   admitGroupCallInvite,
   admitGroupCallRosterDelta,
   assertComposableGroupCallRoster,
+  CALL_RING_TIMEOUT_MS,
   groupCallInviteIsRingable,
   type CallEndReason,
   type GroupCallInviteEnvelope,
@@ -136,6 +137,16 @@ export interface GroupSessionState {
    * sessions we started. */
   starterOffer: StoredGroupOffer | null;
   /**
+   * Whether the starter has already re-offered the ring leg once
+   * (`inviteWhileLive`'s swap). ONE swap per session: each swap re-arms the
+   * leg's 60 s ring timer, so an unbounded swap loop was an unbounded ring —
+   * a starter re-offering every 55 s held a phone ringing indefinitely
+   * (§6.4's rule, which the 1:1 machine keeps by answering a second offer
+   * from a ringing caller busy). Optional so a session row persisted before
+   * this field existed restores as "not yet swapped".
+   */
+  ringSwapped?: boolean;
+  /**
    * Who has said "I am in" (or proven it by connecting a leg). R6 refuses to
    * re-offer toward anyone not announced: re-offering an unanswered invite
    * would be a re-RING, and only R2's single ring may ring. The starter is
@@ -234,6 +245,18 @@ export type SessionEffect =
    * human already answered — rule 25's whole content.
    */
   | { type: 'openLegAnswer'; peerId: string; cid: string; offer: StoredGroupOffer }
+  /**
+   * Persist an ADMITTED invite's offer for a cold restore. The SDP is what a
+   * lock-screen answer needs after the process died, and the ratchet consumed
+   * its message key on first decrypt, so the row must be written while the
+   * frame is in hand — but only for an invite this module rang, held, swapped
+   * or auto-accepted. The coordinator used to persist every ringable invite
+   * BEFORE the verdict, so a stranger's SDP, fingerprint and candidate
+   * addresses sat in `call_offers` for a call answered busy. Emitted FIRST in
+   * its step, ahead of the session row and the CallKit report, so there is no
+   * window in which the system shows a call a restore could not answer. Never
+   * for a redelivered frame. */
+  | { type: 'persistOffer'; offer: StoredGroupOffer }
   | { type: 'closeLeg'; peerId: string; cid: string; reason: CallEndReason; announce: boolean }
   | {
       type: 'sendRosterDelta';
@@ -323,6 +346,8 @@ function viewOf(state: GroupSessionState): GroupCallSessionView {
     roster: state.roster,
     se: state.se,
     video: state.video,
+    // A session that has carried media is never in glare (`admitGroupCallInvite`).
+    connected: state.connectedAt !== null,
   };
 }
 
@@ -395,7 +420,13 @@ function teardownAll(
   const effects: SessionEffect[] = [];
   for (const leg of Object.values(state.legs)) {
     if (leg.phase === 'gone') continue;
-    effects.push({ type: 'closeLeg', peerId: leg.peerId, cid: leg.cid, reason, announce });
+    effects.push({
+      type: 'closeLeg',
+      peerId: leg.peerId,
+      cid: leg.cid,
+      reason: legEndReason(leg, reason),
+      announce,
+    });
   }
   if (state.starterOffer) {
     effects.push({
@@ -410,6 +441,22 @@ function teardownAll(
     effects.push({ type: 'closeLeg', peerId: held.from, cid: held.invite.cid, reason, announce });
   }
   return effects;
+}
+
+/**
+ * What a session-level `hangup` means for ONE leg (the 1:1 machine's own
+ * rule, lifted): a leg the peer never answered — still inviting, ringing, or
+ * unreachable — is CANCELLED, which is what makes it a missed call on their
+ * side (`MISSED_REASONS`, and CallKit's `.unanswered`); a leg they answered
+ * is a hangup. Closing a ringing leg with `hangup` logged the starter's
+ * pre-answer hangup as a completed call on every callee — no missed row, no
+ * badge. Every other reason passes through untouched.
+ */
+function legEndReason(leg: LegSummary, reason: CallEndReason): CallEndReason {
+  if (reason !== 'hangup') return reason;
+  return leg.phase === 'inviting' || leg.phase === 'ringing' || leg.phase === 'unreachable'
+    ? 'cancelled'
+    : 'hangup';
 }
 
 /**
@@ -503,8 +550,12 @@ function ringFresh(
     starterId: from, // frame.from of the accepted ginvite — written once, never a payload field
     selfId,
     roomId: null,
-    roster: invite.r, // the roster held FROM THE STARTER, epoch 0
-    se: 0,
+    roster: invite.r, // the roster held FROM THE STARTER, at the epoch it asserts
+    // The starter's own epoch, when the invite carries it (an invite from
+    // a build that predates the field reads 0, which is the only epoch an
+    // ORIGINAL member can be at). A member added at epoch k who seeded 0
+    // held every later delta forever — see `GroupCallInviteEnvelope.se`.
+    se: invite.se ?? 0,
     held: null,
     video: invite.vid,
     phase: 'ringing',
@@ -522,6 +573,7 @@ function ringFresh(
   return {
     state,
     effects: [
+      { type: 'persistOffer', offer },
       { type: 'writeSessionRow' },
       { type: 'openLegRinging', peerId: from, cid: invite.cid, offer },
       { type: 'reportGroupIncoming', sid: invite.sid, starterId: from, hasVideo: invite.vid },
@@ -581,7 +633,15 @@ function applyAuthority(
       const removed = delta.m;
       const leg: LegSummary | undefined = cur.legs[removed];
       if (leg && !TERMINAL_PHASES.has(leg.phase)) {
-        effects.push({ type: 'closeLeg', peerId: removed, cid: leg.cid, reason: 'hangup', announce: true });
+        // A member removed while still RINGING is cancelled, not hung up on
+        // (`legEndReason`): they never answered, so their row is a missed call.
+        effects.push({
+          type: 'closeLeg',
+          peerId: removed,
+          cid: leg.cid,
+          reason: legEndReason(leg, 'hangup'),
+          announce: true,
+        });
         cur = withLeg(cur, { ...leg, phase: 'left' });
       }
       const heldFromRemoved = cur.heldOffers[removed];
@@ -1064,10 +1124,26 @@ function inviteWhileLive(
           // session and the SAME CXCall: fold the old ringing leg silently
           // and ring the new cid internally — no second reportGroupIncoming,
           // because R2 rings a session once, not once per offer.
+          //
+          // ONCE, AND ONLY WITHIN THE ORIGINAL RING. Each swap re-arms the
+          // leg's 60 s ring timer, so a starter re-offering every 55 s held
+          // the phone ringing without bound. A second swap, or any swap
+          // past the deadline the first ring set, is answered busy on the
+          // fresh cid and the ring already up runs out on its own clock.
+          const pastDeadline = now >= state.startedAt + CALL_RING_TIMEOUT_MS;
+          if (state.ringSwapped === true || pastDeadline) {
+            return {
+              state,
+              effects: [
+                { type: 'closeLeg', peerId: from, cid: invite.cid, reason: 'busy', announce: true },
+              ],
+            };
+          }
           const offer: StoredGroupOffer = { from, invite, serverTs };
           return {
-            state: { ...state, starterOffer: offer },
+            state: { ...state, starterOffer: offer, ringSwapped: true },
             effects: [
+              { type: 'persistOffer', offer },
               {
                 type: 'closeLeg',
                 peerId: from,
@@ -1084,10 +1160,11 @@ function inviteWhileLive(
         // human answers the session — `createAnswer` starts the camera, and
         // rule 25 forbids it while we ring. A newer offer from the same peer
         // replaces the older hold; the superseded cid dies on their side.
-        return NOTHING({
-          ...state,
-          heldOffers: { ...state.heldOffers, [from]: { from, invite, serverTs } },
-        });
+        const held: StoredGroupOffer = { from, invite, serverTs };
+        return {
+          state: { ...state, heldOffers: { ...state.heldOffers, [from]: held } },
+          effects: [{ type: 'persistOffer', offer: held }],
+        };
       }
 
       // The session is answered, so a member's leg is auto-accepted — the
@@ -1110,6 +1187,7 @@ function inviteWhileLive(
       }
       const offer: StoredGroupOffer = { from, invite, serverTs };
       next = withLeg(next, freshLeg(from, invite.cid, 'in', 'connecting'));
+      effects.push({ type: 'persistOffer', offer });
       effects.push({ type: 'openLegAnswer', peerId: from, cid: invite.cid, offer });
       return { state: next, effects };
     }
@@ -1196,6 +1274,14 @@ function legChanged(
         : [];
       // §4.3: connect on the FIRST leg. Later legs connecting emit nothing —
       // the CXCall connected when the call became real, not N times.
+      //
+      // The CallKit CONNECT report is the STARTER's alone: it is
+      // `reportOutgoingCall(with:connectedAt:)`, a fact about an outgoing
+      // call, and an incoming session's CXCall was connected by its answer.
+      // Issuing it for an incoming session filed the wrong transition
+      // against CallKit's bookkeeping (and grew `outgoingConnected` with an
+      // incoming UUID); the aggregate's own `connectedAt`/`phase` latch is
+      // unchanged either way.
       if (next.callKit === 'reported') {
         next = {
           ...next,
@@ -1203,7 +1289,11 @@ function legChanged(
           connectedAt: next.connectedAt ?? now,
           phase: 'live',
         };
-        return withAnswer(next, [...metrics, { type: 'reportGroupConnected', sid: state.sid }]);
+        const report: SessionEffect[] =
+          state.starterId === state.selfId
+            ? [{ type: 'reportGroupConnected', sid: state.sid }]
+            : [];
+        return withAnswer(next, [...metrics, ...report]);
       }
       return withAnswer(next, metrics);
     }
@@ -1240,6 +1330,25 @@ function legChanged(
       // the incumbents broadcast before it existed — and the race would be
       // a permanent hole instead of a two-re-offer repair.
       if (reason === 'busy') next = announce(next, peerId);
+      // AND SO IS AN ANSWER. A leg the peer ANSWERED — `answeredAt` on the
+      // report (the 1:1 machine latches it when their `call.answer` lands),
+      // or a summary already past `connecting` — proved their presence as
+      // surely as a busy does, so a first-attempt ICE failure on it is R6's
+      // to repair even when no `gjoin` from them has arrived. Incumbents
+      // broadcast their sovereign announce once, at their own answer, BEFORE
+      // a late joiner exists; without this the joiner↔incumbent leg that
+      // failed before its first connect stayed "Couldn't connect" for the
+      // rest of the call, and the incumbent (direction 'in') could not repair
+      // it either. The summary alone is not enough: an out-leg's phase stays
+      // `ringing` through the peer's answer (the more specific phase is kept
+      // until ICE connects), so the answer itself is what must be read.
+      if (
+        typeof input.answeredAt === 'number' ||
+        leg.phase === 'connecting' ||
+        leg.phase === 'reconnecting'
+      ) {
+        next = announce(next, peerId);
+      }
       const effects: SessionEffect[] = [];
       // R6: the designated offerer repairs a failed leg — and only failures.
       // The delay ladder indexes off the retries already spent, so the first

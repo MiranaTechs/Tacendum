@@ -10,10 +10,13 @@ import type {
   CallMetricPublisher,
   CallMetricStore,
 } from '../call-metrics.js';
+import { CALL_METRIC_DEDUPE_TABLE } from '@tacendum/shared';
 import { makeDocClient } from '../db/client.js';
 import type { Deps } from '../handlers/http.js';
 
-export const CALL_METRIC_DEDUPE_TABLE_ENV = 'TACENDUM_TABLE_CALL_METRIC_DEDUPE';
+/** The env name the stack sets on HttpFn — from the shared table contract,
+ * no longer a third copy of the literal. */
+export const CALL_METRIC_DEDUPE_TABLE_ENV = CALL_METRIC_DEDUPE_TABLE.envVar;
 
 type DedupeStatus = 'pending' | 'publishing' | 'published';
 

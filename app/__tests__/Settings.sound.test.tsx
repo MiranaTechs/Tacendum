@@ -107,6 +107,15 @@ afterEach(async () => {
   await db.close();
 });
 
+/** Open a row's ⓘ: the testID lands on the disclosure composite first, so
+ * the press names the node that actually carries onPress. */
+async function openInfo(tree: ReactTestRenderer.ReactTestRenderer, testID: string): Promise<void> {
+  const node = tree.root.findAllByProps({ testID }).find(n => n.props.onPress !== undefined)!;
+  await ReactTestRenderer.act(async () => {
+    node.props.onPress();
+  });
+}
+
 async function render(): Promise<ReactTestRenderer.ReactTestRenderer> {
   let tree!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(async () => {
@@ -167,8 +176,13 @@ describe('the Message sounds toggle', () => {
 
   it('the teaching copy names the three limits and the outer authority', async () => {
     const tree = await render();
-    const note = tree.root.findByProps({ testID: 'settings-sound-note' }).props
-      .children as string;
+    // Behind the row's ⓘ: closed until opened, under its row.
+    expect(JSON.stringify(tree.toJSON())).not.toContain('A short tone when a message arrives');
+    await openInfo(tree, 'settings-sound-info');
+    const note = tree.root
+      .findAllByType(require('react-native').Text)
+      .map(n => (Array.isArray(n.props.children) ? n.props.children.join('') : String(n.props.children ?? '')))
+      .find(s => s.startsWith('A short tone when a message arrives'));
     // iOS (jest's default Platform): both halves of the switch are named —
     // the in-app tone and the notification's sound — plus the limits.
     expect(note).toBe(

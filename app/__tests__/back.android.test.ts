@@ -428,10 +428,14 @@ test('hardware Back keeps a Calls-origin thread through peer, group, and group-m
       return { remove: jest.fn() };
     });
   const tree = await renderApp();
+  // The platform's own dispatch (RN BackHandler): NEWEST handler first,
+  // stopping at the first `true`. The thread registers its own handler
+  // after the router's (its sheets and drawers) and yields with nothing
+  // open, so "the last handler" alone is no longer the router.
   const hardwareBack = async (): Promise<boolean> => {
     let consumed!: boolean;
     await ReactTestRenderer.act(async () => {
-      consumed = handlers[handlers.length - 1]();
+      consumed = [...handlers].reverse().some(handler => handler());
     });
     return consumed;
   };
@@ -454,6 +458,10 @@ test('hardware Back keeps a Calls-origin thread through peer, group, and group-m
   expect(await hardwareBack()).toBe(true);
   expect(currentRoute()).toBe('calls');
 
+  // A room MEMBER's profile pops back to the ROOM: three consumed presses
+  // to Calls, not two. This block used to pin the defect — member profile
+  // → 'thread' → 'calls', a 1:1 with someone you only share a room with —
+  // and was rewritten deliberately.
   await openCallsThread(tree);
   await ReactTestRenderer.act(async () => {
     renderedThread(tree).props.onOpenGroupProfile();
@@ -462,6 +470,8 @@ test('hardware Back keeps a Calls-origin thread through peer, group, and group-m
     renderedGroupProfile(tree).props.onOpenMember('01KYDBSSDJSPC9J0E5N2AWMJ60');
   });
   expect(currentRoute()).toBe('peerProfile');
+  expect(await hardwareBack()).toBe(true);
+  expect(currentRoute()).toBe('groupProfile');
   expect(await hardwareBack()).toBe(true);
   expect(currentRoute()).toBe('thread');
   expect(await hardwareBack()).toBe(true);

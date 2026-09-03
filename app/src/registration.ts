@@ -8,6 +8,7 @@ import {
   setSecret,
   signAuthChallenge,
 } from 'tacendum-crypto';
+import { LOW_PREKEY_THRESHOLD } from '@tacendum/shared';
 import {
   apiAuth,
   apiAuthChallenge,
@@ -154,6 +155,69 @@ export class AccountMismatchError extends Error {
     super('account_mismatch');
     this.name = 'AccountMismatchError';
   }
+}
+
+/* ── ONE-TIME PREKEY REPLENISHMENT ──────────── */
+
+/** Keychain key under which the last successful replenishment is stamped
+ * (epoch ms as a decimal string). A preference, not a secret; it lives
+ * beside the other preferences the Keychain keeps. */
+export const PREKEY_REPLENISHED_AT_KEY = 'prekeyReplenishedAt';
+/** The scheduled cadence: one fresh batch a day. */
+export const PREKEY_REPLENISH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+/** The floor between two uploads whatever the reason — the server budgets
+ * `PUT /v1/keys` at 5 burst / 10 per hour per account, and a client that
+ * answers every low-pool signal with an upload would spend it on itself.
+ * One per hour from the signal path is ample: a batch is 100 keys against
+ * a drain floor of 30 fetches a day per target. */
+export const PREKEY_REPLENISH_MIN_GAP_MS = 60 * 60 * 1000;
+/** Re-exported so the trigger and the test read one number. */
+export { LOW_PREKEY_THRESHOLD };
+
+/**
+ * Mint a FRESH batch of one-time prekeys and re-advertise the pool.
+ *
+ * The pool used to be uploaded exactly once, at `register()`. Every inbound
+ * session bootstrap consumes one server-side (the per-target drain floor is
+ * 30 fetches a day, so any ULID-holder could empty it in days), and once it
+ * was empty every new session to this device was signed-prekey-only, for
+ * the life of the install — initial-message forward secrecy degraded to
+ * the long-lived signed prekey. `lowPrekeyCount` existed on the bundle DTO
+ * with no consumer.
+ *
+ * `existingKeysForUpload` is the mint (native, both platforms): fresh
+ * one-time prekeys at ids the store has never used, old private halves KEPT
+ * so ciphertext already built against them still decrypts, and the signed
+ * and kyber prekeys re-advertised from their stored records. PUT /v1/keys
+ * replaces the server's pool wholesale with keys nobody has been handed.
+ * Signed-prekey rotation is a follow-up; nothing here rotates it.
+ *
+ * `reason` is `'schedule'` (the daily pass from messaging.start) or `'low'`
+ * (a served bundle for THIS device said the pool is under
+ * LOW_PREKEY_THRESHOLD); the second waits only the hourly floor. Returns
+ * whether an upload happened; a failed upload throws and leaves the stamp
+ * untouched, so the next start asks again. Never runs in duress (a duress
+ * session is network-silent) and never without an
+ * identity (there is nothing to mint from).
+ */
+export async function replenishPrekeys(
+  token: string,
+  opts: { reason?: 'schedule' | 'low'; now?: number } = {},
+): Promise<'uploaded' | 'skipped'> {
+  if (session.mode === 'duress') return 'skipped';
+  if (!(await hasIdentity())) return 'skipped';
+  const now = opts.now ?? Date.now();
+  const last = Number(await getSecret(PREKEY_REPLENISHED_AT_KEY)) || 0;
+  const gap =
+    opts.reason === 'low' ? PREKEY_REPLENISH_MIN_GAP_MS : PREKEY_REPLENISH_INTERVAL_MS;
+  const since = now - last;
+  // A stamp from the FUTURE (the clock went backwards) proves nothing and
+  // does not hold the upload back.
+  if (last > 0 && since >= 0 && since < gap) return 'skipped';
+  const keys = await existingKeysForUpload();
+  await apiUploadKeys(token, keys);
+  await setSecret(PREKEY_REPLENISHED_AT_KEY, String(now));
+  return 'uploaded';
 }
 
 export async function createOrRestoreAccount(): Promise<db.ProfileRow> {

@@ -326,3 +326,113 @@ describe('a tick never remounts rows (the memo/key pin)', () => {
     await unmount(tree);
   });
 });
+
+describe('"New messages" is a newest-arrival compare, not a row count', () => {
+  /** What the jump bar says, or null while it is not on glass. */
+  function jumpLabel(tree: ReactTestRenderer.ReactTestRenderer): string | null {
+    const found = tree.root.findAll(
+      n =>
+        typeof n.props.children === 'string' &&
+        (n.props.children === 'New messages' || n.props.children === 'Latest messages'),
+    );
+    return found.length > 0 ? (found[0]!.props.children as string) : null;
+  }
+
+  async function requery(): Promise<void> {
+    await ReactTestRenderer.act(async () => {
+      for (const cb of changeListeners) cb();
+      jest.advanceTimersByTime(200); // past REFRESH_DEBOUNCE_MS
+    });
+    await ReactTestRenderer.act(async () => {});
+  }
+
+  test('a row deleted and a row arrived inside one requery still raises "New messages" (red before the fix)', async () => {
+    rows = [
+      messageRow(),
+      messageRow({ msgId: ulid('SEC0ND'), body: 'second', ts: 2_000 }),
+    ];
+    const tree = await renderThread();
+    await scrollUp(tree);
+    expect(jumpLabel(tree)).toBe('Latest messages');
+
+    // Both land in one debounce window: the second row is deleted for me
+    // and a newer one arrives. The inbound COUNT is unchanged — two before,
+    // two after — which is exactly what the old register compared.
+    rows = [
+      messageRow(),
+      messageRow({ msgId: ulid('THIRD'), body: 'third', ts: 3_000 }),
+    ];
+    await requery();
+
+    expect(jumpLabel(tree)).toBe('New messages');
+    await unmount(tree);
+  });
+
+  /**
+   * THE GATE'S DEFECT. The identity register kept `null` for BOTH "the
+   * list has not answered yet" and "it answered and there were no inbound
+   * rows", so the FIRST arrival into a thread of only my own sends — or a
+   * fresh room — was swallowed: `priorNewest !== null` was false, and
+   * nothing raised the bar. The count-based code this replaced did raise
+   * it (1 inbound > 0 seen). */
+  test('the first inbound row into an outbound-only thread raises "New messages" (red before the fix)', async () => {
+    rows = [
+      messageRow({
+        msgId: ulid('MINE1'),
+        direction: 'out',
+        status: 'sent',
+        body: 'are you around?',
+        ts: 1_000,
+      }),
+      messageRow({
+        msgId: ulid('MINE2'),
+        direction: 'out',
+        status: 'sent',
+        body: 'no rush',
+        ts: 2_000,
+      }),
+    ];
+    const tree = await renderThread();
+    await scrollUp(tree);
+    expect(jumpLabel(tree)).toBe('Latest messages');
+
+    rows = [
+      ...rows,
+      messageRow({ msgId: ulid('THEIRS'), body: 'just got in', ts: 3_000 }),
+    ];
+    await requery();
+
+    expect(jumpLabel(tree)).toBe('New messages');
+    await unmount(tree);
+  });
+
+  test('a deletion alone never claims new messages', async () => {
+    rows = [
+      messageRow(),
+      messageRow({ msgId: ulid('SEC0ND'), body: 'second', ts: 2_000 }),
+    ];
+    const tree = await renderThread();
+    await scrollUp(tree);
+
+    rows = [messageRow()];
+    await requery();
+
+    expect(jumpLabel(tree)).toBe('Latest messages');
+    await unmount(tree);
+  });
+
+  test('a repaint of the same rows (a receipt, a reaction) never claims new messages', async () => {
+    rows = [
+      messageRow(),
+      messageRow({ msgId: ulid('SEC0ND'), body: 'second', ts: 2_000 }),
+    ];
+    const tree = await renderThread();
+    await scrollUp(tree);
+
+    rows = rows.map(r => ({ ...r }));
+    await requery();
+
+    expect(jumpLabel(tree)).toBe('Latest messages');
+    await unmount(tree);
+  });
+});

@@ -125,6 +125,29 @@ export interface Spec extends TurboModule {
    */
   dismissPendingIncomingCall(peerId: string, reason: string, cid: string): Promise<void>;
   endCall(cid: string, reason: string): Promise<void>;
+  /**
+   * Answer a REPORTED incoming call from the app's own UI, by the id it was
+   * reported under.
+   *
+   * The `createAnswer` bridge already does this for a 1:1 call, keyed by the
+   * leg cid it is answering. A small-group session reports ONE CallKit call
+   * under its sid (N legs, one CXCall), so no leg's `createAnswer` can find
+   * it, and an in-app Answer performed no CXAnswerCallAction: the audio
+   * session never activated, `didActivate` never fired, and under §7.4's
+   * manual-audio rule the WebRTC unit never started — dead audio both ways
+   * unless answered from the system UI. No-op when the id names nothing
+   * unanswered (a system-UI answer already consumed it, or it was outgoing).
+   */
+  answerReportedCall(cid: string): Promise<void>;
+  /**
+   * Post a local "Missed call" notification for `peerId`, threaded by peer
+   * so it can be cleared with the others for that person. `displayName` is
+   * what the body says; the payload carries nothing else. Never rejects.
+   */
+  postMissedCall(peerId: string, displayName: string): Promise<void>;
+  /** Clear the missed-call notifications for `peerId`, or all of them when
+   * empty. Never rejects. */
+  clearMissedCall(peerId: string): Promise<void>;
 
   // --- PushKit ---
 

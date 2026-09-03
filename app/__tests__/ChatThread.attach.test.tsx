@@ -169,8 +169,17 @@ test('the drawer offers four icon tiles, named', async () => {
   expect(text).toContain('Camera');
   expect(text).toContain('Document');
   expect(text).toContain('Location');
-  // The one promise the icons could be read as making, said once.
-  expect(text).toContain('aren’t saved to your Photos');
+  // The promise the icons could be read as making sits behind the drawer's
+  // ⓘ: absent until asked for, present once asked — the house
+  // InfoDisclosure pattern.
+  expect(text).not.toContain('aren’t saved to your Photos');
+  const about = tree.root
+    .findAllByProps({ testID: 'attach-about' })
+    .find(n => n.props.onPress);
+  await ReactTestRenderer.act(async () => {
+    about!.props.onPress();
+  });
+  expect(renderedText(tree)).toContain('aren’t saved to your Photos');
   // Every tile keeps its full description for a screen reader.
   const camera = tree.root
     .findAllByProps({ testID: 'attach-camera' })

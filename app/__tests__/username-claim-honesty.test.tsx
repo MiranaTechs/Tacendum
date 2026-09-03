@@ -158,9 +158,9 @@ describe('the age gate is counted from the ID the server minted, and said before
   it('the wait is said in rounded days past 48 h; an aged account and an undecodable ID are both quiet', async () => {
     expect(ACCOUNTS_USERNAME_COPY.needsAge(52)).toContain('about 2 days');
     expect(ACCOUNTS_USERNAME_COPY.needsAge(1)).toContain('about 1 hour.');
-    // A CONDITION, never a promise (gate fix): the age is one of several
-    // server gates, so the sentence says when the three days end and never
-    // that a claim will land.
+    // A CONDITION, never a promise (fix): the age is one of several server
+    // gates, so the sentence says when the three days end and never that a
+    // claim will land.
     expect(ACCOUNTS_USERNAME_COPY.needsAge(12)).toContain('the three days are up in about 12 hours.');
     expect(ACCOUNTS_USERNAME_COPY.needsAge(12)).not.toMatch(/will go through|will succeed|will land/);
     stubRows({ email: EMAIL_ROW, profile: profileAged(10 * HOUR_MS) });
@@ -431,5 +431,102 @@ describe('the find flow: a bare handle typed with no chip chosen runs the userna
     expect(byName).not.toHaveBeenCalled();
     expect(rendered(tree).toLowerCase().includes('username')).toBe(false);
     tree.unmount();
+  });
+});
+
+/* ── 6. the consent box on the CLAIM form ── */
+
+describe('unchecking consent on the CLAIM form says what a claim with findability off means', () => {
+  it('never "You hold this name" before the name is held', async () => {
+    stubRows({ email: EMAIL_ROW, profile: profileAged(4 * DAY_MS) });
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.claimUnfindable);
+    await press(tree, 'account-username-consent');
+    const text = rendered(tree);
+    expect(text).toContain(ACCOUNTS_USERNAME_COPY.claimUnfindable);
+    expect(text).not.toContain('You hold this name');
+    tree.unmount();
+  });
+
+  it('the held state keeps its own sentence, on the surface and on the rename form', async () => {
+    stubRows({ row: { ...HELD, discoverable: false }, email: EMAIL_ROW });
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.heldUnfindable);
+    // A rename seeds the box from the row (unfindable → unchecked): the
+    // sentence under it is still about the name that IS held.
+    await press(tree, 'account-username-rename');
+    const text = rendered(tree);
+    expect(text).toContain(ACCOUNTS_USERNAME_COPY.heldUnfindable);
+    expect(text).not.toContain(ACCOUNTS_USERNAME_COPY.claimUnfindable);
+    tree.unmount();
+  });
+});
+
+/* ── 7. the preconditions stop inviting a doomed tap ── */
+
+describe('the claim preconditions: a door beside the identifier sentence, and a button that waits out the age gate', () => {
+  it('no verified identifier on this device: the sentence carries a "Link an email" door; the form stays (a sibling may hold the verification)', async () => {
+    stubRows({ profile: profileAged(4 * DAY_MS) });
+    const onOpenAccountEmail = jest.fn();
+    const tree = await render(
+      <AccountUsernameScreen onBack={jest.fn()} onOpenAccountEmail={onOpenAccountEmail} />,
+    );
+    expect(has(tree, 'account-username-needs-identifier')).toBe(true);
+    expect(has(tree, 'account-username-input')).toBe(true);
+    await press(tree, 'account-username-link-email');
+    expect(onOpenAccountEmail).toHaveBeenCalledTimes(1);
+    tree.unmount();
+  });
+
+  it('without the door wired, the sentence stands alone', async () => {
+    stubRows({ profile: profileAged(4 * DAY_MS) });
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(tree, 'account-username-needs-identifier')).toBe(true);
+    expect(has(tree, 'account-username-link-email')).toBe(false);
+    tree.unmount();
+  });
+
+  it('a young account: the button is disabled under the hours sentence, and re-arms on its own when the three days are up', async () => {
+    // The age is this device's own account-level truth (the server counts the
+    // CALLER's createdAt, which the ULID carries), so refusing the tap locally
+    // costs nothing true. Fake timers drive the re-arm; the clock and the
+    // timers move together.
+    jest.restoreAllMocks();
+    jest.useFakeTimers({ now: NOW_MS });
+    try {
+      // 71 h old: sixty minutes to go — "about 1 hour" until the gate opens.
+      stubRows({ email: EMAIL_ROW, profile: profileAged(71 * HOUR_MS) });
+      const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+      await type(tree, 'account-username-input', 'alice_7');
+      const submit = () =>
+        tree.root.findAllByProps({ testID: 'account-username-submit' }).find(n => n.props.onPress !== undefined)!;
+      expect(has(tree, 'account-username-needs-age')).toBe(true);
+      expect(rendered(tree)).toContain('about 1 hour');
+      expect(submit().props.disabled).toBe(true);
+
+      // 31 minutes on: 29 to go, still "about 1 hour" (the hours round up),
+      // still refused. The 60 s ticks have re-rendered it thirty-one times.
+      await ReactTestRenderer.act(async () => {
+        jest.advanceTimersByTime(31 * 60_000);
+      });
+      expect(rendered(tree)).toContain('about 1 hour');
+      expect(submit().props.disabled).toBe(true);
+
+      // …and the moment the three days are up, the button re-arms on its own.
+      await ReactTestRenderer.act(async () => {
+        jest.advanceTimersByTime(30 * 60_000);
+      });
+      expect(has(tree, 'account-username-needs-age')).toBe(false);
+      expect(submit().props.disabled).toBe(false);
+      tree.unmount();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('the module: when the claim gate opens, in milliseconds since the epoch; null for an ID that does not decode', () => {
+    const created = NOW_MS - HOUR_MS;
+    expect(accountsUsername.usernameClaimOpensAtMs(ulid(created))).toBe(created + 72 * HOUR_MS);
+    expect(accountsUsername.usernameClaimOpensAtMs('01HQSELF000000000000000000')).toBeNull();
   });
 });

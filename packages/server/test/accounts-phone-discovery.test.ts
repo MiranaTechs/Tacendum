@@ -13,7 +13,7 @@ import {
 } from '@tacendum/shared';
 import { makeDocClient, makeDynamoClient } from '../src/db/client.js';
 import { TABLES as SERVER_TABLES } from '../src/db/tables.js';
-import { groupRowKey, makeDataLayer, type DataLayer } from '../src/db/data.js';
+import { groupRowKey, makeTestOnlyDataLayer, type TestOnlyDataLayer } from '../src/db/data.js';
 import {
   activeEmailClaimKeys,
   activePhoneClaimKeys,
@@ -59,7 +59,7 @@ import { makeMemoryDb, makeTestDeps, type LogEntry, type TestDeps } from './help
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
 let doc: DynamoDBDocumentClient;
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 let flagOn = true;
 let phoneFlagOn = true;
@@ -205,7 +205,7 @@ function expectUniform(res: HttpResult): void {
 beforeAll(async () => {
   const client = makeDynamoClient();
   doc = makeDocClient(client);
-  const base = makeDataLayer(doc);
+  const base = makeTestOnlyDataLayer(doc);
   db = {
     ...base,
     isAccountsFeatureEnabled: async () => flagOn,

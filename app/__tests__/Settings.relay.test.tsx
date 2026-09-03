@@ -19,8 +19,8 @@ import * as calling from '../src/call';
  *    appears to work and changes nothing.
  *  - remove the row's testIDs, i.e. no row at all — the shipped state this
  *    file exists to make impossible: 4 of 5 fail.
- *  - drop `testID="settings-relay-note"`: 1 fails, the disclosure.
- */
+ *  - drop `testID="settings-relay-note"` (the visible consent line) or the
+ *    row's ⓘ (`settings-relay-info`): 1 fails, the disclosure. */
 
 const keychain = (
   jest.requireMock('tacendum-crypto') as { __keychain: Map<string, string> }
@@ -31,6 +31,15 @@ jest.mock('../src/api', () => ({
   apiRegisterPushToken: jest.fn(async () => undefined),
   apiTurnCredentials: jest.fn(async () => ({ iceServers: [], ttlSeconds: 3600 })),
 }));
+
+/** Open a row's ⓘ: the testID lands on the disclosure composite first, so
+ * the press names the node that actually carries onPress. */
+async function openInfo(tree: ReactTestRenderer.ReactTestRenderer, testID: string): Promise<void> {
+  const node = tree.root.findAllByProps({ testID }).find(n => n.props.onPress !== undefined)!;
+  await ReactTestRenderer.act(async () => {
+    node.props.onPress();
+  });
+}
 
 async function render(): Promise<ReactTestRenderer.ReactTestRenderer> {
   let tree!: ReactTestRenderer.ReactTestRenderer;
@@ -118,9 +127,16 @@ describe('Settings → CALLS', () => {
     // traffic but not content, and the first call is protected either way —
     // without that last one, "Off" reads as "hand my address to strangers".
     const tree = await render();
-    const note = tree.root.findByProps({ testID: 'settings-relay-note' }).props
+    // The consent-grade cost — the IP disclosure — stays VISIBLE under the
+    // chips; the machinery sits behind the row's ⓘ, closed until opened,
+    // and directly under its own row rather than after the sheet.
+    const consent = tree.root.findByProps({ testID: 'settings-relay-note' }).props
       .children as string;
+    expect(consent).toMatch(/IP address/);
+    expect(JSON.stringify(tree.toJSON())).not.toMatch(/hear none of it/i);
 
+    await openInfo(tree, 'settings-relay-info');
+    const note = JSON.stringify(tree.toJSON());
     expect(note).toMatch(/IP address/);
     expect(note).toMatch(/first call/i);
     expect(note).toMatch(/longer to connect/i);

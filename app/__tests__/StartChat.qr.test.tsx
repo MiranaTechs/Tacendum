@@ -179,6 +179,9 @@ async function readPhoto(
 describe('showing your own code', () => {
   test('the panel is collapsed until asked for, and nothing is drawn before then', async () => {
     const tree = await render(screen());
+    // The own-ID block itself waits behind "Show my ID"; the QR
+    // disclosure sits inside it.
+    await press(tree, 'show-self-id');
 
     expect(byId(tree, 'show-self-qr').length).toBe(1);
     expect(byId(tree, 'self-qr-image').length).toBe(0);
@@ -193,6 +196,7 @@ describe('showing your own code', () => {
 
   test('the disclosure opens, closes, and says which it is', async () => {
     const tree = await render(screen());
+    await press(tree, 'show-self-id');
     expect(byId(tree, 'show-self-qr')[0].props.accessibilityState.expanded).toBe(
       false,
     );
@@ -217,7 +221,13 @@ describe('showing your own code', () => {
   test('the written ID and its existing actions are untouched by any of this', async () => {
     const tree = await render(screen());
 
-    // The QR is additive. The text path is what the screen shows by default.
+    // The QR is additive. The written id and its actions are exactly what
+    // they were — behind "Show my ID" since this screen is for reaching
+    // THEM, so your own id waits behind one tap rather than a scroll.
+    // (Rewritten deliberately: the earlier version pinned the block open
+    // by default.)
+    expect(byId(tree, 'self-user-id').length).toBe(0);
+    await press(tree, 'show-self-id');
     expect(byId(tree, 'self-user-id').length).toBe(1);
     expect(byId(tree, 'copy-self-id').length).toBe(1);
     expect(byId(tree, 'share-self-id').length).toBe(1);

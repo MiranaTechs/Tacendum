@@ -14,6 +14,7 @@ import {
 import type { ProfileRow } from '../db';
 import { DEVICE_NOUN } from '../deviceNoun';
 import { useKeyboardInset } from '../keyboardInset';
+import * as lock from '../lock';
 import {
   AVATAR_PHOTO,
   PickCancelled,
@@ -25,8 +26,10 @@ import {
 import { messaging } from '../messaging';
 import { shareIdMessage } from '../peerId';
 import { deleteAccount } from '../registration';
+import { session } from '../session';
 import { useTheme } from '../theme';
 import { Avatar } from '../ui/Avatar';
+import { PinPad } from '../ui/PinPad';
 import {
   IdentityRow,
   InlineError,
@@ -107,6 +110,14 @@ const COPY = {
   // destroyed either — the account is exactly as it was.
   signOutFailed:
     'Tacendum couldn’t reach the server, so nothing was deleted. Try again when you’re back on.',
+  /** The App Lock code before the one irreversible verb on this screen: an
+   * unlocked phone handed over for a moment must not be enough to delete
+   * the account. The verdict sentences are the Settings flow's, byte for
+   * byte. */
+  deleteCodePrompt: 'Enter your code to delete.',
+  deleteWrongCode: 'Wrong code.',
+  deleteCooldown: 'Too many tries. Wait a bit, then try again.',
+  deleteCheckFailed: 'Something went wrong. Nothing was deleted — try again.',
 } as const;
 
 /**
@@ -153,7 +164,31 @@ export function ProfileScreen({
   const [notice, setNotice] = useState<string | null>(null);
   const [confirmingSignOut, setConfirmingSignOut] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
+  /** The re-entrancy latch, synchronous where the STATE above is not: two
+   * submit affordances now call `confirmSignOut` (the pad's ⏎ and the
+   * outline confirm), and two taps in one tick both read `signingOut ===
+   * false` before React re-renders — two verifies burn two of the five free
+   * attempts on one mistyped code, and the right code deletes twice. Same
+   * fix Settings carries for the same reason (submitPin), and the
+   * LockScreen precedent before it. `signingOut` stays, for the UI. */
+  const signingOutRef = useRef(false);
   const [signOutError, setSignOutError] = useState<string | null>(null);
+  /**
+   * Whether App Lock guards the delete: read at mount and again when the
+   * panel opens; the session override wins over the Keychain so a duress
+   * session tells ONE story (rule 16). `null` until read — the confirm
+   * waits for the answer rather than guessing. */
+  const [deleteLockOn, setDeleteLockOn] = useState<boolean | null>(null);
+  const [deleteCode, setDeleteCode] = useState('');
+  const readDeleteLock = () => {
+    void lock
+      .status()
+      .then(s => setDeleteLockOn(session.lockUi.enabled ?? s.enabled))
+      // Unreadable: fail CLOSED — ask for the code; a verify that cannot
+      // read the store lands on deleteCheckFailed, and nothing is deleted.
+      .catch(() => setDeleteLockOn(true));
+  };
+  useEffect(readDeleteLock, []);
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(
@@ -279,8 +314,39 @@ export function ProfileScreen({
   };
 
   const confirmSignOut = async () => {
+    if (signingOutRef.current) return;
+    signingOutRef.current = true;
     setSigningOut(true);
     setSignOutError(null);
+    // THE CODE BEFORE THE VERB: a REAL session accepts only the real
+    // verdict — the give-away code opens nothing real, exactly as in
+    // Settings; a DURESS session accepts either, and `deleteAccount`
+    // itself runs the decoy-wipe branch there (registration.ts) — the
+    // coerced delete looks like it worked. A cooldown is said as one.
+    if (deleteLockOn !== false) {
+      let verdict: lock.LockVerdict;
+      try {
+        verdict = await lock.verify(deleteCode);
+      } catch {
+        setSignOutError(COPY.deleteCheckFailed);
+        signingOutRef.current = false;
+        setSigningOut(false);
+        return;
+      }
+      setDeleteCode('');
+      if (verdict.verdict === 'cooldown') {
+        setSignOutError(COPY.deleteCooldown);
+        signingOutRef.current = false;
+        setSigningOut(false);
+        return;
+      }
+      if (verdict.verdict === 'fail' || (session.mode === 'real' && verdict.verdict !== 'real')) {
+        setSignOutError(COPY.deleteWrongCode);
+        signingOutRef.current = false;
+        setSigningOut(false);
+        return;
+      }
+    }
     try {
       await deleteAccount();
       onSignedOut();
@@ -288,12 +354,18 @@ export function ProfileScreen({
       // Server-first: reaching here means the server was never told, so the
       // account — and everything local — is still intact. Say so plainly.
       setSignOutError(COPY.signOutFailed);
+      signingOutRef.current = false;
       setSigningOut(false);
     }
   };
 
   const hasName = profile.displayName !== '';
   const hasAbout = profile.about !== '';
+  /** The confirm waits for the lock answer, and — with the lock on — for a
+   * code the pad would accept (4+ digits), so it never fires a verify that
+   * can only burn an attempt. */
+  const confirmDisabled =
+    signingOut || deleteLockOn === null || (deleteLockOn && deleteCode.length < 4);
 
   // Collapsing the hero text into one button would otherwise silence the name
   // and the about line, so both are spoken before the action.
@@ -713,7 +785,11 @@ export function ProfileScreen({
                 ]}
               >
                 <Pressable
-                  onPress={() => setConfirmingSignOut(true)}
+                  onPress={() => {
+                    setConfirmingSignOut(true);
+                    setDeleteCode('');
+                    readDeleteLock();
+                  }}
                   disabled={confirmingSignOut}
                   accessibilityRole="button"
                   accessibilityLabel={COPY.signOut}
@@ -752,6 +828,26 @@ export function ProfileScreen({
                     >
                       {COPY.signOutConfirm}
                     </Text>
+                    {deleteLockOn === true ? (
+                      <>
+                        <Text
+                          style={[t.type.body, styles.deletePrompt, { color: t.color.inkBody }]}
+                          testID="profile-delete-code-prompt"
+                        >
+                          {COPY.deleteCodePrompt}
+                        </Text>
+                        <PinPad
+                          value={deleteCode}
+                          onChange={next => {
+                            setSignOutError(null);
+                            setDeleteCode(next);
+                          }}
+                          onSubmit={() => void confirmSignOut()}
+                          disabled={signingOut}
+                          submitLabel={COPY.confirmSignOut}
+                        />
+                      </>
+                    ) : null}
                     <View style={styles.confirmActions}>
                       <Pressable
                         onPress={() => {
@@ -789,12 +885,12 @@ export function ProfileScreen({
                       <View style={styles.actionGap} />
                       <Pressable
                         onPress={() => void confirmSignOut()}
-                        disabled={signingOut}
+                        disabled={confirmDisabled}
                         accessibilityRole="button"
                         // Not the same word as the control that opened this
                         // panel: a confirmation has to name its consequence.
                         accessibilityLabel={COPY.confirmSignOut}
-                        accessibilityState={{ disabled: signingOut }}
+                        accessibilityState={{ disabled: confirmDisabled }}
                         testID="profile-sign-out-confirm"
                         style={({ pressed }) => [
                           styles.confirmAction,
@@ -802,10 +898,10 @@ export function ProfileScreen({
                             minHeight: t.layout.touchTarget,
                             borderRadius: t.radius.button,
                             borderWidth: 1,
-                            borderColor: signingOut
+                            borderColor: confirmDisabled
                               ? t.color.lineSoft
                               : t.color.danger,
-                            backgroundColor: signingOut
+                            backgroundColor: confirmDisabled
                               ? t.color.paperInset
                               : pressed
                                 ? t.color.dangerWash
@@ -817,7 +913,7 @@ export function ProfileScreen({
                           style={[
                             t.type.buttonCompact,
                             {
-                              color: signingOut
+                              color: confirmDisabled
                                 ? t.color.inkMuted
                                 : t.color.danger,
                             },
@@ -1054,6 +1150,7 @@ const styles = StyleSheet.create({
 
   signOut: { marginTop: 32 },
   signOutAction: { alignItems: 'center', justifyContent: 'center' },
+  deletePrompt: { marginTop: 12, marginBottom: 8, textAlign: 'center' },
   confirm: { borderLeftWidth: 3, padding: 12 },
   confirmActions: { flexDirection: 'row', marginTop: 10 },
   confirmAction: {

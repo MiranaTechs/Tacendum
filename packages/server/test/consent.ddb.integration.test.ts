@@ -66,8 +66,8 @@ async function countRow(userId: string): Promise<number | undefined> {
 }
 
 describe('consent-edge store (DynamoDB Local)', () => {
-  it('writes, reads strongly consistently, re-consents idempotently, and counts exactly once', async () => {
-    if (!available) return;
+  it('writes, reads strongly consistently, re-consents idempotently, and counts exactly once', async (ctx) => {
+    if (!available) return ctx.skip();
     const human = uid();
     const agent = uid();
     purgeUsers.push(human);
@@ -82,8 +82,8 @@ describe('consent-edge store (DynamoDB Local)', () => {
     expect(await countRow(human)).toBe(1);
   });
 
-  it('enforces CONSENT_MAX_EDGES in the transaction condition and frees slots on delete', async () => {
-    if (!available) return;
+  it('enforces CONSENT_MAX_EDGES in the transaction condition and frees slots on delete', async (ctx) => {
+    if (!available) return ctx.skip();
     const human = uid();
     purgeUsers.push(human);
     const agents: string[] = [];
@@ -103,8 +103,8 @@ describe('consent-edge store (DynamoDB Local)', () => {
     expect(await db.hasConsentEdge(human, over)).toBe(true);
   });
 
-  it('a re-consent at the cap answers already, never cap_reached (edge precedence)', async () => {
-    if (!available) return;
+  it('a re-consent at the cap answers already, never cap_reached (edge precedence)', async (ctx) => {
+    if (!available) return ctx.skip();
     const human = uid();
     purgeUsers.push(human);
     let first = '';
@@ -117,8 +117,8 @@ describe('consent-edge store (DynamoDB Local)', () => {
     expect(await countRow(human)).toBe(CONSENT_MAX_EDGES);
   });
 
-  it('double-delete releases exactly once, and total revocation leaves NO counter row (delete-on-zero)', async () => {
-    if (!available) return;
+  it('double-delete releases exactly once, and total revocation leaves NO counter row (delete-on-zero)', async (ctx) => {
+    if (!available) return ctx.skip();
     const human = uid();
     const agent = uid();
     purgeUsers.push(human);
@@ -132,8 +132,8 @@ describe('consent-edge store (DynamoDB Local)', () => {
     expect(await db.hasConsentEdge(human, agent)).toBe(false);
   });
 
-  it('delete-on-zero re-arms cleanly: the next grant recreates the counter at 1 and the cap still holds', async () => {
-    if (!available) return;
+  it('delete-on-zero re-arms cleanly: the next grant recreates the counter at 1 and the cap still holds', async (ctx) => {
+    if (!available) return ctx.skip();
     const human = uid();
     purgeUsers.push(human);
     const a1 = uid();
@@ -152,8 +152,8 @@ describe('consent-edge store (DynamoDB Local)', () => {
     expect(await countRow(human)).toBe(1);
   });
 
-  it('deletion is never blocked by counter drift: the edge goes even when the count is already 0', async () => {
-    if (!available) return;
+  it('deletion is never blocked by counter drift: the edge goes even when the count is already 0', async (ctx) => {
+    if (!available) return ctx.skip();
     const human = uid();
     const agent = uid();
     purgeUsers.push(human);
@@ -174,16 +174,16 @@ describe('consent-edge store (DynamoDB Local)', () => {
     expect(await countRow(human)).toBe(0);
   });
 
-  it('refuses the #count control key as an edge probe', async () => {
-    if (!available) return;
+  it('refuses the #count control key as an edge probe', async (ctx) => {
+    if (!available) return ctx.skip();
     const human = uid();
     purgeUsers.push(human);
     await db.writeConsentEdge(human, uid(), Date.now());
     expect(await db.hasConsentEdge(human, CONSENT_COUNT_KEY)).toBe(false);
   });
 
-  it('purge sweeps the whole partition — edges and the control row', async () => {
-    if (!available) return;
+  it('purge sweeps the whole partition — edges and the control row', async (ctx) => {
+    if (!available) return ctx.skip();
     const human = uid();
     const a1 = uid();
     const a2 = uid();

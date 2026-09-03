@@ -165,6 +165,20 @@ describe('DDB fixed-window rate limiter', () => {
     }
   });
 
+  gated('a multi-token take charges the window by count', async () => {
+    const rl = makeDdbRateLimiter(doc);
+    const bucket = freshBucket();
+    expect(await rl.take(bucket, OPTS, 3)).toBe(0); // 3 of 5
+    expect(await rl.take(bucket, OPTS, 2)).toBe(0); // 5 of 5
+    expect(await rl.take(bucket, OPTS, 1)).toBeGreaterThan(0);
+    // A refused multi-token take still counts against the window — the
+    // fixed-window counter never un-adds, and the bucket is the caller's own.
+    const other = freshBucket();
+    expect(await rl.take(other, OPTS, 4)).toBe(0);
+    expect(await rl.take(other, OPTS, 4)).toBeGreaterThan(0);
+    expect(await rl.take(other, OPTS, 1)).toBeGreaterThan(0);
+  });
+
   gated('buckets are isolated', async () => {
     const rl = makeDdbRateLimiter(doc);
     const one = freshBucket();

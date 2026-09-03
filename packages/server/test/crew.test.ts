@@ -9,7 +9,7 @@ import {
 import { CREW_MAX_MEMBERS, TABLES } from '@tacendum/shared';
 import { makeDocClient, makeDynamoClient } from '../src/db/client.js';
 import { TABLES as SERVER_TABLES } from '../src/db/tables.js';
-import { makeDataLayer, type DataLayer } from '../src/db/data.js';
+import { makeTestOnlyDataLayer, type TestOnlyDataLayer } from '../src/db/data.js';
 import { userRefForLog } from '../src/opaque-ref.js';
 import { crewAdoptHandler } from '../src/handlers/crew.js';
 import { integrationRevokeHandler } from '../src/handlers/integrations.js';
@@ -31,7 +31,7 @@ import { allQueued, makeTestDeps, parseBody, type TestDeps } from './helpers.js'
 
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let doc: DynamoDBDocumentClient;
 let available = false;
 
@@ -78,7 +78,7 @@ let mintSeq = 0;
 beforeAll(async () => {
   const client = makeDynamoClient();
   doc = makeDocClient(client);
-  db = makeDataLayer(doc);
+  db = makeTestOnlyDataLayer(doc);
   hdeps = {
     ...makeTestDeps(db),
     newUserId: () => `crew-${RUN}-hmint-${++mintSeq}`,
@@ -402,20 +402,20 @@ describe('deleteCrewMemberAndReleaseSlot — exactly-once by construction', () =
 });
 
 /**
- * A DataLayer whose doc client runs `beforeTransact` immediately before
+ * A TestOnlyDataLayer whose doc client runs `beforeTransact` immediately before
  * forwarding each TransactWriteCommand (1-indexed); everything else passes
  * straight through. Real DynamoDB end to end — this only schedules a
  * concurrent writer's COMMITTED work into the gap between adoptCrewMember's
  * pre-read and its transaction, the interleaving a two-process race produces
  * nondeterministically and a test must produce on demand.
  */
-function interleaved(beforeTransact: (transactSeq: number) => Promise<void>): DataLayer {
+function interleaved(beforeTransact: (transactSeq: number) => Promise<void>): TestOnlyDataLayer {
   let transactSeq = 0;
   const send = async (command: object): Promise<unknown> => {
     if (command instanceof TransactWriteCommand) await beforeTransact(++transactSeq);
     return (doc.send as unknown as (c: object) => Promise<unknown>)(command);
   };
-  return makeDataLayer({ send } as unknown as DynamoDBDocumentClient);
+  return makeTestOnlyDataLayer({ send } as unknown as DynamoDBDocumentClient);
 }
 
 describe('the crew pin — a member crewId is always its owner crewId', () => {
@@ -871,20 +871,20 @@ describe('slot release on teardown', () => {
 });
 
 /**
- * A DataLayer whose doc client runs `beforeDelete` immediately before
+ * A TestOnlyDataLayer whose doc client runs `beforeDelete` immediately before
  * forwarding each single-item DeleteCommand (1-indexed); everything else
  * passes straight through. The DeleteCommand sibling of `interleaved` above:
  * deleteUser's tombstone fallback re-runs the user-row delete OUTSIDE the
  * transaction, and the gap in front of THAT delete is one a concurrent
  * adopt can commit into just as it can the gap before the transaction.
  */
-function interleavedOnDelete(beforeDelete: (deleteSeq: number) => Promise<void>): DataLayer {
+function interleavedOnDelete(beforeDelete: (deleteSeq: number) => Promise<void>): TestOnlyDataLayer {
   let deleteSeq = 0;
   const send = async (command: object): Promise<unknown> => {
     if (command instanceof DeleteCommand) await beforeDelete(++deleteSeq);
     return (doc.send as unknown as (c: object) => Promise<unknown>)(command);
   };
-  return makeDataLayer({ send } as unknown as DynamoDBDocumentClient);
+  return makeTestOnlyDataLayer({ send } as unknown as DynamoDBDocumentClient);
 }
 
 describe('the delete-leg crew guard — enforced AT the row, not only at the read', () => {

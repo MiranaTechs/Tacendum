@@ -296,6 +296,36 @@ RCT_EXPORT_MODULE()
   resolve(nil);
 }
 
+// An answer taken on the app's own screen for a call CallKit reported under
+// `cid` (a session's sid) — the CXAnswerCallAction the 1:1 `createAnswer`
+// funnel already requests, for the one CXCall no leg's cid can find.
+- (void)answerReportedCall:(NSString *)cid
+                   resolve:(RCTPromiseResolveBlock)resolve
+                    reject:(RCTPromiseRejectBlock)reject
+{
+  [[CallKitCenter shared] answerFromAppWithCid:cid];
+  resolve(nil);
+}
+
+#pragma mark - missed calls
+
+- (void)postMissedCall:(NSString *)peerId
+           displayName:(NSString *)displayName
+               resolve:(RCTPromiseResolveBlock)resolve
+                reject:(RCTPromiseRejectBlock)reject
+{
+  [[TacendumCallImpl shared] postMissedCallWithPeerId:peerId displayName:displayName];
+  resolve(nil);
+}
+
+- (void)clearMissedCall:(NSString *)peerId
+                resolve:(RCTPromiseResolveBlock)resolve
+                 reject:(RCTPromiseRejectBlock)reject
+{
+  [[TacendumCallImpl shared] clearMissedCallWithPeerId:peerId];
+  resolve(nil);
+}
+
 #pragma mark - PushKit
 
 - (void)getVoipToken:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject

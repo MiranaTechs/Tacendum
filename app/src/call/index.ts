@@ -3,7 +3,7 @@ import type { CallState } from '@tacendum/shared';
 import { idleState, OFFER_TTL_MS } from '@tacendum/shared';
 import * as native from 'tacendum-call';
 import { getSecret, setSecret } from 'tacendum-crypto';
-import { Platform } from 'react-native';
+import { AppState, Platform, type AppStateStatus } from 'react-native';
 import {
   apiDeletePushToken,
   onApiAuthRenewed,
@@ -178,6 +178,7 @@ let pressure: PressureInputs = {
 function notify(state: CallState): void {
   const previousCid = current.call?.cid ?? null;
   const previousName = current.name;
+  const previousVideo = current.call?.video ?? false;
   current = state;
   // A new call starts from a known media state. Without this, a mute toggled
   // in one call was still SHOWN in the next one against a fresh, unmuted
@@ -231,6 +232,29 @@ function notify(state: CallState): void {
     // Waiting for the next thermal notification would mean the one call most
     // likely to overheat the device is the one that runs uncapped.
     if (video) void applyPressure();
+  } else if (
+    nextCid !== null &&
+    previousVideo &&
+    state.call?.video === false &&
+    localMedia.videoEnabled
+  ) {
+    // "ANSWER WITHOUT VIDEO" — the same cid, narrowed from a video invite to
+    // an audio answer (`acceptIncoming`, §10.3). The reset above is keyed on
+    // the cid, so this edge left the mirror saying the camera was ON for a
+    // call whose answer never started it: "Turn camera off" over a black
+    // preview, Flip camera enabled, and a tap into the audio-call camera
+    // toggle. Re-derived here from the call's own video flag; the speaker
+    // follows the route, as `switchToVoice` does it — the flag darkens only
+    // once the earpiece has actually been asked for and taken.
+    localMedia = { ...localMedia, videoEnabled: false };
+    void native
+      .setSpeaker(nextCid, false)
+      .then(() => {
+        if (current.call?.cid !== nextCid) return;
+        localMedia = { ...localMedia, speakerOn: false };
+        notifyMedia();
+      })
+      .catch(() => undefined);
   }
   // Battery monitoring is not free, so it runs only while a call does. Keyed
   // on entering/leaving idle rather than on the cid, so a glare swap does not
@@ -283,7 +307,7 @@ export function callController(): CallController {
   if (controller) return controller;
   controller = new CallController({
     messaging,
-    native,
+    native: nativeForController,
     fetchTurnCredentials: async () => {
       const token = await getSecret(AUTH_TOKEN_KEY);
       if (!token) throw new Error('not signed in');
@@ -295,19 +319,47 @@ export function callController(): CallController {
       // mid-call still leaves evidence it happened, and closed here.
       // `startCallLog` is a no-op on conflict, so replaying a terminal effect
       // cannot duplicate a row.
-      await db.startCallLog({
-        cid: row.cid,
-        peerId: row.peerId,
-        direction: row.direction,
-        kind: row.kind,
-        startedAt: row.startedAt,
-      });
-      await db.endCallLog(row.cid, {
-        reason: row.reason,
-        connectedAt: row.connectedAt,
-        endedAt: row.endedAt,
-        missed: row.missed,
-      });
+      try {
+        await db.startCallLog({
+          cid: row.cid,
+          peerId: row.peerId,
+          direction: row.direction,
+          kind: row.kind,
+          startedAt: row.startedAt,
+        });
+        await db.endCallLog(row.cid, {
+          reason: row.reason,
+          connectedAt: row.connectedAt,
+          endedAt: row.endedAt,
+          missed: row.missed,
+        });
+      } finally {
+        // A missed call on a locked phone used to leave NOTHING: CallKit ends
+        // the ring as .unanswered but is excluded from Recents, and the app
+        // posted no notification — the person learned of the call only by
+        // opening the Calls tab. The row IS the fact; this is its notice —
+        // and it is posted WHETHER OR NOT the row could be written, because
+        // the phone most likely to miss a call is the locked one, whose
+        // workspace refuses the write. The name goes along only when this
+        // device actually knows one; '' lets native fall back to the name
+        // mirror the ring itself paints from. …and NEVER for a row the
+        // controller wrote on a silenced caller's behalf (§10.6, `silenced`):
+        // the notice is audible and on the lock screen, so keyed on `missed`
+        // alone it let a stranger chime the phone the policy keeps quiet,
+        // once per offer.
+        if (row.missed && row.direction === 'in' && !row.silenced) {
+          const known = await db
+            .getChat(row.peerId)
+            .then(
+              chat =>
+                sanitizeDisplayName(chat?.localName) ||
+                sanitizeDisplayName(chat?.displayName) ||
+                '',
+            )
+            .catch(() => '');
+          void postMissedCallNotice(row.peerId, known);
+        }
+      }
     },
     // The name CallKit shows on the lock screen.
     //
@@ -429,6 +481,14 @@ export function groupCall(): GroupCallCoordinator {
           applied => applied === true,
           () => false,
         ),
+      // The in-app Answer's CallKit half for a SESSION (the CXCall is keyed
+      // by sid, departure 8): a CXAnswerCallAction against it, so the audio
+      // session activates and the WebRTC unit starts under §7.4's manual
+      // rule. Total for the same reason `postMissedCallNotice` is.
+      answerReportedCall: sid =>
+        Promise.resolve()
+          .then(() => native.answerReportedCall(sid))
+          .catch(() => undefined),
     },
     transport: {
       sendCallEnvelope: (peerId, envelope, opts) =>
@@ -967,7 +1027,10 @@ export async function startCalling(): Promise<() => void> {
     native.events.iceCandidate(e => {
       const candidate = { cand: e.cand, mid: e.mid, idx: e.idx };
       if (groupCall().onLocalIceCandidate(e.cid, candidate)) return;
-      c.onLocalIceCandidate(candidate);
+      // WITH ITS CID. A candidate a dead group leg gathers late is not
+      // claimed above and must not be queued under whatever 1:1 call is
+      // live; the controller drops anything not naming its own call.
+      c.onLocalIceCandidate(candidate, e.cid);
     }),
     native.events.iceState(e =>
       void groupCall()
@@ -1039,10 +1102,7 @@ export async function startCalling(): Promise<() => void> {
         void groupCall().setMuted(e.muted);
         return;
       }
-      localMedia = { ...localMedia, muted: e.muted };
-      void native.setAudioEnabled(e.cid, !e.muted);
-      announceMedia();
-      notifyMedia();
+      void applyMute(e.muted);
     }),
     // THE ROUTE, RE-ASSERTED AT THE FIRST MOMENT IT CAN MEAN ANYTHING.
     // The speaker is asked for when the call first gets a cid — during the
@@ -1160,6 +1220,16 @@ export async function startCalling(): Promise<() => void> {
   // said which world this is, and `adoptPushRegistration` replays whatever
   // arrived in the meantime. See the guard at the top of `uploadPushTokens`.
 
+  // §6.6: BACKGROUNDING A VIDEO CALL TELLS THE PEER. iOS interrupts the
+  // capture session in the background; the encoder stops and the far decoder
+  // holds the last frame, so without this the other person watched a still
+  // image under "Connected" with no camera-off cue. The track is disabled
+  // (so the peer's own view gets the muted-track signal too), the peer is
+  // told, and the camera comes back on return — only if it was on when the
+  // app left, and only for the SAME call.
+  const appState = AppState.addEventListener('change', next => {
+    void onAppStateForCall(next);
+  });
   await c.start();
   // AFTER every subscription above and after `start()`, because this releases
   // whatever CallKit raised before JS existed — and on a cold launch from a
@@ -1181,6 +1251,8 @@ export async function startCalling(): Promise<() => void> {
     // teardown reaches whatever workspace the next verdict declares.
     quiesceCallMetrics();
     for (const s of subs) s.remove();
+    appState.remove();
+    videoPausedForBackground = null;
     c.stop();
     // The session goes with the controller. `c.stop()` disposes the 1:1
     // service; a coordinator left holding N leg services, a live roster and
@@ -1371,8 +1443,29 @@ export function nudgePushRegistration(): void {
   void uploadPushTokens();
 }
 
-/** Cleared when calling stops, so a test render cannot leak a live timer. */
+/**
+ * Cleared when calling stops, so a test render cannot leak a live timer.
+ *
+ * THE BUDGET GOES WITH THE TIMER, and dropping only the timer was a hole.
+ * Every call site of `uploadPushTokens` is `void uploadPushTokens()`, so a PUT
+ * is routinely still on the wire when the session that started it ends — a
+ * relock, an unmount, a fresh verdict. Its catch calls `armAlertRetry`, which
+ * is gated on `alertRetriesLeft` alone; with the budget left at six, a
+ * teardown that had just cleared the pending timer got a NEW one armed
+ * underneath it moments later, and five more behind that: thirty seconds of
+ * registrations carrying the ended session's bearer token, into whatever
+ * workspace the next verdict had since declared. It also outlived a jest
+ * environment, where the resumed upload reads `Platform.OS` through
+ * react-native's lazy index getter and throws an unhandled "import after
+ * teardown" — a red CI check with no failing test in it.
+ *
+ * Zeroing here is not permanent: every legitimate re-arm restores the budget
+ * before it uploads — `adoptPushRegistration` (a fresh real verdict) and
+ * `restorePushTokens` (consent restored) to the full six,
+ * `nudgePushRegistration` (foregrounding) to at least two.
+ */
 function clearAlertRetry(): void {
+  alertRetriesLeft = 0;
   if (alertRetryTimer) {
     clearTimeout(alertRetryTimer);
     alertRetryTimer = null;
@@ -1543,6 +1636,37 @@ export async function restorePushTokens(): Promise<void> {
   await uploadPushTokens();
 }
 
+/**
+ * The missed-call notification, and its clearing (§10.4's "the person
+ * learns of the call" half). Threaded by peer so the thread and the Calls
+ * tab can clear exactly the notices they answer. Total: a module without the
+ * method (an older binary under a newer JS bundle) or a refused post costs
+ * the notice, never the row or the call.
+ */
+function postMissedCallNotice(peerId: string, name: string): Promise<void> {
+  return Promise.resolve()
+    .then(() => missedCallBridge.post(peerId, name))
+    .catch(() => undefined);
+}
+
+export function clearMissedCallNotices(peerId: string | null): Promise<void> {
+  return Promise.resolve()
+    .then(() => missedCallBridge.clear(peerId ?? ''))
+    .catch(() => undefined);
+}
+
+/**
+ * The two module calls behind the notices, behind one object — a test seam
+ * in the `subscribeForTests` family. `import * as native` is a per-importer
+ * copy under the RN babel preset, so a method planted on the mock from a
+ * test never reaches this file; a spy on this object's properties does.
+ */
+export const missedCallBridge = {
+  post: (peerId: string, displayName: string): Promise<void> =>
+    native.postMissedCall(peerId, displayName),
+  clear: (peerId: string): Promise<void> => native.clearMissedCall(peerId),
+};
+
 /** Local track state, mirrored for the UI. */
 export function localMediaState(): typeof localMedia {
   return localMedia;
@@ -1649,10 +1773,37 @@ function announceMedia(): void {
 }
 
 export async function toggleMute(): Promise<void> {
+  await applyMute(!localMedia.muted);
+}
+
+/**
+ * Mute or unmute the live 1:1 call, HONOURING THE NATIVE VERDICT.
+ *
+ * `setAudioEnabled` answers whether a track was actually changed, and this
+ * used to ignore it: the flag flipped, `call.media{a:false}` went out, the
+ * lock screen and the button said muted — and a microphone that had no track
+ * yet (the CallKit Mute tapped right after answering a video call, inside
+ * the camera-enumeration window before `addLocalMedia` finishes) kept
+ * transmitting the moment the track was installed — the worst failure a
+ * call can have.
+ *
+ * Two outcomes for a `false`:
+ *  - the call is CONNECTED, so a track exists and the change genuinely
+ *    failed: nothing is claimed — the flag stays where it was and no
+ *    announce goes out.
+ *  - the call is not connected yet: the track is not born. The INTENT is
+ *    kept (so CallKit and the button agree with what the person asked) and
+ *    `reapplyMediaIntent` lands it on the track the moment `createOffer` /
+ *    `createAnswer` resolves — the wrapped native below is what makes that
+ *    moment observable here.
+ */
+async function applyMute(muted: boolean): Promise<void> {
   const cid = current.call?.cid;
   if (!cid) return;
-  localMedia = { ...localMedia, muted: !localMedia.muted };
-  await native.setAudioEnabled(cid, !localMedia.muted);
+  const applied = await native.setAudioEnabled(cid, !muted).catch(() => false);
+  if (current.call?.cid !== cid) return;
+  if (!applied && current.name === 'connected') return;
+  localMedia = { ...localMedia, muted };
   announceMedia();
   notifyMedia();
 }
@@ -1660,8 +1811,84 @@ export async function toggleMute(): Promise<void> {
 export async function toggleVideo(): Promise<void> {
   const cid = current.call?.cid;
   if (!cid) return;
-  localMedia = { ...localMedia, videoEnabled: !localMedia.videoEnabled };
-  await native.setVideoEnabled(cid, localMedia.videoEnabled);
+  const next = !localMedia.videoEnabled;
+  // THE VERDICT, HONOURED (the group arm already does). An audio call
+  // negotiated no video m-line and has no local video track; `false` here
+  // means nothing changed, and claiming otherwise showed an opaque black
+  // preview locally and sent `call.media{v:true}` — which turned the PEER's
+  // whole screen into a black video surface with no track behind it.
+  const applied = await native.setVideoEnabled(cid, next).catch(() => false);
+  if (!applied || current.call?.cid !== cid) return;
+  localMedia = { ...localMedia, videoEnabled: next };
+  announceMedia();
+  notifyMedia();
+}
+
+/**
+ * Land the stored mute / camera intent on a track that has just been born.
+ *
+ * Called by the wrapped native's `createOffer` / `createAnswer` once they
+ * resolve — the first moment `addLocalMedia` has run. Level-triggered
+ * against the native track (the `applyPressure` rule): re-issuing against a
+ * track already in that state is a no-op, so this is safe to call for every
+ * offer and answer, restarts included.
+ */
+function reapplyMediaIntent(cid: string): void {
+  if (current.call?.cid !== cid) return;
+  if (localMedia.muted) {
+    void native.setAudioEnabled(cid, false).catch(() => undefined);
+  }
+  if (current.call.video && !localMedia.videoEnabled) {
+    void native.setVideoEnabled(cid, false).catch(() => undefined);
+  }
+}
+
+/**
+ * The call's media surface, as the controller sees it: the module, with the
+ * two calls that BIRTH a track wrapped so `reapplyMediaIntent` runs the
+ * moment they resolve. Nothing else is changed — every other method is the
+ * module's own, by reference.
+ */
+const nativeForController: typeof native = {
+  ...native,
+  createOffer: async (cid, withVideo) => {
+    const sdp = await native.createOffer(cid, withVideo);
+    reapplyMediaIntent(cid);
+    return sdp;
+  },
+  createAnswer: async (cid, remoteOfferSdp, withVideo) => {
+    const sdp = await native.createAnswer(cid, remoteOfferSdp, withVideo);
+    reapplyMediaIntent(cid);
+    return sdp;
+  },
+};
+
+/** What the camera was doing when the app left the foreground, for the
+ * call it was doing it in — or null. */
+let videoPausedForBackground: { cid: string } | null = null;
+
+async function onAppStateForCall(next: AppStateStatus): Promise<void> {
+  const call = current.call;
+  if (next === 'background' || next === 'inactive') {
+    if (!call || !localMedia.videoEnabled || videoPausedForBackground) return;
+    videoPausedForBackground = { cid: call.cid };
+    localMedia = { ...localMedia, videoEnabled: false };
+    await native.setVideoEnabled(call.cid, false).catch(() => undefined);
+    if (current.call?.cid !== call.cid) return;
+    announceMedia();
+    notifyMedia();
+    return;
+  }
+  if (next !== 'active') return;
+  const paused = videoPausedForBackground;
+  videoPausedForBackground = null;
+  // Restored only for the call that was paused, and only if it is still
+  // live: a call that ended in the background has nothing to restore, and
+  // the NEXT call starts from its own reset.
+  if (!paused || !call || call.cid !== paused.cid) return;
+  const applied = await native.setVideoEnabled(call.cid, true).catch(() => false);
+  if (!applied || current.call?.cid !== call.cid) return;
+  localMedia = { ...localMedia, videoEnabled: true };
   announceMedia();
   notifyMedia();
 }
@@ -1731,6 +1958,45 @@ export async function flipCamera(): Promise<void> {
 }
 
 /**
+ * Answer the ringing 1:1 call, asking for permissions FIRST (§7.5).
+ *
+ * The outgoing paths have always asked at the moment of the call; the accept
+ * handlers called `accept()` directly, so a first-ever call that was incoming
+ * put the system mic/camera prompts over the connecting screen — after
+ * `didActivate` had fired, whose audio-unit start then failed under the
+ * prompt. A denied camera degrades to an audio answer, exactly as a denied
+ * camera degrades a dial; a denied microphone cannot proceed, and the honest
+ * answer to the caller is a decline rather than a silent call.
+ */
+export async function acceptIncomingCall(
+  withVideo: boolean,
+): Promise<{ ok: boolean; video: boolean; reason?: string }> {
+  const c = callController();
+  const permission = await ensurePermissions(withVideo);
+  // The ring can end under the prompt — the caller cancels, the ring times
+  // out. Nothing to accept then, and nothing to decline either.
+  if (c.state.name !== 'incoming_ringing') return permission;
+  if (!permission.ok) {
+    await c.decline().catch(() => undefined);
+    return permission;
+  }
+  await c.accept(permission.video ? undefined : { video: false });
+  return permission;
+}
+
+/**
+ * Whether a video answer can be offered right now: the camera has not been
+ * REFUSED. "Undetermined" still counts — `acceptIncomingCall` asks at the
+ * tap, exactly as a dial does. Total: a module that cannot say answers yes,
+ * and the tap's own request settles it. */
+export async function cameraAvailableForAnswer(): Promise<boolean> {
+  return native
+    .cameraPermission()
+    .then(state => state !== 'denied')
+    .catch(() => true);
+}
+
+/**
  * Ask for permissions at the moment of the call, never at launch.
  *
  * A denied camera downgrades to audio rather than refusing: an audio call is
@@ -1789,6 +2055,7 @@ export function resetCallingForTests(): void {
   // gate that was already open, which is the state this whole latch exists to
   // stop production being in.
   pushRegistrationAdopted = false;
+  videoPausedForBackground = null;
   localMedia = {
     muted: false,
     videoEnabled: false,

@@ -109,6 +109,11 @@ class TacendumCallModule(private val reactContext: ReactApplicationContext) :
     PushTokenStore.install(null)
     pressure?.stop()
     pressure = null
+    // The proximity lock is derived from the live calls, which are left
+    // alone above — but a lock nobody can recompute is a lock that could
+    // outlive its reason, so it goes with the module and the next one
+    // re-derives it from the calls Telecom still holds.
+    ProximityGuard.release()
     super.invalidate()
   }
 
@@ -365,6 +370,10 @@ class TacendumCallModule(private val reactContext: ReactApplicationContext) :
    */
   private fun refreshCallPresence() {
     val context = reactContext.applicationContext
+    // The proximity lock is derived from the same live set, at the same
+    // moments — an install, a close — plus the negotiation that births the
+    // video track it reads.
+    CallAudioGate.refreshProximity()
     reactContext.runOnUiQueueThread {
       val live: Boolean
       val anyVideo: Boolean
@@ -393,6 +402,9 @@ class TacendumCallModule(private val reactContext: ReactApplicationContext) :
         val pc = makeCall(cid)
         pc.createOffer(withVideo, false) { sdp, error ->
           endNegotiation(cid)
+          // The local tracks were born inside the call above; the proximity
+          // rule's video input can only be read now.
+          CallAudioGate.refreshProximity()
           if (sdp != null) promise.resolve(sdp)
           else promise.reject("offer_failed", "could not create an offer")
         }
@@ -417,6 +429,7 @@ class TacendumCallModule(private val reactContext: ReactApplicationContext) :
         val pc = call(cid) ?: makeCall(cid)
         pc.createAnswer(remoteOfferSdp, withVideo) { sdp, error ->
           endNegotiation(cid)
+          CallAudioGate.refreshProximity()
           if (sdp != null) promise.resolve(sdp)
           else promise.reject("answer_failed", "could not create an answer")
         }
@@ -602,6 +615,27 @@ class TacendumCallModule(private val reactContext: ReactApplicationContext) :
 
   override fun endCall(cid: String, reason: String, promise: Promise) {
     TelecomCenter.endCall(cid, reason)
+    promise.resolve(null)
+  }
+
+  /** An in-app answer for a call reported under `cid` (a session's sid) —
+   * see `TelecomCenter.answerFromApp`. Never rejects. */
+  override fun answerReportedCall(cid: String, promise: Promise) {
+    TelecomCenter.answerFromApp(cid)
+    promise.resolve(null)
+  }
+
+  // MARK: - missed calls
+
+  override fun postMissedCall(peerId: String, displayName: String, promise: Promise) {
+    // Never rejects: a refused post costs the notice, never the row or the
+    // call — the same rule `setBadgeCount` keeps.
+    MissedCallNotification.post(reactContext.applicationContext, peerId, displayName)
+    promise.resolve(null)
+  }
+
+  override fun clearMissedCall(peerId: String, promise: Promise) {
+    MissedCallNotification.clear(reactContext.applicationContext, peerId)
     promise.resolve(null)
   }
 

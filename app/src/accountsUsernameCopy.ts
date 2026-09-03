@@ -50,6 +50,10 @@ export const ACCOUNTS_USERNAME_COPY = {
    * up front from THIS device's own knowledge and each with its own
    * sentence (build 24 — simulator testing typed names into thirteen
    * "try again later"s): a name is free to hold, never free to mint. */
+  /**
+   * The door beside the sentence above: the step it names, one tap away.
+   * Opens the email surface — the class every binary can link. */
+  needsIdentifierAction: 'Link an email',
   needsIdentifier:
     'Link and verify an email address or phone number first — a username can only be claimed by an account that holds one and is at least three days old. This keeps names from being grabbed by the thousand.',
   /** The age gate, said with the wait left: the account's birth is the
@@ -95,6 +99,11 @@ export const ACCOUNTS_USERNAME_COPY = {
   discoverableNote:
     'Off means the name stays yours but no one can find your account by typing it. Turning it on or off never changes whether you can be found by email or phone number.',
   heldUnfindable: 'You hold this name, but no one can find you by it until you turn findability on.',
+  /** The same fact on the CLAIM form, BEFORE the name is held: unchecking
+   * the box there was rendering "You hold this name" over a name not yet
+   * claimed. */
+  claimUnfindable:
+    'If you claim it with this off, the name is yours but no one can find you by it until you turn findability on.',
   /** The held state's lead: the name this device recorded at claim time —
    * the local row is the ONLY readable home of it (the server stores
    * a keyed hash and never echoes a name). */

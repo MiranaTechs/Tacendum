@@ -322,3 +322,82 @@ test('the real code opens the real workspace', async () => {
   expect(sqlite.opened).not.toContain('tacendum-decoy.sqlite');
   expect(session.mode).toBe('real');
 });
+
+// --- the App Lock nudge ----------------------
+
+const NUDGE_USER_ID = '01KYDBSSDJSPC9J0E5N2AWMJ5Y';
+
+/** A real workspace holding a finished, NAMED account (back.android's
+ * fixture): the naming nudge is not owed, so the lock nudge is the one on
+ * the list. */
+function seedRealWorkspaceWithProfile(): void {
+  const instance: FakeDb = {
+    name: 'tacendum.sqlite',
+    execute: jest.fn(async (sql: string) => {
+      const s = String(sql);
+      if (s.includes('FROM profile')) {
+        return {
+          rows: [
+            { key: 'userId', value: NUDGE_USER_ID },
+            { key: 'registrationId', value: '7' },
+            { key: 'displayName', value: 'Me' },
+            { key: 'about', value: '' },
+            { key: 'avatarB64', value: '' },
+            { key: 'profileVersion', value: '3' },
+          ],
+        };
+      }
+      if (s.includes('PRAGMA table_info(attachments')) {
+        return { rows: [{ name: 'direction' }] };
+      }
+      if (s.includes('PRAGMA table_info(reactions')) {
+        return { rows: [{ name: 'targetDirection' }, { name: 'reactorId' }] };
+      }
+      if (s.includes('PRAGMA table_info(pending_revisions')) {
+        return { rows: [{ name: 'writerId' }] };
+      }
+      return { rows: [] };
+    }),
+    close: jest.fn(),
+  };
+  sqlite.instances.set('tacendum.sqlite', instance);
+}
+
+async function flushMicrotasks(): Promise<void> {
+  for (let i = 0; i < 60; i++) await Promise.resolve();
+}
+
+test("the App Lock nudge's Open Settings lands on Settings and settles the nudge for good", async () => {
+  // A registered, named account, no lock, nothing answered: the chat list
+  // owes the nudge, and App.tsx must give it somewhere to go.
+  crypto.__keychain.set('authToken', 'token-for-this-test');
+  const identityPublicKey = (crypto as unknown as { identityPublicKey: jest.Mock })
+    .identityPublicKey;
+  identityPublicKey.mockResolvedValue('BQ0IDENTITYKEYBASE64');
+  seedRealWorkspaceWithProfile();
+  try {
+    const tree = await renderApp();
+    await ReactTestRenderer.act(flushMicrotasks);
+    const route = () =>
+      (globalThis as Record<string, unknown>).TacendumDevRoute as string;
+    expect(route()).toBe('chats');
+
+    const open = tree.root
+      .findAllByProps({ testID: 'lock-nudge-open' })
+      .find(node => typeof node.props.onPress === 'function');
+    expect(open).toBeDefined();
+    await ReactTestRenderer.act(async () => {
+      open!.props.onPress();
+      await flushMicrotasks();
+    });
+
+    // The Settings surface is on glass, and the one showing is spent.
+    expect(route()).toBe('settings');
+    expect(
+      tree.root.findAllByProps({ testID: 'settings-account-email' }).length,
+    ).toBeGreaterThan(0);
+    expect(crypto.__keychain.get('lockNudge.dismissed')).toBe('1');
+  } finally {
+    identityPublicKey.mockResolvedValue(null);
+  }
+});

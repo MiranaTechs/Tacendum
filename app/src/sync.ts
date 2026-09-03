@@ -46,6 +46,12 @@ export const SyncTranscript = z.object({
   msgId: z.string().min(1).max(64),
   body: z.string().min(1),
   ts: z.number().int().nonnegative(),
+  /** The disappearing-timer deadline the sender stamped on its OWN row
+   * (absolute epoch ms), so the sibling's copy expires with it — a transcript
+   * used to be materialised with no expiry at all and outlived the message it
+   * copied. Optional and ADDITIVE: an older sibling's parse strips it and
+   * keeps the transcript. */
+  expiresAt: z.number().int().positive().optional(),
 });
 export type SyncTranscript = z.infer<typeof SyncTranscript>;
 

@@ -1,8 +1,10 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { ListTablesCommand } from '@aws-sdk/client-dynamodb';
 import {
+  BatchWriteCommand,
   GetCommand,
   PutCommand,
+  QueryCommand,
   ScanCommand,
   UpdateCommand,
   type DynamoDBDocumentClient,
@@ -25,7 +27,8 @@ import {
   recoveryRowKey,
   emailCooldownKeyFromClaimKey,
   makeDataLayer,
-  type DataLayer,
+  makeTestOnlyDataLayer,
+  type TestOnlyDataLayer,
 } from '../src/db/data.js';
 import { emailClaimKey, emailSuppressionKey, identifierClaimHash } from '../src/opaque-ref.js';
 import { deleteAccountHandler } from '../src/handlers/account.js';
@@ -72,8 +75,8 @@ import { allQueued, makeTestDeps, type TestDeps } from './helpers.js';
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
 
 let doc: DynamoDBDocumentClient;
-let base: DataLayer;
-let db: DataLayer;
+let base: TestOnlyDataLayer;
+let db: TestOnlyDataLayer;
 let available = false;
 
 // Digits only (valid Crockford base32); '77' is this file's discriminator
@@ -89,7 +92,7 @@ const TEST_KID = 'test-identifier-hmac-key';
 
 beforeAll(async () => {
   const client = makeDynamoClient();
-  base = makeDataLayer(makeDocClient(client));
+  base = makeTestOnlyDataLayer(makeDocClient(client));
   doc = makeDocClient(client);
   db = { ...base, isAccountsFeatureEnabled: async () => true };
   try {
@@ -332,15 +335,18 @@ describe('the four-surfaces sweep: survivor case FIRST, then the everything-dele
       }),
     ).toBe('created');
     expect(
-      await base.putLinkOfferInit({
-        offerNonce: initNonce,
-        groupId: gid,
-        offererUserId: phone.userId,
-        acceptorUserId: strangerB.userId,
-        acceptorClass: 'tablet',
-        rosterEpoch: 2,
-        expiresAt: nowS() + 600,
-      }),
+      await base.putLinkOfferInit(
+        {
+          offerNonce: initNonce,
+          groupId: gid,
+          offererUserId: phone.userId,
+          acceptorUserId: strangerB.userId,
+          acceptorClass: 'tablet',
+          rosterEpoch: 2,
+          expiresAt: nowS() + 600,
+        },
+        nowS(),
+      ),
     ).toBe('created');
     // A bound-but-unadopted agent on the phone (crewCount stays 0, so the
     // crew_not_empty refusal does not apply — the member-deletion binding
@@ -599,7 +605,7 @@ describe('the -deferred physical reaps: the explicit clock refuses (already), an
     expect(await rawRow(SERVER_TABLES.users, { userId: suppKey })).toBeUndefined();
   });
 
-  gated('an elapsed emailcool shadow is inert by its own clock (already) and physically deleted at the reading walk (f2 named it an reap class)', async () => {
+  gated('an elapsed emailcool shadow is inert by its own clock (already) and physically deleted at the reading walk (a reap class)', async () => {
     const deps = freshDeps();
     const nowS = Math.floor(deps.now() / 1000);
     const hash = identifierClaimHash(TEST_KID, `reap-cool-${RUN}@example.com`);
@@ -890,5 +896,51 @@ describe('the fix-pass closures: recovery rows can neither be born dead nor die 
     expect(res2.statusCode).toBe(200);
     expect(deps.emailsSent.length).toBe(sent + 1);
     expect(await rawRow(SERVER_TABLES.users, { userId: v1Key })).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The queued-ciphertext purge on account
+// deletion paged the caller's queue at the DEFAULT consistency: a stale page
+// could miss a row enqueued moments before the delete, and that ciphertext
+// (plus senderId / recipientId / ts) then lived to its 30-day TTL — "it
+// expires eventually" is not deletion. DynamoDB Local does not simulate the
+// stale replica, so the property is pinned on the SDK command itself, the
+// purgeConsentEdges / queue.consistency.test.ts discipline. Not gated: no
+// store is touched.
+// ---------------------------------------------------------------------------
+
+describe('purgeQueuedMessages reads the queue strongly consistently', () => {
+  it('every page of the keys-only Query carries ConsistentRead, and each page is deleted', async () => {
+    const commands: unknown[] = [];
+    let page = 0;
+    const doc = {
+      send: async (cmd: unknown): Promise<unknown> => {
+        commands.push(cmd);
+        if (cmd instanceof QueryCommand) {
+          page += 1;
+          // Two pages: the first continues, the second is the last.
+          return page === 1
+            ? { Items: [{ recipientId: 'R', msgId: 'M1' }], LastEvaluatedKey: { recipientId: 'R', msgId: 'M1' } }
+            : { Items: [{ recipientId: 'R', msgId: 'M2' }] };
+        }
+        return {}; // BatchWrite: nothing unprocessed
+      },
+    } as unknown as DynamoDBDocumentClient;
+
+    await makeDataLayer(doc).purgeQueuedMessages('R');
+
+    const queries = commands.filter((c) => c instanceof QueryCommand) as QueryCommand[];
+    expect(queries).toHaveLength(2);
+    for (const q of queries) {
+      expect(q.input.TableName).toBe(SERVER_TABLES.messages);
+      expect(q.input.ConsistentRead).toBe(true);
+      // Keys only: ciphertext is never read to be destroyed.
+      expect(q.input.ProjectionExpression).toBe('recipientId, msgId');
+    }
+    const deleted = (commands.filter((c) => c instanceof BatchWriteCommand) as BatchWriteCommand[])
+      .flatMap((b) => b.input.RequestItems?.[SERVER_TABLES.messages] ?? [])
+      .map((w) => (w.DeleteRequest?.Key as { msgId: string }).msgId);
+    expect(deleted).toEqual(['M1', 'M2']);
   });
 });

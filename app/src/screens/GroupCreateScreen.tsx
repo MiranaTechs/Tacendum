@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import {
   FlatList,
   Pressable,
@@ -17,6 +17,8 @@ import { personName, sanitizeDisplayName } from '../person';
 import { useTheme } from '../theme';
 import { Avatar } from '../ui/Avatar';
 import { InlineError, PrimaryButton, ScreenHeader, TextAction } from '../ui/primitives';
+import { RoomMark } from '../ui/RoomMark';
+import { useCoalescedSubscribe } from '../ui/useCoalescedSubscribe';
 
 interface Props {
   profile: db.ProfileRow;
@@ -41,6 +43,15 @@ const COPY = {
   capReached: `A room holds ${GROUP_MAX_MEMBERS} people, including you.`,
   identityChanged:
     'Safety number changed — review it in their chat before adding them.',
+  /** The group the identity-changed rows sit under, at the bottom of the
+   * list: a seat that cannot be taken yet is not shuffled in among the
+   * ones that can. */
+  needsReview: 'Needs review',
+  /** Someone this device blocks is left off the list without a row — the
+   * one line that says so, shown only when it actually happened. */
+  blockedOmitted: 'People you’ve blocked aren’t listed.',
+  /** The chip's VoiceOver name: the chip IS the un-pick. */
+  removePick: (name: string) => `Remove ${name}`,
   noContacts:
     'A room is made from people you already talk to. Start a chat first — the + on the chat list.',
 
@@ -64,6 +75,9 @@ const COPY = {
 
   nameNeeded: 'Give the room a name first.',
   memberNeeded: 'Pick at least one person.',
+  /** Under a Create button that is off for both reasons at once. The
+   * single-reason lines above serve when only one is missing. */
+  createHint: 'Name the room and pick at least one person.',
   createFailed: 'Tacendum couldn’t create this room. Try again.',
   inviteFailed: (names: string) =>
     `The room was made, but the invitation to ${names} couldn’t be sent.`,
@@ -204,6 +218,24 @@ export async function createRoom(
 }
 
 /**
+ * The hairline between two candidates. A module-level component, not an
+ * arrow in the FlatList prop: defined during render, React saw a new
+ * component type every render and remounted every separator — and lint
+ * said so. */
+function CandidateSeparator(): React.JSX.Element {
+  const t = useTheme();
+  return (
+    <View
+      style={{
+        marginLeft: t.layout.separatorInset - t.layout.gutter,
+        height: t.hairline,
+        backgroundColor: t.color.lineSoft,
+      }}
+    />
+  );
+}
+
+/**
  * Name the room, pick its people, create it.
  * The pick list is the chat list minus rooms (a room cannot join a room) and
  * minus anyone this device blocks; a changed safety number shows, disabled,
@@ -221,6 +253,11 @@ export function GroupCreateScreen({ profile, onBack, onOpenRoom }: Props) {
   /** Set when the room exists but some invitation could not be sent, so the
    * error can offer the room instead of stranding the person here. */
   const [createdId, setCreatedId] = useState<string | null>(null);
+  /** How many conversations were left off the list because this device
+   * blocks the person: the one number the omission line needs. Counted from
+   * the rows actually skipped, not from `blocked_peers` — a blocked id with
+   * no conversation was never a candidate. */
+  const [omittedBlocked, setOmittedBlocked] = useState(0);
 
   const refresh = useCallback(() => {
     void (async () => {
@@ -230,8 +267,12 @@ export function GroupCreateScreen({ profile, onBack, onOpenRoom }: Props) {
       ]);
       const blockedSet = new Set(blocked);
       const rows: Candidate[] = [];
+      let omitted = 0;
       for (const chat of chats) {
-        if (blockedSet.has(chat.peerId)) continue;
+        if (blockedSet.has(chat.peerId)) {
+          omitted += 1;
+          continue;
+        }
         // A room is not a person: rows with an anchor never appear here.
         if ((await db.getGroup(chat.peerId).catch(() => null)) !== null) {
           continue;
@@ -241,14 +282,25 @@ export function GroupCreateScreen({ profile, onBack, onOpenRoom }: Props) {
           identityChanged: chat.identityChangedAt !== null,
         });
       }
+      // The pickable rows first, in the chat list's own order; the
+      // identity-changed rows after them, in theirs. A stable sort, so
+      // nothing inside either group moves.
+      rows.sort((a, b) => Number(a.identityChanged) - Number(b.identityChanged));
       setCandidates(rows);
+      setOmittedBlocked(omitted);
     })();
   }, []);
 
-  useEffect(() => {
-    refresh();
-    return messaging.subscribe(refresh);
-  }, [refresh]);
+  /** Where the "Needs review" group starts, or -1 with nobody to review. */
+  const reviewFrom = useMemo(
+    () => candidates.findIndex(c => c.identityChanged),
+    [candidates],
+  );
+
+  // ONE coalesced re-read per notify burst: subscribed raw, every receipt,
+  // frame and socket transition re-ran the listChats + a getGroup per row
+  // above while a backlog drained.
+  useCoalescedSubscribe(refresh);
 
   // The composer's half of the bound: at the cap, unpicked rows close.
   const seatsTaken = picked.size + 1;
@@ -279,6 +331,13 @@ export function GroupCreateScreen({ profile, onBack, onOpenRoom }: Props) {
         : personName(peerId);
     },
     [candidates],
+  );
+
+  /** The picks as chips, in pick order: the list scrolls, the strip does
+   * not, so the whole roster is visible beside the counter. */
+  const chips = useMemo(
+    () => [...picked].map(peerId => ({ peerId, name: nameFor(peerId) })),
+    [nameFor, picked],
   );
 
   const create = useCallback(() => {
@@ -353,6 +412,22 @@ export function GroupCreateScreen({ profile, onBack, onOpenRoom }: Props) {
           </View>
         ) : null}
 
+        {/* The room as it will appear: the
+            walled square every room row and the room profile draw, at hero
+            size, its monogram following the name as it is typed — the
+            NamingScreen's live preview, for a room. There is no id yet (it
+            is minted at create), so an unnamed room shows the mark's own
+            "?" until the first letter lands. Visual only: the field beneath
+            it carries the words. */}
+        <View style={styles.preview}>
+          <RoomMark
+            roomId=""
+            name={name}
+            size={t.layout.avatar.hero}
+            monogramSize={t.type.screenTitle.fontSize}
+            testID="room-preview-mark"
+          />
+        </View>
         <Text
           style={[
             t.type.utilityLabel,
@@ -416,17 +491,88 @@ export function GroupCreateScreen({ profile, onBack, onOpenRoom }: Props) {
             {COPY.capReached}
           </Text>
         ) : null}
+        {omittedBlocked > 0 ? (
+          <Text
+            style={[
+              t.type.compactBody,
+              styles.blockedNote,
+              { color: t.color.inkMuted },
+            ]}
+            testID="room-blocked-note"
+          >
+            {COPY.blockedOmitted}
+          </Text>
+        ) : null}
+        {chips.length > 0 ? (
+          <View style={styles.picks} testID="room-picks">
+            {chips.map(chip => (
+              <Pressable
+                key={chip.peerId}
+                onPress={() => toggle(chip.peerId)}
+                accessibilityRole="button"
+                accessibilityLabel={COPY.removePick(chip.name)}
+                testID={`room-chip-${chip.peerId}`}
+                // 44pt effective on a 32pt pill — the reaction chips'
+                // discipline: the box plus 6 of slop is exactly 44.
+                hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                style={({ pressed }) => [
+                  styles.chip,
+                  {
+                    borderRadius: t.radius.circle,
+                    borderColor: t.color.pineLine,
+                    backgroundColor: pressed
+                      ? t.color.paperInset
+                      : t.color.pineWash,
+                  },
+                ]}
+              >
+                <Text
+                  numberOfLines={1}
+                  style={[t.type.buttonCompact, { color: t.color.pine }]}
+                >
+                  {chip.name}
+                </Text>
+                <Text
+                  allowFontScaling={false}
+                  style={[
+                    t.type.buttonCompact,
+                    styles.chipMark,
+                    { color: t.color.inkMuted },
+                  ]}
+                >
+                  ×
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+        ) : null}
       </View>
     ),
-    [about, focused, full, name, seatsTaken, t],
+    [about, chips, focused, full, name, omittedBlocked, seatsTaken, t, toggle],
   );
+
+  /** Why Create is off, in one line under it — or nothing once it is on,
+   * while it is working, or while the room already exists and the footer
+   * is saying something more important. */
+  const missingName = name.trim() === '';
+  const missingPeople = picked.size === 0;
+  const createHint =
+    busy || createdId !== null || error !== null
+      ? null
+      : missingName && missingPeople
+        ? COPY.createHint
+        : missingName
+          ? COPY.nameNeeded
+          : missingPeople
+            ? COPY.memberNeeded
+            : null;
 
   return (
     <View style={[styles.root, { backgroundColor: t.color.paperGround }]}>
       <ScreenHeader title={COPY.title} onBack={onBack} testIDBack="room-back" />
       <FlatList
         data={candidates}
-        extraData={{ picked, full }}
+        extraData={{ picked, full, reviewFrom }}
         keyExtractor={row => row.chat.peerId}
         keyboardShouldPersistTaps="handled"
         // The reading column: the list and its
@@ -445,15 +591,7 @@ export function GroupCreateScreen({ profile, onBack, onOpenRoom }: Props) {
           paddingHorizontal: t.layout.gutter,
         }}
         ListHeaderComponent={header}
-        ItemSeparatorComponent={() => (
-          <View
-            style={{
-              marginLeft: t.layout.separatorInset - t.layout.gutter,
-              height: t.hairline,
-              backgroundColor: t.color.lineSoft,
-            }}
-          />
-        )}
+        ItemSeparatorComponent={CandidateSeparator}
         ListEmptyComponent={
           <Text
             style={[
@@ -465,11 +603,24 @@ export function GroupCreateScreen({ profile, onBack, onOpenRoom }: Props) {
             {COPY.noContacts}
           </Text>
         }
-        renderItem={({ item }) => {
+        renderItem={({ item, index }) => {
           const selected = picked.has(item.chat.peerId);
           const closed = item.identityChanged || (full && !selected);
           return (
             <View>
+              {index === reviewFrom ? (
+                <Text
+                  accessibilityRole="header"
+                  style={[
+                    t.type.utilityLabel,
+                    styles.reviewLabel,
+                    { color: t.color.inkMuted },
+                  ]}
+                  testID="room-needs-review"
+                >
+                  {COPY.needsReview}
+                </Text>
+              ) : null}
               <Pressable
                 onPress={() => toggle(item.chat.peerId)}
                 disabled={closed}
@@ -586,10 +737,22 @@ export function GroupCreateScreen({ profile, onBack, onOpenRoom }: Props) {
           busyLabel={COPY.creating}
           onPress={create}
           busy={busy}
-          disabled={name.trim() === '' || picked.size === 0 || createdId !== null}
+          disabled={missingName || missingPeople || createdId !== null}
           testID="room-create"
           style={styles.createButton}
         />
+        {createHint !== null ? (
+          <Text
+            style={[
+              t.type.compactBody,
+              styles.createHint,
+              { color: t.color.inkMuted },
+            ]}
+            testID="room-create-hint"
+          >
+            {createHint}
+          </Text>
+        ) : null}
       </View>
     </View>
   );
@@ -606,6 +769,8 @@ const styles = StyleSheet.create({
     marginLeft: -8,
   },
   aboutLine: { marginBottom: 8 },
+  /** The live RoomMark, centred like the NamingScreen's hero. */
+  preview: { marginTop: 20, alignItems: 'center' },
   nameLabel: { marginTop: 12 },
   nameInput: { marginTop: 6, paddingHorizontal: 14 },
   membersRow: {
@@ -616,6 +781,19 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   capNote: { marginBottom: 8 },
+  blockedNote: { marginBottom: 8 },
+  /** The chip strip: wraps, never scrolls. */
+  picks: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 8 },
+  chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    minHeight: 32,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+  },
+  chipMark: { marginLeft: 6 },
+  /** Heads the identity-changed group at the list's tail. */
+  reviewLabel: { marginTop: 16, marginBottom: 8 },
   candidate: { flexDirection: 'row', alignItems: 'center' },
   candidateName: { flex: 1, marginLeft: 12 },
   seat: {
@@ -631,4 +809,5 @@ const styles = StyleSheet.create({
   noContacts: { marginTop: 12 },
   footer: { paddingTop: 8, paddingBottom: 12 },
   createButton: { marginTop: 8 },
+  createHint: { marginTop: 8, textAlign: 'center' },
 });

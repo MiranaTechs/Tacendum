@@ -44,6 +44,7 @@ import {
   decryptEnvelope,
   encryptText,
   getSecret,
+  hasIdentity,
   hasSession,
   type InboxEntry,
   isIdentityChangeError,
@@ -87,6 +88,8 @@ import {
 import * as db from './db';
 import { syncDecoyProfile } from './decoy';
 import { FileEnvelope,
+  DELETED_PREVIEW,
+  PREVIEW_SCAN,
   VoiceEnvelope,
   VOICE_MAX_SECONDS,
   encodeEnvelope,
@@ -116,6 +119,7 @@ import {
   applyPeerMutationNotice,
   applyServedRoster,
   fanoutDeviceSet,
+  forgetPeerIdentity,
   inboundGateFor,
   recordPeerIdentity,
   type ServedSibling,
@@ -343,11 +347,6 @@ const PROFILE_FUTURE_TOLERANCE_MS = 24 * 60 * 60 * 1000;
 /** Call signalling flushes ahead of ordinary messages. */
 const CALL_OUTBOX_PRIORITY = 1;
 
-/** How far back to look for the newest VISIBLE row when recomputing a chat
- * preview — carriers (edits, retractions, reactions, cards) can stack on top
- * of the real last message. */
-const PREVIEW_SCAN = 20;
-
 /**
  * A revision's stamp, from a timestamp the sender chose. Two jobs: order
  * revisions against each other (so a stale redelivery loses), and mark the
@@ -359,10 +358,6 @@ function reviseStamp(ts: number): number {
   if (!Number.isFinite(ts) || ts < 1) return 1;
   return Math.min(ts, Date.now() + PROFILE_FUTURE_TOLERANCE_MS);
 }
-
-/** What the chat list says for a conversation whose last message was
- * retracted. The thread says the same thing in its own words. */
-const DELETED_PREVIEW = 'Message deleted';
 
 /** The room envelopes as parseEnvelope's union carries them (plus `grp.hist`, plus `grp.consent` —
  * the roster-style member-consent announcement). */
@@ -455,6 +450,15 @@ function isNotFound(err: unknown): boolean {
     err.name === 'ApiRequestError' &&
     (err as ApiRequestError).status === 404
   );
+}
+
+/**
+ * "The server answered in a shape this build cannot read" — `api.ts`'s
+ * ServerAheadError. Matched by name for the same reason isNotFound() is: a
+ * jest module mock of `./api` that omits the class must not turn the check
+ * into a TypeError inside a catch block. */
+function isServerAhead(err: unknown): boolean {
+  return err instanceof Error && err.name === 'ServerAheadError';
 }
 
 /**
@@ -629,6 +633,18 @@ class MessagingService {
   private listeners = new Set<Listener>();
   /** Recovery hooks for subsystems that must retry only after a live transport. */
   private transportOpenListeners = new Set<() => void>();
+  /**
+   * Has the CURRENT socket produced any server frame at all? False from
+   * `open` until the first receipt, message, typing or accounts frame
+   * arrives; a send made while this is false burns no `attempts`. A
+   * half-open socket — NAT rebinding, radio hand-off — reads OPEN to the
+   * kernel and swallows every `send` without answering, and the outbox used
+   * to count ten such sends (about fifteen minutes) and then mark the
+   * message failed under a screen that said "Connected". Retry attempts are
+   * evidence about the MESSAGE only when the socket has shown it can carry
+   * anything; the transport's own receive-silence watchdog (ws.ts) is what
+   * tears a dead socket down. */
+  private socketLive = false;
   private envelopeListeners = new Set<EnvelopeListener>();
   private typingListeners = new Set<TypingListener>();
   /** See onFrameVerdict. Subscription-owned like envelopeListeners:
@@ -654,11 +670,41 @@ class MessagingService {
    * cannot hold the door against — or delete the claim of — the next
    * workspace's handling of the same msgId. */
   private inflightMsgIds = new Map<string, number>();
+  /**
+   * The spool drain's PROOF OF IMPORT: every wire id `noteSeen` wrote while
+   * a drain is running, plus the ids whose durable `seen` row already proved
+   * an import from an earlier launch (the short-circuit at the top of
+   * handleIncomingInner). Non-null only for the duration of `drainInbox`,
+   * which consumes it — so it is bounded by one spool's worth of ids and
+   * costs nothing on the socket path. The drain used to read `seen` back
+   * instead, and `markSeen`'s prune could evict the row it had just
+   * inserted, so an imported message was never cleared. */
+  private drainWitness: Set<string> | null = null;
   /** The parked duplicate per msgId, if one arrived mid-handling. The
    * pre-decrypted body rides along when the parked copy has one — it may be
    * the only plaintext in existence. */
   private parkedDuplicates = new Map<string, { frame: MsgFrame; preDecrypted?: string }>();
-  private busyRetryTimers: ReturnType<typeof setTimeout>[] = [];
+  /** Store-busy retries WAITING IN PLACE (see the busy branch of
+   * handleIncomingInner): the timer, and the wake that resolves the wait —
+   * `stop()` clears the one and fires the other with `false`, so a handler
+   * parked on a relocked workspace returns instead of dangling. */
+  private busyRetryWaits: Array<{
+    timer: ReturnType<typeof setTimeout>;
+    wake: (woke: boolean) => void;
+  }> = [];
+  /**
+   * PER-SENDER ORDER ON THE INBOUND PATH: one promise chain per
+   * `frame.from`, so a sender's frames are handled in the order they
+   * arrived and a frame that is WAITING — a store-busy retry — cannot be
+   * overtaken by its successor. The hazard was concrete: a `prekey` message
+   * that establishes the session hits the extension's transient store lock
+   * and waits 1.5 s; the `ciphertext` right behind it decrypts against a
+   * session that does not exist yet, and the generic catch below classifies
+   * that as tamper — error row, seen, ACKED — a permanent loss of a message
+   * that would have decrypted a moment later. Cross-sender concurrency is
+   * untouched (one chain per sender), and the chain is bookkeeping only:
+   * entries drop as soon as they settle. */
+  private senderChains = new Map<string, Promise<void>>();
   /** Drives the timeout-based retry while the socket stays open and idle. */
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   /** Unsubscribe for the linking module's signed peer-notice feed — armed in start(), released in stop(). */
@@ -752,6 +798,13 @@ class MessagingService {
    */
   private groupChain: Promise<unknown> = Promise.resolve();
   public wsState: WsState = 'closed';
+  /**
+   * The server answered a send-path DTO in a shape this build cannot
+   * read: set when a prekey bundle fails to parse, cleared the next time
+   * one parses. The state a thread can show as "update Tacendum" instead
+   * of a connection error; the socket's own reading of the same condition
+   * is `WsClient.serverAhead`. */
+  public serverAhead = false;
 
   private runGroupApply<T>(fn: () => Promise<T>): Promise<T> {
     const result = this.groupChain.then(fn, fn);
@@ -1119,8 +1172,10 @@ class MessagingService {
     );
 
     this.ws.onFrame(frame => {
+      // Any parsed server frame proves the socket carries traffic both ways.
+      this.socketLive = true;
       if (frame.type === 'msg') {
-        void this.handleIncoming(frame);
+        void this.dispatchIncoming(frame);
       } else if (frame.type === 'receipt') {
         void this.handleReceipt(frame.msgId, frame.state);
       } else if (frame.type === 'typing') {
@@ -1139,6 +1194,8 @@ class MessagingService {
         // drain posts in the next moments is backlog that already sounded
         // as pushes, not news.
         noteTransportOpen();
+        // A fresh socket has proved nothing yet (see `socketLive`).
+        this.socketLive = false;
         // New connection: nothing is in flight yet; re-flush the whole outbox.
         this.inflight.clear();
         void this.flushPending();
@@ -1249,6 +1306,40 @@ class MessagingService {
     // Crash recovery: finish work whose durable record exists but whose side
     // effects may not (interrupted blob downloads, unapplied reactions).
     void this.reconcileLocalState();
+    // The one-time prekey pool, topped up on a schedule: off the boot
+    // path, best-effort, at most once a day.
+    void this.maybeReplenishPrekeys('schedule');
+  }
+
+  /**
+   * Top up this device's one-time prekey pool:
+   * `registration.replenishPrekeys` mints a fresh batch natively and
+   * re-advertises it, throttled to once a day from here and to once an
+   * hour from a served `lowPrekeyCount` signal. Best-effort — a failure is
+   * asked again on the next start — and never logged: the failure could
+   * name the server's answer.
+   *
+   * `registration.ts` is loaded LAZILY, at the call, on purpose (the
+   * devhook.ts idiom): it imports the call stack and this module, and a
+   * static import here would make the cycle a load-order hazard for every
+   * module that starts with this one. A `require` rather than `import()`
+   * because the jest runtime cannot evaluate a dynamic import without
+   * `--experimental-vm-modules`. `hasIdentity` is asked first so a device
+   * with nothing to mint from never loads it at all. */
+  private async maybeReplenishPrekeys(reason: 'schedule' | 'low'): Promise<void> {
+    const gen = this.generation;
+    if (!this.token || session.mode === 'duress') return;
+    try {
+      if (!(await hasIdentity())) return;
+      if (this.stale(gen)) return;
+      const { replenishPrekeys } = require('./registration') as typeof import('./registration');
+      const token = this.token;
+      if (this.stale(gen) || !token) return;
+      await replenishPrekeys(token, { reason });
+    } catch {
+      // Best-effort: the next start() (or the next low-pool signal) asks
+      // again. The pool this device already advertised stays valid.
+    }
   }
 
   /** Measure the persistent storage ledger — attachments AND chat avatars
@@ -1404,13 +1495,20 @@ class MessagingService {
     // A busy-retry timer poking the store after a relock would race the next
     // workspace's own drain; the generation check inside the callback already
     // refuses, so this is belt and braces plus hygiene.
-    for (const t of this.busyRetryTimers.splice(0)) clearTimeout(t);
+    for (const wait of this.busyRetryWaits.splice(0)) {
+      clearTimeout(wait.timer);
+      wait.wake(false);
+    }
+    // Chains hold only this generation's frames; the next workspace's
+    // first frame from any sender must not queue behind a dead handler.
+    this.senderChains.clear();
     this.parkedDuplicates.clear();
     // Cleared so the next workspace's first frame for a msgId is not turned
     // away by a claim whose handler died with this generation; the stale
     // handler's finally only deletes entries carrying its OWN generation.
     this.inflightMsgIds.clear();
     this.ws.stop();
+    this.socketLive = false;
     // With the socket, and in the same breath: an ongoing "Connected"
     // notification that outlived its session would advertise a connection
     // nothing is holding, and a Doze policy that outlived one would pause a
@@ -1526,9 +1624,37 @@ class MessagingService {
     // human comparison made against the superseded key must not survive
     // the reset to vouch for the new one.
     await db.clearPeerPairSafety(peerUserId);
+    // The ROSTER pin too: `peer_devices` recorded
+    // the superseded key at the first TOFU moment, and that row — not the
+    // native store — is what verifies a signed `x.acct.notice` from this
+    // contact and vouches for their cross-signed siblings. Left standing,
+    // every later notice failed against the key the human just retired:
+    // dropped and acked, silently. Unpinned here, in the findings group,
+    // for the same reason the findings are: a failed write throws before
+    // the reset and leaves sending blocked, the safe direction. The next
+    // served bundle re-pins (recordPeerIdentity's empty-key path) —
+    // fetched below when the network allows, and by the next send otherwise.
+    await forgetPeerIdentity(peerUserId, this.peerDeviceDeps());
     await db.setIdentityChanged(peerUserId, null);
     await resetPeer(peerUserId);
     this.identityChanged.delete(peerUserId);
+    // Re-pin now rather than at the next send, so a signed notice arriving
+    // in between verifies. Best-effort by contract: offline, the unpinned
+    // row waits for the bundle the next send fetches anyway — and the
+    // acceptance itself has already stood.
+    if (this.token) {
+      try {
+        const bundle = await apiGetPrekeyBundle(this.token, peerUserId);
+        const pd = this.peerDeviceDeps();
+        await recordPeerIdentity(peerUserId, bundle.identityKey, pd, { force: true });
+        // The roster signal every bundle fetch is (§2.5): siblings are
+        // re-judged under the key just pinned.
+        await this.notePeerBundle(peerUserId, bundle);
+      } catch {
+        // Transient: the unpinned row vouches for nothing until the next
+        // bundle fetch re-pins it — never a stale key, never a silent trust.
+      }
+    }
     // The design: the hold this acceptance releases may
     // have been raised by an asserted sibling in the 'pending' state — the
     // human's review here IS the acceptance that ends the block-and-warn,
@@ -3829,6 +3955,28 @@ class MessagingService {
     this.notify();
   }
 
+  /**
+   * Remove one message from THIS phone only. Nothing is said to anybody —
+   * `sendDelete` is the retraction; this is the local erase.
+   *
+   * It lives here, rather than as a bare `db.deleteMessage` in the screen,
+   * because deleting a message CHANGES THE CHAT'S LINE, and every other
+   * line-changing path in this file notifies. The thread's own `refresh`
+   * repaints the thread; under the wide shell the chat list is live BESIDE
+   * the open thread and repaints on nothing but `notify()`, so a db-only
+   * delete left the list row previewing the words the person had just
+   * deleted — until an unrelated receipt or socket transition happened to
+   * fire, or indefinitely while offline.
+   *
+   * No `refreshPreview`: the new line is recomputed inside deleteMessage's
+   * own transaction (db.recomputeChatPreviewInTx), which is the single
+   * source of it — recomputing again from out here could only race that.
+   */
+  async deleteForMe(msgId: string, direction: 'in' | 'out'): Promise<void> {
+    await db.deleteMessage(msgId, direction);
+    this.notify();
+  }
+
   /** Answer a specific earlier message. Unlike edit/del this is ordinary
    * conversation — a row of its own, previewed by its own words. */
   async sendReply(
@@ -3974,6 +4122,12 @@ class MessagingService {
    * block-and-warn until the human accepts.
    */
   private async notePeerBundle(userId: string, bundle: PrekeyBundle): Promise<void> {
+    // A bundle served for THIS device that says the pool is low is the one
+    // in-band signal the client has about its own prekeys: answer it,
+    // throttled to the hourly floor inside replenishPrekeys.
+    if (bundle.userId === this.selfUserId && bundle.lowPrekeyCount) {
+      void this.maybeReplenishPrekeys('low');
+    }
     const pd = this.peerDeviceDeps();
     await recordPeerIdentity(userId, bundle.identityKey, pd);
     const siblings = bundle.siblings ?? [];
@@ -4119,8 +4273,13 @@ class MessagingService {
     if (!this.selfUserId) throw new Error('messaging not started');
     const msgId = await nextMsgId();
     const ts = Date.now();
+    // The timer is read BEFORE the legs are sealed: the sibling transcript
+    // carries the same deadline the row gets, so the copy on the other
+    // device disappears when this one does.
+    const timer = (await db.getChat(peerUserId))?.disappearSec ?? 0;
+    const expiresAt = timer > 0 ? ts + timer * 1000 : null;
     const legs = await buildDeviceLegs(
-      { selfUserId: this.selfUserId, anchorId: peerUserId, body: plaintext, msgId, ts },
+      { selfUserId: this.selfUserId, anchorId: peerUserId, body: plaintext, msgId, ts, expiresAt },
       this.deviceFanDeps(),
     );
     // PRIMARY PROMOTION: the anchor's leg where
@@ -4141,7 +4300,6 @@ class MessagingService {
       }
     }
     if (this.stale(gen)) throw new Error('messaging not started');
-    const timer = (await db.getChat(peerUserId))?.disappearSec ?? 0;
     const extras = [];
     for (const leg of legs) {
       if (leg === primary) continue;
@@ -4152,9 +4310,11 @@ class MessagingService {
         msgId: await randomMsgId(randomBytes),
         msgType: leg.msgType,
         payload: leg.payload,
-        // PEER extras join the leg ledger: a member device leg
-        // written off must be a durable LEG_FAILED row, never a silent
-        // delete. Sibling sync legs stay best-effort by design.
+        // PEER extras join the leg ledger: a member device leg written off
+        // must be a durable LEG_FAILED row, never a silent delete. Sibling
+        // sync legs stay best-effort by design — they still get the row's
+        // purge key (db.enqueueOutgoingDeviceFanout), so an expired or
+        // retracted message takes its un-flushed transcripts with it.
         ledger: leg.kind === 'peer',
       });
     }
@@ -4166,7 +4326,7 @@ class MessagingService {
         body: plaintext,
         ts,
         status: 'pending',
-        expiresAt: timer > 0 ? ts + timer * 1000 : null,
+        expiresAt,
       },
       {
         msgType: primary.msgType,
@@ -4205,7 +4365,9 @@ class MessagingService {
             body: d.body,
             ts: d.ts,
             status: 'sent',
-            expiresAt: null,
+            // The sender's deadline, when the chat had a timer: the sweep
+            // reaches this copy exactly as it reaches the original.
+            expiresAt: d.expiresAt ?? null,
           });
         } catch {
           return false; // Redelivery: the row exists — idempotent.
@@ -4541,7 +4703,27 @@ class MessagingService {
           'safety number changed — verify and accept it before sending',
         );
       }
+      if (isServerAhead(err)) {
+        // The bundle no longer parses on this build: not a
+        // connection problem, not this contact, not fixable by retrying —
+        // fixable by updating. Nothing was enqueued and the ratchet did not
+        // advance, so the words are still the person's to send again once
+        // they have; the flag is the state the thread can show meanwhile,
+        // and the error keeps its own name and its "update Tacendum" text
+        // for the composer's classifier.
+        if (!this.serverAhead) {
+          this.serverAhead = true;
+          this.notify();
+        }
+        throw err;
+      }
       throw err;
+    }
+    if (this.serverAhead) {
+      // A bundle parsed again: whatever was ahead of this build no longer is
+      // (an update, or a server rollback). Cleared on evidence, not on time.
+      this.serverAhead = false;
+      this.notify();
     }
     if (payload.length > MAX_PAYLOAD_B64_LENGTH) {
       // Reject before enqueue: the server would reject an oversized frame and
@@ -4621,11 +4803,14 @@ class MessagingService {
         let errored = false;
         for (const item of pending) {
           if (this.stale(gen)) return;
-          // A fan-out leg routes its failures through the
-          // leg LEDGER rather than through markOutgoingError: the leg's wire
-          // msgId matches no messages row, and the settled row it leaves
-          // behind is what makes "Not delivered to N of M" honest.
-          const isLeg = item.localMsgId != null;
+          // A fan-out leg routes its failures through the leg LEDGER rather
+          // than through markOutgoingError: the leg's wire msgId matches no
+          // messages row, and the settled row it leaves behind is what makes
+          // "Not delivered to N of M" honest. `ledger` (db.ts): a sibling
+          // transcript row carries the message's purge key too but is NOT a
+          // delivery leg — it fails like a 1:1 envelope, never into "Not
+          // delivered to N of M".
+          const isLeg = item.localMsgId != null && item.ledger !== 0;
           // Second line of defence behind db.blockPeer's transactional purge —
           // this catches an envelope enqueued in the same tick as the block.
           // DROPPED, not parked: a parked queue means unblocking delivers a
@@ -4715,7 +4900,13 @@ class MessagingService {
           });
           if (!ok) break; // socket dropped; retry on next open
           this.inflight.set(item.msgId, Date.now());
-          await db.bumpOutboxAttempt(item.msgId);
+          // The attempt is recorded only on a socket that has produced a
+          // frame: a send into a socket the far end may not even be on is
+          // not evidence the message is undeliverable, and counting it is
+          // how a dead link marked good messages failed. The inflight clock
+          // above still runs, so the row is retried on the ordinary schedule
+          // — it just does not walk toward MAX_SEND_ATTEMPTS.
+          if (this.socketLive) await db.bumpOutboxAttempt(item.msgId);
         }
         // Exhaustion almost always fires from the silent retry-timer path,
         // where nothing else repaints the thread — without this notify, the
@@ -4796,6 +4987,12 @@ class MessagingService {
     } catch {
       return;
     }
+    // The witness is armed for the whole drain and disarmed after it (see
+    // the field): a handler that finishes writes the id here through
+    // `noteSeen`, and that write — not a read of `seen` — is the proof.
+    const witness = new Set<string>();
+    this.drainWitness = witness;
+    try {
     for (const entry of entries) {
       try {
         // Straight through the ordinary inbound path, with the plaintext
@@ -4823,17 +5020,29 @@ class MessagingService {
         // whose ciphertext is already spent. There is no second chance for
         // these; the server's copy cannot be decrypted again by anyone.
         //
-        // Every branch that genuinely finishes writes `seen` — the message
-        // branch, the carrier branches, the blocked drop. The early returns do
-        // not. So `seen` is the proof, and its absence means try again next
-        // launch.
-        if (await db.hasSeen(entry.msgId)) {
+        // Every branch that genuinely finishes marks the id seen through
+        // `noteSeen` — the message branch, the carrier branches, the blocked
+        // drop — and a frame whose `seen` row is ALREADY there was imported
+        // on an earlier launch, which the short-circuit witnesses too. The
+        // early returns do not. So the WITNESS of that write is the proof,
+        // and its absence means try again next launch.
+        //
+        // The witness, not a read of the `seen` table: `markSeen` prunes the
+        // table on every call, and a prune can never be trusted to spare the
+        // row the handler just wrote — the id-ordered version evicted exactly
+        // that row for every 1:1 message once 5000 CSPRNG wire ids existed,
+        // so the spool was re-imported on every launch (chat lines regressed,
+        // ready photos flipped back to 'pending' and re-downloaded).
+        if (witness.has(entry.msgId)) {
           await clearInboxEntry(entry.msgId);
         }
       } catch {
         // Leave it in the spool and try again next launch. A message that
         // cannot be imported is not a message that should be discarded.
       }
+    }
+    } finally {
+      if (this.drainWitness === witness) this.drainWitness = null;
     }
   }
 
@@ -4971,6 +5180,34 @@ class MessagingService {
    * into text, and a second copy of that logic is a second place for the two
    * to disagree about what a message means.
    */
+  /**
+   * The socket's door for `msg` frames: claim the dispatch token NOW (arrival
+   * order is what the token records — see handleIncoming), then run the
+   * handler behind whatever this sender already has in flight. See
+   * `senderChains` for why the order is per sender.
+   */
+  private dispatchIncoming(frame: MsgFrame): Promise<void> {
+    const token = this.claimDispatchToken();
+    const prev = this.senderChains.get(frame.from);
+    // An idle sender starts NOW — synchronously up to the handler's first
+    // await, exactly the timing the door has always had; only a sender with
+    // handling in flight queues behind it. handleIncoming never throws (its
+    // own catch discipline); the catch is so a link that somehow did could
+    // never wedge the sender's chain.
+    const link = (
+      prev
+        ? prev.then(() => this.handleIncoming(frame, undefined, undefined, token))
+        : this.handleIncoming(frame, undefined, undefined, token)
+    ).catch(() => undefined);
+    this.senderChains.set(frame.from, link);
+    void link.then(() => {
+      if (this.senderChains.get(frame.from) === link) {
+        this.senderChains.delete(frame.from);
+      }
+    });
+    return link;
+  }
+
   private async handleIncoming(
     frame: MsgFrame,
     preDecrypted?: string,
@@ -5070,7 +5307,8 @@ class MessagingService {
     // Re-narrowed here (the outer guard cannot carry across the split); a
     // stop() between the two is caught by the generation check regardless.
     if (!this.selfUserId) return;
-    if ((await db.hasSeen(frame.msgId)) || this.stale(gen)) {
+    const alreadySeen = await db.hasSeen(frame.msgId);
+    if (alreadySeen || this.stale(gen)) {
       // Redelivery of an already-processed message: ack again, re-process
       // nothing — no decrypt, no ratchet advance, no row, no re-mark. But
       // for the ring, SAY SO: the seen msgId proves this delivery can never
@@ -5094,6 +5332,19 @@ class MessagingService {
       // next session's redelivery re-decides it and may yet prove a ring.
       // That is the contract's "relock-stale return" case (onFrameVerdict),
       // and stop() has torn down this controller's subscription regardless.
+      //
+      // AND, for a drain in flight, this counts as proof of import. The
+      // witness is in-memory, so it can only ever speak for THIS
+      // drain; an entry whose import finished on an earlier launch but whose
+      // `clearInboxEntry` never landed (app killed, workspace relocked, the
+      // clear threw) would otherwise have no proof on any later launch and
+      // would sit in the spool until `markSeen`'s prune dropped its id — at
+      // which point the drain re-imported the spooled plaintext, which is
+      // the duplicate-import symptom deferred rather than removed. A DURABLE seen row
+      // is exactly as good a proof as the witness of a write, and the
+      // sibling rescue path already treats it that way. The stale arm is
+      // pointedly excluded: a relock proves nothing was imported.
+      if (alreadySeen) this.drainWitness?.add(frame.msgId);
       if (!this.stale(gen)) {
         this.emitFrameVerdict(frame.from, 'not_call');
         this.ws.send({ type: 'ack', msgId: frame.msgId });
@@ -5166,7 +5417,7 @@ class MessagingService {
         // for one extra reason here: a redelivery that re-decrypted against an
         // already-advanced ratchet would throw and manufacture a visible error
         // row for someone whose traffic is supposed to be invisible.
-        await db.markSeen(frame.msgId, Date.now());
+        await this.noteSeen(frame.msgId);
         // The ack goes to the SERVER and is never routed to the peer. Their
         // 'delivered' receipt is emitted by the server at send time from
         // socket liveness (packages/server/src/handlers/ws.ts), not from this
@@ -5216,7 +5467,7 @@ class MessagingService {
       // before anything rings), which is the same persist-before-ack ordering
       // every other branch here uses.
       if (envelope && isCallTcm(envelope.tcm)) {
-        await db.markSeen(frame.msgId, Date.now());
+        await this.noteSeen(frame.msgId);
         this.ws.send({ type: 'ack', msgId: frame.msgId });
         if (session.mode !== 'duress') {
           this.emitEnvelope(frame.from, envelope, {
@@ -5240,7 +5491,7 @@ class MessagingService {
       // silent drop and never the message — the one-way ratchet makes a
       // parser-shaped refusal a permanent loss.
       if (envelope === null && text.startsWith('{"tcm":"call.g')) {
-        await db.markSeen(frame.msgId, Date.now());
+        await this.noteSeen(frame.msgId);
         this.ws.send({ type: 'ack', msgId: frame.msgId });
         const group = parseGroupCallEnvelope(text);
         // Call-shaped, but nothing this build can ring — the malformed
@@ -5267,7 +5518,7 @@ class MessagingService {
       // build predates rooms entirely — cannot arise here: this build knows
       // all five.)
       if (envelope === null && text.startsWith('{"tcm":"grp.')) {
-        await db.markSeen(frame.msgId, Date.now());
+        await this.noteSeen(frame.msgId);
         this.ws.send({ type: 'ack', msgId: frame.msgId });
         return;
       }
@@ -5288,7 +5539,7 @@ class MessagingService {
         // and the frame still acks byte-identically, because not acking
         // would be the observable difference.
         if (session.mode === 'duress') {
-          await db.markSeen(frame.msgId, Date.now());
+          await this.noteSeen(frame.msgId);
           this.ws.send({ type: 'ack', msgId: frame.msgId });
           return;
         }
@@ -5325,7 +5576,7 @@ class MessagingService {
         // frame this phone never persisted, and redelivery is the only
         // repair there is.
         if (this.stale(gen)) return;
-        await db.markSeen(frame.msgId, Date.now());
+        await this.noteSeen(frame.msgId);
         this.ws.send({ type: 'ack', msgId: frame.msgId });
         this.notify();
         return;
@@ -5348,7 +5599,7 @@ class MessagingService {
             if (outcome === 'applied') this.notify();
           }
         }
-        await db.markSeen(frame.msgId, Date.now());
+        await this.noteSeen(frame.msgId);
         this.ws.send({ type: 'ack', msgId: frame.msgId });
         return;
       }
@@ -5377,7 +5628,7 @@ class MessagingService {
           if (this.stale(gen)) return;
           if (outcome === 'applied') this.notify();
         }
-        await db.markSeen(frame.msgId, Date.now());
+        await this.noteSeen(frame.msgId);
         this.ws.send({ type: 'ack', msgId: frame.msgId });
         return;
       }
@@ -5400,7 +5651,7 @@ class MessagingService {
       // drop staying the floor is what makes a future x.* kind deployable
       // against builds already in the field.
       if (text.startsWith('{"tcm":"x.')) {
-        await db.markSeen(frame.msgId, Date.now());
+        await this.noteSeen(frame.msgId);
         this.ws.send({ type: 'ack', msgId: frame.msgId });
         return;
       }
@@ -5424,7 +5675,7 @@ class MessagingService {
         // person's profile, so anything past a generous clock-skew window is
         // not applied. (Their next card, correctly dated, still lands.)
         if (envelope.v > Date.now() + PROFILE_FUTURE_TOLERANCE_MS) {
-          await db.markSeen(frame.msgId, Date.now());
+          await this.noteSeen(frame.msgId);
           this.ws.send({ type: 'ack', msgId: frame.msgId });
           return;
         }
@@ -5442,7 +5693,7 @@ class MessagingService {
           hasAvatar: Boolean(envelope.att && envelope.key),
           version: envelope.v,
         });
-        await db.markSeen(frame.msgId, Date.now());
+        await this.noteSeen(frame.msgId);
         this.ws.send({ type: 'ack', msgId: frame.msgId });
         if (envelope.att && envelope.key) {
           this.queueAvatarDownload(
@@ -5467,7 +5718,7 @@ class MessagingService {
         // guard the profile card uses — a frame dated far ahead would win
         // forever and freeze the timer.
         if (envelope.v > Date.now() + PROFILE_FUTURE_TOLERANCE_MS) {
-          await db.markSeen(frame.msgId, Date.now());
+          await this.noteSeen(frame.msgId);
           this.ws.send({ type: 'ack', msgId: frame.msgId });
           return;
         }
@@ -5520,7 +5771,7 @@ class MessagingService {
             token,
           );
         }
-        await db.markSeen(frame.msgId, Date.now());
+        await this.noteSeen(frame.msgId);
         this.ws.send({ type: 'ack', msgId: frame.msgId });
         if (applied) this.notify();
         return;
@@ -5599,7 +5850,7 @@ class MessagingService {
             token,
           );
         }
-        await db.markSeen(frame.msgId, Date.now());
+        await this.noteSeen(frame.msgId);
         this.ws.send({ type: 'ack', msgId: frame.msgId });
         if (applied) this.notify();
         return;
@@ -5615,7 +5866,7 @@ class MessagingService {
         const changed = await db
           .markRead(frame.from, envelope.ids, frame.ts)
           .catch(() => 0);
-        await db.markSeen(frame.msgId, Date.now());
+        await this.noteSeen(frame.msgId);
         this.ws.send({ type: 'ack', msgId: frame.msgId });
         // Only when something moved: a replayed receipt must not re-render
         // every open list for no visible change.
@@ -5693,7 +5944,7 @@ class MessagingService {
         // the server forever as a growing, externally visible backlog. A
         // tamper/corruption frame would likewise insert a visible error row.
         // Same two statements as the drop above, for the same reasons.
-        await db.markSeen(frame.msgId, Date.now());
+        await this.noteSeen(frame.msgId);
         if (mustAckInbound(failed)) {
           this.ws.send({ type: 'ack', msgId: frame.msgId });
         }
@@ -5791,20 +6042,36 @@ class MessagingService {
         // token it entered with — this frame's handling continued, not a
         // new event — or a 1.5s wait outranked every frame that landed
         // inside it and dragged the chat line back to older words.
+        //
+        // WAITED IN PLACE, not re-entered from a timer: the 1.5 s is part of
+        // THIS frame's handling, so the per-sender chain
+        // (`dispatchIncoming`) holds every later frame from the same sender
+        // behind it, and the msgId's in-flight claim stays put — a duplicate
+        // arriving mid-wait parks and re-enters after the retry, exactly as
+        // one arriving mid-decrypt does. The retry goes through the INNER
+        // path like the spool rescue: the same handling continued, never a
+        // concurrent duplicate to be turned away.
         if (busyRetriesLeft > 0 && !this.stale(gen)) {
-          const t = setTimeout(() => {
-            const at = this.busyRetryTimers.indexOf(t);
-            if (at >= 0) this.busyRetryTimers.splice(at, 1);
-            if (!this.stale(gen)) {
-              void this.handleIncoming(
-                frame,
-                preDecrypted,
-                busyRetriesLeft - 1,
-                token,
-              );
-            }
-          }, 1_500);
-          this.busyRetryTimers.push(t);
+          const woke = await new Promise<boolean>(resolve => {
+            const wait = {
+              timer: setTimeout(() => {
+                const at = this.busyRetryWaits.indexOf(wait);
+                if (at >= 0) this.busyRetryWaits.splice(at, 1);
+                resolve(true);
+              }, 1_500),
+              wake: resolve,
+            };
+            this.busyRetryWaits.push(wait);
+          });
+          if (woke && !this.stale(gen)) {
+            await this.handleIncomingInner(
+              frame,
+              preDecrypted,
+              busyRetriesLeft - 1,
+              gen,
+              token,
+            );
+          }
         }
         return;
       }
@@ -5839,7 +6106,7 @@ class MessagingService {
           status: 'error',
         });
         await db.upsertChat(frame.from);
-        await db.markSeen(frame.msgId, Date.now());
+        await this.noteSeen(frame.msgId);
         this.ws.send({ type: 'ack', msgId: frame.msgId });
       } catch {
         // Left un-acked on purpose. See above.
@@ -5850,10 +6117,23 @@ class MessagingService {
 
   // --- Rooms: the receive path ----
 
+  /**
+   * The ONE seam every inbound branch marks a wire id seen through: the
+   * durable `seen` row (redelivery dedup) plus, while a spool drain is
+   * running, the in-memory witness the drain clears entries on. Any branch
+   * that finishes its handling calls this; the early returns (no session,
+   * a stale generation, a store-busy retry) do not — which is exactly what
+   * makes the witness a truthful proof of import.
+   */
+  private async noteSeen(msgId: string): Promise<void> {
+    await db.markSeen(msgId, Date.now());
+    this.drainWitness?.add(msgId);
+  }
+
   /** markSeen then ack, in the order every inbound branch uses: seen is the
    * durable proof, the ack purges the server's only other copy. */
   private async ackInbound(msgId: string): Promise<void> {
-    await db.markSeen(msgId, Date.now());
+    await this.noteSeen(msgId);
     this.ws.send({ type: 'ack', msgId });
   }
 
@@ -6621,7 +6901,7 @@ class MessagingService {
       // fetches it hours later, the exact failure the 15s fade exists to
       // prevent), no preview, no unread, no notify. Seen-then-acked so
       // redelivery cannot retry what was refused on purpose.
-            await db.markSeen(ctx.wireMsgId, Date.now());
+            await this.noteSeen(ctx.wireMsgId);
       this.ws.send({ type: 'ack', msgId: ctx.wireMsgId });
       return;
     }
@@ -6644,7 +6924,7 @@ class MessagingService {
         // applied, and NOT HELD — parking it under any key is exactly how a
         // forgery got to suppress the genuine retraction. Acked, so the
         // forgery cannot redeliver either.
-        await db.markSeen(ctx.wireMsgId, Date.now());
+        await this.noteSeen(ctx.wireMsgId);
         this.ws.send({ type: 'ack', msgId: ctx.wireMsgId });
         return;
       }
@@ -6688,7 +6968,7 @@ class MessagingService {
         if (this.stale(gen)) return;
       }
       await this.refreshPreview(ctx.convId);
-      await db.markSeen(ctx.wireMsgId, Date.now());
+      await this.noteSeen(ctx.wireMsgId);
       this.ws.send({ type: 'ack', msgId: ctx.wireMsgId });
       this.notify();
       return;
@@ -6710,7 +6990,7 @@ class MessagingService {
           target.reactorId,
         );
       }
-      await db.markSeen(ctx.wireMsgId, Date.now());
+      await this.noteSeen(ctx.wireMsgId);
       this.ws.send({ type: 'ack', msgId: ctx.wireMsgId });
       this.notify();
       return;
@@ -6796,7 +7076,7 @@ class MessagingService {
         envelope.tcm === 'image' ? envelope.h : null,
       );
     }
-    await db.markSeen(ctx.wireMsgId, Date.now());
+    await this.noteSeen(ctx.wireMsgId);
     this.ws.send({ type: 'ack', msgId: ctx.wireMsgId });
     if (
       envelope?.tcm === 'image' ||
@@ -7221,8 +7501,13 @@ class MessagingService {
         // but this phone.
         const cblock = this.blockStateFor(chat.peerId);
         const mayFetch = mayFetchFor('attachment', cblock);
+        // META, never the bytes: only `.state` is read below, and
+        // `listAttachments` SELECTs every blob's base64 plaintext — at the
+        // 4 GiB storage ceiling that was every photo in every chat
+        // materialised as JS strings on every unlock, an OOM at boot for a
+        // large history.
         const attachments = new Map(
-          (await db.listAttachments(chat.peerId)).map(a => [
+          (await db.listAttachmentMeta(chat.peerId)).map(a => [
             `${a.msgId}:${a.direction}`,
             a,
           ]),

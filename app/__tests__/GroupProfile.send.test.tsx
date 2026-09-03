@@ -119,7 +119,6 @@ interface Engine {
   prepare(sql: string): { all(...args: unknown[]): Row[] };
   close(): void;
 }
-// eslint-disable-next-line @typescript-eslint/no-var-requires
 const { DatabaseSync } = require('node:sqlite') as {
   DatabaseSync: new (p: string) => Engine;
 };
@@ -384,6 +383,7 @@ describe('the sequence lane — the screen reserves the WRITER lane, distinguish
     const tree = await renderProfile({ groupId });
     expect(has(tree, `member-remove-${BEN}`)).toBe(true); // fixture reaches the screen
     await press(tree, `member-remove-${BEN}`);
+    await press(tree, `member-remove-confirm-${BEN}`); // Remove asks first
     await settle(() => outboxLegs().length >= 2);
 
     // The union: the removed member's leg exists too.
@@ -547,6 +547,7 @@ describe('the announcement row — the real seam’s shape, not the old fake’s
 
     const tree = await renderProfile({ groupId });
     await press(tree, `member-remove-${BEN}`);
+    await press(tree, `member-remove-confirm-${BEN}`); // Remove asks first
     await settle(() => outboxLegs().length >= 2);
 
     // The row the receive path can converge with: attributed (authorId) and
@@ -587,6 +588,7 @@ describe('a PRE-apply failure through the screen — the generic copy, never the
     const tree = await renderProfile({ groupId });
     expect(has(tree, `member-remove-${BEN}`)).toBe(true);
     await press(tree, `member-remove-${BEN}`);
+    await press(tree, `member-remove-confirm-${BEN}`); // Remove asks first
     await settle(errorShown(tree));
 
     // Precondition-holds proof that the press reached the seam rather than

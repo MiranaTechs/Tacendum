@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { ListTablesCommand } from '@aws-sdk/client-dynamodb';
-import { GetCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { DeleteCommand, GetCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import {
   MAX_VERIFIED_IDENTIFIERS_PER_GROUP,
   TABLES,
@@ -32,7 +32,7 @@ import { makeMemoryDb } from './helpers.js';
 /**
  * (part A) — THE UNIQUENESS SUITE, driven against the
  * memory twin AND real DynamoDB Local (heavy project; the twin runs
- * unconditionally, the store is gated on:8000 exactly as the accounts-*
+ * unconditionally, the store is gated on :8000 exactly as the accounts-*
  * suites gate — TACENDUM_REQUIRE_DDB=1 turns the skip into a failure). One
  * scenario list, two DataLayers, so the twin can never drift more
  * permissive than the store (the helpers.ts rule).
@@ -893,5 +893,64 @@ describe('the lookup-facing predicate: a tombstone is non-consented through the 
     expect(identifierClaimDiscoverable({ discoverable: true, discoverableAfter: 5 }, 4)).toBe(false);
     expect(identifierClaimDiscoverable({ discoverable: true, discoverableAfter: 5 }, 5)).toBe(true);
     expect(identifierClaimDiscoverable({ discoverable: false }, 0)).toBe(false);
+  });
+});
+
+/**
+ * The reaping read deleted the claim tombstone FIRST and the skeleton
+ * tombstone second, non-transactionally. A crash between the two stranded the
+ * skeleton tombstone: the only pointer to it (`skeletonKey`) lived on the
+ * claim tombstone just deleted, and the users table has no TTL, so nothing
+ * would ever reap it again. Reversed, the unreachable row goes first; a crash
+ * then leaves the REACHABLE claim tombstone, which the next read reaps again
+ * (the skeleton delete no-ops on the absent row). Pinned on the wire with a
+ * scripted doc — no store needed. */
+describe('getUsernameClaim reaps the unreachable skeleton tombstone BEFORE the reachable claim tombstone', () => {
+  const CLAIM_KEY = 'usernamehash#v1#elapsed';
+  const SKELETON_KEY = 'nameskel#v1#elapsed';
+  const NOW = 2_000;
+
+  function scriptedDoc(skeletonRefuses: boolean): {
+    deletes: string[];
+    doc: DynamoDBDocumentClient;
+  } {
+    const deletes: string[] = [];
+    const send = async (cmd: unknown): Promise<unknown> => {
+      if (cmd instanceof GetCommand) {
+        return {
+          Item: {
+            userId: CLAIM_KEY,
+            kind: 'identifierClaim',
+            tombstoned: true,
+            freesAt: NOW - 1,
+            skeletonKey: SKELETON_KEY,
+          },
+        };
+      }
+      if (cmd instanceof DeleteCommand) {
+        const key = (cmd.input.Key as { userId: string }).userId;
+        deletes.push(key);
+        if (skeletonRefuses && key === SKELETON_KEY) {
+          throw Object.assign(new Error('refused'), { name: 'ConditionalCheckFailedException' });
+        }
+        return {};
+      }
+      return {};
+    };
+    return { deletes, doc: { send } as unknown as DynamoDBDocumentClient };
+  }
+
+  it('deletes the skeleton tombstone first, then the claim tombstone', async () => {
+    const { deletes, doc } = scriptedDoc(false);
+    const db = makeDataLayer(doc);
+    expect(await db.getUsernameClaim(CLAIM_KEY, NOW)).toBeUndefined();
+    expect(deletes).toEqual([SKELETON_KEY, CLAIM_KEY]);
+  });
+
+  it('a skeleton row already taken by a live re-claim (condition refused) does not stop the claim reap', async () => {
+    const { deletes, doc } = scriptedDoc(true);
+    const db = makeDataLayer(doc);
+    expect(await db.getUsernameClaim(CLAIM_KEY, NOW)).toBeUndefined();
+    expect(deletes).toEqual([SKELETON_KEY, CLAIM_KEY]);
   });
 });

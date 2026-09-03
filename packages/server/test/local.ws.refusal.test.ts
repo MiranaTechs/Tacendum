@@ -4,7 +4,7 @@ import type { Server } from 'node:http';
 import WebSocket from 'ws';
 import { startWsServer } from '../src/local/ws.js';
 import { makeMemoryDb, makeTestDeps, testIdentityKey } from './helpers.js';
-import { sessionTokenDigest, type DataLayer } from '../src/db/data.js';
+import { sessionTokenDigest, type TestOnlyDataLayer } from '../src/db/data.js';
 
 /**
  * HOW THE LOCAL ADAPTER REFUSES, which is not the same question as WHY.
@@ -27,7 +27,7 @@ import { sessionTokenDigest, type DataLayer } from '../src/db/data.js';
  * reaches `wsConnectHandler` directly — the status is asserted a dozen times
  * and the code it turns into, nowhere.
  */
-let db: DataLayer;
+let db: TestOnlyDataLayer;
 let deps: ReturnType<typeof makeTestDeps>;
 let server: Server;
 let wsUrl: string;
