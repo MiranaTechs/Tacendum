@@ -47,6 +47,17 @@ export interface InboundOptions {
    * in this phase.
    */
   attachments?: { token: Credential; saveDir: string } | undefined;
+  /**
+   * `listen --detail` (§3.7): print a message's DETAIL after its
+   * brief, and carry it in the `--json` record. OFF by default, in both
+   * modes, and the default is the decision — `listen` is a stream people
+   * grep, and a 3 000-character finding wrapping between two `[peer] …` lines
+   * would end that. Brief-first everywhere; the rest on request.
+   *
+   * `sync` and `send --drain` never set it: they are not reading surfaces,
+   * and `tacendum inbox --detail` is where a spooled detail is read.
+   */
+  detail?: boolean | undefined;
 }
 
 export interface Inbound {
@@ -769,6 +780,13 @@ export function attachInbound(opts: InboundOptions): Inbound {
               rendered.tcm === 'grp.msg'
                 ? {
                     ...(rendered.grp ? { grp: rendered.grp } : {}),
+                    //the room message id, the second half
+                    // of the §5.3 row key a rounds answer replies to. It
+                    // rides in `roomMeta` so BOTH literals below — the spool
+                    // append AND the quarantine — carry it: a field present
+                    // in one and missing from the other is silently lost on
+                    // exactly the recovery path nobody exercises.
+                    ...(rendered.rm ? { rm: rendered.rm } : {}),
                     ...(rendered.men ? { men: true } : {}),
                     // The wrapper's AI-origin marker, recorded per
                     // author so the room send path can drop an unmentioned
@@ -776,6 +794,17 @@ export function attachInbound(opts: InboundOptions): Inbound {
                     ...(rendered.ai ? { ai: true } : {}),
                   }
                 : {};
+            //the DETAIL, which is BODY and not room routing
+            // — so it rides its own object rather than `roomMeta`'s, and is
+            // not gated on `grp.msg`: a 1:1 attend answer stays a `msg` and
+            // may carry one (R3). Extracted into a shared object for
+            // `roomMeta`'s exact reason: BOTH literals below — the spool
+            // append AND the quarantine — must carry it, and a field present
+            // in one and missing from the other is silently lost on exactly
+            // the recovery path nobody exercises. Empty is no field: the
+            // renderer already collapsed an absent, non-string or
+            // control-only `d` to '' (render.ts `detailOf`).
+            const bodyMeta = rendered.detail ? { detail: rendered.detail } : {};
             try {
               log.append({
                 id: frame.msgId,
@@ -787,6 +816,7 @@ export function attachInbound(opts: InboundOptions): Inbound {
                 read: false,
                 ...(rendered.ref ? { ref: rendered.ref } : {}),
                 ...(rendered.ofs ? { ofs: rendered.ofs } : {}),
+                ...bodyMeta,
                 ...roomMeta,
               });
             } catch (err) {
@@ -814,7 +844,11 @@ export function attachInbound(opts: InboundOptions): Inbound {
                 ...(rendered.ref ? { ref: rendered.ref } : {}),
                 ...(rendered.ofs ? { ofs: rendered.ofs } : {}),
                 // The quarantine is the same record, preserved whole — a
-                // recovered row must trigger exactly as the lost one would.
+                // recovered row must trigger exactly as the lost one would,
+                // and must READ as the lost one would: this file holds the
+                // last copy of the plaintext, and half a message recovered is
+                // a finding whose evidence is gone.
+                ...bodyMeta,
                 ...roomMeta,
               });
               // `localErrno`, never `err.message`: an fs error's message
@@ -837,10 +871,32 @@ export function attachInbound(opts: InboundOptions): Inbound {
                 // the spool write failed, so this print is the LAST copy of
                 // the plaintext AND the one an attacker most wants to forge
                 // on. Losing a line here is unacceptable, which is why the
-                // rule prefixes rather than flattens (render.ts, an earlier revision).
+                // rule prefixes rather than flattens (render.ts, round 14).
+                //
+                // THE DETAIL RIDES ALONG UNGATED BY `--detail`, which is the
+                // one place on this path the flag has no business. Everywhere
+                // else `--detail` chooses how much of a message a reader is
+                // shown, and the rest stays on disk. Here there IS no disk:
+                // both writes failed, so this line is the whole custody of
+                // the message, and a flag nobody passed would silently
+                // destroy the half the quarantine literal argues hardest to
+                // keep ("half a message recovered is a finding whose evidence
+                // is gone"). Same indentation as the reading surface, through
+                // the same `prefixLines`, so a recovered line reads the way
+                // the delivered one would have.
                 report.line(
-                  { from: shownFrom, msgId: frame.msgId, ts: frame.ts, unlogged: true, text: rendered.text },
-                  prefixLines(`[${shownFrom}] `, rendered.text),
+                  {
+                    from: shownFrom,
+                    msgId: frame.msgId,
+                    ts: frame.ts,
+                    unlogged: true,
+                    text: rendered.text,
+                    ...(rendered.detail ? { detail: rendered.detail } : {}),
+                  },
+                  rendered.detail
+                    ? `${prefixLines(`[${shownFrom}] `, rendered.text)}\n` +
+                        prefixLines(`[${shownFrom}]     `, rendered.detail)
+                    : prefixLines(`[${shownFrom}] `, rendered.text),
                 );
               }
               return;
@@ -915,6 +971,13 @@ export function attachInbound(opts: InboundOptions): Inbound {
               await saveInboundAttachment(opts.attachments, text, report);
             }
 
+            // §3.7: `text` is the BRIEF on every surface, and the
+            // detail is a second thing this line may or may not be asked for.
+            // Gated on the flag in `--json` too, so the two modes agree about
+            // what `--detail` means — a machine consumer that wants the whole
+            // answer asks for it exactly as a human does, and a stream nobody
+            // asked to widen stays the width it was.
+            const showDetail = opts.detail === true && rendered.detail !== undefined;
             const record = {
               from: shownFrom,
               msgId: frame.msgId,
@@ -922,6 +985,7 @@ export function attachInbound(opts: InboundOptions): Inbound {
               tcm: rendered.tcm,
               carrier: rendered.carrier,
               text: rendered.text,
+              ...(showDetail ? { detail: rendered.detail } : {}),
             };
             // A machine consumer gets everything, tagged. A human gets the same
             // split the phone makes: carriers are state changes, not lines of
@@ -956,7 +1020,19 @@ export function attachInbound(opts: InboundOptions): Inbound {
               report.note(prefixLines(`[${shownFrom}] (${rendered.tcm}) `, rendered.text));
               return;
             }
-            report.line(record, prefixLines(`[${shownFrom}] `, rendered.text));
+            report.line(
+              record,
+              showDetail
+                ? // Brief first, then the detail INDENTED under it, through
+                  // the same `prefixLines` the brief uses — every line of it,
+                  // for that helper's whole reason: this is peer plaintext
+                  // and its newlines are the peer's, so a line of it must
+                  // never start at column zero where a `GCALL …` it wrote
+                  // would read as something this program said.
+                  `${prefixLines(`[${shownFrom}] `, rendered.text)}\n` +
+                    prefixLines(`[${shownFrom}]     `, rendered.detail as string)
+                : prefixLines(`[${shownFrom}] `, rendered.text),
+            );
           } catch (renderErr) {
             // Named, never re-acked, and never rule-4-unsafe: only the id,
             // the already-public peer address and a shape-checked errno —

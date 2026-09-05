@@ -36,6 +36,17 @@
  * a notice, never as raw JSON and never as silence.
  */
 
+/**
+ * The ONE detail bound (§3.1's "import the number, mirror the
+ * pattern"). `@tacendum/shared/rounds` is zod-only and node-builtin-free, so
+ * importing it costs this pure module nothing it did not already have — and
+ * the alternative, a local `3000`, is precisely the drift the shared-constant
+ * discipline exists to prevent: the schema that decides whether a composed
+ * `d` is legal lives in that file, and a renderer cutting at a different
+ * number would silently disagree with it.
+ */
+import { DETAIL_MAX } from '@tacendum/shared/rounds';
+
 /** How a structured body announces itself. Must match app/src/envelope.ts. */
 const ENVELOPE_SENTINEL = '{"tcm":';
 
@@ -113,7 +124,7 @@ const DECLARED_TCM = /^\{"tcm":"([a-z][a-z0-9._-]{0,31})"/;
  * ESC 1B and CR 0D), DEL (7F) and C1 (80-9F) goes.
  */
 // eslint-disable-next-line no-control-regex
-const CONTROL_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
+export const CONTROL_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
 
 /**
  * Where a LINE ENDS, according to everyone who reads this program's output.
@@ -201,6 +212,44 @@ export interface RenderedBody {
    * to identify agent members. Present only when true.
    */
   ai?: boolean;
+  /**
+   * `grp.msg` only: the room message id (`env.m`) — the
+   * SECOND half of the §5.3 compound row key `${authorId}.${m}` every member
+   * derives for this message. Set by room-render.ts, which is the only place
+   * `env.m` is in scope at render time, exactly as `grp` learns `env.g`
+   * there; the spool persists it on grp.msg rows only (inbound.ts).
+   *
+   * Why the spool needs it at all: a rounds answer is composed as a `reply`
+   * whose `ref` is the HUMAN row's compound key, and `${row.peer}.${row.rm}`
+   * is the only way to rebuild that key from a spooled row — `row.id` is the
+   * wire msgId of this account's own leg, which every member's leg differs on
+   * (rule 19), so it is not the room-wide key and can never be one. It is
+   * ULID/flag-class routing metadata, not body: it survives redaction with
+   * `grp`/`men`/`ai` (msglog.ts) and is never rendered.
+   */
+  rm?: string;
+  /**
+   * `msg` and `reply` only (§3.7): the DETAIL — the full
+   * finding whose headline is `text`. One message, one model, one sender:
+   * nothing here splits them and nothing recombines them.
+   *
+   * NOT folded into `text`, and that is the whole point of it being a field:
+   * `text` is the brief on every surface, and a terminal, a spool line and an
+   * MCP body each decide separately whether to show the rest. Surfaced for
+   * `peerName`'s stated reason — re-parsing our own rendered text to get the
+   * detail back out would make the display string a wire format.
+   *
+   * ITS OWN BOUND, not `str`'s 4096. A 3 000-unit detail is legal on the wire
+   * (`@tacendum/shared/rounds:DETAIL_MAX`) and 4096 would either cut it or, if
+   * a longer one arrived, pass a string the composer's own schema refuses —
+   * either way the reader would disagree with the writer about what a legal
+   * detail is. Cut here, at the shared number, so an over-long `d` from any
+   * sender loses its tail rather than this build's agreement with the wire.
+   *
+   * BODY-CLASS, not routing (R16): unlike `rm`, this does NOT survive
+   * redaction — it is content, and content is exactly what retention purges.
+   */
+  detail?: string;
 }
 
 /**
@@ -783,6 +832,32 @@ function str(value: unknown, max = 80): string {
   return typeof value === 'string' ? sanitizeForTerminal(value).slice(0, max) : '';
 }
 
+/**
+ * The DETAIL field, read the way `str` reads a text field but at the shared
+ * `DETAIL_MAX` (§3.7). One function rather than two call sites
+ * spelling `str(env.d, DETAIL_MAX)`, so the `msg` and `reply` arms cannot
+ * drift apart the way two hand-written bounds eventually do.
+ *
+ * Returns '' for absent, non-string, or emptied-by-sanitizing input — the
+ * callers spread the field only when it is non-empty, which is the receive
+ * side of `roundDetail`'s `.min(1)`.
+ *
+ * NEVER ENDS ON A LONE HIGH SURROGATE, mirroring `capDetail`'s last two lines
+ * (packages/shared/src/rounds.ts): `str` slices UTF-16 UNITS, so a `d` longer
+ * than `DETAIL_MAX` whose astral character straddles the bound would be cut
+ * through the middle of a pair, and the invalid sequence would be OURS. A
+ * compliant sender's `d` is already capped, so this only fires on a peer that
+ * did not cap — but mcp.ts rejects a lone surrogate by withholding the WHOLE
+ * message and flagging `invalid_utf8`, and blaming the sender for a break the
+ * reader made is a false provenance claim, not just a broken glyph. Dropping
+ * the orphan costs one unit and keeps the result at most `DETAIL_MAX`.
+ */
+function detailOf(value: unknown): string {
+  const out = str(value, DETAIL_MAX);
+  const last = out.charCodeAt(out.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? out.slice(0, -1) : out;
+}
+
 function num(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
@@ -844,8 +919,20 @@ export function renderBody(
       const text = str(env.text, 4096);
       const rawRef = typeof env.ref === 'string' && /^[0-9A-HJKMNP-TV-Z]{26}(\.[0-9A-HJKMNP-TV-Z]{26})?$/.test(env.ref) ? env.ref : undefined;
       const ofs = env.ofs === true ? true : undefined;
+      //the optional detail, at its OWN bound (see
+      // `RenderedBody.detail`). An empty or absent `d` yields no field, which
+      // is the receive side of `roundDetail`'s `.min(1)`: a disclosure
+      // control over nothing is a lie about there being more.
+      const detail = detailOf(env.d);
       return text
-        ? { tcm: declared, carrier: false, text, ...(rawRef ? { ref: rawRef } : {}), ...(ofs ? { ofs } : {}) }
+        ? {
+            tcm: declared,
+            carrier: false,
+            text,
+            ...(rawRef ? { ref: rawRef } : {}),
+            ...(ofs ? { ofs } : {}),
+            ...(detail ? { detail } : {}),
+          }
         : { tcm: declared, carrier: false, text: `[${UNSUPPORTED_TEXT}]` };
     }
     case 'mention': {
@@ -900,8 +987,11 @@ export function renderBody(
       // ornament: the CLI's peers here are the agent's own owner and
       // crew-mates, and the badge surface is the phone's.
       const text = str(env.text, 4096);
+      // The 1:1 attend answer keeps its kind and may carry a detail (R3);
+      // read here for the reply arm's reason and at the same bound.
+      const detail = detailOf(env.d);
       return text
-        ? { tcm: declared, carrier: false, text }
+        ? { tcm: declared, carrier: false, text, ...(detail ? { detail } : {}) }
         : { tcm: declared, carrier: false, text: `[${UNSUPPORTED_TEXT}]` };
     }
     case 'image': {

@@ -6,6 +6,7 @@ import {
   CREW_MAX_MEMBERS,
   EMAIL_CODE_ATTEMPT_CAP,
   EMAIL_SUPPRESSION_TTL_SECONDS,
+  KIT_ZERO_MATERIAL_B64,
   MAX_VERIFIED_IDENTIFIERS_PER_GROUP,
   PHONE_SUPPRESSION_TTL_SECONDS,
   USERNAME_RENAME_COOLDOWN_SECONDS,
@@ -38,6 +39,7 @@ import {
   sessionTokenDigest,
   type AccountGroupMember,
   type AuthChallengeRecord,
+  type KitChallengeRecord,
   type ConnectionRecord,
   type DataLayer,
   type TestOnlyDataLayer,
@@ -54,6 +56,7 @@ import {
   type UserRecord,
   type UsernameTombstoneRecord,
   LINK_OFFER_POINTER_CAP,
+  parseClientPolicyItem,
 } from '../src/db/data.js';
 import type { Deps, HttpEvent } from '../src/handlers/http.js';
 import type { LogFields } from '../src/log.js';
@@ -85,6 +88,10 @@ export function makeMemoryDb(
   setAccountsPhoneFeatureEnabled(on: boolean): void;
   /** Same twin-only operator seam for `feature#accounts-username`. */
   setAccountsUsernameFeatureEnabled(on: boolean): void;
+  /** Same twin-only operator seam for the `policy#client` row.
+   * Takes the RAW item, so a suite can plant the
+   * malformed ones an operator console admits. */
+  setClientPolicyRow(item: unknown): void;
 } {
   const quota = resolveQueueQuota(queueQuota);
   const wallNowMs = hooks.nowMs ?? Date.now;
@@ -95,6 +102,14 @@ export function makeMemoryDb(
     { ticket: string; userId: string; expiresAt: number; role: WsTicketRole; sessionDigest?: string }
   >();
   const authChallenges = new Map<string, AuthChallengeRecord>();
+  // The kit's two challenge namespaces (§3), keyed by
+  // (kind, account, nonce) so per-request rows COEXIST here exactly as the
+  // store's prefix-disjoint digest keys make them coexist there. A twin that
+  // modelled one-outstanding-per-account would pass the very lockout test
+  // §2 inv. 6 exists to fail.
+  const kitChallenges = new Map<string, KitChallengeRecord>();
+  const kitChallengeKey = (kind: KitChallengeRecord['kind'], userId: string, challenge: string) =>
+    `${kind}\n${userId}\n${challenge}`;
   const sessions = new Map<string, SessionRecord>();
   const prekeys = new Map<string, OneTimePrekey[]>(); // userId -> sorted by keyId
   // The pool generation on each user row, mirrored so a consume or count
@@ -170,6 +185,13 @@ export function makeMemoryDb(
   // Revoked identity keys. The real layer keeps the
   // tombstone ON the claim row; a side set is the same observable behavior.
   const tombstonedKeys = new Set<string>();
+  /** The twin's model of the store's `claimedUserId` attribute on an `idkey#`
+   * claim row: which account that claim NAMES. Kept beside `usersById`
+   * because the twin's claim rows are `UserRecord`s and carry no such field,
+   * and it is load-bearing — the rebind's leg (b) conditions on
+   * `claimedUserId = :self`, so a twin without the pointer could not model the
+   * drift state where an old key's claim belongs to a DIFFERENT account. */
+  const idkeyClaimOwner = new Map<string, string>();
   // Directed consent edges: userId -> the agentIds that
   // human consented to. A Set per partition mirrors the store's edge rows;
   // its SIZE mirrors the `#count` control row — one synchronous step per
@@ -212,7 +234,12 @@ export function makeMemoryDb(
   let accountsPhoneFeatureOn = false;
   // ABSENT = OFF — the username class boots dark.
   let accountsUsernameFeatureOn = false;
-  // Email linking + recovery mirroring the store's
+  // The `policy#client` row, held as the RAW item an
+  // operator would type rather than as a parsed record: the twin runs the
+  // store's own `parseClientPolicyItem` over it, so a suite that plants a
+  // typo exercises the real refusal instead of a fake that cannot hold one.
+  let clientPolicyItem: unknown;
+  // Email linking + recovery, mirroring the store's
   // rows: claim rows keyed by their versioned HMAC key, one code row per
   // requesting device (attempt cap enforced in the same synchronous step as
   // the read — the store's conditional increment), suppression shadows, and
@@ -463,6 +490,7 @@ export function makeMemoryDb(
       if (claims.identityKeyPub !== undefined && !tombstonedKeys.has(claims.identityKeyPub)) {
         usersByIdentityKey.delete(claims.identityKeyPub);
         usersById.delete(`${IDKEY_CLAIM_PREFIX}${claims.identityKeyPub}`);
+        idkeyClaimOwner.delete(`${IDKEY_CLAIM_PREFIX}${claims.identityKeyPub}`);
       }
       // The fused pending-recovery delete mirrored: a hinted recovery row still naming this device dies in the same
       // synchronous step as the row; one re-minted for another device is
@@ -508,6 +536,7 @@ export function makeMemoryDb(
       // Mirror DynamoDB: the transactional claim shares the users table under
       // 'idkey#<b64>', so the getUserById guard above stays testable.
       usersById.set(claimKey, { userId: claimKey, createdAt: createdAtMs });
+      idkeyClaimOwner.set(claimKey, candidateUserId);
       return { kind: 'ok', user: created, created: true };
     },
     async bindIntegrationOwner(integrationUserId, ownerUserId) {
@@ -615,6 +644,150 @@ export function makeMemoryDb(
       authChallenges.delete(mapKey);
       return true;
     },
+    // --- Paper recovery kit (§3) ---
+    // MIRRORS THE STORE, and the fidelity is the point: the original identity
+    // immutability defect survived its first draft precisely because the twin
+    // was more permissive than the store it stands in for (see `storeKeys`
+    // below). Every condition the real transaction carries is carried here.
+
+    async setKitEnrollment(userId, salt, verifierDigest, nowMs) {
+      // Mirror the store's `isClaimKey` guard: a caller-supplied `idkey#…`
+      // must not be able to ask whether that key is registered, nor have kit
+      // attributes written onto a bookkeeping row.
+      if (isClaimKey(userId)) return false;
+      // Mirror the store's all-zero refusal.
+      if (salt === KIT_ZERO_MATERIAL_B64 || verifierDigest === KIT_ZERO_MATERIAL_B64) return false;
+      const row = usersById.get(userId);
+      // Mirror `attribute_exists(userId) AND attribute_not_exists(tombstoned)`:
+      // a revoked device must not be able to arm a recovery for the account it
+      // was cut off from.
+      if (!row || row.tombstoned === true) return false;
+      row.kitSalt = salt;
+      row.kitVerifierDigest = verifierDigest;
+      row.kitEnrolledAt = nowMs;
+      return true;
+    },
+
+    async clearKitEnrollment(userId) {
+      // Mirror the store's `isClaimKey` guard — see `setKitEnrollment`.
+      if (isClaimKey(userId)) return;
+      const row = usersById.get(userId);
+      // Idempotent by contract, mirroring the store: revoking a kit that is
+      // not there is a success, and a missing row is a no-op rather than a
+      // throw.
+      if (!row) return;
+      delete row.kitSalt;
+      delete row.kitVerifierDigest;
+      delete row.kitEnrolledAt;
+    },
+
+    async putKitChallenge(rec) {
+      // Per (kind, account, nonce), like the store's prefix-disjoint digest
+      // key: concurrent mints coexist and one can never clobber a sibling's.
+      kitChallenges.set(kitChallengeKey(rec.kind, rec.userId, rec.challenge), { ...rec });
+    },
+
+    async consumeKitChallengeIfMatches(kind, userId, challenge) {
+      const mapKey = kitChallengeKey(kind, userId, challenge);
+      const rec = kitChallenges.get(mapKey);
+      if (!rec) return undefined;
+      // Spent by the ATTEMPT, expired or not — the store's conditional delete
+      // with ALL_OLD does not read the clock either, so a caller cannot retry
+      // a dead nonce until the clock suits them. Expiry is the caller's call
+      // on the record handed back.
+      kitChallenges.delete(mapKey);
+      return { ...rec };
+    },
+
+    async rebindUserIdentity(input) {
+      const { userId, expectedIdentityKeyPub, core, nowMs } = input;
+      // Mirror the store's `isClaimKey` guard — see `setKitEnrollment`.
+      if (isClaimKey(userId)) return { kind: 'stale' };
+      // The crashed client's retry (§0.5), short-circuited BEFORE anything
+      // else exactly as the store does — there, because legs (a) and (c)
+      // would address one item twice and DynamoDB would 500 the whole
+      // transaction; here, so the two agree about what a retry answers.
+      if (expectedIdentityKeyPub === core.identityKeyPub) return { kind: 'unchanged' };
+
+      const oldClaimKey = `${IDKEY_CLAIM_PREFIX}${expectedIdentityKeyPub}`;
+      const newClaimKey = `${IDKEY_CLAIM_PREFIX}${core.identityKeyPub}`;
+
+      // PRECEDENCE MIRRORS THE STORE'S. The real catch reads
+      // CancellationReasons positionally and tests index 2 (the new claim)
+      // FIRST, so when the row condition and the claim condition fail
+      // together the answer is `key_in_use`. A twin that answered `stale`
+      // there would make a handler test prove the wrong 4xx.
+      if (usersById.has(newClaimKey)) return { kind: 'key_in_use' };
+
+      const row = usersById.get(userId);
+      // Mirror `attribute_exists(userId) AND attribute_not_exists(tombstoned)
+      // AND identityKeyPub = :old`: a delete or a second rebind racing us
+      // wins, and this call loses rather than overwriting; and a REVOKED row
+      // loses to the same guard `setKitEnrollment` already applies, so a kit
+      // armed before the revoke cannot rekey a tombstoned account into a
+      // sign-in-but-cannot-send split state. Nothing is mutated on this branch
+      // — the store's transaction is all-or-none.
+      if (!row || row.tombstoned === true || row.identityKeyPub !== expectedIdentityKeyPub) {
+        return { kind: 'stale' };
+      }
+      // Mirror leg (b)'s `attribute_exists(userId)`: the OLD claim is
+      // TOMBSTONED, never minted. A row whose key has no claim is drift, and
+      // the store fails loudly on it rather than writing a bare tombstone for
+      // a key that was never registered (`tombstoneIdentityKey`'s stated
+      // rule). It answers `stale`; the caller re-reads.
+      // …AND `claimedUserId = :self`: the claim must already NAME this
+      // account, so a drift state where the old key belongs to someone else
+      // cannot have that other account's LIVE claim revoked from here.
+      if (!usersById.has(oldClaimKey) || idkeyClaimOwner.get(oldClaimKey) !== userId) {
+        return { kind: 'stale' };
+      }
+
+      const poolGen = randomUUID();
+      row.registrationId = core.registrationId;
+      row.identityKeyPub = core.identityKeyPub;
+      row.signedPrekey = core.signedPrekey;
+      row.kyberPrekey = core.kyberPrekey;
+      // The pool generation rolls in the SAME step as the key:
+      // the old one-time pool is orphaned atomically with
+      // the swap, so no bundle can ever pair the new identity key with an old
+      // one-time prekey.
+      row.prekeyPoolGen = poolGen;
+      // `prekeyGens` is NOT touched, and that is the whole mechanism. It
+      // models the generation stamped on the stored PREKEY ITEMS, which the
+      // store writes with the pool and this transaction does not rewrite. The
+      // row's generation moves; the pool's stamp does not; so every consume
+      // and count under the generation a bundle reads off the row now answers
+      // nothing, and the entire old pool is orphaned atomically with the key.
+      // Setting it here would model a store that rewrites 100 prekey items
+      // inside a 3-item TransactWrite, which is not a store anyone can build.
+
+      // The OLD claim survives, TOMBSTONED IN PLACE. The store SETs one
+      // attribute on the EXISTING item, exactly as `tombstoneIdentityKey`
+      // does — it does not replace the row — so the birth `createdAt` and
+      // every other attribute survive, and the twin does the same rather than
+      // re-minting the item (the earlier draft's whole-item write discarded
+      // both, and this file exists because a twin that drifts from the store
+      // is how the identity-immutability defect survived its first draft).
+      //
+      // The twin does not model the store's `claimedUserId` attribute at all:
+      // resolution here goes through the `usersByIdentityKey` map, and the
+      // `tombstonedKeys` set is the twin's own spelling of the flag, kept in
+      // step with it. The consequence that matters is the same on both sides:
+      // the old key's next sign-in latches `identity_tombstoned` instead of
+      // minting a fresh account, which is what a found-or-stolen old phone
+      // must hear.
+      const oldClaim = usersById.get(oldClaimKey);
+      if (oldClaim) oldClaim.tombstoned = true;
+      tombstonedKeys.add(expectedIdentityKeyPub);
+      // The old key keeps resolving to this row, mirroring the retained
+      // `claimedUserId`. It is unreachable as a live account: every resolver
+      // checks the tombstone first.
+      usersByIdentityKey.set(core.identityKeyPub, row);
+      usersById.set(newClaimKey, { userId: newClaimKey, createdAt: nowMs });
+      idkeyClaimOwner.set(newClaimKey, userId);
+      return { kind: 'rebound', prekeyPoolGen: poolGen };
+    },
+
     async putWsTicket(rec) {
       wsTickets.set(rec.ticket, rec);
     },
@@ -1232,6 +1405,9 @@ export function makeMemoryDb(
     async isAccountsUsernameFeatureEnabled() {
       return accountsUsernameFeatureOn;
     },
+    async getClientPolicy() {
+      return parseClientPolicyItem(clientPolicyItem);
+    },
     async putLinkOffer(rec) {
       // Same loud throws as the store: malformed tuples are caller bugs.
       if ((rec.rosterEpoch === 0) !== (rec.offererClass !== undefined)) {
@@ -1481,6 +1657,7 @@ export function makeMemoryDb(
       if (claims.identityKeyPub !== undefined && !tombstonedKeys.has(claims.identityKeyPub)) {
         usersByIdentityKey.delete(claims.identityKeyPub);
         usersById.delete(`${IDKEY_CLAIM_PREFIX}${claims.identityKeyPub}`);
+        idkeyClaimOwner.delete(`${IDKEY_CLAIM_PREFIX}${claims.identityKeyPub}`);
       }
       return 'deleted';
     },
@@ -2196,6 +2373,9 @@ export function makeMemoryDb(
     },
     setAccountsUsernameFeatureEnabled(on: boolean) {
       accountsUsernameFeatureOn = on;
+    },
+    setClientPolicyRow(item: unknown) {
+      clientPolicyItem = item;
     },
   };
 }

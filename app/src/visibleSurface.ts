@@ -97,7 +97,14 @@ export type SurfaceRouteName =
   // either way.
   | 'accountUsername'
   | 'discover'
-  | 'recover';
+  | 'recover'
+  // The update wall (§9 rule 9 a fourth time: a new
+  // name in the union, NO fifth consumer). Locked/landing/loading's class,
+  // for their reason — an empty screen a person must keep access to while
+  // mirroring, with nothing on it to read — and register-class to every
+  // other consumer: it stands in front of a workspace that was never
+  // opened, so it proves none and redeems no push tap.
+  | 'updateRequired';
 
 /** A routed surface that is visible right now. `peerId` rides along where
  * the route carries one; disclosure is keyed on the NAME (thread /
@@ -173,6 +180,10 @@ const CAPTURE_EXEMPT: ReadonlySet<SurfaceRouteName> = new Set([
   'locked',
   'landing',
   'loading',
+  // The update wall carries a title, one sentence, and the way to the
+  // store. Covering it would hide the only control that ends the state
+  // from someone mirroring their screen for help.
+  'updateRequired',
 ]);
 
 /** The routes that exist WITHOUT an open workspace. Everything else can
@@ -186,6 +197,10 @@ const NO_WORKSPACE: ReadonlySet<SurfaceRouteName> = new Set([
   // the landing screen, before any profile or verdict — it can be on glass
   // with no workspace open, so it must prove nothing.
   'recover',
+  // The update wall replaces the workspace opening rather than following
+  // it: `messaging.start` is never reached from here, so nothing behind it
+  // is open.
+  'updateRequired',
 ]);
 
 /** The two routes that show conversation content, by name. */
@@ -287,9 +302,24 @@ export function deriveSurfaceFacts(
       // `recover` refuses redemption with `register`: it is reachable
       // pre-workspace, and the conservative answer — wait for a surface
       // that provably has somewhere for a thread to live — fails safe on
-      // its post-registration visits too.
-      r => r.name !== 'landing' && r.name !== 'register' && r.name !== 'recover',
+      // its post-registration visits too. `updateRequired` refuses for the
+      // same reason and more plainly: a tap consumed there is spent, and
+      // the thread it names cannot open until the app is updated.
+      r =>
+        r.name !== 'landing' &&
+        r.name !== 'register' &&
+        r.name !== 'recover' &&
+        r.name !== 'updateRequired',
     ),
-    pushNavLandable: routes.every(r => r.name !== 'locked'),
+    // `updateRequired` is here as well as in the list above, and it has to
+    // be: refusing to CONSUME a tap on the wall says nothing about a tap
+    // consumed a moment earlier, on `chats`, whose shared-state read is
+    // still in flight when the gate raises the wall. Landing that thread put
+    // a full workspace surface on top of a screen the gate says nothing is
+    // reachable from, over a workspace this build has just been told it may
+    // not use. The lock screen refuses for the same reason and longer.
+    pushNavLandable: routes.every(
+      r => r.name !== 'locked' && r.name !== 'updateRequired',
+    ),
   };
 }

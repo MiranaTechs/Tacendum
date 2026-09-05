@@ -28,7 +28,10 @@ import { MinimizeGlyph } from '../ui/CallControlGlyphs';
 // so the minimized call window shows them the same way;
 // unchanged, and this screen's rendered tree is byte-identical.
 import { PeerBackdrop } from '../ui/PeerBackdrop';
-// The draggable corner preview's geometry and wiring, lifted out
+// The id-refusal rule this screen shares with the group tiles: a surface a
+// stranger holding the phone sees never letters itself with id characters.
+import { tileName, UNNAMED } from '../ui/CallTile';
+// The draggable corner preview's geometry and wiring, lifted out (2026-08-28)
 // so the minimized call window drags through the SAME gesture. The names
 // are re-exported below so every existing import of them from this screen —
 // the suite's included — keeps meaning what it meant.
@@ -215,6 +218,7 @@ function PeerFace({
   size,
   styles,
   labelled = false,
+  ground = false,
 }: {
   peerId: string;
   peerName: string;
@@ -222,15 +226,32 @@ function PeerFace({
   size: number;
   styles: ReturnType<typeof makeStyles>;
   labelled?: boolean;
+  /**
+   * Set where the face stands INSIDE a video surface, which paints itself
+   * opaque black when it has no track. Without the pine ground under it the
+   * disc floats in that black, which is the state the hardware report
+   * (2026-08-13) named: "person B is all dark screen".
+   */
+  ground?: boolean;
 }): React.JSX.Element {
+  // The id-refusal rule the backdrop and the group tiles already keep, kept
+  // HERE rather than at each call site so the disc cannot be handed a name it
+  // must not letter with. `tileName` answers with a sentinel, not with
+  // letters, so the sentinel is mapped explicitly: passed through as a
+  // display name it letters `SO`, and dropped for `null` it letters two
+  // characters of the id. The same person wore `SO` on the pre-connect disc
+  // and `?` the instant the call connected, seconds apart.
+  const shown = tileName(peerId, peerName);
+  const unnamed = shown === UNNAMED;
   return (
-    <View style={styles.avatarWrap} pointerEvents="none">
+    <View style={ground ? styles.avatarGround : styles.avatarWrap} pointerEvents="none">
       <Avatar
         peerId={peerId}
-        displayName={peerName}
+        displayName={shown}
+        {...(unnamed ? { monogramOverride: '?' } : {})}
         photoB64={photoB64}
         size={size}
-        {...(labelled ? { accessibilityLabel: `${peerName}'s picture` } : {})}
+        {...(labelled ? { accessibilityLabel: `${shown}'s picture` } : {})}
       />
     </View>
   );
@@ -336,6 +357,35 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
    */
   const remoteVideoLive = state.name === 'connected' && call?.peerVideo === true;
 
+  /**
+   * Whether there is a remote track for the peer's PHOTO to stand in for.
+   *
+   * The backdrop covers the remote surface with the peer's photo, cover
+   * cropped to it exactly as their video would be. That is the honest fill
+   * for a connected call whose far camera is off, and a lie before the call
+   * connects: a full-bleed face where the remote camera goes is what a live
+   * remote camera looks like, so the screen read as connected video while
+   * the header still said "Ringing…".
+   *
+   * `reconnecting` belongs with `connected`: the call HAS connected, the
+   * track exists, and the photo is standing in for media that stopped
+   * flowing — the case the backdrop was built for.
+   *
+   * So does `ending`, which is why the test is `connectedAt` rather than a
+   * list of phase names: the fact the surface needs is whether this call ever
+   * had remote media, and the context already carries it. Named phases alone
+   * swapped the full-bleed peer for a 128pt disc for the whole of a hangup,
+   * while a call cancelled before it connected (`ending` with no
+   * `connectedAt`) correctly stays on the disc.
+   *
+   * Before either, the person is drawn the way an audio call draws them: one
+   * centred disc, at the size §10.3 designed, over the pine ground. No scrim
+   * and no blur is added to the connected case instead; theme.ts rules
+   * scrims out of the product outright.
+   */
+  const mediaEstablished =
+    state.name === 'connected' || state.name === 'reconnecting' || call?.connectedAt != null;
+
   // One timer, once per second, only while there is something to count.
   useEffect(() => {
     if (!call?.connectedAt) return undefined;
@@ -393,11 +443,26 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
               anything underneath is invisible by definition. A child of the
               Pressable rather than a sibling, so tap-to-swap still works
               through it. */}
-          {!swapped && !remoteVideoLive && (
+          {!swapped && mediaEstablished && !remoteVideoLive && (
             <PeerBackdrop
               peerId={call.peerId}
               peerName={peerName}
               photoB64={peerAvatarB64}
+            />
+          )}
+          {/* Before the call connects: the audio layout's disc, over the pine
+              ground, so the surface is neither black nor mistakable for the
+              far camera. `PeerFace` applies CallTile's rule 2 itself, so a
+              "name" that is really the peer's id cannot letter this surface
+              and the raw name goes down. */}
+          {!swapped && !mediaEstablished && (
+            <PeerFace
+              peerId={call.peerId}
+              peerName={peerName}
+              photoB64={peerAvatarB64}
+              size={128}
+              styles={styles}
+              ground
             />
           )}
         </Pressable>
@@ -464,7 +529,12 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
               <PeerBackdrop
                 peerId={call.peerId}
                 peerName={peerName}
-                photoB64={peerAvatarB64}
+                // The photo is withheld until there is media for it to stand
+                // in for, exactly as on the full surface: a cover-cropped
+                // face in the corner reads as the far camera just as
+                // readily. The pine ground and the monogram stay, so the
+                // corner is never bare black.
+                photoB64={mediaEstablished ? peerAvatarB64 : null}
                 compact
               />
             )}
@@ -610,8 +680,8 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
             />
           </>
         )}
-        {/* Offered only where an earpiece exists to route away from
-. On an iPad every route lands on the
+        {/* Offered only where an earpiece exists to route away from.
+            On an iPad every route lands on the
             loudspeaker — `.none` and `.defaultToSpeaker` alike — so the
             toggle would claim a distinction the hardware does not have:
             "Speaker off" over audio still playing out loud is the exact
@@ -736,6 +806,20 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       bottom: 0,
       alignItems: 'center',
       justifyContent: 'center',
+    },
+    /** The same centring, plus the ground: the pine wash the app puts behind
+     * every photo-less person on the media surface (`PeerBackdrop`'s own
+     * fill). Used where the disc stands inside a video surface, which is
+     * opaque black with no track in it. */
+    avatarGround: {
+      position: 'absolute',
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: theme.color.pineWash,
     },
     // The person-at-surface-size styles (backdrop, backdropPhoto, the two
     // monogram sizes) moved to ../ui/PeerBackdrop.tsx with the component.

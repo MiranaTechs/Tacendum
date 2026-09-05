@@ -948,3 +948,40 @@ describe('an unrecognised claudeDriver mints no room session key', () => {
     ).toBe(false);
   });
 });
+
+/**
+ * ADDITIVE: the agent-class clause lands in the D3 arm and
+ * the OWNER BRANCH DOES NOT MOVE.
+ *
+ * The clause refuses a structured mention whose author this room's own record
+ * calls an agent, which is what keeps "agents cannot start each other's turns"
+ * true after rounds widens DELIVERY. The owner branch needs no such read —
+ * `row.peer === ownerUserId` there and an owner is human-class by construction
+ * (`crew adopt` refuses a human-class member) — so a second read "for
+ * symmetry" would buy nothing and could only fail. This case is the fence: if
+ * anybody adds the clause above the owner check, the owner stops being
+ * answerable the moment their own row carries a marker.
+ */
+describe('the class clause leaves the owner branch alone', () => {
+  it('an OWNER mention still triggers in a room where the owner’s own rows are AI-marked', async () => {
+    const h = harness();
+    const log = new MessageLog('bot');
+    // A marker-record row attributed to the OWNER — the shape
+    // `roomAgentAuthorIds`'s marker half would pick up.
+    log.append({ ...roomRow('[crew] earlier', { gid: GID }), ai: true });
+    log.append(roomRow('[crew] @you ship it', { gid: GID, men: true }));
+    expect(await attendOnce('bot', h.io)).toBe('answered');
+    expect(h.turns, 'the owner is answerable however their rows are marked').toHaveLength(1);
+    expect(h.roomReplies).toHaveLength(1);
+  });
+
+  it('and a room reply-to-continue from the owner is equally untouched', async () => {
+    const h = harness();
+    outRoomRow(M1, GID);
+    const log = new MessageLog('bot');
+    log.append({ ...roomRow('[crew] earlier', { gid: GID }), ai: true });
+    log.append(roomRow('[crew] and now deploy it', { gid: GID, ref: `${SELF}.${M1}` }));
+    expect(await attendOnce('bot', h.io)).toBe('answered');
+    expect(h.turns).toHaveLength(1);
+  });
+});

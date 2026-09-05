@@ -45,6 +45,40 @@ import { API_BASE } from './config';
  * ID has actually stopped working — offline, this throws and destroys
  * nothing. Then stop the socket so nothing writes during the wipe, clear
  * local state, and only then the identity keys and token.
+ *
+ * "Leave nothing behind" is total up to the secret store, and BEST-EFFORT
+ * past it (AD-1, 2026-09-03). Every local wipe is attempted; a store that
+ * refuses a delete it cannot complete (SecretStore.kt throws on a failed
+ * unlink; TacendumCryptoImpl.swift throws on any Keychain status but
+ * success/notFound) can leave lock keys behind on a device whose account is
+ * gone. That residue is inert and already an accepted edge — §11,
+ * "the relaunch after a deletion shows the lock screen" — and it is NOT
+ * reported to the caller, because past the server delete there is no honest
+ * error to report and no retry that helps: the token is gone, so a second
+ * attempt skips `DELETE /v1/account` entirely and fails the same way for
+ * ever. See the comment at the wipe itself.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT REACH — the on-device residuals, named
+ * here so nobody has to discover them one at a time. Every one is a
+ * Keychain generic-password item belonging to the INSTALL rather than to the
+ * account, and each survives deletion (and a reinstall) on purpose:
+ *
+ *  - `screensec.blank` — the "hide messages while the screen is shared"
+ *    preference (`screenSecurity.ts`). Written by that module alone and
+ *    re-read at every launch; a person who turned it off does not mean
+ *    "until my next account".
+ *  - `updateGate.policy` — the last update policy the server gave this
+ *    build, and `updateGate.softDismissed`, the store build whose nudge was
+ *    waved away (`updateGate.ts`, as amended). These
+ *    are about this BINARY's build number, not about any account: signing
+ *    out does not make an old build new, so a blocked verdict that a
+ *    wipe-and-re-register could erase would be a way out of the update wall
+ *    for anyone who found it.
+ *
+ * The rule they share, and the one to apply to the next such key: if the
+ * value describes the DEVICE rather than the person, deletion leaves it, and
+ * the fact is written down here, beside the deletion itself, instead of
+ * being left to a reader of this function to notice.
  */
 export async function deleteAccount(): Promise<void> {
   if (session.mode === 'duress') {
@@ -87,8 +121,24 @@ export async function deleteAccount(): Promise<void> {
   await db.clearLocalState();
   await resetProtocolState();
   await deleteSecret(AUTH_TOKEN_KEY);
-  await lock.clearAll();
-  await db.clearDecoyState();
+  // Both, not one-then-the-other (AD-1, 2026-09-03). These are two
+  // independent wipes and neither is a precondition of the other, so a
+  // Keychain that refuses to drop `lock.enabled` must not also strand the
+  // decoy database on an account that no longer exists.
+  //
+  // And NEITHER failure is reported, because the only caller cannot tell the
+  // truth about one. ProfileScreen's catch renders COPY.signOutFailed
+  // (ProfileScreen.tsx: "Tacendum couldn't reach the server, so nothing was
+  // deleted. Try again when you're back on.") and skips onSignedOut(). By the
+  // time these two lines run the server HAS been reached, the account IS
+  // gone, and the auth token has already been deleted — so that sentence
+  // would be false and the retry it invites is a closed loop that can only
+  // ever repeat it. Rejecting here would buy an untrue sentence and a screen
+  // with no exit; the surviving lock keys are inert and are the accepted
+  // §11 edge instead. Rule 4: nothing is logged and no error
+  // carries a key or a value.
+  await lock.clearAll().catch(() => undefined);
+  await db.clearDecoyState().catch(() => undefined);
 }
 
 /** A duress session is network-silent. A coerced

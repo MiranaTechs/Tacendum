@@ -445,6 +445,15 @@ export function callReducer(
     // --- media negotiation --------------------------------------------------
     case 'ringingReceived':
       if (state.name !== 'outgoing_connecting') return NOTHING(state);
+      // A `call.ringing` that arrives BEHIND the answer it preceded. The
+      // machine stays in `outgoing_connecting` across `answerReceived`, so
+      // the state guard above lets a late or redelivered ring run the clock
+      // swap a second time: it would cancel the connect timer the answer had
+      // just re-armed and arm a 60 s ring deadline on a call that is already
+      // answered, leaving the negotiation with no deadline of its own.
+      // `remoteReady` is the per-call latch for "an answer has been applied",
+      // the same discriminator `answerReceived` uses to refuse a redelivery.
+      if (call.remoteReady) return NOTHING(state);
       // The ring clock REPLACES the connect clock. The 45 s connect timer
       // armed at `placeCall` covers "the offer never reached anyone"; once
       // the callee's device says it is ringing, the only honest deadline is

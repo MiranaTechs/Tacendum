@@ -893,6 +893,20 @@ describe('Settings → ACCOUNT: the username row (pin ON) is labeled from the de
     });
     // No verified identifier of either class: the sentence carries the door.
     stubRows({});
+    // The boot now ASKS THE SERVER what build it still talks to, before the
+    // socket. Left to the environment's real
+    // `fetch`, that request is an outbound connection this suite never
+    // wanted and the opening waits on its 20 s deadline, so the route never
+    // leaves 'loading'. An empty answer is refused by the DTO parse, which
+    // the gate reads as unknown — the fail-open posture — and the boot
+    // carries on exactly as it did.
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = jest.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({}),
+      text: async () => '',
+    })) as unknown as typeof fetch;
     let tree!: ReactTestRenderer.ReactTestRenderer;
     try {
       await ReactTestRenderer.act(async () => {
@@ -915,6 +929,7 @@ describe('Settings → ACCOUNT: the username row (pin ON) is labeled from the de
       await ReactTestRenderer.act(async () => {
         tree?.unmount();
       });
+      globalThis.fetch = realFetch;
       crypto.hasIdentity.mockResolvedValue(false);
       crypto.identityPublicKey.mockResolvedValue(null);
       crypto.__keychain.clear();

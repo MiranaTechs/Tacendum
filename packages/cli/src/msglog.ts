@@ -176,6 +176,35 @@ export interface MessageRecord {
    * it. The room send path reads the union back to drop an unaddressed
    * agent's leg. */
   ai?: boolean;
+  /** grp.msg rows ONLY: the room message id (`env.m`), the
+   * SECOND half of the §5.3 compound row key `${peer}.${rm}` every member of
+   * the room derives for this message. `id` above is the wire msgId of THIS
+   * account's own leg, which differs per member by construction (rule 19), so
+   * it is not the room-wide key and cannot stand in for one — without `rm` the
+   * rounds composer cannot build the reply `ref` that joins an answer to the
+   * human turn it answers, and cannot key the once-per-round guard.
+   *
+   * Routing metadata of the `grp`/`men`/`ai` class, never body: a ULID this
+   * client rendered off an authenticated frame. It SURVIVES redaction with
+   * them (see `applyRetention`) — a detail, which is body, would not. */
+  rm?: string;
+  /**
+   * `msg` and `reply` rows: the DETAIL the sender wrote
+   * beside this row's brief. `text` stays the brief on every surface; this is
+   * the rest of the same message, by the same author, in the same frame.
+   *
+   * BODY, NOT METADATA, and that distinction is the whole of R16: `grp`,
+   * `men`, `ai` and `rm` are ULID/flag-class routing this client derived from
+   * an authenticated frame, and they ride through redaction because losing
+   * them silently changes routing. A detail is prose a peer wrote — the exact
+   * class of thing `applyRetention` exists to purge — so it is DROPPED there
+   * with `text`, and the drop is pinned by a test rather than left to a
+   * reviewer noticing an absent line.
+   *
+   * `bytes` on a redacted row keeps meaning "the size of the delivered body",
+   * i.e. `text` alone; see `applyRetention`.
+   */
+  detail?: string;
 }
 
 export interface ReadOptions {
@@ -863,6 +892,13 @@ export class MessageLog {
             tcm: record.tcm,
             text: '',
             read: true,
+            // `bytes` KEEPS ITS MEANING: the size of the DELIVERED body, i.e.
+            // `text` alone. A detail is purged with it and
+            // is deliberately not added in here — this number is documented
+            // as what was shown, `mcp.ts` reports it as `byte_count`, and
+            // silently redefining it to "everything the frame carried" is
+            // worse than under-reporting: a caller comparing it against a
+            // body it received would find a discrepancy with no explanation.
             bytes: Buffer.byteLength(record.text, 'utf8'),
             red: true,
             // The route is metadata, not content: a redacted reply still
@@ -884,6 +920,28 @@ export class MessageLog {
             ...(record.grp ? { grp: record.grp } : {}),
             ...(record.men ? { men: record.men } : {}),
             ...(record.ai ? { ai: record.ai } : {}),
+            // `rm` rides through for the same reason and by the same rule
+            //the room message id is a ULID, the
+            // second half of the §5.3 row key — routing, not content.
+            // Dropping it would silently un-key a redacted row, so a round
+            // whose human turn had aged into redaction would compose a bare
+            // answer with no reply ref and no once-per-round guard — a
+            // behaviour change nothing would report.
+            ...(record.rm ? { rm: record.rm } : {}),
+            // AND `detail` IS ABSENT HERE ON PURPOSE. It is
+            // the one new field of the BODY class: prose a peer wrote, the
+            // second half of the same message `text` is the first half of.
+            // Everything listed above is routing this client derived from an
+            // authenticated frame; dropping one of those silently changes
+            // where messages go, which is why they ride through. Carrying a
+            // detail through instead would leave the longest peer-written
+            // text on this disk surviving the purge that exists to remove
+            // exactly it — and `inbox --purge`'s promise ("get the consumed
+            // plaintext off this disk NOW") would be false by the width of a
+            // 3 000-character finding. The rebuild is an ALLOWLIST, so the
+            // absence is enforced by construction; `msglog.rounds.test.ts`
+            // pins it, because an absence no test names is an absence the
+            // next field addition quietly ends.
           };
           kept.push(JSON.stringify(purged));
           redacted += 1;

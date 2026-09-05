@@ -31,7 +31,10 @@ import { getSecret, hasIdentity } from 'tacendum-crypto';
 // The membership fold: one answer about who is in a room, shared by the room
 // thread, the send path and the in-call Add picker.
 import { foldRoster } from '@tacendum/shared/group-fold';
-import { smallGroupCallParticipantCap } from '@tacendum/shared';
+import {
+  type ClientPolicyResponse,
+  smallGroupCallParticipantCap,
+} from '@tacendum/shared';
 import { clearBadge, syncBadge } from './src/badge';
 import {
   activateCallMetricDrainForWorkspace,
@@ -75,6 +78,7 @@ import { PeerProfileScreen } from './src/screens/PeerProfileScreen';
 import { PhotoViewerScreen } from './src/screens/PhotoViewerScreen';
 import { ProfileScreen } from './src/screens/ProfileScreen';
 import { RegisterScreen } from './src/screens/RegisterScreen';
+import { UpdateRequiredScreen } from './src/screens/UpdateRequiredScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import { StartChatScreen } from './src/screens/StartChatScreen';
 import {
@@ -135,6 +139,7 @@ import { loadPushConsent } from './src/pushConsent';
 import { accountGone, onAccountGone } from './src/reauth';
 import { screenSecurity } from './src/screenSecurity';
 import { session } from './src/session';
+import { type CheckReason, storeUrl, updateGate } from './src/updateGate';
 import { ThemeProvider, useTheme } from './src/theme';
 import { useReduceMotion } from './src/useReduceMotion';
 import {
@@ -185,6 +190,12 @@ type Route =
   | { name: 'loading' }
   | { name: 'locked' }
   | { name: 'landing' }
+  // The update wall: the server's answer to "what
+  // build do you still talk to" came back above this binary's. A ROUTE and
+  // not a modal, because nothing behind it ran — the workspace opening
+  // returns before `messaging.start`, so there is no workspace to dismiss
+  // back into. Joined THROUGH the visible-surface module (§9 rule 9).
+  | { name: 'updateRequired' }
   | { name: 'register' }
   | { name: 'chats' }
   | { name: 'calls' }
@@ -297,6 +308,7 @@ export const CALL_OVERLAY_SURFACE: Record<Route['name'], 'full' | 'window'> = {
   landing: 'full',
   register: 'full',
   recover: 'full',
+  updateRequired: 'full',
   // The workspace.
   chats: 'window',
   calls: 'window',
@@ -785,6 +797,63 @@ function AppContent() {
     [],
   );
 
+  /** The policy the update wall renders from, held as state so a re-check
+   * that changes the operator's message repaints. The gate itself is the
+   * module singleton — this is a copy for the screen, never a second
+   * source of the decision. */
+  const [updatePolicy, setUpdatePolicy] = useState<
+    ClientPolicyResponse | undefined
+  >(undefined);
+  /** Ask the gate, and bring the answer back into React. Every one
+   * of the three check points goes through here, so "what did we ask, and
+   * what did we do about it" is one function rather than three. */
+  const checkForUpdate = useCallback(async (reason: CheckReason) => {
+    const decision = await updateGate.checkNow(reason);
+    setUpdatePolicy(updateGate.policy);
+    return decision;
+  }, []);
+  /** What "Check again" is doing, for the wall to say so. `stillOld` is the
+   * settled acknowledgement a recheck that changes nothing owes the person
+   * who pressed: without it the only control on the screen looks dead. */
+  const [updateRecheck, setUpdateRecheck] = useState<
+    'idle' | 'checking' | 'stillOld'
+  >('idle');
+  /** The same acknowledgement at check point 1. "Get started" runs a network
+   * check before registration begins, and until this flag existed it ran it
+   * behind a button that looked untouched — so a slow link read as a dead
+   * door and invited a second press. */
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+
+  /**
+   * TAKE THE WORKSPACE DOWN BEHIND THE WALL.
+   *
+   * The gate describes the wall as a route with nothing running behind it, and
+   * the boot check point earns that by returning before `messaging.start`.
+   * Neither of the two other ways to reach the wall did. Foregrounding into
+   * a raised floor left the socket open, the previews armed and the push
+   * tokens registered, so a build the server had just declared too old went
+   * on syncing and went on ringing for calls it could not complete, under a
+   * screen telling its owner it could no longer connect. And the boot path
+   * had already registered this device and armed the lease several steps
+   * ABOVE the gate, so even there the wall's promise was only half kept.
+   *
+   * This is `relock()`'s teardown minus the parts that belong to a verdict:
+   * no `db.close`, no `session.setMode`, no route. "Check again" reopens
+   * through `beginWorkspaceOpening('real')`, which closes and reopens the
+   * database itself.
+   */
+  const quiesceForUpdateWall = useCallback(async () => {
+    // First, and synchronously: everything below awaits, and an APNs
+    // rotation landing in that window must not re-register a build that is
+    // about to be walled off. Nothing is withdrawn, only withheld.
+    adoptPushRegistration({ real: false });
+    await endCallOnQuiesce();
+    messaging.stop();
+    disposeGroupCall();
+    quiesceCallMetrics();
+    await disarmPreviews().catch(() => undefined);
+  }, []);
+
   /** Open the real workspace: the normal boot, and the 'real' verdict. */
   const enterRealWorkspace = useCallback(async (generation: number) => {
     try {
@@ -925,6 +994,32 @@ function AppContent() {
       if (existing) {
         if (!openingIsCurrent(generation)) return;
         setProfile(existing);
+        // CHECK POINT 2, and the load-bearing one:
+        // after the profile read, so a phone with no account never dials
+        // this on the way to the landing screen, and STRICTLY BEFORE the
+        // workspace-shaped work below: a blocked build must reach neither
+        // the call adoption (which registers this device) nor
+        // `messaging.start` (which opens the socket). Never on the locked
+        // route, because this whole function runs after the verdict; never
+        // in duress, because `checkNow` returns before it can dial.
+        //
+        // WHAT IT CANNOT WITHHOLD BY SITTING HERE, AND SO UNDOES INSTEAD.
+        // Three workspace-shaped things run ABOVE this line and have to:
+        // the push registration (whose whole argument is that it must not
+        // hang off anything that can throw), the preview lease, and the
+        // database. The wall's "push adoption stays off, no socket is opened"
+        // was therefore only true of the socket. The blocked arm now spends
+        // the first two back, so a walled build stops being woken by VoIP
+        // pushes for calls it cannot take.
+        const gate = await checkForUpdate('enterWorkspace');
+        if (!openingIsCurrent(generation)) return;
+        if (gate === 'blocked') {
+          await quiesceForUpdateWall();
+          if (!openingIsCurrent(generation)) return;
+          setUpdateRecheck('idle');
+          setRoute({ name: 'updateRequired' });
+          return;
+        }
         // THE VERDICT'S OTHER HALF. `startCalling` armed the ring at mount and
         // deliberately touched nothing that needed a workspace; this is where
         // the workspace-shaped work lands, now that "which world" has an
@@ -1071,7 +1166,7 @@ function AppContent() {
       if (!openingIsCurrent(generation)) return;
       setRoute(lockEnabled ? { name: 'locked' } : { name: 'landing' });
     }
-  }, [openingIsCurrent]);
+  }, [checkForUpdate, openingIsCurrent, quiesceForUpdateWall]);
 
   /** Open the decoy workspace: the 'duress' verdict.
    * Messaging is never started — the session is network-silent. */
@@ -1299,6 +1394,13 @@ function AppContent() {
     // at the top of this function with the push gate.
     db.relockWorkspace();
     session.setMode('real');
+    // The update answer belongs to the session that asked for it, and this
+    // one is over. It is a process singleton, so without this line a real
+    // session's 'soft' verdict stood in memory through the lock and the
+    // decoy chat list rendered the real session's "Update available" card
+    // from it. The getters refuse a non-real session as well; this is the
+    // half that also covers a real unlock inheriting a stale answer.
+    updateGate.forgetSession();
     setProfile(null);
     setRoute({ name: 'locked' });
   }, []);
@@ -1465,6 +1567,53 @@ function AppContent() {
       }
     });
   }, []);
+
+  // CHECK POINT 3: the app coming back to the foreground, throttled
+  // to once per six hours inside the gate. Its OWN listener, deliberately
+  // apart from the lock/transport one below: that branch is a chain of
+  // fail-closed early returns owned by the relock verdict, and a policy
+  // fetch has no business inside it.
+  //
+  // Only from a surface that PROVES a workspace is open — the same
+  // visible-surface fact the preview-lease renewal reads. `session.mode`
+  // defaults to 'real' at launch, so "not duress" alone would also match
+  // the lock screen and the landing screen, and a phone that foregrounds
+  // into the lock screen must stay network-silent.
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', next => {
+      if (next !== 'active') return;
+      if (session.mode !== 'real') return;
+      if (!surfaceFactsRef.current.provesWorkspaceOpen) return;
+      void (async () => {
+        const generation = openingGeneration.current;
+        const gate = await checkForUpdate('foreground');
+        if (gate !== 'blocked') return;
+        // EVERY PRECONDITION IS RE-READ AFTER THE AWAIT, NOT JUST THE
+        // SURFACE. The three guards above this task ran before a fetch that
+        // can take seconds, and all three can go stale in that window.
+        //
+        // The generation covers a relock and any other opening: an answer
+        // that belongs to the session that asked must not navigate for the
+        // one that replaced it. The session mode is checked again because
+        // it is the one that matters most and the generation is not
+        // literally it: a DURESS session that began while this was in
+        // flight would otherwise be shown the wall, and the wall's only
+        // control opens the REAL workspace. A decoy that ever showed this
+        // screen would also be telling a coercer which phone this is.
+        if (openingGeneration.current !== generation) return;
+        if (session.mode !== 'real') return;
+        if (!surfaceFactsRef.current.provesWorkspaceOpen) return;
+        // The wall says this build can no longer connect; this is what makes
+        // that sentence true on this path as well.
+        await quiesceForUpdateWall();
+        if (openingGeneration.current !== generation) return;
+        if (session.mode !== 'real') return;
+        setUpdateRecheck('idle');
+        setRoute({ name: 'updateRequired' });
+      })();
+    });
+    return () => subscription.remove();
+  }, [checkForUpdate, quiesceForUpdateWall]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', next => {
@@ -1873,10 +2022,89 @@ function AppContent() {
 
         {route.name === 'locked' && <LockScreen onUnlocked={applyVerdict} />}
 
+        {route.name === 'updateRequired' && (
+          <UpdateRequiredScreen
+            url={storeUrl(updatePolicy)}
+            message={updatePolicy?.message}
+            checking={updateRecheck === 'checking'}
+            stillOld={updateRecheck === 'stillOld'}
+            // "Check again" is the ONLY way out, and it re-enters the same
+            // opening the gate turned back: with the floor lowered (or the
+            // row deleted) the app opens exactly as it would have, and with
+            // no profile it lands on the landing screen. Nothing here
+            // pretends a workspace is already open.
+            onCheckAgain={() => {
+              if (updateRecheck === 'checking') return;
+              // THE WALL IS A REAL-SESSION SURFACE, AND THIS LINE IS WHAT
+              // MAKES THAT SAFE RATHER THAN MERELY INTENDED. `checkNow`
+              // short-circuits to 'ok' in duress, so in a decoy session
+              // `gate !== 'blocked'` is guaranteed and the branch below
+              // would run `beginWorkspaceOpening('real')`: one tap under
+              // coercion turning the decoy world into the real one, from
+              // the only control on the screen. The check point above no
+              // longer raises the wall over a decoy at all; this refuses
+              // the conversion even if some later path does.
+              if (session.mode !== 'real') return;
+              const generation = openingGeneration.current;
+              setUpdateRecheck('checking');
+              void (async () => {
+                const gate = await checkForUpdate('recheck');
+                setUpdateRecheck(gate === 'blocked' ? 'stillOld' : 'idle');
+                if (gate === 'blocked') return;
+                // A relock (or any other opening) won while this was in
+                // flight. Opening from here would dismiss whatever screen
+                // that put up, the lock screen included.
+                if (openingGeneration.current !== generation) return;
+                if (session.mode !== 'real') return;
+                if (routeRef.current.name !== 'updateRequired') return;
+                beginWorkspaceOpening('real');
+              })();
+            }}
+          />
+        )}
+
         {route.name === 'landing' && (
           <LandingScreen
-            onGetStarted={() => setRoute({ name: 'register' })}
-            // Recovery sits BESIDE registration: its own door, its own screen — the register flow
+            // CHECK POINT 1: before registration BEGINS, not after.
+            // A build the server will not talk to must not create an
+            // account it cannot then use — and this is the one check point
+            // that runs with no profile on the phone at all. The route
+            // still changes on a failed check: unknown allows.
+            //
+            // AND IT NAVIGATES ONLY IF THE SCREEN IT WAS PRESSED ON IS
+            // STILL THERE. This continuation can resolve seconds later, and
+            // a relock in that window leaves the app on the lock screen:
+            // an unguarded `setRoute` then dismissed the lock without any
+            // unlock, which is the fail-closed invariant the foreground
+            // branch pins for itself a few hundred lines up. The generation
+            // is the same fence that branch uses; the route check catches
+            // the ordinary case of someone navigating away meanwhile.
+            // A check in flight, said on the button itself. The busy state is
+            // cleared in a `finally` rather than on the navigating arm: every
+            // early return above is a case where this screen STAYS, and a flag
+            // left set there is a permanently dead door.
+            checkingUpdate={checkingUpdate}
+            onGetStarted={() => {
+              const generation = openingGeneration.current;
+              setCheckingUpdate(true);
+              void (async () => {
+                try {
+                  const gate = await checkForUpdate('getStarted');
+                  if (openingGeneration.current !== generation) return;
+                  if (routeRef.current.name !== 'landing') return;
+                  if (gate === 'blocked') setUpdateRecheck('idle');
+                  setRoute(
+                    gate === 'blocked'
+                      ? { name: 'updateRequired' }
+                      : { name: 'register' },
+                  );
+                } finally {
+                  setCheckingUpdate(false);
+                }
+              })();
+            }}
+            // Recovery sits BESIDE registration (item 3,
+            // §9 rule 3): its own door, its own screen — the register flow
             // stays identifier-free, structurally.
             onRecover={() => setRoute({ name: 'recover', from: 'landing' })}
           />
@@ -2615,6 +2843,10 @@ const DEPTH: Record<Route['name'], number> = {
   loading: 0,
   locked: 0,
   landing: 0,
+  // The wall sits at the pre-workspace floor with the lock and the landing
+  // screen: it is entered from every depth and left only by starting over,
+  // so neither direction should read as a descent.
+  updateRequired: 0,
   register: 1,
   chats: 1,
   // A sibling of chats, not a descent: switching tabs slides neither way.

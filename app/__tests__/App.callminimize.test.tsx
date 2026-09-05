@@ -95,7 +95,10 @@ test('every route decides the window: `full` is exactly the set that proves no w
     expect([name, CALL_OVERLAY_SURFACE[name]]).toEqual([name, proves ? 'window' : 'full']);
   }
   expect(names.filter(n => CALL_OVERLAY_SURFACE[n] === 'full').sort()).toEqual(
-    ['landing', 'loading', 'locked', 'recover', 'register'],
+    // updateRequired joins the pre-workspace set:
+    // the opening returns before `messaging.start`, so there is no
+    // workspace behind the wall for a minimized call to sit over.
+    ['landing', 'loading', 'locked', 'recover', 'register', 'updateRequired'],
   );
 });
 

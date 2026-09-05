@@ -570,8 +570,6 @@ test('5.1.2(i): the canonical sentence is on screen BEFORE consent can be given'
 test('the room surface QUOTES the constant — no per-surface variant', () => {
   // `toBe` alone would pass vacuously with both sides undefined; pin one
   // load-bearing fragment so the absence of the copy is a failure too.
-  expect(ROOM_COPY.consentDisclosure).toContain(
-    'relay ciphertext only.',
-  );
+  expect(ROOM_COPY.consentDisclosure).toContain('relay message ciphertext, not plaintext.');
   expect(ROOM_COPY.consentDisclosure).toBe(AI_DISCLOSURE_SENTENCE);
 });

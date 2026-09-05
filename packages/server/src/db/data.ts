@@ -20,11 +20,13 @@ import {
   CREW_MAX_MEMBERS,
   EMAIL_CODE_ATTEMPT_CAP,
   EMAIL_SUPPRESSION_TTL_SECONDS,
+  KIT_ZERO_MATERIAL_B64,
   MAX_VERIFIED_IDENTIFIERS_PER_GROUP,
   PHONE_SUPPRESSION_TTL_SECONDS,
   SESSIONS_USER_INDEX,
   USERNAME_RENAME_COOLDOWN_SECONDS,
   USERNAME_TOMBSTONE_TTL_SECONDS,
+  ClientPolicyResponse,
   type DeviceClass,
   type KyberPrekey,
   type OneTimePrekey,
@@ -148,6 +150,30 @@ export interface UserRecord {
    * walk deletes nothing for it, and the set dies with this row.
    */
   linkOfferNonces?: Set<string>;
+  /**
+   * PAPER RECOVERY KIT enrolment (§3). Three
+   * attributes, written and cleared only by `setKitEnrollment` /
+   * `clearKitEnrollment`, both of which demand an identity-key signature one
+   * layer up — a bearer token alone must never be able to enrol a kit (that
+   * would turn a stolen 30-day session into a permanent seizure, §0.1) nor
+   * strip one (a denial of service against exactly the person having the bad
+   * day).
+   *
+   * `kitVerifierDigest` is a DIGEST of a client-derived verifier: the server
+   * never sees the printed secret (§2 inv. 1). None of the three may ever be
+   * logged, echoed in an error, or served on any route — the salt is served
+   * only by `POST /v1/rebind/challenge`, and there beside a decoy of the same
+   * width for accounts that have no kit (rule 4; §2 inv. 7).
+   *
+   * `Kit`-prefixed, never `recovery`-prefixed: `recoveryGroupId` above belongs
+   * to the SHIPPED identifier-recovery verb, which is a different verb
+   * with different powers, and the two must never be conflated.
+   */
+  kitSalt?: string;
+  /** See `kitSalt`. SHA-256 of the client-derived verifier. */
+  kitVerifierDigest?: string;
+  /** See `kitSalt`. Unix ms; UX only — no policy reads it. */
+  kitEnrolledAt?: number;
 }
 
 /** The identity + signed-prekey material stored on the user row. */
@@ -235,6 +261,101 @@ export interface AccountGroupMember {
     expiresAt: number;
   };
 }
+
+// --- Paper recovery kit (§3) ---
+
+/**
+ * Which kit ceremony a pending challenge row belongs to (§3).
+ *
+ * The two are SEPARATE namespaces, not one with a flag, because they are
+ * reached by different callers under different authority: `kitEnroll` rows are
+ * minted for an authenticated account, `kitRebind` rows for an anonymous
+ * caller holding nothing but a ULID. A nonce minted for one must never be
+ * spendable at the other, and prefix-disjoint keys make that structural
+ * rather than a check someone can forget.
+ */
+export type KitChallengeKind = 'kitEnroll' | 'kitRebind';
+
+/**
+ * A pending kit challenge (§3). Per-request and single-use:
+ * concurrent challenges COEXIST, exactly as `AuthChallengeRecord` does and
+ * deliberately NOT as the one-outstanding `chal#` replace shape would — the
+ * rebind mint takes nothing but a public ULID, so a replace-on-mint row would
+ * let any stranger clobber the true owner's in-flight recovery at will (§2
+ * inv. 6, and the same defect the auth challenge key was reshaped to close).
+ */
+export interface KitChallengeRecord {
+  kind: KitChallengeKind;
+  /** The account the challenge was minted for. Stored on the row under
+   * `kitUserId`, NEVER `userId` — see `putKitChallenge`. */
+  userId: string;
+  challenge: string;
+  /** Unix seconds. */
+  expiresAt: number;
+}
+
+/**
+ * The one operation in this system that changes an account's identity key
+ * after birth (§3; §2.1's single
+ * exception). Everything else — `storeKeys`, every handler, every role —
+ * still refuses.
+ */
+export interface RebindIdentityInput {
+  /** The account being rebound. Its ULID does NOT change; that is the whole
+   * value of the kit over the shipped identifier-recovery verb — peers'
+   * address-book entries
+   * keep resolving. */
+  userId: string;
+  /** The key the caller read off the row BEFORE verifying the proof. The
+   * transaction conditions on it, so a concurrent write (a delete, a second
+   * rebind) loses rather than being overwritten. */
+  expectedIdentityKeyPub: string;
+  /** The new identity key and its first signed/kyber prekeys. One-time
+   * prekeys are deliberately NOT here: the client uploads them afterwards
+   * through the ordinary `PUT /v1/keys`, under an UNCHANGED immutability
+   * check. */
+  core: CoreKeys;
+  /** Unix ms, stamped on the claim rows this writes. */
+  nowMs: number;
+}
+
+/**
+ * `rebound` — committed; carries the FRESH pool generation the same Update
+ *   stamped, which is what orphans the entire old one-time prekey pool
+ *   atomically with the key swap. A bundle
+ *   read before the commit is self-consistent (old key, old generation); one
+ *   after finds the new key and no matching one-time prekey, which is the
+ *   honest signed-prekey-only fallback `getKeysHandler` already produces.
+ * `unchanged` — the two keys the CALLER passed are equal, and NOTHING ELSE.
+ *   Read that literally: this branch performs no read, so it asserts nothing
+ *   about the row — not that it exists, not that it holds the key, not that
+ *   it is live. Confirmed executably against an empty database. It is the
+ *   crashed client's retry answered as success (§0.5), and it is only sound
+ *   because THE CALLER MUST HAVE READ `expectedIdentityKeyPub` OFF THE ROW IN
+ *   THIS SAME REQUEST (see the contract on `rebindUserIdentity`). A handler
+ *   that passes the REQUESTED key here and then mints a session on
+ *   `unchanged` would mint one for an account it never confirmed exists.
+ *   The short-circuit is not merely an optimisation either: legs (a) and (c)
+ *   would address one item twice and DynamoDB would reject the whole
+ *   transaction as a ValidationException — a 500, not the promised 409.
+ * `key_in_use` — the NEW key is already claimed by a DIFFERENT account. The
+ *   409 the client answers by minting another keypair and retrying.
+ * `stale` — a genuine ConditionalCheckFailed on the row or on the old claim:
+ *   the row is gone, TOMBSTONED, its key moved under us (a delete or a second
+ *   rebind won the race), or its old key has no `idkey#` claim to tombstone —
+ *   or has one that names a DIFFERENT account, which is drift. The caller
+ *   re-reads; it never overwrites. It does NOT cover a cancellation reported
+ *   without detail — a TransactionConflict, a throttle, an empty
+ *   `CancellationReasons` — those THROW, because `stale` is terminal for this
+ *   caller (the signature no longer matches a moved key) and answering it to a
+ *   throttled write would tell a user in an emergency that their paper kit
+ *   failed. Same rule as `deleteUser`; same prior incident.
+ */
+export type RebindIdentityResult =
+  | { kind: 'rebound'; prekeyPoolGen: string }
+  | { kind: 'unchanged' }
+  | { kind: 'key_in_use' }
+  | { kind: 'stale' };
 
 /**
  * The `group#<groupId>` row: ≤3 members ⇒ one row, one
@@ -1378,6 +1499,71 @@ export interface DataLayer {
    */
   consumeAuthChallengeIfMatches(identityKeyPub: string, challenge: string): Promise<boolean>;
 
+  // --- Paper recovery kit (§3) ---
+  //
+  // UNREACHABLE FROM THE WIRE as of 2026-09-03. There is no route, no handler
+  // and no caller: the store lands additively so the handler can be reviewed
+  // against a store that already exists, on the dark-lane discipline
+  // §6 rollout step 1 used. The two DELETE paths this feature
+  // must also harden (`deleteUser`, `deleteGroupedUser`) are deliberately
+  // untouched here and are held for a supervised pass.
+  /**
+   * Enrol or REPLACE the account's kit material. `true` on success, `false`
+   * when the row is missing or tombstoned — a revoked device must not be able
+   * to arm a recovery for the account it was cut off from.
+   *
+   * Replacing needs no OLD kit: the identity-key signature the handler demands
+   * is the factor, and a user who still holds their key has already proved
+   * everything the old paper could prove.
+   */
+  setKitEnrollment(
+    userId: string,
+    salt: string,
+    verifierDigest: string,
+    nowMs: number,
+  ): Promise<boolean>;
+  /** Revoke the kit. Idempotent by contract — a user tearing up a piece of
+   * paper should not have to learn whether the server agreed about its
+   * existence. */
+  clearKitEnrollment(userId: string): Promise<void>;
+  /** Mint a pending kit challenge. Per-request rows COEXIST; issuing one can
+   * never invalidate another that is mid-flight (§2 inv. 6). */
+  putKitChallenge(rec: KitChallengeRecord): Promise<void>;
+  /**
+   * Atomically consume the pending challenge for exactly this (kind, account,
+   * nonce) triple, returning the row it spent so the caller can judge expiry
+   * from the same read that spent it. `undefined` if already spent, never
+   * issued, or issued for a different account or ceremony.
+   *
+   * Expiry is NOT checked here, and that is deliberate: the row is spent by
+   * the attempt whether or not it turns out to be stale, exactly as
+   * `consumeWsTicket` is, so a caller cannot retry a dead nonce until the
+   * clock suits them.
+   */
+  consumeKitChallengeIfMatches(
+    kind: KitChallengeKind,
+    userId: string,
+    challenge: string,
+  ): Promise<KitChallengeRecord | undefined>;
+  /**
+   * THE ONE PATH THAT CHANGES AN IDENTITY KEY AFTER BIRTH. See
+   * `RebindIdentityInput` / `RebindIdentityResult`, §3, and the
+   * amended doctrine comment at the head of `@tacendum/shared`'s `dto.ts`.
+   *
+   * One TransactWrite: the row rekeyed AND its prekey pool generation rolled,
+   * the OLD claim tombstoned, the NEW claim written — all or none.
+   *
+   * CALL ORDERING IS PART OF THE CONTRACT, not a suggestion. The caller MUST
+   * have (1) read `expectedIdentityKeyPub` off the row in this same request
+   * and (2) verified the kit proof BEFORE calling. Both matter: the four
+   * result kinds are distinguishable from one another and the `userId` is a
+   * PUBLIC ULID, so calling this before the proof check turns
+   * `key_in_use` / `stale` / `unchanged` into a three-way oracle over a bare
+   * identifier; and `unchanged` is decided from the caller's own two
+   * arguments without any read at all (see `RebindIdentityResult`).
+   */
+  rebindUserIdentity(input: RebindIdentityInput): Promise<RebindIdentityResult>;
+
   /**
    * WebSocket tickets: mint one bound to a user, then spend it
    * exactly once at `$connect`.
@@ -1839,10 +2025,19 @@ export interface DataLayer {
    */
   isAccountsUsernameFeatureEnabled(): Promise<boolean>;
   /**
-   * Write the INIT-leg row for a ceremony: the tuple the server minted for
-   * A to sign, recorded before any signature exists. The SAME
-   * one-transaction shape as `putLinkOffer` — init row plus the nonce ADDed
-   * to both named users' `linkOfferNonces` reverse sets (the ADD is
+   * The `policy#client` row: the minimum build each
+   * platform must be running, or `undefined` when there is no such row:
+   * absent AND malformed both, because a fleet gate is not a place to guess.
+   * Strongly consistent, for the flags' reason: a floor that lags its write is
+   * not a floor, and neither is an ungate that lags its delete. Deliberately
+   * NO write method.
+   */
+  getClientPolicy(): Promise<ClientPolicyRecord | undefined>;
+  /**
+   * Write the INIT-leg row for a ceremony (§2.2 step 4): the tuple the
+   * server minted for A to sign, recorded before any signature exists. The
+   * SAME one-transaction shape as `putLinkOffer` — init row plus the nonce
+   * ADDed to both named users' `linkOfferNonces` reverse sets (the ADD is
    * idempotent, so the later promote re-asserting the same nonce costs
    * nothing) — because an init row carries the same ULIDs an offer row does
    * and owes the sweep the same findability.
@@ -1919,8 +2114,8 @@ export interface DataLayer {
    * Amicable unlink: remove the member entry AND clear the user
    * row's `groupId` in one transaction under the epoch + acting-membership
    * ConditionExpressions — the acting member is bound INSIDE the transaction
-   * via `contains(memberIds,:actor)`, never by the precheck alone
-   *. The last member's departure deletes
+   * via `contains(memberIds,:actor)`, never by the precheck alone.
+   * The last member's departure deletes
    * the group row AND every identifier claim row its `identifierRefs`
    * reverse list names, in the same transaction, conditioned on the list
    * not having moved —: only the last member's exit takes
@@ -2572,9 +2767,51 @@ export const ACCOUNTS_PHONE_FEATURE_FLAG_KEY = `${FEATURE_FLAG_PREFIX}accounts-p
 export const ACCOUNTS_USERNAME_FEATURE_FLAG_KEY = `${FEATURE_FLAG_PREFIX}accounts-username`;
 
 /**
- * Identifier claim rows (`emailhash#v<K>#<hmac>`),
- * their suppression shadow (`emailsupp#…`), and pending recovery rows
- * (`recovery#<groupId>`) all live in the users table and are NOT
+ * The operator-written client-policy row: the one
+ * place that says what build a phone must be running before it may open its
+ * workspace. It lives in the users table for the flags' reason, a single
+ * strongly consistent GetItem, no TTL, and a new table would buy nothing but
+ * a second IAM surface, and it obeys the flags' discipline exactly: ABSENT =
+ * NO GATE (the shipped default), MALFORMED = NO GATE, and deliberately NO
+ * DataLayer write method, so raising the floor is one operator console write
+ * and ungating a fleet is one delete.
+ *
+ * Its own prefix rather than `feature#`, because it is not a boolean and its
+ * absence is not "off": absent means the fleet is ungated, which is the state
+ * the product ships in. `CLAIM_PREFIXES` below keeps it unaddressable as a
+ * user, like every other users-table resident that is not an identity.
+ */
+export const CLIENT_POLICY_PREFIX = 'policy#';
+export const CLIENT_POLICY_ROW_KEY = `${CLIENT_POLICY_PREFIX}client`;
+
+/**
+ * What the row holds, which is exactly what the route answers.
+ *
+ * The stored shape and the wire shape are ONE schema on purpose. The route is
+ * a passthrough (it reads a row and serialises it), so a row the response
+ * DTO would refuse is a row no client could read, and validating it once at
+ * the read is what turns an operator typo into "no gate" instead of into an
+ * unparseable answer on every phone.
+ */
+export type ClientPolicyRecord = ClientPolicyResponse;
+
+/**
+ * The item -> record read, shared by the store and its in-memory twin so both
+ * refuse the same typos.
+ *
+ * Unknown attributes are STRIPPED, not refused: an operator's scratch note on
+ * the row must not gate the fleet. A malformed one is refused whole rather
+ * than partially read: half a policy is a floor nobody wrote.
+ */
+export function parseClientPolicyItem(item: unknown): ClientPolicyRecord | undefined {
+  const parsed = ClientPolicyResponse.safeParse(item);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/**
+ * Identifier claim rows (`emailhash#v<K>#<hmac>` — §3),
+ * their suppression shadow (`emailsupp#…`, §3), and pending recovery rows
+ * (`recovery#<groupId>`, §3) all live in the users table and are NOT
  * addressable identities — the same row-existence-oracle / dead-letter-mint
  * refusal the group and flag prefixes carry. The claim-key HMAC derivation
  * itself lives in opaque-ref.ts (the one-module rule); this file only ever
@@ -2796,6 +3033,10 @@ export const CLAIM_PREFIXES = [
   // verb that may answer it.
   USERNAME_CLAIM_KEY_PREFIX,
   NAMESKEL_CLAIM_KEY_PREFIX,
+  //the operator-written client-policy row. Same
+  // users-table-resident, never-a-user class as the flags, guarded in the
+  // commit that creates it (the SET-not-check rule).
+  CLIENT_POLICY_PREFIX,
 ] as const;
 
 /** True when a caller-supplied id is really a claim row rather than a user. */
@@ -2819,7 +3060,31 @@ const authChallengeKey = (identityKeyPub: string, challenge: string): string =>
 const wsTicketKey = (ticket: string): string => `wst#${ticket}`;
 
 /**
- * Pending link-offer rows in the SESSIONS table (the
+ * Pending KIT challenge rows in the SESSIONS table (§3): two
+ * more prefix-disjoint namespaces beside `chal#`/`wst#`/`sess:`/`linkoffer#`/
+ * `emailcode#`, every reader re-checking the `kind` attribute rather than
+ * trusting key shape alone.
+ *
+ * KEYED BY A DIGEST OF (account, nonce), the `authChallengeKey` shape, so
+ * concurrent challenges coexist and one mint can never clobber another's. The
+ * rebind mint takes nothing but a bare public ULID, so a key that made issuing
+ * an overwrite would hand any stranger a lockout of the true owner's recovery
+ * — the identical defect that reshaped `chal#`, arriving here by a route the
+ * bearer-authenticated version never had.
+ *
+ * Exported for the sweep and consume tests, matching `LINK_OFFER_KEY_PREFIX`.
+ */
+export const KIT_ENROLL_CHALLENGE_KEY_PREFIX = 'echal#';
+/** See `KIT_ENROLL_CHALLENGE_KEY_PREFIX`. */
+export const KIT_REBIND_CHALLENGE_KEY_PREFIX = 'rchal#';
+const kitChallengeKey = (kind: KitChallengeKind, userId: string, challenge: string): string => {
+  const prefix =
+    kind === 'kitEnroll' ? KIT_ENROLL_CHALLENGE_KEY_PREFIX : KIT_REBIND_CHALLENGE_KEY_PREFIX;
+  return `${prefix}${createHash('sha256').update(userId).update('|').update(challenge).digest('hex')}`;
+};
+
+/**
+ * Pending link-offer rows in the SESSIONS table (§2.2, the
  * challenge-row shape): their own namespace beside `chal#`/`wst#`/`sess:`,
  * all mutually prefix-disjoint, every reader re-checking the `kind`
  * attribute rather than trusting key shape alone. Keyed by the server-minted
@@ -4952,6 +5217,327 @@ export function makeTestOnlyDataLayer(
       }
     },
 
+    // --- Paper recovery kit (§3) ---
+    // Nothing below is reachable from the wire: no route, no handler, no
+    // caller. See the DataLayer declarations for why it lands dark.
+
+    async setKitEnrollment(userId, salt, verifierDigest, nowMs) {
+      // NOT A CLAIM ROW. `getUserById` refuses these for the same reason
+      // (data.ts's `isClaimKey` / `CLAIM_PREFIXES` doctrine): without the
+      // guard, `setKitEnrollment('idkey#<b64>', …)` passes
+      // `attribute_exists(userId) AND attribute_not_exists(tombstoned)` on a
+      // live claim row and returns `true` iff that identity key is registered
+      // and unrevoked — a registration oracle — while writing kit attributes
+      // onto a bookkeeping row. The DTOs are ULID-bound today, which was true
+      // of every path this guard was later retrofitted to.
+      if (isClaimKey(userId)) return false;
+      // NO ALL-ZERO MATERIAL. A salt or digest of 32 zero bytes is the one
+      // value an attacker gets for free; a kit armed with it is not a kit.
+      // `KitEnrollRequest` refuses it on the wire, and the guard lands HERE
+      // too so a caller that never went through that schema cannot arm one —
+      // the SET-not-check rule: rows exist from this phase on, so the guard
+      // lands in the same commit as the rows.
+      //
+      // SCOPE, honestly: this refuses the two values the store can recognise.
+      // It cannot refuse "the digest OF the all-zero verifier", because the
+      // store does not know the digest scheme — that check belongs to the kit
+      // handler, which computes it. It is defence in depth either way: the
+      // enrol and disenrol preimages now carry SEPARATE domain tags
+      // so a disenrol signature is not an enrolment
+      // signature for zeroed material and never was redeemable as one.
+      if (salt === KIT_ZERO_MATERIAL_B64 || verifierDigest === KIT_ZERO_MATERIAL_B64) return false;
+      try {
+        await doc.send(
+          new UpdateCommand({
+            TableName: TABLES.users,
+            Key: { userId },
+            UpdateExpression:
+              'SET kitSalt = :s, kitVerifierDigest = :v, kitEnrolledAt = :t',
+            ExpressionAttributeValues: { ':s': salt, ':v': verifierDigest, ':t': nowMs },
+            // The row must exist AND be live. A revoked device's row survives
+            // as a tombstone (§2.3) and must not be able to arm
+            // a recovery for the account it was cut off from — that would
+            // hand a lost-or-stolen phone a second way back in, which is the
+            // exact thing the revoke was for.
+            ConditionExpression: 'attribute_exists(userId) AND attribute_not_exists(tombstoned)',
+          }),
+        );
+        return true;
+      } catch (err) {
+        // Reported, not thrown: a missing or dead row is a client-visible
+        // outcome, and the adapter's generic 500 would say nothing useful.
+        if (errName(err) === 'ConditionalCheckFailedException') return false;
+        throw err;
+      }
+    },
+
+    async clearKitEnrollment(userId) {
+      // NOT A CLAIM ROW — see `setKitEnrollment`. A REMOVE against a live
+      // claim row would strip attributes off a bookkeeping row, and its
+      // `attribute_exists(userId)` condition would answer the same
+      // is-this-key-registered question by whether it threw.
+      if (isClaimKey(userId)) return;
+      try {
+        await doc.send(
+          new UpdateCommand({
+            TableName: TABLES.users,
+            Key: { userId },
+            UpdateExpression: 'REMOVE kitSalt, kitVerifierDigest, kitEnrolledAt',
+            // Deliberately NOT conditioned on an enrolment existing: revoking
+            // a kit that is not there is a success, not a 404. The condition
+            // is only that this is a real row, so a REMOVE can never mint a
+            // bare user row for a ULID nobody registered.
+            ConditionExpression: 'attribute_exists(userId)',
+          }),
+        );
+      } catch (err) {
+        // No row: nothing to revoke; idempotent no-op by contract.
+        if (errName(err) !== 'ConditionalCheckFailedException') throw err;
+      }
+    },
+
+    async putKitChallenge(rec) {
+      // Unconditional Put onto a key that already binds THIS (account, nonce)
+      // pair: minting a challenge can only ever create its own row, never
+      // overwrite a sibling's. Rows self-expire via TTL two minutes out and
+      // minting is per-IP rate limited, so the coexistence is bounded.
+      //
+      // NO `userId` ATTRIBUTE ON THIS ROW — the `linkoffer#`/`emailcode#`
+      // rule, and it is load-bearing here too: the sessions table's
+      // user-index is partitioned on `userId`, so naming it that would put
+      // kit challenges in that index and have `deleteSessionsForUser`
+      // batch-delete an in-flight enrolment on every sign-in. It rides as
+      // `kitUserId`, the `ticketUserId` spelling.
+      await doc.send(
+        new PutCommand({
+          TableName: TABLES.sessions,
+          Item: {
+            token: kitChallengeKey(rec.kind, rec.userId, rec.challenge),
+            kind: rec.kind,
+            kitUserId: rec.userId,
+            challenge: rec.challenge,
+            expiresAt: rec.expiresAt,
+          },
+        }),
+      );
+    },
+
+    async consumeKitChallengeIfMatches(kind, userId, challenge) {
+      try {
+        // Atomic single-use, the `consumeAuthChallengeIfMatches` shape:
+        // read-then-delete would let two concurrent callers both pass the
+        // read. `ALL_OLD` hands back the row the delete just spent, so the
+        // caller judges expiry from the same operation that consumed it
+        // rather than from a second read that could disagree.
+        //
+        // The condition re-checks `kind` and the account even though the
+        // digest key already binds them — every reader of this namespace
+        // checks the attributes rather than trusting key shape alone.
+        const res = await doc.send(
+          new DeleteCommand({
+            TableName: TABLES.sessions,
+            Key: { token: kitChallengeKey(kind, userId, challenge) },
+            ConditionExpression: '#k = :k AND kitUserId = :u AND challenge = :c',
+            ExpressionAttributeNames: { '#k': 'kind' },
+            ExpressionAttributeValues: { ':k': kind, ':u': userId, ':c': challenge },
+            ReturnValues: 'ALL_OLD',
+          }),
+        );
+        const item = res.Attributes;
+        if (!item) return undefined;
+        return {
+          kind,
+          userId: item.kitUserId as string,
+          challenge: item.challenge as string,
+          expiresAt: item.expiresAt as number,
+        };
+      } catch (err) {
+        if (errName(err) === 'ConditionalCheckFailedException') return undefined;
+        throw err;
+      }
+    },
+
+    async rebindUserIdentity(input) {
+      const { userId, expectedIdentityKeyPub, core, nowMs } = input;
+
+      // NOT A CLAIM ROW — see `setKitEnrollment`. `stale` rather than a throw
+      // because it is the outcome the uniform 403 collapses correctly, and
+      // because the answer must not depend on whether the claim exists.
+      if (isClaimKey(userId)) return { kind: 'stale' };
+
+      // OLD == NEW SHORT-CIRCUIT, BEFORE THE TRANSACTION (§0.5). This is the
+      // crashed client's retry: it verified its proof, the transaction
+      // committed, and the response never arrived. Answering success here is
+      // not merely kind — legs (a) and (c) below would address the SAME item
+      // twice and DynamoDB rejects the whole transaction as a
+      // ValidationException, which surfaces as a 500 rather than as anything
+      // the client could act on.
+      //
+      // IT READS NOTHING. This compares two CALLER-SUPPLIED strings, so
+      // `unchanged` asserts nothing whatever about the row — see the contract
+      // on the `rebindUserIdentity` declaration and on `RebindIdentityResult`.
+      if (expectedIdentityKeyPub === core.identityKeyPub) return { kind: 'unchanged' };
+
+      const oldClaimKey = idkeyClaimKey(expectedIdentityKeyPub);
+      const newClaimKey = idkeyClaimKey(core.identityKeyPub);
+      // A FRESH POOL GENERATION IN THE SAME UPDATE AS THE KEY
+      // This is what disarms the chimera bundle atomically
+      // instead of by ordering: `getKeysHandler` consumes one-time prekeys
+      // strictly under the generation it read off the row, so rolling it here
+      // orphans the entire old pool at the instant the key changes. A bundle
+      // read before the commit is self-consistent (old key, old pool); one
+      // after finds the new key and no matching one-time prekey — the honest
+      // signed-prekey-only fallback the handler already produces on
+      // exhaustion. Sweeping the orphaned rows is housekeeping, not a control.
+      const poolGen = randomUUID();
+
+      // THE ITEM INDICES ARE NAMED AND CHECKED, not remembered. The catch
+      // below reads `CancellationReasons` positionally, which is only sound
+      // while the shape is fixed — and the later phase is already
+      // committed to adding a fourth item (clear a rebound grouped member's
+      // roster certs, bump the group epoch). A fourth item appended without
+      // moving these constants would silently turn the 409 into the wrong
+      // answer, and no test would go red; the length assertion below turns
+      // that into a loud failure on the day it happens.
+      const ROW = 0;
+      const OLD_CLAIM = 1;
+      const NEW_CLAIM = 2;
+      const items = [
+        {
+          // (a) The row: new key material AND a rolled pool generation.
+          //
+          // THE ONE SET OF `identityKeyPub` AFTER BIRTH in this system
+          // (§2.1's single exception,
+          // §3). Conditioned on the key the caller read, so a
+          // delete or a second rebind racing us LOSES rather than being
+          // overwritten — the caller re-reads and decides again.
+          //
+          // AND `attribute_not_exists(tombstoned)`, the same guard
+          // `setKitEnrollment` carries, for the same reason and then some. A
+          // revoke (`tombstoneAgentBindings`, the roster revoke)
+          // tombstones BOTH the user row and its claim; without this
+          // condition a kit armed BEFORE the revoke — the normal case, since
+          // you print the paper while things are fine and revoke later
+          // precisely because the phone was lost — would rekey the row, write
+          // a FRESH untombstoned claim for the new key, and leave the account
+          // able to sign in (nothing in `authHandler` inspects
+          // `user.tombstoned`) while `userAccountState` still answers
+          // `tombstoned` and every enqueue refuses. That split state is worse
+          // than either clean answer. If a paper kit is ever ruled to
+          // OUTRANK a device revoke, that is a §0 decision and
+          // it must clear the row tombstone inside this same transaction.
+          Update: {
+            TableName: TABLES.users,
+            Key: { userId },
+            UpdateExpression:
+              'SET registrationId = :r, identityKeyPub = :ik, signedPrekey = :sp, kyberPrekey = :kp, prekeyPoolGen = :g',
+            ExpressionAttributeValues: {
+              ':r': core.registrationId,
+              ':ik': core.identityKeyPub,
+              ':sp': core.signedPrekey,
+              ':kp': core.kyberPrekey,
+              ':g': poolGen,
+              ':old': expectedIdentityKeyPub,
+            },
+            ConditionExpression:
+              'attribute_exists(userId) AND attribute_not_exists(tombstoned) AND identityKeyPub = :old',
+          },
+        },
+        {
+          // (b) The OLD claim, tombstoned — an UPDATE under
+          // `attribute_exists(userId)`, EXACTLY the shape
+          // `tombstoneIdentityKey` uses, and for the rule that function
+          // states verbatim: "Only an EXISTING claim can be tombstoned — this
+          // must never mint a bare tombstone row for a key that was never
+          // registered."
+          //
+          // THE DRAFT MADE THIS AN UNCONDITIONAL WHOLE-ITEM PUT, justified by
+          // "a legacy row minted through `createUser` has no claim at all".
+          // That path cannot exist in production: `createUser` is on
+          // `TestOnlyDataLayer`, and production births a row only through
+          // `getOrCreateUserByIdentityKey`'s claim transaction, which writes
+          // row and claim together. What the Put DID do was replace the item
+          // (discarding the claim's birth `createdAt`, and any attribute a
+          // later phase adds), mint the very tombstone this rule forbids, and
+          // — in any drift state where the key's claim names a DIFFERENT
+          // account — silently repoint and revoke that other account's live
+          // claim, from a route that will be anonymous. A missing claim here
+          // is drift worth failing loudly on, which is what the roster revoke
+          // helper says too; it now answers `stale` and the caller re-reads.
+          //
+          // `claimedUserId = :self` closes the last of it: the claim must
+          // already NAME the account being rebound. Without it, the drift
+          // state where the old key's claim belongs to someone ELSE would
+          // still let this transaction set `tombstoned` on that other
+          // account's LIVE claim — a cross-account identity-key revocation
+          // reachable from a route that will be anonymous. On the legitimate
+          // path the condition is free: a row born through
+          // `getOrCreateUserByIdentityKey` has a claim naming it.
+          Update: {
+            TableName: TABLES.users,
+            Key: { userId: oldClaimKey },
+            UpdateExpression: 'SET tombstoned = :true',
+            ExpressionAttributeValues: { ':true': true, ':self': userId },
+            ConditionExpression: 'attribute_exists(userId) AND claimedUserId = :self',
+          },
+        },
+        {
+          // (c) The NEW claim. `attribute_not_exists` is the 409: one
+          // account per identity key, held by a base-table conditional
+          // write and no index — an index over identity keys would be
+          // the enumeration primitive the whole account model deletes.
+          // It also refuses a TOMBSTONED claim, so a revoked key can
+          // never be rebound onto a live account.
+          Put: {
+            TableName: TABLES.users,
+            Item: {
+              userId: newClaimKey,
+              claimedUserId: userId,
+              createdAt: nowMs,
+            },
+            ConditionExpression: 'attribute_not_exists(userId)',
+          },
+        },
+      ];
+      if (items.length !== 3) {
+        throw new Error('rebind transaction shape changed; update the CancellationReasons indices');
+      }
+
+      try {
+        await doc.send(new TransactWriteCommand({ TransactItems: items }));
+        return { kind: 'rebound', prekeyPoolGen: poolGen };
+      } catch (err) {
+        const name = errName(err);
+        if (name !== 'TransactionCanceledException' && name !== 'ConditionalCheckFailedException') {
+          throw err;
+        }
+        const reasons =
+          (err as { CancellationReasons?: { Code?: string }[] }).CancellationReasons ?? [];
+        // ONLY A GENUINE ConditionalCheckFailed IS AN OUTCOME. DynamoDB raises
+        // TransactionCanceledException for TransactionConflict,
+        // ThrottlingError, ProvisionedThroughputExceeded and friends too, and
+        // mapping those to a terminal answer was exactly the `deleteUser`
+        // defect the gate caught (see the comment there, and on
+        // `sendRosterTransact`, which returns reasons only when one of them is
+        // a ConditionalCheckFailed and throws otherwise). `stale` is terminal
+        // for this caller — on a genuine stale the row's key has moved, so the
+        // signature no longer matches and the only honest answer is the
+        // uniform 403 — so a throttled write answered as `stale` would tell a
+        // user in an emergency that their paper kit failed. An EMPTY reasons
+        // array is that shape, and it now throws.
+        const failed = (index: number): boolean => reasons[index]?.Code === 'ConditionalCheckFailed';
+        // Index 2 (the new claim) is read FIRST: when it and the row both
+        // refuse, the answer is `key_in_use`, and the memory twin mirrors that
+        // precedence.
+        if (failed(NEW_CLAIM)) return { kind: 'key_in_use' };
+        // Index 0 is the row: gone, tombstoned, or its key moved under us.
+        // Index 1 is the old claim: absent, or naming a DIFFERENT account.
+        // Either way it is drift, and the caller re-reads.
+        if (failed(ROW) || failed(OLD_CLAIM)) return { kind: 'stale' };
+        throw err;
+      }
+    },
+
     async putWsTicket(rec) {
       await doc.send(
         new PutCommand({
@@ -6726,6 +7312,21 @@ export function makeTestOnlyDataLayer(
       // stay dark until an operator writes this row; deleting it is the
       // class kill switch AND the rotation-window brake.
       return res.Item?.enabled === true;
+    },
+
+    async getClientPolicy() {
+      const res = await doc.send(
+        new GetCommand({
+          TableName: TABLES.users,
+          Key: { userId: CLIENT_POLICY_ROW_KEY },
+          ConsistentRead: true,
+        }),
+      );
+      // The flags' read, inverted where it matters: those fail CLOSED because
+      // an unreadable flag must keep a dark route dark, while an unreadable
+      // policy must NOT invent a floor: a row that does not parse is answered
+      // as no row, and the fleet stays ungated.
+      return parseClientPolicyItem(res.Item);
     },
 
     async putLinkOffer(rec) {

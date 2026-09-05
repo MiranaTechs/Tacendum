@@ -38,6 +38,33 @@ describe('http adapter', () => {
     expect(await res.json()).toEqual({ ok: true });
   });
 
+  it('serves GET /v1/client-policy with no credential, through the ordinary dispatch', async () => {
+    // Registered as a real table entry rather than as an inline special case
+    // like /health, so this proves the whole request path (routing, the body
+    // cap, the error wrapper) and not just that a string matched. The route
+    // shipped in the AWS dispatch table and CDK before it shipped here once
+    // already, which is the drift the parity test pins on the deployed side
+    // and this pins on the local one.
+    // The memory db holds no policy row, so the handler falls through to
+    // `TACENDUM_MIN_BUILD_IOS` / `_ANDROID`, a supported operator lever that
+    // any shell or CI job may be exporting. Neutralised so this pins the
+    // SHIPPED default rather than the ambient one.
+    vi.stubEnv('TACENDUM_MIN_BUILD_IOS', '');
+    vi.stubEnv('TACENDUM_MIN_BUILD_ANDROID', '');
+    let res: Response;
+    try {
+      res = await fetch(`${base}/v1/client-policy`);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ios: { minBuild: 0 }, android: { minBuild: 0 } });
+    expect(res.headers.get('cache-control')).toBe('max-age=300');
+    // No AGPL §13 offer: the offer is scoped to the routes AuthFn hosts when
+    // deployed, and this one rides HttpFn.
+    expect(res.headers.get('link')).toBeNull();
+  });
+
   it('routes DELETE /v1/account behind auth (401 without a token, not 404)', async () => {
     const res = await fetch(`${base}/v1/account`, { method: 'DELETE' });
     expect(res.status).toBe(401);
@@ -83,7 +110,7 @@ describe('http adapter', () => {
   });
 
   it('does NOT crash on a malformed percent-encoded URL (regression)', async () => {
-    // %%%A is invalid UTF-8 percent-encoding -> decodeURIComponent throws.
+    // %E0%A4%A is invalid UTF-8 percent-encoding -> decodeURIComponent throws.
     const res = await fetch(`${base}/v1/keys/%E0%A4%A`);
     expect([400, 401]).toContain(res.status); // handled, not a dropped socket
     // Server is still alive:

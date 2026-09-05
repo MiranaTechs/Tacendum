@@ -29,6 +29,12 @@ import {
   GroupRosterEnvelope,
   GroupSettingsEnvelope,
 } from '@tacendum/shared/group-envelope';
+// The ROUNDS detail field (§3.1). Subpath for the reason the room
+// envelopes are: the package's main entry — which the server imports — stays
+// byte-identical. Two fragments, deliberately: `roundDetail` is the receive
+// side (`.catch(undefined)`), `roundDetailStrict` is the compose side, and
+// `encodeEnvelope` below is where the difference is spent.
+import { roundDetail, roundDetailStrict } from '@tacendum/shared/rounds';
 import { z } from 'zod';
 
 /** How a structured body announces itself. Anything not starting with this
@@ -519,6 +525,29 @@ export const ReplyEnvelope = z.object({
   /** True when the quoted message was sent by the REPLIER themself. */
   ofs: z.boolean(),
   text: bodyText,
+  /**
+   * THE ROUNDS DETAIL (§3.1), canonical in
+   * `@tacendum/shared/rounds` so the app, the CLI and the tests share ONE
+   * fragment. `text` is then the BRIEF — what a phone shows — and this is the
+   * full answer behind a tap. Read by `detailText` below and by nothing else:
+   * the two words-of-a-message readers under it are untouched by this field
+   * and must stay that way (their own comments hold the argument).
+   *
+   * TWO CONSEQUENCES, both intended and both stated here rather than
+   * discovered later:
+   *
+   * 1. `encodeEnvelope` and `parseEnvelope` share ONE schema, so this build's
+   *    own composer is now bounded at `DETAIL_MAX` for `d`. This build never
+   *    composes one (there is no UI for it), so the bound costs nothing today
+   *    — and it means the number cannot be raised later without a build.
+   * 2. `.catch(undefined)` collapses a malformed detail on the RECEIVE side,
+   *    which is §5.5's rule: a parser refusal on a one-way ratchet is a
+   *    permanent loss, so the detail costs itself and never the words. The
+   *    COMPOSE-side refusal therefore cannot live in this schema — `.catch`
+   *    swallows rather than throws — and lives instead beside the mention
+   *    count in `encodeEnvelope`, which holds the same argument verbatim.
+   */
+  d: roundDetail,
 });
 export type ReplyEnvelope = z.infer<typeof ReplyEnvelope>;
 
@@ -827,6 +856,31 @@ export function encodeEnvelope(envelope: Envelope): string {
       throw new EnvelopeRefusedError('mention', ['text', 'who']);
     }
   }
+  // THE COMPOSE-STRICT HALF OF THE ROUNDS DETAIL (§3.1), on
+  // the mention rule's exact terms and for a sharper version of its reason.
+  // `d` is `.optional().catch(undefined)` because the receive side must stay
+  // permissive — but `.catch` SWALLOWS rather than throws, so a refusal
+  // expressed inside the schema is not a refusal at all: the `safeParse` above
+  // SUCCEEDS on an over-cap or sentinel-leading detail, `d` collapses to
+  // `undefined`, and this function would emit a brief-only body with no signal
+  // to anyone. That is a silent content loss at compose time, which is the one
+  // thing this function exists to make impossible.
+  //
+  // The CALLER's value is what is checked, deliberately: `parsed.data.d` has
+  // already been through the `.catch` and can only ever look fine. `d` is only
+  // a field on the kinds that carry it, so a body without one is untouched and
+  // every already-shipped composer keeps its exact behaviour.
+  //
+  // The CLI's round fan-out never reaches this throw — it asks
+  // `roundDetailStrict.safeParse(d).success` first and sends brief-only with a
+  // `detail-dropped` journal classification (R22), because a throw inside a
+  // fan-out would lose the whole answer rather than just its detail.
+  if (parsed.data.tcm === 'reply' || parsed.data.tcm === 'msg') {
+    const supplied = (envelope as { d?: unknown }).d;
+    if (supplied !== undefined && !roundDetailStrict.safeParse(supplied).success) {
+      throw new EnvelopeRefusedError(parsed.data.tcm, ['d']);
+    }
+  }
   // `parsed.data`, not the argument: zod strips unknown keys, so what is
   // stringified is exactly what the receiver will reconstruct. Encoding the
   // raw argument would let a stray property ride the wire unchecked.
@@ -1042,6 +1096,38 @@ export function displayText(
     return isCarrierEnvelope(body) ? '' : UNSUPPORTED_TEXT;
   }
   return body;
+}
+
+/**
+ * THE DETAIL of a message, or null when it has none (§3.1).
+ *
+ * A round answer is a BRIEF and a DETAIL written by one model in one message
+ * under one sender: the brief is the words — what the bubble, the chat list
+ * and the lock screen show, through the readers above, unchanged — and the
+ * detail is the full answer the disclosure control reveals. The two nouns are
+ * fixed (§2): brief, detail, full answer. Never "summary".
+ *
+ * A SEPARATE READER, not a second content switch. It mirrors the unwrap arms
+ * of the words reader above and NOTHING else, for the reason §5.2 gives: a
+ * body's structure is decided in one place. Adding an arm here that is not
+ * there — or leaving one out that is — would be two switches disagreeing about
+ * what a body is, which is the defect that shape exists to prevent.
+ *
+ * Returns null for every kind without a detail, so a caller can ask about any
+ * body. It never returns `''`: the shared fragment refuses an empty detail,
+ * because a disclosure control over nothing is a lie about there being more.
+ */
+export function detailText(body: string): string | null {
+  const envelope = parseEnvelope(body);
+  if (envelope?.tcm === 'reply') return envelope.d ?? null;
+  if (envelope?.tcm === 'msg') return envelope.d ?? null;
+  // A room message's detail is the detail of what it wraps, exactly as its
+  // words are (§5.2) — the wrapper carries routing and the origin claim, never
+  // content.
+  if (envelope?.tcm === 'grp.msg') return detailText(envelope.b);
+  // A device leg's, on the same terms (§2.4).
+  if (envelope?.tcm === 'dev.msg') return detailText(envelope.b);
+  return null;
 }
 
 /**

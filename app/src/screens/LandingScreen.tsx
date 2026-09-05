@@ -3,11 +3,24 @@ import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useTheme } from '../theme';
 import { BrandLockup } from '../ui/BrandMark';
 import { PrimaryButton, TextAction } from '../ui/primitives';
+import { UPDATE_COPY } from '../updateGateCopy';
 import { usePaneWidth } from '../windowClass';
 
 interface Props {
   onGetStarted: () => void;
-  /** "Recover my account grouping" — BESIDE
+  /**
+   * The update check this door runs before registration begins
+   * (check point 1) is out.
+   *
+   * It can take seconds — a slow link spends the gate's whole three second
+   * ceiling — and for every one of them the button used to sit there looking
+   * pressable and doing nothing, which is how a person ends up pressing it
+   * twice. Busy is the same treatment the wall's "Check again" already gets,
+   * for the same reason: the only control on the screen has to say what it
+   * is doing.
+   */
+  checkingUpdate?: boolean;
+  /** "Recover my account grouping" (item 3) — BESIDE
    * registration, never in it: its own door on this surface, its own
    * screen, and the register flow stays identifier-free. */
   onRecover: () => void;
@@ -29,7 +42,11 @@ const PROMISE = 'No feed. No directory. No contacts uploaded.';
  * here — the site's ambient glyph field is deliberately absent, so the first
  * screen is already as quiet as the product it promises.
  */
-export function LandingScreen({ onGetStarted, onRecover }: Props) {
+export function LandingScreen({
+  onGetStarted,
+  checkingUpdate = false,
+  onRecover,
+}: Props) {
   const t = useTheme();
   // The PANE's width. Landing is a full-window route at
   // every width (a pinned fact), so this answers the window today — the point
@@ -79,6 +96,8 @@ export function LandingScreen({ onGetStarted, onRecover }: Props) {
         <PrimaryButton
           label="Get started"
           onPress={onGetStarted}
+          busy={checkingUpdate}
+          busyLabel={UPDATE_COPY.checking}
           testID="landing-get-started"
           style={styles.cta}
         />

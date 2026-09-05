@@ -152,6 +152,18 @@ export function CallOverlay(props: CallOverlayProps): React.JSX.Element | null {
   /** The full screen's gate, unchanged: `connected` is the machine's word for
    * media flowing, `peerVideo` the far end's own report of its camera. */
   const remoteVideoLive = state.name === 'connected' && call?.peerVideo === true;
+  /** The full screen's second gate, unchanged too: whether there is a remote
+   * track for the peer's PHOTO to stand in for. Before the call connects
+   * there is none, and a cover-cropped face where the remote camera goes is
+   * what a live remote camera looks like.
+   * `reconnecting` counts as connected: the track exists and stopped
+   * flowing, which is the case the backdrop was built for. So does `ending`,
+   * which is why the test is `connectedAt` rather than a list of phase names:
+   * the fact wanted is whether this call ever had remote media, and the
+   * context already carries it. A call cancelled before it connected has no
+   * `connectedAt`, so it still ends on the letters. */
+  const mediaEstablished =
+    state.name === 'connected' || state.name === 'reconnecting' || call?.connectedAt != null;
 
   // The drag, above the idle early-return like every other hook here. The
   // box follows the call's shape and the keyboard: the peer's camera coming
@@ -225,7 +237,10 @@ export function CallOverlay(props: CallOverlayProps): React.JSX.Element | null {
             <PeerBackdrop
               peerId={call.peerId}
               peerName={peerName}
-              photoB64={peerAvatarB64}
+              // Withheld until there is media for it to stand in for; the
+              // pine ground and the monogram stay either way, so the window
+              // is never the bare black of a track-less surface.
+              photoB64={mediaEstablished ? peerAvatarB64 : null}
               compact
             />
           )}

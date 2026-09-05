@@ -223,6 +223,9 @@ const heavy = [
   'packages/cli/test/gate.unit-program-registered.test.ts',
   'packages/cli/test/gate.unreadable-profile.test.ts',
   'packages/cli/test/gate.value-redaction.test.ts',
+  // The `inbox --detail` surface test: it asserts on the REAL CLI's stdout,
+  // so every case is another `node --import tsx main.ts` child.
+  'packages/cli/test/inbox.rounds.test.ts',
   'packages/cli/test/keychain.test.ts',
   'packages/cli/test/mcp.test.ts',
   'packages/cli/test/run.test.ts',

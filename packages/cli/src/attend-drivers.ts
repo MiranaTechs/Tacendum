@@ -188,6 +188,20 @@ export interface DriverIo {
    * its non-literal-specifier rule).
    */
   sdkImport?: SdkImport;
+  /**
+   * THE RESOLVED PARENT ENVIRONMENT, for the one driver that must READ it
+   * before it spawns (`geminiDriver`'s run-time credential foreclosure,
+   * §3.8). Every other driver only ever WRITES an env delta
+   * through `spawn` above, so none of them needs this and none of them
+   * takes it.
+   *
+   * A seam rather than a bare `process.env` read for `sdkImport`'s exact
+   * reason: the gate it feeds is a REFUSAL, and a refusal proved only by
+   * mutating the test process's own environment is a test that leaks into
+   * every file vitest runs in the same worker. Absent means `process.env`,
+   * which is what a supervised turn actually resolves.
+   */
+  env?: Readonly<Record<string, string | undefined>>;
 }
 
 export interface HostDriver {
@@ -203,12 +217,15 @@ export interface HostDriver {
 /**
  * The per-host argv.
  *
- * THE TWO HOSTS PUT CAPS ON OPPOSITE SIDES OF THE TARGET. That is not a
+ * THE HOSTS PUT CAPS ON OPPOSITE SIDES OF THE TARGET. That is not a
  * stylistic drift to be tidied into one shape — it is the difference
- * between the two argument parsers, and flattening it breaks codex:
+ * between the argument parsers, and flattening it breaks codex:
  *
  *   codex   [exec, ...caps, ...target]   target = `resume <id>` — a SUBCOMMAND
  *   claude  [-p,   ...target, ...caps]   target = `--resume <id>` — a FLAG
+ *   gemini  [      ...target, ...caps]   target = `--resume=<id>` — a FLAG,
+ *                                        and NO `-p`: headless is detected
+ *                                        from non-TTY stdio (§3.8)
  *
  * `codex exec` is a clap command with subcommands, so every host-level
  * option — `-s/--sandbox`, `-m`, `-c`, `--profile` — belongs to `exec` and
@@ -297,12 +314,42 @@ export interface HostDriver {
  * failure — where `r.host` would produce codex's argv for claude's binary,
  * which is a usage error the operator sees as "the turn failed (exit N)".
  *
- * ONE FUNCTION FOR BOTH HOSTS, ON PURPOSE, even though each driver below
+ * ONE FUNCTION FOR EVERY HOST, ON PURPOSE, even though each driver below
  * only ever takes its own branch: the caps asymmetry above is a single
- * incident record ABOUT THE PAIR of shapes, the key-derivation fallbacks are
- * the same third defence for both, and the session-argv gate proves both
- * shapes through this one signature.
+ * incident record ABOUT THE SET of shapes, the key-derivation fallbacks are
+ * the same third defence for all of them, and the session-argv gate proves
+ * every shape through this one signature.
  */
+/**
+ * THE GEMINI TARGET TOKEN, DERIVED ONCE FROM THE ROUTE — never re-read off a
+ * built argv (R25). `turnArgv`'s gemini branch and `geminiDriver` both call
+ * this, so the FORM the driver reasons about is the form attend actually
+ * emitted. Reading it back off argv[0] instead let an operator caps profile
+ * beginning `--resume=…` — which `attend enable` has no rule against — make
+ * the driver believe a target was tried, buying a second byte-identical
+ * spawn on every 42 and writing `ownSessionStarted` from a caps word.
+ *
+ * The empty-value guards are `turnArgv`'s, kept here with them: gemini reads
+ * an empty `--resume=` as RESUME_LATEST.
+ */
+function geminiTarget(
+  cfg: AttendConfig,
+  r: Route,
+  over: { ownStarted?: boolean } = {},
+): { form: GeminiTargetForm; argv: string[] } {
+  const ownStarted = over.ownStarted ?? cfg.ownSessionStarted === true;
+  const key =
+    r.kind === 'session' ? hostSessionKey(r.key)
+    : ownStarted ? hostSessionKey(cfg.ownSession)
+    : undefined;
+  const create = r.kind === 'session' ? undefined : hostSessionKey(cfg.ownSession);
+  if (key !== undefined && key !== '') return { form: 'resume', argv: [`--resume=${key}`] };
+  if (create !== undefined && create !== '') {
+    return { form: 'create', argv: [`--session-id=${create}`] };
+  }
+  return { form: 'none', argv: [] };
+}
+
 export function turnArgv(
   cfg: AttendConfig,
   r: Route,
@@ -333,6 +380,50 @@ export function turnArgv(
   // Only the own route may CREATE a session; a routed key that failed the
   // shape rule must not silently hijack the machine's own transcript.
   const create = r.kind === 'session' ? undefined : hostSessionKey(cfg.ownSession);
+  /**
+   * GEMINI — claude's SHAPE (target as flags, caps after), gemini's own
+   * flag names, and ONE EXTRA GUARD claude does not need
+   * (§3.8). Documented against gemini-cli v0.58.0; the binary is NOT
+   * installed on this machine (`command -v gemini` empty, 2026-09-04), so
+   * M1/M2 in §3.8's measurement table — does yargs accept the inline
+   * `--resume=<v>` / `--session-id=<v>` form — are OWED, not run. Nothing
+   * here claims otherwise.
+   *
+   *   own, not started   `--session-id=<own>`   pin at creation
+   *   own, started       `--resume=<own>`       continue the same transcript
+   *   session (routed)   `--resume=<key>`
+   *   own, key unusable  no target              a fresh, unpinned session
+   *
+   * NO `-p`, and no prompt in argv: gemini auto-detects headless on
+   * non-TTY stdio, so the prompt rides stdin under `turnArgv`'s standing
+   * argv-injection rule. EXACTLY ONE TARGET TOKEN, ever — `--resume`,
+   * `--session-id` and `--session-file` are mutually exclusive at the
+   * yargs layer, and two of them is a usage error before any model call.
+   * The target is argv[0] BY CONSTRUCTION here, which is what lets
+   * `geminiDriver` splice its model pin in after it. The driver does NOT
+   * read the form back off this argv: it calls `geminiTarget` with the same
+   * inputs, so an operator caps word spelled `--resume=…` can never be
+   * mistaken for a target attend actually emitted.
+   *
+   * NO `--output-format` TOKEN IS EMITTED, and that is deliberate: `text` is
+   * the documented headless default for v0.58.0, and an argv token a given
+   * install's yargs does not know would fail EVERY turn — so this file's
+   * reasoning about a frameless text channel rides that DEFAULT and not a
+   * flag we set. Whether v0.58.0 accepts `--output-format text`, and whether
+   * text is in fact the headless default, is §3.8 M12 — owed.
+   *
+   * THE EMPTY-VALUE GUARD IS THE EXTRA ONE. gemini coerces an empty
+   * `--resume=` to RESUME_LATEST and would attach the turn to whatever
+   * session the operator most recently ran in this project directory — a
+   * different conversation, silently. `hostSessionKey` already refuses an
+   * empty string, so both `!== ''` tests below are belt-over-boundary; they
+   * are written anyway because the failure they prevent is invisible, and
+   * `--session-id` gets the same guard rather than only one of the two:
+   * guarding one of a pair is how the other one gets forgotten.
+   */
+  if (cfg.host === 'gemini') {
+    return [...geminiTarget(cfg, r, over).argv, ...cfg.caps];
+  }
   const target =
     key !== undefined ? [`--resume=${key}`]
     : create !== undefined ? [`--session-id=${create}`]
@@ -905,9 +996,393 @@ export function codexHomeDir(account: string): string {
   return join(stateDir(account), 'codex-home');
 }
 
+/**
+ * The attend-owned gemini home for an account — `codexHomeDir`'s shape and
+ * its reasoning verbatim: ONE derivation, exported so `attend enable`'s copy
+ * and the driver's spawn provably name the same directory, and under
+ * `stateDir` because a CLI home is exactly the kind of thing the state/keys
+ * compartment split keeps out of "the key directory".
+ */
+export function geminiHomeDir(account: string): string {
+  return join(stateDir(account), 'gemini-home');
+}
+
+/**
+ * GEMINI'S ENVIRONMENT ISOLATION (§3.8) — a DRIVER-SIDE
+ * CONSTANT, not caps, for `CLAUDE_ISOLATION`'s recorded reason: caps are
+ * persisted into attend.json at enable time and no later command rewrites
+ * them, so a capability set that must move with the code cannot live there.
+ *
+ *   GEMINI_CLI_HOME             per account, 0700, created on demand — the
+ *                               `CODEX_HOME` analogue (added per spawn below,
+ *                               since it is the one value that varies)
+ *   GEMINI_CLI_TRUST_WORKSPACE  folder trust hard-fails (exit 55) every turn
+ *                               under a fresh isolated home. Setting it is a
+ *                               CAPABILITY DECISION — it also re-enables
+ *                               non-default approval modes — so it is named
+ *                               in the enable copy rather than smuggled in
+ *   GEMINI_TELEMETRY_ENABLED    off
+ *
+ * The credential is NOT here: `GEMINI_API_KEY` (or, once §3.8 M7 names them,
+ * the Vertex triple) is INHERITED from the environment attend itself runs
+ * under. It is never stored in attend.json, never printed, never put in an
+ * error (rule 4), and nothing in this module reads its value — only whether
+ * one is present.
+ *
+ * THE HONEST SCOPE OF THE ISOLATION CLAIM: this moves USER-LEVEL config
+ * only. The project's own `.gemini/` directory, a project `GEMINI.md` and
+ * the `.env` walk from cwd still load — gemini v0.58.0 has no `--safe-mode`
+ * / `--setting-sources=` equivalent to close them. A narrower claim stated
+ * plainly beats a wider one stated hopefully (`CLAUDE_ISOLATION`'s rule).
+ * What `GEMINI_CLI_HOME` actually moves is §3.8 M5, and whether it moves the
+ * OAuth cache is M8: both are OWED, not measured — the binary is absent
+ * here.
+ */
+const GEMINI_ISOLATION = {
+  GEMINI_CLI_TRUST_WORKSPACE: 'true',
+  GEMINI_TELEMETRY_ENABLED: 'false',
+} as const;
+
+/**
+ * THE CREDENTIAL SHAPES THIS BUILD ACCEPTS FOR GEMINI, in ONE place because
+ * two gates read it: `attend enable --host gemini` (fail closed, before
+ * anything is saved) and `geminiDriver` (fail closed, before anything is
+ * spawned).
+ *
+ * WHY AT ALL. Google's Gemini CLI FAQ forbids third-party software
+ * piggybacking on Gemini CLI's OAuth authentication and names the remedy.
+ * The two FRAGMENTS below are what the scope audit read on 2026-09-03 —
+ * quoted as fragments, deliberately not paraphrased and deliberately not
+ * presented as whole sentences, because a paraphrased terms quotation is an
+ * overclaim about somebody else's licence:
+ *
+ *   "third-party software, tools, or services to … piggyback on Gemini
+ *    CLI's OAuth authentication"
+ *
+ *   "the supported and secure method is to use a Vertex AI or Google AI
+ *    Studio API key."
+ *
+ * A builder who re-reads the FAQ replaces these with the verbatim sentences
+ * AND records the URL and the read date; until then they stay fragments.
+ *
+ * ONLY `GEMINI_API_KEY` FOR NOW. §3.8 M7 — the Vertex env-var triple's exact
+ * names — is owed, and accepting a credential shape nobody verified is the
+ * one direction that cannot be walked back: refusing too much costs the
+ * operator a re-run, accepting too much configures a host we cannot say we
+ * gated.
+ */
+const GEMINI_CREDENTIAL_VARS = ['GEMINI_API_KEY'] as const;
+
+/** Present and non-empty — presence ONLY. Nothing anywhere reads the value. */
+export function geminiCredentialPresent(
+  env: Readonly<Record<string, string | undefined>>,
+): boolean {
+  return GEMINI_CREDENTIAL_VARS.some(v => {
+    const value = env[v];
+    return typeof value === 'string' && value.trim() !== '';
+  });
+}
+
+/** The names, for copy that must tell the operator what to set. Never a value. */
+export const GEMINI_CREDENTIAL_NAMES: readonly string[] = GEMINI_CREDENTIAL_VARS;
+
+/**
+ * WHAT A GEMINI EXIT CODE MEANS — BY CODE, NEVER BY STDERR TEXT
+ * (§3.8). gemini's refusal sentences are expected to be
+ * buffered away by gemini's default text output (§3.8 M3 asks whether stderr is
+ * populated at all), and guessing a host's sentences is exactly how the
+ * wrong driver got the wrong refusal table once already — which is why
+ * `classifyRefusal` above is claude-only by construction, is NOT reused
+ * here, and has a regression test pinning that.
+ *
+ * Codes are gemini-cli v0.58.0's documented set, read 2026-09-03; none of
+ * them has been OBSERVED on this machine, where the binary is absent.
+ *
+ *   0    ok
+ *   41   auth — refuse, do not retry
+ *   42   input/session error, NO MODEL CALLED. Ambiguous by itself:
+ *        "session not found" and "session id already in use" share it,
+ *        which is why R25 disambiguates by argv FORM and not by code
+ *   44   sandbox
+ *   52   documented, unnamed here — the generic sentence
+ *   53   turn limit
+ *   54   tool execution
+ *   55   untrusted workspace
+ *   130  cancelled
+ *   127  the binary could not be launched — `attendPass`'s own 127 arm
+ *        answers it, so nothing is added here
+ */
+export type GeminiExit =
+  | 'ok'
+  | 'auth'
+  | 'input'
+  | 'sandbox'
+  | 'unnamed'
+  | 'turn-limit'
+  | 'tool'
+  | 'untrusted'
+  | 'cancelled'
+  | 'launch'
+  | 'other';
+
+export function classifyGeminiExit(code: number): GeminiExit {
+  switch (code) {
+    case 0:
+      return 'ok';
+    case 41:
+      return 'auth';
+    case 42:
+      return 'input';
+    case 44:
+      return 'sandbox';
+    case 52:
+      return 'unnamed';
+    case 53:
+      return 'turn-limit';
+    case 54:
+      return 'tool';
+    case 55:
+      return 'untrusted';
+    case 130:
+      return 'cancelled';
+    case 127:
+      return 'launch';
+    default:
+      return 'other';
+  }
+}
+
+/**
+ * OUR OWN sentence for a classified failure — a closed set written here,
+ * never the host's text (`hostExplanation`'s rule: stderr never leaves this
+ * process, because a failing host writes its environment into it).
+ *
+ * It rides `stdout` with the host's own non-zero code, on `capsRefusal`'s
+ * precedent: that is the one sanctioned path to the operator's phone for a
+ * failed turn. And ONLY when the host said nothing itself — a turn that
+ * printed its own words keeps them.
+ *
+ * '' means "add nothing": `ok`, the generic `other`/`unnamed` arms (which
+ * `attendPass` already reports as `exit N`), and `launch`, whose 127 arm
+ * has a better sentence than this one could write.
+ */
+export function geminiExitSentence(kind: GeminiExit): string {
+  switch (kind) {
+    case 'auth':
+      return (
+        'gemini refused the credentials it resolved. This host runs on an API key only: ' +
+        `set ${GEMINI_CREDENTIAL_NAMES.join(' or ')} in the environment attend runs under ` +
+        '(no value is printed or stored here). Nothing ran.'
+      );
+    case 'input':
+      // ONLY what always happened. The recovery re-spawn runs on ONE path
+      // (own route, a target actually tried), so `geminiDriver` appends the
+      // second clause itself — a routed 42, or an own turn whose key was
+      // unusable, must not be told about an attempt attend never made.
+      return 'gemini refused the session input it was given.';
+    case 'sandbox':
+      return "gemini's sandbox did not start. Nothing ran.";
+    case 'turn-limit':
+      return 'gemini stopped at its own turn limit before finishing.';
+    case 'tool':
+      return 'a tool gemini ran failed, so the turn ended early.';
+    case 'untrusted':
+      return (
+        'gemini refused this workspace as untrusted. attend sets ' +
+        'GEMINI_CLI_TRUST_WORKSPACE for its own isolated home; a turn that still ' +
+        'refuses is being told otherwise by the environment it runs under.'
+      );
+    case 'cancelled':
+      return 'the gemini turn was cancelled before it finished.';
+    default:
+      return '';
+  }
+}
+
+/**
+ * The RUN-TIME half of the terms gate, and the word matters: this
+ * FORECLOSES a cached sign-in, it does not DETECT one. gemini's default
+ * text output has no frame channel, so there is no `apiKeySource` analogue to read
+ * the way the claude sdk driver reads one — the driver cannot observe which
+ * credential gemini resolved. What it can do is (a) point `GEMINI_CLI_HOME`
+ * at a home that contains no `oauth_creds.json`, and (b) refuse to spawn at
+ * all when the resolved child environment carries no credential we accept.
+ * Whether (a) is structural or merely advisory is §3.8 M8 — owed.
+ */
+const GEMINI_NO_CREDENTIAL_REFUSAL =
+  'this account is configured for the gemini host, which attend runs on an ' +
+  `operator-supplied API key only: ${GEMINI_CREDENTIAL_NAMES.join(' or ')} is not set in ` +
+  'the environment attend runs under (no value is read or printed here). Google\'s ' +
+  'Gemini CLI FAQ names an API key as the supported method for third-party tools, so ' +
+  'attend does not fall back to a cached sign-in. Set the key where the supervised unit ' +
+  'can see it and re-run. Nothing ran.';
+
+/** Which target form a turn took — see `geminiTarget`, which derives it from
+ * the route rather than from any argv a caller could have edited. */
+type GeminiTargetForm = 'resume' | 'create' | 'none';
+
+/**
+ * A model name this build is willing to put in an argv element: printable
+ * ASCII, bounded, not flag-shaped. `operatorGeminiModel` applies the same
+ * rule at CAPTURE time, so this is `turnArgv`'s third defence wearing a model
+ * pin — attend.json is a durable file a hand edit can reach, and an unusable
+ * value must yield NO FLAG (gemini's own default, the behaviour the operator
+ * already had) rather than a word the host parser reads as something else.
+ */
+function geminiModelPin(name: string | undefined): string[] {
+  if (name === undefined || name.startsWith('-')) return [];
+  return /^[\x21-\x7e]{1,64}$/.test(name) ? ['-m', name] : [];
+}
+
+/** Do the operator's own caps already choose the model? Then the captured
+ * pin stays out of the argv entirely — one `-m` in the command, deterministic,
+ * with no assumption about which of two yargs would keep. */
+function capsPinAModel(caps: readonly string[]): boolean {
+  return caps.some(
+    (w, i) =>
+      ((w === '-m' || w === '--model') && caps[i + 1] !== undefined) ||
+      w.startsWith('--model=') ||
+      w.startsWith('-m='),
+  );
+}
+
+/**
+ * gemini — the SPAWN-SEAM driver (§3.8). It mirrors
+ * `codexDriver`'s exec arm and nothing else: one spawn, prompt on stdin, no
+ * `ask`, no steer, no stream, no approvals, NO REFUSAL TABLE, and
+ * `TurnResult.sessionKey` deliberately absent — nothing on gemini's
+ * default text output can capture a session id, and claiming one would
+ * route a later reply into a spawn that fails.
+ *
+ * SHIPPED UNMEASURED, AND SAID SO EVERYWHERE. The gemini binary is not
+ * installed on this machine (2026-09-04), so this driver is written against
+ * the documented v0.58.0 interface and proved with a fake binary
+ * (test/gate.gemini-driver.test.ts). §3.8's measurement table M1..M11 is
+ * owed, `attend enable --host gemini` prints the unmeasured-host notice
+ * until it is filled, and no line here claims a measurement that was not
+ * run.
+ */
+const geminiDriver: HostDriver = {
+  host: 'gemini',
+  async runTurn(req: TurnRequest, io: DriverIo): Promise<TurnResult> {
+    const { cfg, route } = req;
+    // THE FORECLOSURE, BEFORE THE SPAWN (see `GEMINI_NO_CREDENTIAL_REFUSAL`).
+    // Presence only, on the resolved child environment — the parent's, since
+    // the delta below adds no credential.
+    if (!geminiCredentialPresent(io.env ?? process.env)) {
+      return { stdout: GEMINI_NO_CREDENTIAL_REFUSAL, stderr: '', code: 1, refusal: null };
+    }
+    const home = geminiHomeDir(req.account);
+    try {
+      mkdirSync(home, { recursive: true, mode: 0o700 });
+    } catch {
+      // `codexDriver`'s arm verbatim: nothing ran, and 127 is the code that
+      // already means "this could not be launched".
+      return { stdout: '', stderr: '', code: 127, refusal: null };
+    }
+    const childEnv = { GEMINI_CLI_HOME: home, ...GEMINI_ISOLATION };
+    const spawnTurn = (
+      argv: string[],
+    ): Promise<{ stdout: string; stderr: string; code: number }> =>
+      io.spawn(argv, cfg.workdir, req.prompt, childEnv);
+
+    // The model pin, captured from the operator's own `~/.gemini/settings.json`
+    // at enable time (`operatorGeminiModel`), for `codexModel`'s reason: an
+    // isolated home would otherwise change the model SILENTLY. Skipped when
+    // the operator's caps already name one — theirs is the later statement
+    // and the more explicit.
+    const pin = capsPinAModel(cfg.caps) ? [] : geminiModelPin(cfg.geminiModel);
+    const routed = turnArgv(cfg, route);
+    // The FORM comes from the route, not from `routed[0]`: `cfg.caps` is
+    // operator-supplied and nothing refuses a caps word spelled like a
+    // target (see `geminiTarget`).
+    const { form } = geminiTarget(cfg, route);
+    // The target keeps argv[0] (see `geminiTargetForm`); the pin sits in
+    // option space ahead of the operator's caps.
+    const argv =
+      form === 'none'
+        ? [...pin, ...routed]
+        : [routed[0] as string, ...pin, ...routed.slice(1)];
+
+    /**
+     * WHAT THE PASS LEARNED ABOUT THE OWN TRANSCRIPT — AN INFERENCE, NOT AN
+     * OBSERVATION (R25, and the comment says so on purpose).
+     *
+     * claude's `observeOwn` reads "session not found" and "already in use"
+     * apart from STDERR TEXT. gemini has no such channel here — §3.8 M3
+     * expects stderr to be buffered away — and exit 42 conflates the two.
+     * So the discriminator is the argv FORM this turn took, plus the code:
+     *
+     *   42 on the `--resume=<own>` form   the key is GONE (a gemini session
+     *                                     store prunes at 30 days): false, so
+     *                                     the next turn creates
+     *   any other code on that form       the transcript answered: true
+     *   any code but 127 on the create
+     *   form                              true — 42 there means "id already
+     *                                     in use" (M4), and any create that
+     *                                     reached the host wrote a transcript.
+     *                                     claude's cheap direction: over-report
+     *                                     a create, and one failing resume
+     *                                     corrects it
+     *   127                               nothing ran; nothing is written
+     *   the no-target form                nothing about the OWN key was tried,
+     *                                     so nothing is learned
+     *
+     * Without this, BOTH routes loop forever at two spawns per turn with a
+     * session pin that quietly does nothing — the aged-out resume that never
+     * clears the flag, and the create that never sets it. M3/M4 are the
+     * measurements that would replace the inference with a reading.
+     */
+    let ownExists: boolean | undefined;
+    const observeOwn = (at: GeminiTargetForm, code: number): void => {
+      if (route.kind !== 'own' || code === 127) return;
+      if (at === 'resume') ownExists = code !== 42;
+      else if (at === 'create') ownExists = true;
+    };
+
+    let turn = await spawnTurn(argv);
+    observeOwn(form, turn.code);
+    let kind = classifyGeminiExit(turn.code);
+    /**
+     * THE ONE RECOVERY, and only for the code that means the host did
+     * NOTHING (`recoveryArgv`'s economics: a startup refusal costs a
+     * process, not a turn). Own route only — a routed session that answers
+     * "no such session" is the OPERATOR's session, and inventing a fresh
+     * transcript under it would answer them in a room that only looks like
+     * the one they replied to. And only when a target was actually tried:
+     * re-spawning the identical no-target command is not a recovery.
+     *
+     * The re-spawn carries NO target, so it teaches nothing about the own
+     * key — `observeOwn` is deliberately not called again, and the first
+     * spawn's inference is what the supervisor persists.
+     */
+    let recovered = false;
+    if (kind === 'input' && route.kind === 'own' && form !== 'none') {
+      turn = await spawnTurn([...pin, ...cfg.caps]);
+      kind = classifyGeminiExit(turn.code);
+      recovered = true;
+    }
+    const said = turn.stdout.trim() === '' ? geminiExitSentence(kind) : '';
+    // The recovery clause is added by the ONE path that ran a recovery, so
+    // no other 42 claims an attempt that never happened.
+    const sentence =
+      recovered && kind === 'input' && said !== '' ?
+        `${said} Starting a fresh one also failed.`
+      : said;
+    return {
+      stdout: sentence === '' ? turn.stdout : sentence,
+      stderr: turn.stderr,
+      code: turn.code,
+      refusal: null,
+      ...(ownExists === undefined ? {} : { ownExists }),
+    };
+  },
+};
+
 const DRIVERS: Readonly<Record<AttendHost, HostDriver>> = {
   claude: claudeDriver,
   codex: codexDriver,
+  gemini: geminiDriver,
 };
 
 /** The one lookup. `cfg.host` is refused at `attend enable` unless it names

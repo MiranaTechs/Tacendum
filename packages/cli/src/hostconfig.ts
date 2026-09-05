@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { tacendumHome } from './config.js';
@@ -194,6 +194,64 @@ export function hostConfigPathFor(surface: SetupSurface): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The model the OPERATOR's own `~/.gemini/settings.json` pins (`model.name`),
+ * or undefined (§3.8; `attend.ts:operatorCodexModel`'s sibling,
+ * and its asymmetry argument holds verbatim).
+ *
+ * Read once, at `attend enable` time, so gemini's isolated `GEMINI_CLI_HOME`
+ * cannot change the operator's model silently: `model.name` is a user-level
+ * settings key, so an isolated home drops it and every reply would come from
+ * gemini's built-in default at a different price and quality with nothing in
+ * the reply saying so.
+ *
+ * JSON, NOT TOML, so none of the toml-keys machinery applies — one guarded
+ * `JSON.parse` does, and it deliberately does NOT go through
+ * `parseJsonConfig`: that function REFUSES an unparseable file because it is
+ * about to rewrite it, and refusing is the right posture for a merge and the
+ * wrong one for a read. EVERY failure here reads as UNPINNED — no file, bad
+ * JSON, not an object, no `model.name`, a name this cannot state as an argv
+ * word. The two failure shapes are not symmetric: unpinned falls back to
+ * gemini's own supported default, while a mis-decoded name would ask gemini
+ * for a model that does not exist and fail EVERY turn until someone
+ * re-enables.
+ *
+ * Printable ASCII, bounded, because the value lands in an argv element
+ * (`-m <name>`) — the same guard that keeps a NUL or a control byte out of
+ * execve. The PATH comes from `hostConfigPathFor('gemini')`, so the file this
+ * reads is the one file this module already names for that surface.
+ *
+ * Measured on this machine 2026-09-04: `~/.gemini/settings.json` exists and
+ * pins NO `model.name` (it declares only `mcpServers.aws-mcp`), so the
+ * unpinned path is the live path here.
+ */
+export function operatorGeminiModel(io: { readFile?: (p: string) => string } = {}): string | undefined {
+  let raw: string;
+  try {
+    raw = (io.readFile ?? ((p: string) => readFileSync(p, 'utf8')))(hostConfigPathFor('gemini'));
+  } catch {
+    return undefined; // no settings file: gemini's default IS current behaviour
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined; // a hand edit mid-thought is not a model pin to guess at
+  }
+  if (!isRecord(parsed)) return undefined;
+  const model = parsed['model'];
+  if (!isRecord(model)) return undefined;
+  const name = model['name'];
+  if (typeof name !== 'string') return undefined;
+  // NOT FLAG-SHAPED, at CAPTURE time — the same rule `geminiModelPin` applies
+  // at emit time, so the two cannot disagree. Without this a hand-edited
+  // `model.name` of `--yolo` is captured and persisted, the driver drops it,
+  // and the enable read-back reports `geminiModelPinned: true` for a pin no
+  // turn will ever use.
+  if (name.startsWith('-')) return undefined;
+  return /^[\x21-\x7e]{1,64}$/.test(name) ? name : undefined;
 }
 
 /** Parse an existing JSON config, with mcp-install's exact refusal posture:

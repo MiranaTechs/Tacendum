@@ -28,6 +28,10 @@
  */
 
 import { z } from 'zod';
+// The ROUNDS detail field (§3.1). Imported rather than mirrored:
+// it is a SCHEMA, and a second copy of a schema is a second thing to get
+// wrong. `rounds.ts` is zod-only, so the purity note above still holds.
+import { DETAIL_MAX, roundDetail, roundDetailStrict } from './rounds.js';
 
 /**
  * The marker field. `.catch(undefined)` is the §5.5 receiver rule in one
@@ -65,6 +69,13 @@ const ENVELOPE_SENTINEL = '{"tcm":';
  * drift is visible — if one moves, both move in the same commit. The number
  * itself is the §5.6 plaintext ceiling: room for the envelope, the ratchet
  * header and base64's 4/3 expansion inside the frame cap.
+ *
+ * A ROUND ANSWER IS BOUNDED FAR BELOW THIS (§3.1). `BRIEF_MAX`
+ * (280) and `DETAIL_MAX` (3 000) in `rounds.ts` carry their own written-out
+ * byte budget against `send.ts:MAX_BODY_BYTES`, because a `msg` or `reply`
+ * carrying `d` is wrapped twice and escaped twice before it meets the frame
+ * cap. The two budgets live one import apart on purpose: this one bounds what
+ * the KIND may hold, that one bounds what a ROUND may send.
  */
 export const MAX_AGENT_TEXT = 20_000;
 
@@ -100,6 +111,19 @@ export const AgentTextEnvelope = z.object({
     .refine(value => !value.startsWith(ENVELOPE_SENTINEL), {
       message: 'text may not itself be an envelope',
     }),
+  /**
+   * THE ROUNDS DETAIL (§3.1). Optional, and on a kind build 25
+   * already parses — the only widening this wire permits. When it is present
+   * `text` IS the brief and this is the full answer behind a tap; when it is
+   * absent nothing about the kind changes, which is what makes a build in the
+   * field indifferent to it (unknown keys strip; §5.5's receiver rule collapses
+   * a malformed one to "no detail" rather than costing the words).
+   *
+   * A round answer in a ROOM is composed as `reply` (`app/src/envelope.ts`)
+   * inside the `ai`-marked `grp.msg` wrapper; this field is the 1:1 attend
+   * path's half of the same wire.
+   */
+  d: roundDetail,
   ai: aiOrigin,
 });
 
@@ -116,12 +140,42 @@ export type AgentTextEnvelope = z.infer<typeof AgentTextEnvelope>;
  * LITERAL prefix `{"tcm":` before parsing anything. The key order is pinned
  * by reconstruction here, not left to an upstream object's insertion order.
  */
-export function composeAgentText(text: string): string {
-  const parsed = AgentTextEnvelope.safeParse({ tcm: AGENT_TEXT_TCM, text, ai: true });
+export function composeAgentText(text: string, detail?: string): string {
+  // THE DETAIL IS CHECKED HERE AND NOT BY THE SCHEMA ABOVE, and the reason is
+  // the whole of R24: `d` is `.catch(undefined)` on the receive side, and
+  // `.catch` SWALLOWS rather than throws — `AgentTextEnvelope.safeParse` of an
+  // over-cap or sentinel-leading detail SUCCEEDS with `d` collapsed to
+  // `undefined`, and this function would then emit a brief-only body with no
+  // signal to anybody. That is the silent drop this feature must not have, and
+  // it would make this function's own promise — strict on the way out, a
+  // malformed frame of our own making is a bug in this build and must be loud
+  // — false for the new field. `roundDetailStrict` is the same chain without
+  // the `.catch`, so it can actually say no.
+  if (detail !== undefined && !roundDetailStrict.safeParse(detail).success) {
+    // The MESSAGE names the field and the bound, never the value: this string
+    // is logged and rendered, and the detail is payload (rule 4).
+    throw new Error(
+      `refusing to compose a msg: detail must be 1..${DETAIL_MAX} characters and not itself an envelope`,
+    );
+  }
+  const parsed = AgentTextEnvelope.safeParse({
+    tcm: AGENT_TEXT_TCM,
+    text,
+    ...(detail === undefined ? {} : { d: detail }),
+    ai: true,
+  });
   if (!parsed.success) {
     throw new Error(
       `refusing to compose a msg: ${parsed.error.issues[0]?.message ?? 'malformed'}`,
     );
   }
-  return JSON.stringify({ tcm: AGENT_TEXT_TCM, text: parsed.data.text, ai: true });
+  // `d` is omitted entirely when there is no detail, so a caller that predates
+  // rounds gets BYTE-IDENTICAL output to before (pinned in ai-origin.test.ts).
+  // Key order is reconstructed rather than inherited, as ever: `tcm` first.
+  return JSON.stringify({
+    tcm: AGENT_TEXT_TCM,
+    text: parsed.data.text,
+    ...(parsed.data.d === undefined ? {} : { d: parsed.data.d }),
+    ai: true,
+  });
 }

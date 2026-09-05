@@ -343,8 +343,8 @@ export interface FanoutLegOutcome {
 }
 
 /**
- * A room fan-out: N ordinary pairwise sends on ONE 'send'-role socket
- *. Lives in this module because the
+ * A room fan-out: N ordinary pairwise sends on ONE 'send'-role socket.
+ * Lives in this module because the
  * send sequence has one owner (see the module header): connect FIRST, then
  * per leg one ratchet-lock acquisition for bootstrap-if-absent + encrypt,
  * the frame, the receipt. A refused socket still costs ZERO ratchet
@@ -455,6 +455,14 @@ export async function sendEncryptedFanout(args: {
 }
 
 /**
+ * The body argument that means "read stdin", spelled the way every POSIX tool
+ * spells it. `args.ts` already classifies a bare `-` as a POSITIONAL rather
+ * than an option (`arg === '-'`), so this is a value this function sees, not
+ * a flag the parser has to learn.
+ */
+export const STDIN_SENTINEL = '-';
+
+/**
  * Compose the plaintext a `send` will carry.
  *
  * `make build || tacendum send --title "build failed"` is the premise of the
@@ -466,18 +474,46 @@ export async function sendEncryptedFanout(args: {
  * would need matching app-side parsing shipped in the same release, and until
  * then every phone would render the notification as "Unsupported message".
  * Two lines of text works on every build that already exists.
+ *
+ * WHERE THE BODY COMES FROM, and why there are two ways to say "stdin"
+ * (which asked for "a TTY check or an explicit `-`" and now
+ * has both):
+ *
+ *  - A body ARGUMENT is the body. No fd 0 read happens at all.
+ *  - `-` as the body argument means READ STDIN, DELIBERATELY. It is honoured
+ *    even on a TTY, where it makes the CLI wait for a heredoc or a typed EOF,
+ *    because the operator said so in as many words.
+ *  - An OMITTED body reads stdin only when fd 0 is not a terminal — the
+ *    implicit pipe form the product is built around
+ *    (`make build || tacendum send ci me`).
+ *
+ * The sentinel is defence in depth rather than a fix: the TTY guard already
+ * catches the interactive mistake, but it cannot see that a NON-TTY fd 0 is
+ * somebody's transport rather than somebody's pipe. `-` gives any embedding a
+ * way to be unambiguous, and gives a future reader of a script a way to tell
+ * "I meant stdin" from "I forgot the body".
  */
-function composeBody(
+export function composeBody(
   text: string | undefined,
   title: string | undefined,
   report: Reporter,
+  /**
+   * How fd 0 is read. Injected ONLY so a test can exercise the two branches
+   * above without a pty and without consuming the runner's own stdin — every
+   * production caller takes the default, which is the same `readFileSync(0)`
+   * this function has always used.
+   */
+  readStdin: () => string = () => readFileSync(0, 'utf8'),
 ): string {
-  let body = text;
+  let body = text === STDIN_SENTINEL ? undefined : text;
   if (body === undefined) {
-    if (process.stdin.isTTY) {
+    // The refusal is for an OMITTED body only. `-` is an instruction, and an
+    // instruction is not a mistake to guard against.
+    if (text !== STDIN_SENTINEL && process.stdin.isTTY) {
       throw new CliError(
         EXIT.USAGE,
-        'nothing to send: pass the text as an argument, or pipe it on stdin',
+        'nothing to send: pass the text as an argument, pipe it on stdin, ' +
+          'or pass - to read stdin deliberately',
       );
     }
     // fd 0 read whole, not line-buffered: the body is one message, and a
@@ -488,8 +524,8 @@ function composeBody(
     // future embedding that OWNS stdin — the MCP server speaks JSON-RPC over
     // exactly this fd — must pass the body explicitly, because an omitted
     // body here consumes ALL of fd 0 and would swallow the transport whole
-    //.
-    body = readFileSync(0, 'utf8');
+    // (the security review named this one).
+    body = readStdin();
   }
 
   // A pipe almost always ends in a newline that nobody meant to send.

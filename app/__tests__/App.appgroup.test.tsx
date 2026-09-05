@@ -115,12 +115,36 @@ function seedRealWorkspace(): void {
 
 const mounted: ReactTestRenderer.ReactTestRenderer[] = [];
 
+/** The boot now ASKS THE SERVER what build it still talks to, before the
+ * socket. Left to the environment's real `fetch`
+ * that is an outbound connection this suite never wanted, and the opening
+ * waits on its 20 s deadline — the route would still read 'loading' when the
+ * assertions run. An empty answer is refused by the DTO parse, which the gate
+ * reads as unknown (the fail-open posture), so the boot carries on exactly as
+ * it did before the gate existed. */
+const realFetch = globalThis.fetch;
+const fetchMock = jest.fn(async () => ({
+  ok: true,
+  status: 200,
+  json: async () => ({}),
+  text: async () => '',
+}));
+afterAll(() => {
+  globalThis.fetch = realFetch;
+});
+
 async function renderApp(): Promise<ReactTestRenderer.ReactTestRenderer> {
   let tree!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(async () => {
     tree = ReactTestRenderer.create(<App />);
   });
   mounted.push(tree);
+  // The boot's own awaits, drained: the gate's check sits between the
+  // profile read and `messaging.start`, so a settled opening is one flush
+  // further out than it used to be.
+  await ReactTestRenderer.act(async () => {
+    for (let i = 0; i < 60; i++) await Promise.resolve();
+  });
   return tree;
 }
 
@@ -145,6 +169,7 @@ beforeEach(async () => {
   crypto.__sharedState.clear();
   jest.clearAllMocks();
   sqlite.reset();
+  globalThis.fetch = fetchMock as unknown as typeof fetch;
 });
 
 test('an unavailable App Group container does not cost the account', async () => {

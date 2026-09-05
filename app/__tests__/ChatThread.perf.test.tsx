@@ -68,7 +68,24 @@ const VOICE_IN = {
   ts: T0 + 180_000,
   status: 'received',
 };
-const ROWS = [TEXT_IN, TEXT_OUT, REPLY_IN, VOICE_IN];
+/** A round answer: brief + detail in one message (§3.1). Its
+ * detail is read through envelope.ts's own `detailText`, whose internal parse
+ * is not this seam — so the row still costs the screen exactly ONE parse. */
+const DETAIL_IN = {
+  msgId: '01DETAILIN',
+  peerId: 'peer-1',
+  direction: 'in',
+  body: JSON.stringify({
+    tcm: 'reply',
+    ref: '01TEXTOUT',
+    ofs: false,
+    text: 'Two findings.',
+    d: 'The first is the cursor guard.',
+  }),
+  ts: T0 + 240_000,
+  status: 'received',
+};
+const ROWS = [TEXT_IN, TEXT_OUT, REPLY_IN, VOICE_IN, DETAIL_IN];
 
 beforeEach(async () => {
   await db.close();
@@ -154,6 +171,67 @@ test('a requery that changes nothing parses nothing', async () => {
   await ReactTestRenderer.act(async () => {});
 
   expect(fixtureParses(parse)).toBe(after);
+
+  await ReactTestRenderer.act(() => {
+    tree.unmount();
+  });
+});
+
+/**
+ * ROUNDS (§3.9 step 5). `sameRowProps` gained `expanded`
+ * and `onToggleDetail`, and a comparator that grows fields is a comparator
+ * that can grow a REPAINT. Opening one row's full answer is a state change on
+ * the screen, not a data change: it must not re-parse the OTHER rows.
+ *
+ * WHAT THIS SPY CAN AND CANNOT SEE. `fixtureParses` counts
+ * `envelope.parseEnvelope` through the module binding, which catches every
+ * parse the SCREEN performs directly. It does NOT catch the parse inside
+ * `envelope.detailText`, because that is an intra-module call in envelope.ts
+ * and never goes through the binding a spy replaces. So the count below is
+ * the screen's own seam, and the `detailText` counter after it measures the
+ * rest — a REAL per-render cost this case used to certify away rather than
+ * measure. Both numbers are asserted, so neither claim can drift.
+ */
+test('opening a full answer re-parses no OTHER row, and costs exactly one detail read', async () => {
+  const parse = jest.spyOn(envelope, 'parseEnvelope');
+  const detail = jest.spyOn(envelope, 'detailText');
+  const tree = await renderThread();
+  const before = fixtureParses(parse);
+  expect(before).toBe(ROWS.length);
+  // The residue, stated rather than assumed: every mounted non-structured
+  // bubble reads its detail out of its body AGAIN, because `detailText` takes
+  // a body and not the `item.envelope` this screen already parsed. Four of
+  // the five fixture rows are non-structured. Lifting it needs a
+  // `detailOf(envelope)` reader in envelope.ts — the wire's file, not this
+  // screen's — and
+  // this number is what would change when that lands.
+  const detailsAtMount = detail.mock.calls.length;
+  expect(detailsAtMount).toBe(4);
+
+  const toggle = tree.root.findAll(
+    n => typeof n.type === 'string' && n.props.testID === 'detail-01DETAILIN',
+  );
+  expect(toggle).toHaveLength(1);
+  await ReactTestRenderer.act(async () => {
+    tree.root
+      .findAll(n => n.props.testID === 'detail-01DETAILIN' && n.props.onPress)[0]!
+      .props.onPress();
+  });
+  expect(
+    tree.root.findAll(
+      n =>
+        typeof n.type === 'string' &&
+        n.props.testID === 'detail-body-01DETAILIN',
+    ),
+  ).toHaveLength(1);
+
+  // The screen's own seam holds: not one fixture body was parsed again for a
+  // state change, so the new comparator fields did not turn a repaint into a
+  // data change.
+  expect(fixtureParses(parse)).toBe(before);
+  // And the cost that IS there: exactly one more detail read — the toggled
+  // row re-rendering — and none for the four rows that did not move.
+  expect(detail.mock.calls.length).toBe(detailsAtMount + 1);
 
   await ReactTestRenderer.act(() => {
     tree.unmount();

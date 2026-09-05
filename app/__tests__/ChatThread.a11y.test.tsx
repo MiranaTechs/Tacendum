@@ -16,6 +16,7 @@ import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
 import { AccessibilityInfo } from 'react-native';
 import * as db from '../src/db';
+import { ROUND_COPY } from '../src/rounds';
 import { ChatThreadScreen } from '../src/screens/ChatThreadScreen';
 
 interface FakeDb {
@@ -52,6 +53,25 @@ const MINE = {
   deletedAt: null,
 };
 
+/** A round answer (§3.1): brief + detail, one message. */
+const DETAILED = {
+  msgId: '01DETAIL',
+  peerId: 'peer-1',
+  direction: 'in',
+  body: JSON.stringify({
+    tcm: 'reply',
+    ref: '01MINE',
+    ofs: false,
+    text: 'Two findings.',
+    d: 'The first is the cursor guard.',
+  }),
+  ts: T0 + 90_000,
+  status: 'received',
+  editedAt: null,
+  deletedAt: null,
+  ai: 1,
+};
+
 let announce: jest.SpyInstance;
 
 beforeEach(async () => {
@@ -66,7 +86,7 @@ beforeEach(async () => {
   const base = instance.execute.getMockImplementation()!;
   instance.execute.mockImplementation(async (sql: string, params?: unknown) => {
     const s = String(sql);
-    if (s.includes('FROM messages')) return { rows: [THEIRS, MINE] };
+    if (s.includes('FROM messages')) return { rows: [THEIRS, MINE, DETAILED] };
     if (s.includes('FROM chats')) {
       return {
         rows: [
@@ -170,5 +190,71 @@ test('the chip is a polite live region, so TalkBack reads a change in place', as
     n => n.props.accessibilityLiveRegion !== undefined,
   );
   expect(chip?.props.accessibilityLiveRegion).toBe('polite');
+  await ReactTestRenderer.act(() => tree.unmount());
+});
+
+/**
+ * ROUNDS (§3.9 step 5). A bubble is ONE accessibility
+ * element on iOS, which flattens a nested control out of the tree entirely —
+ * so a tap-to-expand inside the bubble is invisible to VoiceOver unless the
+ * bubble ALSO offers it as a rotor action. That is the `reveal` / `link:i`
+ * precedent, and the disclosure needs it for the same reason.
+ */
+test('the full answer is reachable from the bubble as a rotor action, labelled from the deck', async () => {
+  const tree = await renderThread();
+  const bubble = byId(tree, 'msg-01DETAIL').find(
+    n => Array.isArray(n.props.accessibilityActions),
+  )!;
+  const actions = bubble.props.accessibilityActions as {
+    name: string;
+    label: string;
+  }[];
+  expect(actions.map(a => a.name)).toContain('detail');
+  expect(actions.find(a => a.name === 'detail')?.label).toBe(
+    ROUND_COPY.showDetail,
+  );
+
+  await ReactTestRenderer.act(async () => {
+    bubble.props.onAccessibilityAction({
+      nativeEvent: { actionName: 'detail' },
+    });
+  });
+
+  // The action's own label now says which way the next one goes.
+  const after = byId(tree, 'msg-01DETAIL').find(
+    n => Array.isArray(n.props.accessibilityActions),
+  )!;
+  expect(
+    (after.props.accessibilityActions as { name: string; label: string }[]).find(
+      a => a.name === 'detail',
+    )?.label,
+  ).toBe(ROUND_COPY.hideDetail);
+  await ReactTestRenderer.act(() => tree.unmount());
+});
+
+test('the toggle carries accessibilityState.expanded, both ways', async () => {
+  const tree = await renderThread();
+  const toggle = () =>
+    tree.root.findAll(
+      n => typeof n.type === 'string' && n.props.testID === 'detail-01DETAIL',
+    )[0]!;
+  expect(toggle().props.accessibilityRole).toBe('button');
+  expect(toggle().props.accessibilityState).toEqual({ expanded: false });
+  await ReactTestRenderer.act(async () => {
+    byId(tree, 'detail-01DETAIL')[0]!.props.onPress();
+  });
+  expect(toggle().props.accessibilityState).toEqual({ expanded: true });
+  expect(toggle().props.accessibilityLabel).toBe(ROUND_COPY.hideDetail);
+  await ReactTestRenderer.act(() => tree.unmount());
+});
+
+test('a bubble with no detail offers no such action', async () => {
+  const tree = await renderThread();
+  const bubble = byId(tree, 'msg-01THEIRS').find(
+    n => Array.isArray(n.props.accessibilityActions),
+  )!;
+  expect(
+    (bubble.props.accessibilityActions as { name: string }[]).map(a => a.name),
+  ).not.toContain('detail');
   await ReactTestRenderer.act(() => tree.unmount());
 });

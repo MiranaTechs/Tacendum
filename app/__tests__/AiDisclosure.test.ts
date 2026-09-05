@@ -64,8 +64,8 @@ describe('the canonical AI-disclosure sentence', () => {
     // Straight apostrophe, not the app's usual typographic one: the doc is the
     // home and the doc writes `Tacendum's`. Verbatim outranks house style.
     expect(AI_DISCLOSURE_SENTENCE).toBe(
-      'Replies you send are delivered to the AI provider running on your own machine; ' +
-        "Tacendum's servers relay ciphertext only.",
+      "Replies you send are delivered to the AI provider through a client running on your machine; " +
+        "Tacendum's servers relay message ciphertext, not plaintext.",
     );
   });
 
@@ -78,8 +78,8 @@ describe('the canonical AI-disclosure sentence', () => {
     // Mutate one word of the doc's own text in memory and the equality must
     // break — otherwise the assertion above is comparing a value to itself.
     const paraphrased = canonicalSentenceFromDoc().replace(
-      'own machine',
-      'machine',
+      'through a client running on your machine',
+      'through a local client',
     );
     expect(paraphrased).not.toBe(AI_DISCLOSURE_SENTENCE);
   });
@@ -88,9 +88,7 @@ describe('the canonical AI-disclosure sentence', () => {
     // Both halves. `toBe` alone would pass vacuously if the constant went
     // missing (undefined === undefined), which is exactly the state this
     // suite was first run in.
-    expect(MACHINE_COPY.disclosure).toContain(
-      'relay ciphertext only.',
-    );
+    expect(MACHINE_COPY.disclosure).toContain('relay message ciphertext, not plaintext.');
     expect(MACHINE_COPY.disclosure).toBe(AI_DISCLOSURE_SENTENCE);
   });
 });

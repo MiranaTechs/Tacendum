@@ -153,7 +153,7 @@ export const ROOM_COPY = {
    * afterwards is a fresh invitation, never a restore,
    * and the body says so. */
   removeConfirmTitle: (name: string) => `Remove ${name} from this room?`,
-  removeConfirmBody: `Everyone’s ${DEVICE_NOUN} is told to stop sending to them, theirs included. Adding them again sends a new invitation — it doesn’t bring back what they missed.`,
+  removeConfirmBody: 'Everyone’s device is told to stop sending to them, theirs included. Adding them again sends a new invitation — it doesn’t bring back what they missed.',
   removeConfirm: 'Remove',
   removeFailed: 'Tacendum couldn’t change that. Try again.',
 

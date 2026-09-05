@@ -94,14 +94,31 @@ export const LIMITS = {
   // stricter in aggregate and roomy enough for a CI fleet behind one NAT
   // (one sign-in costs TWO requests).
   /**
+   * `GET /v1/client-policy`, keyed by source IP.
+   *
+   * Per-IP is again the only ceiling available: the route is unauthenticated
+   * by design (a phone asks it before it has an account, and at the landing
+   * screen before it has anything at all), so there is no principal to key on.
+   *
+   * SIXTY A MINUTE, against an honest client that asks THREE times a day (the
+   * landing tap, the unlock, and a foreground check throttled to six hours).
+   * The gap is deliberate and it is not generosity: a whole office behind one
+   * NAT shares this key, the answer is cacheable for five minutes anyway, and
+   * the cost of a refusal is a phone that cannot learn it must update. The
+   * aggregate ceiling that actually matters is the route-level API Gateway
+   * throttle in the stack (10 rps / 20 burst), which this sits under.
+   */
+  clientPolicy: { capacity: 60, refillPerSec: 60 / 60 }, // 60 burst, 60/min sustained
+  /**
    * PUT /v1/keys, keyed by the uploading account. It was the only
-   * authenticated data-writing route with no budget, and each call REPLACES
-   * the whole one-time prekey pool — a pool Query, a batch delete, then up
-   * to ~80 BatchWrites for a 1 000-key body — so it was loopable at whatever
-   * the stage throttle admitted. Sized to honest replenishment with room to
-   * spare: one upload at registration, one a day on the schedule, and a
-   * handful of lowPrekeyCount-triggered top-ups (the client replenishment)
-   * all fit inside 5 burst / 10 per hour. */
+   * authenticated data-writing route with no
+   * budget, and each call REPLACES the whole one-time prekey pool — a pool
+   * Query, a batch delete, then up to ~80 BatchWrites for a 1 000-key body —
+   * so it was loopable at whatever the stage throttle admitted. Sized to
+   * honest replenishment with room to spare: one upload at registration,
+   * one a day on the schedule, and a handful of lowPrekeyCount-triggered
+   * top-ups (the client replenishment) all fit inside 5 burst / 10 per hour.
+   */
   keyUpload: { capacity: 5, refillPerSec: 10 / 3600 }, // 5 burst, 10/hour
   /** Prekey-bundle fetch, keyed by (caller, target) — throttles pool draining. */
   prekeyFetch: { capacity: 5, refillPerSec: 5 / 60 }, // 5 burst, 5/min per pair
@@ -120,8 +137,8 @@ export const LIMITS = {
    */
   prekeyFetchGroupPair: { capacity: 12, refillPerSec: 12 / 60 }, // 12 burst, 12/min per group pair
   /**
-   * The FAIR-SHARE decomposition of the pinned 12/min group-pair ceiling
-   *. One undifferentiated 12-token bucket let a few
+   * The FAIR-SHARE decomposition of the pinned 12/min group-pair ceiling.
+   * One undifferentiated 12-token bucket let a few
    * early retries from ONE device pair starve the rest of the mesh: 4
    * retries + 8 uniques exhausted the window before the 9th unique ran, so
    * the pinned worst case (a full 3×3 mesh succeeding in one

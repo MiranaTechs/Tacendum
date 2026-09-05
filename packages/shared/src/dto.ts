@@ -22,8 +22,26 @@ import { Ulid } from './frames.js';
 // needs no PIN: the identity key is immutable per account (§2.1), so even a
 // stolen bearer token cannot rebind the account to a new key. The DEVICE-side
 // PIN derivation (`pinVerifier`) survives in the app, reserved for encrypted
-// backups (FEATURES.md #13), which is a different problem with a different
+// backups, which is a different problem with a different
 // failure mode — losing the PIN loses the backup, not the account.
+//
+// AMENDED 2026-09-03 (§3). "Immutable per
+// account" now has exactly ONE exception, and naming it here is the point:
+// a paper recovery kit, enrolled in advance under a signature from the
+// CURRENT identity key, lets its holder rebind the SAME account ULID to a
+// NEW identity keypair. Nothing else may ever SET `identityKeyPub` after
+// birth — not a bearer token, not a session, not `storeKeys`, not any role.
+// The exception's preimages and constants live in `./recovery.ts`, its
+// transaction in `packages/server/src/db/data.ts` (`rebindUserIdentity`),
+// and the rule it bends is §2.1. The immutability enforcement points that
+// read this sentence as licence are enumerated in the design record; if this
+// comment and that record ever disagree, the record is the audit and this is
+// only the pointer.
+//
+// Nothing in `./recovery.ts` is reachable from the wire as of 2026-09-03:
+// there is no route, no handler and no server import. The doctrine is
+// amended ahead of the code deliberately, so that the first SET of
+// `identityKeyPub` cannot land against a comment that forbids it.
 
 // --- Key distribution ---
 
@@ -458,6 +476,50 @@ export const WsTicketResponse = z.object({
 });
 export type WsTicketResponse = z.infer<typeof WsTicketResponse>;
 
+/**
+ * What one platform must be running.
+ *
+ * `minBuild` is the FLOOR: a client whose own build is below it stops opening
+ * its workspace until the store hands the owner a newer one. It is the one
+ * required field, and it is required for the reason the others are not: a
+ * response the client cannot read is treated as "no answer" and allows, so an
+ * absent floor parsed as zero would be a gate nobody wrote.
+ *
+ * `latestBuild` and `url` are OPTIONAL under the MSG-W1 rule recorded on
+ * `WsTicketResponse` above: the app `.parse()`s this strictly and there is no
+ * OTA path, so any field a server might one day stop emitting must already
+ * tolerate absence in every installed build. Without `url` the screen simply
+ * carries no store button, which is why it can be missing at all.
+ */
+export const ClientPolicyPlatform = z.object({
+  minBuild: z.number().int().nonnegative(),
+  latestBuild: z.number().int().nonnegative().optional(),
+  // HTTP(S) ONLY, and that is not decoration. This value is handed straight
+  // to the client's `Linking.openURL`, and a bare url check admits
+  // `javascript:alert(1)` and `ftp://...`, both verified, exactly as
+  // `linkSafeSourceUrl` found for the AGPL §13 offer. A store link that is
+  // not fetchable over the web is not a store link, and a scheme the OS
+  // hands to something other than a browser is a hole in a row an operator
+  // types by hand.
+  url: z.url({ protocol: /^https?$/ }).max(200).optional(),
+});
+export type ClientPolicyPlatform = z.infer<typeof ClientPolicyPlatform>;
+
+/**
+ * The response to `GET /v1/client-policy`: the same bytes for every caller.
+ *
+ * BOTH platforms are always present so one shape serves both stores and the
+ * client never has to decide what a missing platform means. `message` is the
+ * operator's one line of extra explanation, bounded so a row can never turn
+ * the update screen into a billboard.
+ */
+export const ClientPolicyResponse = z.object({
+  ios: ClientPolicyPlatform,
+  android: ClientPolicyPlatform,
+  message: z.string().max(200).optional(),
+});
+export type ClientPolicyResponse = z.infer<typeof ClientPolicyResponse>;
+
 /** How long an issued challenge stays usable. Long enough for a slow device to
  * run a signature, short enough that a captured nonce is worthless — and it is
  * only a nonce: reading one gains nothing without the private key. */
@@ -569,8 +631,8 @@ export const AuthResponse = z.object({
 export type AuthResponse = z.infer<typeof AuthResponse>;
 
 /**
- * POST /v1/integrations/bind — an integration account names its owner, once
- *. The owner is the ULID the human read off their own
+ * POST /v1/integrations/bind — an integration account names its owner, once.
+ * The owner is the ULID the human read off their own
  * my-code screen and handed to the CLI (`tacendum pair <code>`); a bare id,
  * never a URL or scheme (the standing QR guardrail). Write-once server-side:
  * re-binding to a different owner is a 409.
@@ -1396,8 +1458,7 @@ export const EmailIdentifier = z
   }, 'not an email address');
 
 /** The 6-digit verification code, as minted.
- * ONE shape for both identifier classes — the phone wire reuses it verbatim
- *. */
+ * ONE shape for both identifier classes — the phone wire reuses it verbatim. */
 export const EmailCode = z.string().regex(/^[0-9]{6}$/);
 
 /**
@@ -1916,8 +1977,7 @@ export const ApiErrorCode = z.enum([
   /** The signature does not verify under the presented identity key. */
   'invalid_signature',
   /** An attempt to bind a different identity key to an existing account.
-   * Rotation is not a supported operation — a new key is a new account
-   *. */
+   * Rotation is not a supported operation — a new key is a new account. */
   'identity_key_immutable',
   /** A claim row resolves but its user row is gone — only reachable after a
    * partially-failed deletion. The client retries as a new account rather than
@@ -1961,6 +2021,20 @@ export const ApiErrorCode = z.enum([
    * hint) instead of retrying forever. Discloses only what the prekey route
    * already disclosed to any ULID-holder. */
   'recipient_revoked',
+  // --- Recovery-kit rebind (§3 as amended 2026-09-03) ---
+  // APPENDED, never edited: adding a code to a union the client parses is
+  // safe (an installed build simply never sees it); changing or removing one
+  // breaks every shipped parse, and there is no OTA.
+  /** THE collapsed refusal for `POST /v1/rebind`: wrong proof, unenrolled
+   * account, and unknown ULID answer one byte-identical 403. Distinguishing
+   * them would turn the route into an enrolment oracle over bare ULIDs
+   * (§2 inv. 7). */
+  'kit_rebind_failed',
+  /** The NEW identity key presented for a rebind is already claimed by a
+   * DIFFERENT account. Deliberately distinct from the refusal above: it says
+   * nothing about the target account, only about a key the caller just minted
+   * and can freely mint again — the client regenerates and retries. */
+  'identity_key_in_use',
 ]);
 export type ApiErrorCode = z.infer<typeof ApiErrorCode>;
 
@@ -2040,3 +2114,33 @@ export const CreateReportResponse = z.object({
   reportId: z.string(),
 });
 export type CreateReportResponse = z.infer<typeof CreateReportResponse>;
+
+/*
+ * RE-EXPORTS FOR `./recovery.ts` (2026-09-03).
+ *
+ * The kit/rebind signed-bytes builders live in their own module because the
+ * whole point of the split is that the kit verb never shares a namespace
+ * with the shipped identifier-recovery verb. They still have to produce
+ * bytes the same way `authSignedBytes` does, and a second hand-rolled UTF-8
+ * encoder or base64 decoder in a sibling file is exactly the drift the two
+ * encoders' own comment above warns about — a wire format that varies by
+ * which copy you called is not a wire format.
+ *
+ * So the encoders and the three field schemas are re-exported under names
+ * that say where they belong, rather than being copied. Appended at the end
+ * of the file so no existing line moves.
+ */
+export {
+  /** UTF-8 encode, for signed-bytes builders only. See `utf8Bytes` above. */
+  utf8Bytes as signedBytesUtf8,
+  /** Standard base64 → bytes, for signed-bytes builders only. Throws on a
+   * character outside the alphabet. See `base64ToBytes` above. */
+  base64ToBytes as signedBytesBase64Decode,
+  /** Canonical base64, capped — the ONE spelling of an identity key. */
+  IdentityKeyB64,
+  /** Loose base64, capped — signatures are consumed as bytes, never compared
+   * as strings against another endpoint's spelling. */
+  SignatureB64,
+  /** Loose base64, capped — same reasoning as `SignatureB64`. */
+  ChallengeB64,
+};

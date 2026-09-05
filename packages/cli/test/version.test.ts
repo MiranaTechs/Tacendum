@@ -34,7 +34,7 @@ describe('--version', () => {
     expect(commit).toMatch(/^[0-9a-f]{7,40}$/);
   });
 
-  describe('the build stamp parser (external scan', () => {
+  describe('the build stamp parser (external scan)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'tacendum-verstamp-'));
     afterAll(() => rmSync(dir, { recursive: true, force: true }));
     const stampAt = (commit: unknown): URL => {

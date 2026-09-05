@@ -26,7 +26,7 @@ import {
 // disagreement that produced a bare initial here and a monogram everywhere
 // else.
 import { Avatar } from '../src/ui/Avatar';
-import { monogram } from '../src/person';
+import { monogram, shortId } from '../src/person';
 
 /**
  * The call screen renders `CallState` and calls back — it holds no state and
@@ -274,11 +274,15 @@ describe('the person, when there is no video of them', () => {
   }
 
   /** The cover-cropped photo standing where the peer's video would be —
-   * matched on the HOST node so one picture is one match. */
+   * matched on the HOST node so one picture is one match, and EDGE-PINNED so
+   * the centred disc counts as what it is. Both draw the same blob; only the
+   * surface-filling one can be mistaken for the peer's live camera, which is
+   * the whole distinction the pre-connect rule below turns on. */
   function backdropPhotos(node: ReactTestRenderer.ReactTestInstance) {
-    return node.findAll(
-      n => typeof n.type === 'string' && n.props?.source?.uri === PHOTO_URI,
-    );
+    return node.findAll(n => {
+      if (typeof n.type !== 'string' || n.props?.source?.uri !== PHOTO_URI) return false;
+      return StyleSheet.flatten(n.props.style)?.position === 'absolute';
+    });
   }
 
   /** The backdrop's own wrapper: the pointer-transparent fill inside a video
@@ -292,10 +296,44 @@ describe('the person, when there is no video of them', () => {
       .findAll(n => String(n.type) === 'Text')
       .map(n => [n.props.children].flat().join(''));
 
-  it('shows the peer while their video is still on its way', () => {
+  it('shows the peer as a DISC while their video is still on its way', () => {
     // The reported case exactly: dialling a video call. No remote track can
     // exist yet — the answer has not landed — so the surface is black, and
     // black is what filled the screen where the person should be.
+    //
+    // Filling it with their photo cover-cropped to the surface fixed the
+    // black and bought a worse problem: a
+    // full-bleed face where the remote camera goes IS what a live remote
+    // camera looks like, so the screen read as connected video while the
+    // header still said "Ringing…". Before the call connects there is no
+    // remote media of any kind to stand in for, so the person is drawn the
+    // way an audio call draws them — one 128pt disc, centred, over the pine
+    // ground — which no one reads as a camera feed.
+    const { tree } = renderScreen({
+      state: state({
+        name: 'outgoing_ringing',
+        video: true,
+        peerVideo: true,
+        connectedAt: null,
+      }),
+      peerAvatarB64: PHOTO,
+      videoEnabled: true,
+    });
+    expect(backdropPhotos(tree.root)).toHaveLength(0);
+    const shown = faces(tree);
+    expect(shown).toHaveLength(1);
+    // The audio layout's number, and pinned for the audio layout's reason:
+    // `size={128}` → `size={1}` is a mutation nothing else here would catch.
+    expect(shown[0]!.props.size).toBe(128);
+    expect(shown[0]!.props.peerId).toBe('P1');
+    expect(shown[0]!.props.photoB64).toBe(PHOTO);
+    // The label that was telling the truth all along is untouched.
+    expect(texts(tree.root)).toContain('Ringing…');
+  });
+
+  it('is still the disc while the ANSWER is applied and ICE is not', () => {
+    // `outgoing_connecting` with the answer in hand ("Connecting…") is the
+    // other pre-connect state, and it has no remote media either.
     const { tree } = renderScreen({
       state: state({
         name: 'outgoing_connecting',
@@ -306,7 +344,99 @@ describe('the person, when there is no video of them', () => {
       peerAvatarB64: PHOTO,
       videoEnabled: true,
     });
+    expect(backdropPhotos(tree.root)).toHaveLength(0);
+    expect(faces(tree)).toHaveLength(1);
+    expect(texts(tree.root)).toContain('Connecting…');
+  });
+
+  it('paints the surface-sized photo the moment the call IS connected', () => {
+    // The other half of the rule, and the one that keeps this change from
+    // quietly becoming "the photo never shows": a connected call with the
+    // far camera off is exactly one full-bleed photo, and nothing else.
+    const { tree } = renderScreen({
+      state: state({ name: 'connected', video: true, peerVideo: false }),
+      peerAvatarB64: PHOTO,
+      videoEnabled: true,
+    });
     expect(backdropPhotos(tree.root)).toHaveLength(1);
+    expect(faces(tree)).toHaveLength(0);
+  });
+
+  it('keeps it while a connected call is reconnecting', () => {
+    // Reconnecting is a call that HAS connected: the remote track exists and
+    // is not flowing, which is the case the backdrop was built for.
+    const { tree } = renderScreen({
+      state: state({ name: 'reconnecting', video: true, peerVideo: true }),
+      peerAvatarB64: PHOTO,
+      videoEnabled: true,
+    });
+    expect(backdropPhotos(tree.root)).toHaveLength(1);
+  });
+
+  it('keeps the person through the teardown of a call that CONNECTED', () => {
+    // `ending` is a POST-connect state for any call that reached it: the
+    // remote track existed a moment ago, and nothing about who is on the
+    // screen has changed for the person watching it. Naming only `connected`
+    // and `reconnecting` swapped the full-bleed peer for a 128pt disc for the
+    // whole of the hangup.
+    const { tree } = renderScreen({
+      state: state({
+        name: 'ending',
+        video: true,
+        peerVideo: false,
+        connectedAt: T - 65_000,
+      }),
+      peerAvatarB64: PHOTO,
+      videoEnabled: true,
+    });
+    expect(backdropPhotos(tree.root)).toHaveLength(1);
+    expect(faces(tree)).toHaveLength(0);
+  });
+
+  it('ends a call CANCELLED before it connected on the disc, not the surface', () => {
+    // The other side of the same fact, and the reason the gate cannot simply
+    // add `ending`: a dial you cancel never had remote media, so the
+    // pre-connect rule still holds and no full-bleed face may flash up to
+    // read as the far camera on the way out.
+    const { tree } = renderScreen({
+      state: state({
+        name: 'ending',
+        video: true,
+        peerVideo: true,
+        connectedAt: null,
+      }),
+      peerAvatarB64: PHOTO,
+      videoEnabled: true,
+    });
+    expect(backdropPhotos(tree.root)).toHaveLength(0);
+    expect(faces(tree)).toHaveLength(1);
+  });
+
+  it('letters the pre-connect disc “?”, never the placeholder’s own initials', () => {
+    // `tileName` answers `Someone` for a peer who has never shared a name,
+    // and handing that sentinel to `Avatar` as a display name lettered the
+    // disc `SO`, so the same person wore `SO` while the call rang and `?`
+    // the instant it connected, seconds apart. The name here is the exact
+    // fallback App.tsx hands down (`personName` to `shortId`), not a stand-in.
+    const peerId = '01J0000000000000000000000B';
+    const { tree } = renderScreen({
+      state: state({
+        name: 'outgoing_ringing',
+        peerId,
+        video: true,
+        peerVideo: true,
+        connectedAt: null,
+      }),
+      peerName: shortId(peerId),
+      peerAvatarB64: null,
+      videoEnabled: true,
+    });
+    const rendered = texts(tree.root);
+    expect(rendered).toContain('?');
+    expect(rendered).not.toContain('SO');
+    // Nor the id's own characters, which is what a bare `Avatar` falls to
+    // once the sentinel is refused.
+    expect(rendered).not.toContain(monogram(peerId, null));
   });
 
   it('keeps showing them while their camera is off mid-call', () => {

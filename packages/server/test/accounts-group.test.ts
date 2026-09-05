@@ -12,6 +12,7 @@ import { makeDocClient, makeDynamoClient } from '../src/db/client.js';
 import { TABLES as SERVER_TABLES } from '../src/db/tables.js';
 import {
   ACCOUNTS_FEATURE_FLAG_KEY,
+  CLIENT_POLICY_ROW_KEY,
   GROUP_ROW_PREFIX,
   LINK_OFFER_KEY_PREFIX,
   groupRowKey,
@@ -961,16 +962,85 @@ describe('feature#accounts flag row', () => {
   });
 });
 
+describe('policy#client row', () => {
+  gated('absent = no gate, an operator-written row is echoed field for field, malformed = no gate', async () => {
+    // The ONE case that runs the REAL GetItem behind `getClientPolicy`. Every
+    // other suite reads the policy through the memory twin, and the twin
+    // shares only the parse, so the TableName, the `userId` key attribute
+    // and ConsistentRead are proven here or nowhere. The failure mode is
+    // silent: a read that finds nothing is indistinguishable from the shipped
+    // default of "no row, no gate", so the whole fleet would stay ungated
+    // with the suite green.
+    await doc.send(
+      new DeleteCommand({ TableName: SERVER_TABLES.users, Key: { userId: CLIENT_POLICY_ROW_KEY } }),
+    );
+    expect(await db.getClientPolicy()).toBeUndefined();
+
+    // Operator-written like the flag row above: there is deliberately no
+    // DataLayer write method, so this direct Put IS the console write.
+    await doc.send(
+      new PutCommand({
+        TableName: SERVER_TABLES.users,
+        Item: { userId: CLIENT_POLICY_ROW_KEY, ios: { minBuild: 25 }, android: { minBuild: 24 } },
+      }),
+    );
+    // Deep equality, which puts DynamoDB's number unmarshalling under test as
+    // well as the key: a stored 25 handed back as anything the response DTO
+    // refuses reads as no row, which ungates the fleet silently. The `userId`
+    // key attribute is stripped by the parse, not echoed.
+    expect(await db.getClientPolicy()).toEqual({
+      ios: { minBuild: 25 },
+      android: { minBuild: 24 },
+    });
+
+    // Malformed fails OPEN, the deliberate inverse of the flag row's
+    // fail-closed read directly above.
+    await doc.send(
+      new PutCommand({
+        TableName: SERVER_TABLES.users,
+        Item: {
+          userId: CLIENT_POLICY_ROW_KEY,
+          ios: { minBuild: 'twenty-five' },
+          android: { minBuild: 24 },
+        },
+      }),
+    );
+    expect(await db.getClientPolicy()).toBeUndefined();
+
+    // Deleting the row is how an operator ungates a fleet.
+    await doc.send(
+      new DeleteCommand({ TableName: SERVER_TABLES.users, Key: { userId: CLIENT_POLICY_ROW_KEY } }),
+    );
+    expect(await db.getClientPolicy()).toBeUndefined();
+  });
+});
+
 describe('claim-key discipline (data.ts CLAIM_PREFIXES)', () => {
   gated('group rows and the flag row are unaddressable as users — getUserById refuses the prefixes', async () => {
     const { groupId } = await mkLinkedPair();
     expect(isClaimKey(groupRowKey(groupId))).toBe(true);
     expect(isClaimKey(ACCOUNTS_FEATURE_FLAG_KEY)).toBe(true);
+    expect(isClaimKey(CLIENT_POLICY_ROW_KEY)).toBe(true);
     // The rows EXIST, and are still refused — a caller-supplied group# or
     // feature# reaching GET /v1/keys/{userId} or WS send.to would be an
     // oracle and a dead-letter queue mint.
     expect(await db.getUserById(groupRowKey(groupId))).toBeUndefined();
     expect(await db.getUserById(`${GROUP_ROW_PREFIX}nonexistent`)).toBeUndefined();
     expect(await db.getUserById(ACCOUNTS_FEATURE_FLAG_KEY)).toBeUndefined();
+
+    // The policy row is the one users-table resident an ANONYMOUS route
+    // reads, which is exactly why it must not also be addressable as a user.
+    // Planted for real first: `getUserById` returns whatever item it finds,
+    // so without the prefix guard this row comes back as a user record.
+    await doc.send(
+      new PutCommand({
+        TableName: SERVER_TABLES.users,
+        Item: { userId: CLIENT_POLICY_ROW_KEY, ios: { minBuild: 25 }, android: { minBuild: 25 } },
+      }),
+    );
+    expect(await db.getUserById(CLIENT_POLICY_ROW_KEY)).toBeUndefined();
+    await doc.send(
+      new DeleteCommand({ TableName: SERVER_TABLES.users, Key: { userId: CLIENT_POLICY_ROW_KEY } }),
+    );
   });
 });

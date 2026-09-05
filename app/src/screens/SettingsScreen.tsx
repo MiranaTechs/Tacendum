@@ -14,6 +14,15 @@ import { appearanceChoice, setAppearanceChoice } from '../appearance';
 import { setupDecoy } from '../decoy';
 import * as db from '../db';
 import { DEVICE_NOUN } from '../deviceNoun';
+import {
+  FIELD_VALUES,
+  fieldModeActive,
+  fieldModeDuressRows,
+  recordFieldModeDuressRows,
+  setFieldMode,
+  type FieldModeState,
+} from '../fieldMode';
+import { FIELD_MODE_COPY } from '../fieldModeCopy';
 import { LINKING_COPY } from '../linkingCopy';
 import * as lock from '../lock';
 import { messageSoundEnabled, setMessageSound } from '../messageSound';
@@ -409,6 +418,17 @@ export function SettingsScreen({
   onOpenAccountUsername,
 }: Props) {
   const t = useTheme();
+  /**
+   * FIELD MODE in a DURESS session (rule 16). `fieldMode.ts` writes nothing
+   * there, so the four rows a coerced tap moves live in React state alone —
+   * and React state does not survive closing Settings and opening it again,
+   * while every one of those rows DOES survive in a real session. That
+   * difference is visible in two taps, so the module keeps a session-scoped
+   * copy and the row states below are seeded from it. `null` means the decoy
+   * has not moved them and its own values (App.tsx reset them on the way in)
+   * are what the screen shows.
+   */
+  const duressRows = session.mode === 'duress' ? fieldModeDuressRows() : null;
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [autolockSec, setAutolockSec] = useState(0);
   const [flow, setFlow] = useState<Flow>({ step: 'menu' });
@@ -425,10 +445,14 @@ export function SettingsScreen({
    * concurrent unlocks nearly wiped real data"). Checked and set before
    * `setBusy`, cleared in `finally`. */
   const busyRef = useRef(false);
-  const [blankEnabled, setBlankEnabled] = useState(screenSecurity.blankEnabled);
+  const [blankEnabled, setBlankEnabled] = useState(
+    () => duressRows?.blankWhileCaptured ?? screenSecurity.blankEnabled,
+  );
   const [receipts, setReceipts] = useState(readReceiptsEnabled);
   const [typing, setTyping] = useState(typingIndicatorsEnabled);
-  const [preview, setPreview] = useState<PreviewLevel>(previewLevel);
+  const [preview, setPreview] = useState<PreviewLevel>(
+    () => duressRows?.previewLevel ?? previewLevel(),
+  );
   const [appearance, setAppearance] = useState(appearanceChoice);
   // Read synchronously from the loaded preference; the
   // Keychain read happens at init and on every real unlock.
@@ -437,12 +461,14 @@ export function SettingsScreen({
   const [pushFailed, setPushFailed] = useState(false);
   // The design. Read synchronously from the loaded preference, like the push row
   // above: the Keychain read happens at init and on every real unlock.
-  const [relayAll, setRelayAll] = useState(alwaysRelayEnabled);
-  // read the same way and for the same reason: the Keychain read
+  const [relayAll, setRelayAll] = useState(
+    () => duressRows?.relayEveryCall ?? alwaysRelayEnabled(),
+  );
+  // §10.6, read the same way and for the same reason: the Keychain read
   // happens at init and on every real unlock, so the row starts from the
   // loaded preference rather than from this component's idea of the default.
   const [silenceUnknown, setSilenceUnknown] = useState(
-    silenceUnknownCallersEnabled,
+    () => duressRows?.silenceUnknownCallers ?? silenceUnknownCallersEnabled(),
   );
   // The message chime. Read synchronously from the loaded preference like
   // the rows above: messaging.start() loads it on every real unlock, before
@@ -450,6 +476,21 @@ export function SettingsScreen({
   // No re-read on mount — a read landing after a tap would revert the chip
   // to the file's old value, and there is nothing newer to learn.
   const [sound, setSound] = useState(messageSoundEnabled);
+  /**
+   * FIELD MODE is DERIVED, in BOTH modes — one predicate, computed below from
+   * the six values this screen already holds, so changing any mapped row by
+   * hand moves the Field Mode chip for free and the two can never disagree.
+   * A chip that is remembered while the rows it describes are not is the one
+   * shape that must never ship: it is unreachable in a real session, so it
+   * would tell a coercer which session they are in.
+   */
+  /** Field Mode is five writes behind one chip: the re-entrancy latch the
+   * single-write rows do not need (the `submitPin`/`commit` idiom). Without
+   * it a fast On-then-Off interleaves — the Off pass can read the snapshot
+   * and delete the key while the On pass is still setting — and lands the
+   * rows at the field values with no record of what was there. */
+  const fieldBusyRef = useRef(false);
+  const [fieldBusy, setFieldBusy] = useState(false);
 
   useEffect(() => {
     void lock.status().then(s => {
@@ -459,6 +500,26 @@ export function SettingsScreen({
       setAutolockSec(session.lockUi.autolockSec ?? s.autolockSec);
     });
   }, []);
+
+  /**
+   * Keep the coerced session's copy of the four mapped rows current (rule
+   * 16). Every one of these rows survives a Settings remount in a real
+   * session — through its module's in-memory mirror, or through
+   * `session.lockUi` for auto-lock — so in duress they must survive too, and
+   * this shadow is the only place they can. Driven off the row values rather
+   * than off the Field Mode tap, so a row the coercer changes BY HAND is
+   * remembered as well and the chip cannot come back On over it. A no-op in a
+   * real session.
+   */
+  useEffect(() => {
+    if (session.mode !== 'duress') return;
+    recordFieldModeDuressRows({
+      previewLevel: preview,
+      relayEveryCall: relayAll,
+      silenceUnknownCallers: silenceUnknown,
+      blankWhileCaptured: blankEnabled,
+    });
+  }, [preview, relayAll, silenceUnknown, blankEnabled]);
 
   const toFlow = (next: Flow) => {
     setValue('');
@@ -569,11 +630,19 @@ export function SettingsScreen({
 
   /**
    * The optimistic rows whose write can throw: the chip moves with the
-   * finger, and a failed write puts it back where it was and says so under
-   * the row — instead of a flipped chip over an unchanged preference and an
-   * unhandled rejection. The modules that never reject (sound, relay,
-   * silence) keep their plain optimistic shape. */
-  type RowKey = 'autolock' | 'screensec' | 'receipts' | 'typing' | 'preview';
+   * finger, and a failed write puts it
+   * back where it was and says so under the row — instead of a flipped
+   * chip over an unchanged preference and an unhandled rejection. The
+   * modules that never reject (sound, relay, silence) keep their plain
+   * optimistic shape.
+   */
+  type RowKey =
+    | 'autolock'
+    | 'screensec'
+    | 'receipts'
+    | 'typing'
+    | 'preview'
+    | 'fieldmode';
   const [rowError, setRowError] = useState<RowKey | null>(null);
   const rowErrorFor = (row: RowKey): string | null =>
     rowError === row ? COPY.settingFailed : null;
@@ -728,6 +797,99 @@ export function SettingsScreen({
     await setMessageSound(next);
   };
 
+  /**
+   * FIELD MODE, derived (fieldMode.ts): the five mapped controls plus App
+   * Lock's own state, read from the values this screen already renders. No
+   * `useState` mirror — a mirror is exactly the thing that can disagree with
+   * the settings the switch claims to describe.
+   */
+  const fieldState: FieldModeState = {
+    previewLevel: preview,
+    relayEveryCall: relayAll,
+    silenceUnknownCallers: silenceUnknown,
+    blankWhileCaptured: blankEnabled,
+    lockEnabled: enabled === true,
+    autolockSec,
+  };
+  const fieldOn = fieldModeActive(fieldState);
+
+  /**
+   * The one tap, and ONE path through it. Optimistic like every row here:
+   * turning it ON moves the five rows to their field values before the writes
+   * land, turning it OFF waits for the snapshot to say what to put back
+   * (guessing would be the one thing the restore promise cannot afford). A
+   * failed write reverts all five and says so under the row, through the same
+   * `persist` seam.
+   *
+   * In duress `setFieldMode` touches no store at all and returns the same
+   * five values a real tap would land on, so the rows move identically and
+   * the module's session-scoped shadow (seeded into this screen's state at
+   * mount) keeps them moved across a Settings remount.
+   */
+  const chooseFieldMode = async (next: boolean) => {
+    // Tapping the chip that is already selected changes nothing — and must
+    // not re-snapshot the field values over the record of what was there
+    // before Field Mode was turned on.
+    if (next === fieldOn || fieldBusyRef.current) return;
+    const previous = {
+      preview,
+      relayAll,
+      silenceUnknown,
+      blankEnabled,
+      autolockSec,
+    };
+    const previousUi = session.lockUi.autolockSec;
+    const applyRows = (s: FieldModeState) => {
+      setPreview(s.previewLevel);
+      setRelayAll(s.relayEveryCall);
+      setSilenceUnknown(s.silenceUnknownCallers);
+      setBlankEnabled(s.blankWhileCaptured);
+      setAutolockSec(s.autolockSec);
+      // The session-scoped copy this screen re-reads on EVERY mount, which
+      // `chooseAutolock` and `commit` keep in step for exactly this reason.
+      // Without it the Auto-lock row reads "5 min" over a Keychain holding
+      // 0 the moment Settings is reopened — and the derived chip, reading
+      // that stale 300, reads Off over settings that are all at their field
+      // values.
+      if (s.lockEnabled) session.setLockUi({ autolockSec: s.autolockSec });
+    };
+    if (next) {
+      applyRows({
+        previewLevel: FIELD_VALUES.previewLevel,
+        relayEveryCall: FIELD_VALUES.relayEveryCall,
+        silenceUnknownCallers: FIELD_VALUES.silenceUnknownCallers,
+        blankWhileCaptured: FIELD_VALUES.blankWhileCaptured,
+        lockEnabled: fieldState.lockEnabled,
+        autolockSec: fieldState.lockEnabled
+          ? FIELD_VALUES.autolockSec
+          : previous.autolockSec,
+      });
+    }
+    fieldBusyRef.current = true;
+    setFieldBusy(true);
+    try {
+      await persist(
+        'fieldmode',
+        async () => {
+          applyRows(await setFieldMode(next, fieldState));
+        },
+        () => {
+          setPreview(previous.preview);
+          setRelayAll(previous.relayAll);
+          setSilenceUnknown(previous.silenceUnknown);
+          setBlankEnabled(previous.blankEnabled);
+          setAutolockSec(previous.autolockSec);
+          if (fieldState.lockEnabled) {
+            session.setLockUi({ autolockSec: previousUi });
+          }
+        },
+      );
+    } finally {
+      fieldBusyRef.current = false;
+      setFieldBusy(false);
+    }
+  };
+
   const pinPrompt =
     flow.step === 'current'
       ? COPY.currentPrompt
@@ -746,7 +908,79 @@ export function SettingsScreen({
             screen an honest width instead of stretching every row across
             the glass. Width-only; on phones the cap never engages. */}
         <View style={[styles.column, { maxWidth: t.layout.contentMax }]}>
-          <RuledLabel label={COPY.lockSection} marginTop={24} marginBottom={12} />
+          {/* FIELD MODE sits ABOVE App Lock — the first thing a hurried
+              person reaches — while every row it governs stays exactly where
+              it has always been. It is a statement ABOUT those rows, not a
+              replacement for them, so it is a section of one. */}
+          {flow.step === 'menu' && enabled !== null && (
+            <>
+              <RuledLabel
+                label={FIELD_MODE_COPY.sectionLabel}
+                marginTop={24}
+                marginBottom={12}
+              />
+              <View
+                style={[
+                  styles.sheet,
+                  {
+                    marginHorizontal: -t.layout.gutter,
+                    backgroundColor: t.color.paperSheet,
+                    borderColor: t.color.lineSoft,
+                    borderTopWidth: t.hairline,
+                    borderBottomWidth: t.hairline,
+                  },
+                ]}
+              >
+                <ChoiceRow
+                  label={FIELD_MODE_COPY.label}
+                  options={FIELD_MODE_COPY.options}
+                  value={fieldOn}
+                  onChange={next => void chooseFieldMode(next)}
+                  // Five writes behind one chip: grey out for the duration
+                  // rather than let a second tap interleave with the first.
+                  disabled={fieldBusy}
+                  testIDPrefix="settings-fieldmode"
+                  // What the one tap changes stays VISIBLE (consent-grade);
+                  // the teaching paragraphs sit behind the row's ⓘ.
+                  note={
+                    enabled
+                      ? `${FIELD_MODE_COPY.consent} ${FIELD_MODE_COPY.consentAutolock}`
+                      : FIELD_MODE_COPY.consent
+                  }
+                  info={{
+                    label: COPY.infoLabel,
+                    lines: FIELD_MODE_COPY.infoLines,
+                  }}
+                  error={rowErrorFor('fieldmode')}
+                />
+                {/* Status, not a control: Field Mode never turns App Lock on
+                    (that needs the code ceremony and setupDecoy), so this
+                    says what is missing and stops. */}
+                {!enabled ? (
+                  <Text
+                    testID="settings-fieldmode-needslock"
+                    style={[
+                      t.type.compactBody,
+                      styles.needsLock,
+                      { color: t.color.inkMuted },
+                    ]}
+                  >
+                    {FIELD_MODE_COPY.needsLock}
+                  </Text>
+                ) : null}
+              </View>
+            </>
+          )}
+
+          <RuledLabel
+            label={COPY.lockSection}
+            // Gated on the SAME condition as the FIELD MODE block above, or
+            // the first paint of every Settings open shows APP LOCK at the
+            // top with the wider gap and the section pops in above it once
+            // `lock.status()` resolves.
+            marginTop={flow.step === 'menu' && enabled !== null ? 32 : 24}
+            marginBottom={12}
+          />
           {notice ? <InlineNotice message={notice} tone="pine" marginTop={0} /> : null}
 
           {flow.step === 'menu' && enabled !== null && (
@@ -1111,7 +1345,7 @@ export function SettingsScreen({
                 Offline on purpose. This text is the NOTICE that has to travel
                 with the binary; a screen that fetched it would show nothing on
                 a plane, and "your licence terms require a network" is not a
-                defensible reading of AGPL the design.
+                defensible reading of AGPL §6.
               */}
               <Text
                 testID="settings-licenses-body"
@@ -1283,6 +1517,12 @@ const styles = StyleSheet.create({
   pinFlow: { marginTop: 16, alignItems: 'center' },
   /** The section-level ⓘ under a sheet (the screenshot truth). */
   sectionInfo: { marginTop: 10 },
+  /** The unactionable "needs App Lock" status under the Field Mode row —
+   * inside the sheet, aligned with ChoiceRow's own horizontal padding. */
+  // marginTop is the house spacing for a line hung under a row's content
+  // (`sectionInfo` below); without it this sits flush against the ⓘ that
+  // ends the ChoiceRow.
+  needsLock: { paddingHorizontal: 16, paddingBottom: 10, marginTop: 10 },
   prompt: { marginBottom: 16, textAlign: 'center' },
   explain: { marginTop: 12, marginBottom: 24 },
   versionLine: { marginTop: 12, textAlign: 'center' },

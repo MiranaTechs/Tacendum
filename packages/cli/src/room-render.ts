@@ -127,7 +127,7 @@ function unsupported(tcm: string): RenderedBody {
  * mention arm's constant, on its reasoning: the names file is hand-editable,
  * and a file is an input too.
  */
-function personLabel(names: MentionNames, id: string): string {
+export function personLabel(names: MentionNames, id: string): string {
   if (id === names.selfId) return 'you';
   const stored = names.nameFor(id);
   if (stored === undefined) return id;
@@ -136,13 +136,22 @@ function personLabel(names: MentionNames, id: string): string {
 }
 
 /**
+ * The §5.3 message-id grammar — 26 characters of Crockford base32, the same
+ * alphabet `room-commands.ts:ROOM_REF_RE` reads either half of a room content
+ * ref in. Mirrored rather than imported on `ROOM_REF_RE`'s own terms (one
+ * shape, two readers, drift made visible by test); `packages/cli/test/
+ * gate.rounds.test.ts` compares this source against the shared mirror.
+ */
+const ROOM_M_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+
+/**
  * The room label every line leads with: the stored name when the room has
  * one, else the group id. The name is peer-chosen text bound for a terminal,
  * sanitized AGAIN at display even though the schema bounded it at accept,
  * because the room file is hand-editable and a file is an input too (the
  * peer-names precedent in stores.ts).
  */
-function roomLabel(store: FileGroupStore): string {
+export function roomLabel(store: FileGroupStore): string {
   const name = store.getName();
   if (name === null) return store.groupId;
   const clean = sanitizeForTerminal(name).slice(0, 80).trim();
@@ -507,6 +516,12 @@ function renderGroupBody(
         // refuses it the label.
         const relayer = personLabel(names, from);
         const whose = relayer === 'you' ? 'your' : `${relayer}’s`;
+        // NO `detail` HERE, deliberately (covers `grp.msg`
+        // only): a relayed entry is an unauthenticated claim about a third
+        // party's words, and this arm answers it with ONE framed sentence
+        // that carries the caveat. A detail is shown on its own, away from
+        // that frame, so relaying one would strip the only thing making the
+        // claim honest — and it would do it to the longest text on the path.
         return {
           tcm: declared,
           carrier: false,
@@ -656,11 +671,29 @@ function renderRoomMessage(
     // The inner reply's route survives the wrapper.
     ...(inner.ref ? { ref: inner.ref } : {}),
     ...(inner.ofs ? { ofs: inner.ofs } : {}),
+    //the inner answer's DETAIL rides the wrapper exactly as
+    // its `ref` does, and for the same reason — the wrapper is where a room
+    // message's inner fields go to die if nobody carries them up (the room
+    // reply's accepted ref died here once already). Carried RAW: the room
+    // label prefixes `text` because that is the line a terminal prints, and
+    // prefixing the detail too would put the room's name inside a body that
+    // is shown on its own, under the brief that already names the room.
+    ...(inner.detail ? { detail: inner.detail } : {}),
     // The room trigger metadata: the room id, and the inner
     // mention's structured mentions-self flag riding the wrapper exactly as
     // the inner reply's ref does — this is the ONLY place env.g is in scope
     // at render time, so this is where the spool learns it.
     grp: env.g,
+    //the room message id, the second half of the §5.3
+    // compound row key `${from}.${env.m}`. Here for `grp`'s exact reason —
+    // this is the only place `env.m` is in scope at render time — and
+    // shape-checked HERE as well as at the schema: `GroupMessageEnvelope.m`
+    // is `Ulid`, so this is a belt over the schema's braces, and the belt is
+    // what makes the field's grammar true of the spool even if a future
+    // caller renders a hand-built envelope. A malformed `m` yields no field,
+    // and no field means the rounds composer falls back to bare text
+    // (`ref-unavailable`) rather than composing a guessed ref.
+    ...(ROOM_M_RE.test(env.m) ? { rm: env.m } : {}),
     ...(inner.men ? { men: true } : {}),
     // The Art. 50 marker rides the grp.msg WRAPPER (group-envelope.ts),
     // so an AI-marked wrapper names this author an agent of the room. The

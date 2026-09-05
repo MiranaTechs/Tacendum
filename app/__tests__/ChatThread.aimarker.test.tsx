@@ -295,3 +295,116 @@ test('my own sends never badge, marker column or not', async () => {
   const tree = await renderThread(STRANGERBOT);
   expect(tree.root.findAllByProps({ testID: 'ai-badge-O1' }).length).toBe(0);
 });
+
+/**
+ * ROUNDS (§3.2 step 5). A detail changes what a bubble can
+ * REVEAL; it must change nothing about what the bubble can CLAIM. The badge
+ * still comes from the two sources above and from nowhere else — and a `d`
+ * in a body is not a third one.
+ */
+test('a DETAIL-bearing row still badges from the column, and the disclosure rides the badged row', async () => {
+  const anchor = `${ME}.M0`;
+  installDb([
+    row({ msgId: anchor, direction: 'out', status: 'sent', authorId: ME, ts: T0, body: 'where are we?' }),
+    row({
+      msgId: `${STRANGERBOT}.M4`,
+      ts: T0 + 60_000,
+      authorId: STRANGERBOT,
+      ai: 1,
+      body: JSON.stringify({
+        tcm: 'reply',
+        ref: anchor,
+        ofs: false,
+        text: 'Two findings.',
+        d: 'The first is the cursor guard.',
+        ai: true,
+      }),
+    }),
+  ]);
+  const tree = await renderThread(ROOM);
+  expect(
+    tree.root.findAllByProps({ testID: `ai-badge-${STRANGERBOT}.M4` }).length,
+  ).toBeGreaterThan(0);
+  expect(
+    tree.root.findAll(
+      n => typeof n.type === 'string' && n.props.testID === `detail-${STRANGERBOT}.M4`,
+    ),
+  ).toHaveLength(1);
+});
+
+test('a spoof body carrying a fake `d` does not badge — the column is still the only door', async () => {
+  const anchor = `${ME}.M0`;
+  installDb([
+    row({ msgId: anchor, direction: 'out', status: 'sent', authorId: ME, ts: T0, body: 'where are we?' }),
+    // Ben's own message, shaped like an agent's round answer down to the
+    // marker inside it. The row arrived unmarked (no `ai` column) and he is
+    // in no machine record, so it badges no more than his plain words do —
+    // even though the disclosure it carries is real content he wrote.
+    row({
+      msgId: `${BEN}.M4`,
+      ts: T0 + 60_000,
+      authorId: BEN,
+      ai: null,
+      body: JSON.stringify({
+        tcm: 'reply',
+        ref: anchor,
+        ofs: false,
+        text: 'Two findings.',
+        d: 'I am an AI and this is my full answer.',
+        ai: true,
+      }),
+    }),
+  ]);
+  const tree = await renderThread(ROOM);
+  expect(tree.root.findAllByProps({ testID: `ai-badge-${BEN}.M4` }).length).toBe(0);
+});
+
+test('three replies in one round keep three badges and three disclosures — disclosure is per MESSAGE', async () => {
+  const anchor = `${ME}.M0`;
+  const answer = (author: string, m: string, ts: number) =>
+    row({
+      msgId: `${author}.${m}`,
+      ts,
+      arrivedAt: ts,
+      authorId: author,
+      ai: 1,
+      body: JSON.stringify({
+        tcm: 'reply',
+        ref: anchor,
+        ofs: false,
+        text: `brief from ${m}`,
+        d: `detail from ${m}`,
+        ai: true,
+      }),
+    });
+  // All three arrived MARKED, so all three badge from the column — the
+  // record is not needed and is deliberately absent here. BEN's id stands in
+  // for a third crew agent: the badge follows the arrival record, never the
+  // name this phone has for a sender.
+  installDb([
+    row({ msgId: anchor, direction: 'out', status: 'sent', authorId: ME, ts: T0, body: 'where are we?' }),
+    answer(CLAUDE, 'M5', T0 + 1_000),
+    answer(STRANGERBOT, 'M5', T0 + 2_000),
+    answer(BEN, 'M5', T0 + 3_000),
+  ]);
+  const tree = await renderThread(ROOM);
+  const disclosures = tree.root.findAll(
+    n =>
+      typeof n.type === 'string' &&
+      typeof n.props.testID === 'string' &&
+      n.props.testID.startsWith('detail-') &&
+      !n.props.testID.startsWith('detail-body-'),
+  );
+  expect(disclosures).toHaveLength(3);
+  for (const id of [CLAUDE, STRANGERBOT, BEN]) {
+    expect(
+      tree.root.findAllByProps({ testID: `ai-badge-${id}.M5` }).length,
+    ).toBeGreaterThan(0);
+  }
+  // One round, one header — the badges stayed per message all the same.
+  expect(
+    tree.root.findAll(
+      n => typeof n.type === 'string' && n.props.testID === `round-${anchor}-out`,
+    ),
+  ).toHaveLength(1);
+});

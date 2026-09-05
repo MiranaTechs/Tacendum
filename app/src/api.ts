@@ -2,6 +2,7 @@ import {
   ApiError,
   AuthChallengeResponse,
   AuthResponse,
+  ClientPolicyResponse,
   CreateAttachmentResponse,
   GetAttachmentResponse,
   CreateReportRequest,
@@ -23,6 +24,11 @@ import { MAX_ATTACHMENT_BYTES } from '@tacendum/shared';
 import { API_BASE } from './config';
 import { currentToken, reauthenticate } from './reauth';
 import { session } from './session';
+// TYPE ONLY, and it has to stay that way: `updateGate` imports this module,
+// so a value import here would be a runtime cycle. The gate owns the
+// vocabulary of why a check is happening; this module owns what that costs
+// on the wire (see `apiClientPolicy`).
+import type { CheckReason } from './updateGate';
 
 /** Thin REST client for the endpoints (mirrors the CLI's). */
 
@@ -425,7 +431,60 @@ export async function apiTurnCredentials(
 }
 
 /**
- * Register this device's VoIP token.
+ * What build the server will still talk to.
+ *
+ * TOKEN-FREE, and that is the whole design of the route: the answer is the
+ * same bytes for everyone on a platform, the request carries no identifier,
+ * and a phone that cannot sign in — a fresh install standing on the landing
+ * screen — is exactly the phone most likely to be too old. Passing no token
+ * also means `request` never enters its 401 renewal arm for this call.
+ *
+ * The duress guard inside `request` covers it for free, and the gate reads
+ * the resulting offline-shaped `TypeError` as "unknown" rather than as an
+ * answer (updateGate.ts) — a coerced phone must look like an ordinary
+ * offline one.
+ *
+ * WHY THE REASON CHANGES THE URL. The route answers with `Cache-Control:
+ * max-age=300`, which is right for the two checks nobody is standing in
+ * front of and wrong for the two they are. Someone who taps "Check again" on
+ * the wall, or "Get started" on the landing screen, is asking BECAUSE the
+ * last answer refused them; being handed that same refusal back out of a
+ * cache for five minutes makes the wall's only control look dead, and can
+ * hold a phone behind a floor the operator has already lowered. Those two
+ * reasons therefore ask on a URL no cache has seen — `?r=<reason>&t=<ms>` —
+ * and the boot and foreground checks keep the cacheable one, because they
+ * are exactly the traffic the header exists to absorb.
+ *
+ * Inert on the far side: API Gateway route keys match method and path only,
+ * the local host routes on `new URL(...).pathname`, and the handler never
+ * reads the path at all (packages/server/test/client-policy.test.ts pins
+ * that a query-bearing path answers the same status, headers and bytes, and
+ * spends the same per-IP bucket).
+ */
+export async function apiClientPolicy(
+  reason?: CheckReason,
+): Promise<ClientPolicyResponse> {
+  const res = await request('GET', clientPolicyPath(reason));
+  return parseDto(ClientPolicyResponse, 'ClientPolicyResponse', await res.json());
+}
+
+/** The two reasons a person is waiting on the answer, and so the two that
+ * must not be served from a cache. Everything else keeps the cacheable URL. */
+const UNCACHED_REASONS: ReadonlySet<CheckReason> = new Set<CheckReason>([
+  'getStarted',
+  'recheck',
+]);
+
+function clientPolicyPath(reason: CheckReason | undefined): string {
+  if (!reason || !UNCACHED_REASONS.has(reason)) return '/v1/client-policy';
+  // `r` is for us reading a log or a proxy trace; `t` is what actually makes
+  // the key unique. Both are constants of our own making — no identifier, no
+  // counter, nothing derived from the device.
+  return `/v1/client-policy?r=${reason}&t=${Date.now()}`;
+}
+
+/**
+ * Register this device's VoIP token (§9.2).
  *
  * Without this the server has no way to wake the device, so a call to a
  * backgrounded, locked, or terminated phone never rings — the PushKit

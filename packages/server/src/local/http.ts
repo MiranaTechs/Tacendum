@@ -6,6 +6,7 @@ import { makeDataLayer } from '../db/data.js';
 import { log } from '../log.js';
 import { makeRateLimiter } from '../ratelimit.js';
 import { deleteAccountRoute } from '../handlers/account.js';
+import { clientPolicyHandler } from '../handlers/client-policy.js';
 import { createReportHandler } from '../handlers/report.js';
 import { requireAuth } from '../handlers/auth.js';
 import { turnCredentialsHandler } from '../handlers/turn.js';
@@ -357,6 +358,13 @@ const routes: Route[] = [
     pattern: '/v1/me',
     handler: requireAuth(async (_e, _d, auth) => json(200, auth)),
   },
+  // The update gate's read side, unauthenticated on
+  // both hosts: the landing screen asks it before there is an account. A REAL
+  // TABLE ENTRY, unlike the `/health` special case matched inline in `handle`
+  // below. This one reads a row and holds a rate-limit bucket, so it must go
+  // through the same dispatch, body cap and error handling every other route
+  // does rather than short-circuiting ahead of them.
+  { method: 'GET', pattern: '/v1/client-policy', handler: clientPolicyHandler },
 ];
 
 /** Match a path against a template, returning captured params or null. */

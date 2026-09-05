@@ -63,6 +63,7 @@ import {
   cmdAttendEnable,
   cmdAttendService,
   cmdAttendStatus,
+  cmdAttendRounds,
   cmdAttendTriggers,
   parseCapsFlag,
 } from './attend.js';
@@ -74,8 +75,9 @@ import { cmdReviewPeerService, reviewPeerLoop } from './review-peer.js';
  *   tacendum register <name>
  *   tacendum send <from> <to|userId> ["<text>"] [--title T] [--drain]
  *   tacendum listen <name> [--calls] [--auto-answer|--auto-decline] [--seconds N]
+ *                          [--detail]  (chat stream only, not with --calls)
  *   tacendum sync <name>
- *   tacendum inbox <name> [--peer <id>] [--limit N] [--unread] [--peek]
+ *   tacendum inbox <name> [--peer <id>] [--limit N] [--unread] [--peek] [--detail]
  *   tacendum contacts <name> | doctor <name>
  *   tacendum call <from> <to> [--video] [--ice N] [--seconds N]
  *   tacendum calllog <name> | whoami <name> | safety <a> <b> | trust <a> <b>
@@ -651,7 +653,12 @@ async function runTimed(
   await session.leaveGroup();
 }
 
-async function cmdListen(name: string, report: Reporter, saveDir?: string): Promise<void> {
+async function cmdListen(
+  name: string,
+  report: Reporter,
+  saveDir?: string,
+  detail = false,
+): Promise<void> {
   const stores = new FileStores(name);
   const auth = new AuthSession(name, stores);
   const log = new MessageLog(name);
@@ -675,6 +682,10 @@ async function cmdListen(name: string, report: Reporter, saveDir?: string): Prom
     // --save-dir: file attachments are fetched + decrypted at receive time
     // (inbound.ts's saveInboundAttachment). The same auth object as the dial.
     attachments: saveDir !== undefined ? { token: auth, saveDir } : undefined,
+    // --detail (§3.7): brief-first is the default on this stream
+    // precisely so it stays greppable; the flag opts one operator's terminal
+    // into the whole answer.
+    detail,
   });
 
   // 'listen' — the one command that genuinely wants the account's routing row,
@@ -699,8 +710,8 @@ async function cmdListen(name: string, report: Reporter, saveDir?: string): Prom
 }
 
 /**
- * How long `sync` waits for the queue to go quiet before declaring it drained
- *. There is no end-of-queue frame — the server pours the
+ * How long `sync` waits for the queue to go quiet before declaring it drained.
+ * There is no end-of-queue frame — the server pours the
  * backlog into the socket during $connect and says nothing when it is done —
  * so completion can only be observed as silence. The window is two orders of
  * magnitude above the local adapter's drain and comfortably above one
@@ -772,6 +783,10 @@ function cmdInbox(
     unread: boolean;
     peek: boolean;
     purge: boolean;
+    /** `--detail` (§3.7): show each row's DETAIL under its brief,
+     * and carry it in the `--json` object. Off by default — `text` is the
+     * brief on every surface, and the listing stays the width it has been. */
+    detail: boolean;
   },
   report: Reporter,
 ): void {
@@ -806,6 +821,16 @@ function cmdInbox(
     // written by anything else cannot smuggle control bytes through us.
     const peer = sanitizeServerField(r.peer);
     const text = r.red ? `[body purged after read${r.bytes ? `, ${r.bytes} bytes` : ''}]` : sanitizeForTerminal(r.text);
+    // §3.7. Sanitized AGAIN on the way out for `text`'s exact
+    // reason — the spool is a file and a file is an input — and gated on the
+    // flag so today's listing and today's `--json` object are byte-identical
+    // without it. A redacted row can have none: retention purged the detail
+    // with the body (msglog.ts, R16), so `--detail` on a purged row shows the
+    // purge notice and nothing else, which is the truth about what is left.
+    const detail =
+      opts.detail && !r.red && r.detail !== undefined && r.detail !== ''
+        ? sanitizeForTerminal(r.detail)
+        : '';
     if (report.json) {
       report.line(
         {
@@ -816,6 +841,7 @@ function cmdInbox(
           text,
           read: r.read,
           ...(r.red ? { purged: true } : {}),
+          ...(detail ? { detail } : {}),
         },
         '',
       );
@@ -835,9 +861,17 @@ function cmdInbox(
     // reader scanning this listing must be able to tell which row a line
     // belongs to, and a shorter continuation marker would be a second, weaker
     // rule for the same job.
+    const rowPrefix = `${r.read ? ' ' : '*'} ${new Date(r.ts).toISOString()} [${peer}] `;
     report.line(
       {},
-      prefixLines(`${r.read ? ' ' : '*'} ${new Date(r.ts).toISOString()} [${peer}] `, text),
+      detail
+        ? // The detail INDENTED under its own brief, every line of it through
+          // the same `prefixLines`: the row prefix repeats on continuation
+          // lines here for the reason stated above — a reader must be able to
+          // tell which row a line belongs to — and the extra indent is what
+          // says "this is the rest of that message" rather than a new one.
+          `${prefixLines(rowPrefix, text)}\n${prefixLines(`${rowPrefix}    `, detail)}`
+        : prefixLines(rowPrefix, text),
     );
   }
 
@@ -1393,11 +1427,13 @@ const HELP = `tacendum — end-to-end encrypted notifications to your phone
 usage:
   tacendum register <name> [--integration]
   tacendum pair <name> <owner-id>
-  tacendum send <from> <to> ["<text>" | --attach <file>] [--title T] [--drain]
+  tacendum send <from> <to> ["<text>" | - | --attach <file>] [--title T] [--drain]
   tacendum listen <name> [--calls] [--group] [--auto-answer|--auto-decline]
                          [--seconds N] [--leave-after N] [--save-dir <dir>]
+                         [--detail]        chat stream only; refused with --calls
   tacendum sync <name> [--save-dir <dir>]
   tacendum inbox <name> [--peer <id>] [--limit N] [--unread] [--peek] [--purge]
+                        [--detail]
   tacendum contacts <name>
   tacendum doctor <name>
   tacendum call <from> <to> [--video] [--ice N] [--seconds N]
@@ -1423,11 +1459,12 @@ usage:
   tacendum consent grant|revoke <account> <agent-id>
   tacendum consent list <account>
   tacendum service install|uninstall|status <account>
-  tacendum attend enable|disable|run <account> [--host claude|codex] [--bin P] [--workdir D]
+  tacendum attend enable|disable|run <account> [--host claude|codex|gemini] [--bin P] [--workdir D]
       [--turns N] [--caps "<args>"] [--driver exec|app-server] [--approval-policy untrusted|on-request|never]
       [--approvals <min-app-build>] [--stream <min-app-build>] [--marker <min-app-build>]
   tacendum attend status [<account>]
   tacendum attend triggers <account> [<room-gid> on|off]
+  tacendum attend rounds <account> [<room-gid> on|off]
   tacendum attend service install|uninstall|status <account>
   tacendum review-peer run <account>
   tacendum review-peer service install|uninstall|status <account>
@@ -1472,7 +1509,12 @@ send options:
   --attach <file>  send the file as an end-to-end encrypted attachment (the file
                    is the whole message; the blob is uploaded once and its key
                    travels only inside the encrypted envelope)
+  -                a body of exactly - means READ STDIN, deliberately: honoured
+                   even at a terminal, where it waits for EOF. To send a
+                   literal - as the body, pipe it:
+                     printf -- - | tacendum send <from> <to>
   the body may be piped on stdin:  make build || tacendum send ci me --title "build failed"
+    (an OMITTED body reads stdin only when stdin is not a terminal)
 
 listen/sync --save-dir <dir>: incoming 1:1 file attachments are fetched,
   decrypted and written under <dir> at receive time. Without it the line shows
@@ -1613,7 +1655,7 @@ async function main(): Promise<ExitCode | number> {
     case 'send': {
       const args = parseArgs(argv, { value: ['--title', '--attach'], boolean: ['--drain'] });
       if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
-      const usage = 'tacendum send <from> <to> ["<text>" | --attach <file>] [--title T]';
+      const usage = 'tacendum send <from> <to> ["<text>" | - | --attach <file>] [--title T]';
       const from = requireAccount(args, 0, usage);
       const to = requirePositional(args, 1, usage);
       if (args.positionals.length > 3) {
@@ -1649,11 +1691,23 @@ async function main(): Promise<ExitCode | number> {
     case 'listen': {
       const args = parseArgs(argv, {
         value: ['--seconds', '--leave-after', '--save-dir'],
-        boolean: ['--calls', '--auto-answer', '--auto-decline', '--group'],
+        boolean: ['--calls', '--auto-answer', '--auto-decline', '--group', '--detail'],
       });
       if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
       const name = requireAccount(args, 0, 'tacendum listen <name> [--calls]');
       if (flagBool(args, '--calls')) {
+        // REFUSED, not ignored. `--detail` must be declared for the whole
+        // subcommand because args.ts refuses an unknown flag rather than
+        // dropping it — but accepting it here and doing nothing is that same
+        // lie one level in: `listen --calls` streams call signalling, has no
+        // message body to widen, and the operator would have no way to tell
+        // a silent no-op from a message that carried no detail.
+        if (flagBool(args, '--detail')) {
+          throw new CliError(
+            EXIT.USAGE,
+            'tacendum listen --calls does not take --detail — call signalling has no message body',
+          );
+        }
         await cmdListenCalls(
           name,
           {
@@ -1666,7 +1720,10 @@ async function main(): Promise<ExitCode | number> {
           report,
         );
       } else {
-        await cmdListen(name, report, flagString(args, '--save-dir'));
+        // `--detail` is a chat-stream flag and is read on THIS arm only; the
+        // `--calls` arm above refuses the combination outright rather than
+        // accepting a flag it would not act on.
+        await cmdListen(name, report, flagString(args, '--save-dir'), flagBool(args, '--detail'));
       }
       break;
     }
@@ -1683,7 +1740,7 @@ async function main(): Promise<ExitCode | number> {
     case 'inbox': {
       const args = parseArgs(argv, {
         value: ['--peer', '--limit'],
-        boolean: ['--unread', '--peek', '--purge'],
+        boolean: ['--unread', '--peek', '--purge', '--detail'],
       });
       if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
       const name = requireAccount(args, 0, 'tacendum inbox <name> [--peer <id>] [--limit N]');
@@ -1698,6 +1755,7 @@ async function main(): Promise<ExitCode | number> {
           unread: flagBool(args, '--unread'),
           peek: flagBool(args, '--peek'),
           purge: flagBool(args, '--purge'),
+          detail: flagBool(args, '--detail'),
         },
         report,
       );
@@ -1956,12 +2014,13 @@ async function main(): Promise<ExitCode | number> {
       });
       if (flagBool(args, '--help') || flagBool(args, '-h')) return console.log(HELP), EXIT.OK;
       const usage =
-        'tacendum attend enable|disable|run <account> [--host claude|codex] [--bin P] ' +
+        'tacendum attend enable|disable|run <account> [--host claude|codex|gemini] [--bin P] ' +
         '[--workdir D] [--turns N] [--caps "<args>"] [--driver exec|app-server] ' +
         '[--approval-policy untrusted|on-request|never] [--approvals <min-app-build>] ' +
         '[--stream <min-app-build>] [--marker <min-app-build>] | ' +
         'tacendum attend status [<account>] | ' +
         'tacendum attend triggers <account> [<room-gid> on|off] | ' +
+        'tacendum attend rounds <account> [<room-gid> on|off] | ' +
         'tacendum attend service install|uninstall|status <account>';
       const sub = args.positionals[0] ?? '';
       if (sub === 'triggers') {
@@ -1973,6 +2032,22 @@ async function main(): Promise<ExitCode | number> {
           throw new CliError(EXIT.USAGE, `usage: ${usage}`);
         }
         cmdAttendTriggers(
+          requireAccount(args, 1, usage),
+          args.positionals[2] ?? null,
+          args.positionals[3] ?? null,
+          report,
+        );
+        break;
+      }
+      if (sub === 'rounds') {
+        // The owner's per-room ROUNDS grant — `triggers`'
+        // grammar exactly, positional for positional: two positionals read
+        // the list back, four set one room, and three is the lost-quoting
+        // typo every surplus is refused as.
+        if (args.positionals.length !== 2 && args.positionals.length !== 4) {
+          throw new CliError(EXIT.USAGE, `usage: ${usage}`);
+        }
+        cmdAttendRounds(
           requireAccount(args, 1, usage),
           args.positionals[2] ?? null,
           args.positionals[3] ?? null,

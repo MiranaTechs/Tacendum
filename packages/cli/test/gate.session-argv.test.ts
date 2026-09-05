@@ -321,7 +321,12 @@ describe('4. a NUL cannot reach spawn — and if it does, it costs ONE turn, not
 
 describe('5. attend enable refuses what it used to coerce', () => {
   it('an unknown --host is a usage error naming the set, not a silent downgrade to claude', () => {
-    for (const host of ['CODEX', 'codexx', 'gemini', 'cursor', '', 'Claude']) {
+    // `gemini` LEFT THIS LIST 2026-09-04 (§3.8): it is a
+    // driveable host now, so it is no longer an unknown value. Its own
+    // refusal — no API key, no profile — is a different gate with a
+    // different code, pinned in gate.gemini-driver.test.ts. `cursor` stays:
+    // it notifies and cannot be spawned headless.
+    for (const host of ['CODEX', 'codexx', 'cursor', '', 'Claude']) {
       let thrown: unknown;
       try {
         cmdAttendEnable('bot', { host, bin: '/opt/agent', workdir: '/w' }, report());
@@ -332,7 +337,7 @@ describe('5. attend enable refuses what it used to coerce', () => {
       const err = thrown as { exitCode?: number; message?: string };
       expect(err.exitCode, 'usage errors are 9 — 2 blocks four agent hosts').toBe(EXIT.USAGE);
       expect(err.exitCode).not.toBe(2);
-      expect(err.message).toContain('claude, codex');
+      expect(err.message).toContain('claude, codex, gemini');
       // Rule 4: the rejected VALUE is not echoed back into a hook log.
       if (host !== '') expect(err.message).not.toContain(host);
     }

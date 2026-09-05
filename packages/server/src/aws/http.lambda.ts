@@ -1,5 +1,6 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { deleteAccountRoute } from '../handlers/account.js';
+import { clientPolicyHandler } from '../handlers/client-policy.js';
 import { createReportHandler } from '../handlers/report.js';
 import { requireAuth } from '../handlers/auth.js';
 import { turnCredentialsHandler } from '../handlers/turn.js';
@@ -172,6 +173,22 @@ export const routes: Record<string, Handler> = {
     headers: { 'content-type': 'application/json' },
     body: '{"ok":true}',
   }),
+  // The update gate's read side, and the SECOND
+  // public route on this function. Deliberately not wrapped in requireAuth,
+  // for a reason /health does not share: this one is asked at the landing
+  // screen, BEFORE registration, on a phone that has no account and no
+  // token, so demanding one would leave the client that most needs the
+  // answer (a build too old to be trusted with a workspace) unable to get it.
+  //
+  // Argued for once, in the anonymous-surface pin in
+  // tacendum-security.test.ts, which names exactly two 200-answering routes
+  // and asserts the bytes this one hands an anonymous caller: a zero floor on
+  // both platforms and nothing else. A third public route has to be argued
+  // for there before it can ship. Its ceilings are a per-IP bucket in the
+  // handler and a route-level API Gateway throttle in the stack, /health's
+  // treatment, because an anonymous route drawing on the shared stage bucket
+  // can 429 every signed-in user.
+  'GET /v1/client-policy': clientPolicyHandler,
 };
 
 let cachedHttpDeps: ReturnType<typeof makeAwsDeps> | undefined;

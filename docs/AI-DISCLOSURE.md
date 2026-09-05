@@ -15,8 +15,8 @@ third-party AI.
 
 ## 1. The canonical sentence
 
-> **"Replies you send are delivered to the AI provider running on your own
-> machine; Tacendum's servers relay ciphertext only."**
+> **"Replies you send are delivered to the AI provider through a client running
+> on your machine; Tacendum's servers relay message ciphertext, not plaintext."**
 
 This is the single canonical data-flow sentence. Every surface that uses it
 must quote it verbatim. The provider client runs locally; model processing may

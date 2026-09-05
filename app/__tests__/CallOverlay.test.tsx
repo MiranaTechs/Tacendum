@@ -241,6 +241,68 @@ describe('a video call is the peer’s video in the self-view’s box', () => {
     expect(photos(re.tree)).toHaveLength(1);
   });
 
+  it('does NOT paint their photo over the window before the call connects', () => {
+    // The full screen's rule, on the small window: a cover-cropped face
+    // where the remote camera goes is what
+    // a live remote camera looks like, and before the call connects there is
+    // no remote track for it to stand in for. The pine ground and the
+    // letters stay, so the window is never bare black either.
+    const photoUri = `data:image/jpeg;base64,${PHOTO}`;
+    const photos = (tree: ReactTestRenderer.ReactTestRenderer) =>
+      tree.root.findAll(n => typeof n.type === 'string' && n.props?.source?.uri === photoUri);
+    const ringing = render({
+      state: state({
+        name: 'outgoing_ringing',
+        video: true,
+        peerVideo: true,
+        connectedAt: null,
+      }),
+      peerAvatarB64: PHOTO,
+    });
+    expect(photos(ringing.tree)).toHaveLength(0);
+    expect(ringing.texts()).toContain('DA');
+    expect(ringing.texts()).toContain('Ringing…');
+    // Once connected, the photo is the honest stand-in again.
+    const connected = render({
+      state: state({ name: 'connected', video: true, peerVideo: false }),
+      peerAvatarB64: PHOTO,
+    });
+    expect(photos(connected.tree)).toHaveLength(1);
+  });
+
+  it('keeps their photo through the teardown of a call that CONNECTED', () => {
+    // `ending` is post-connect for any call that reached it. Naming only
+    // `connected` and `reconnecting` dropped the peer's photo for monogram
+    // letters for the whole of the hangup, in the one window whose entire job
+    // is to keep showing who is on the call.
+    const photoUri = `data:image/jpeg;base64,${PHOTO}`;
+    const photos = (tree: ReactTestRenderer.ReactTestRenderer) =>
+      tree.root.findAll(n => typeof n.type === 'string' && n.props?.source?.uri === photoUri);
+    const ending = render({
+      state: state({
+        name: 'ending',
+        video: true,
+        peerVideo: false,
+        connectedAt: T - 65_000,
+      }),
+      peerAvatarB64: PHOTO,
+    });
+    expect(photos(ending.tree)).toHaveLength(1);
+    // And a call cancelled before it connected still ends on the letters:
+    // there was never remote media for the photo to stand in for.
+    const cancelled = render({
+      state: state({
+        name: 'ending',
+        video: true,
+        peerVideo: true,
+        connectedAt: null,
+      }),
+      peerAvatarB64: PHOTO,
+    });
+    expect(photos(cancelled.tree)).toHaveLength(0);
+    expect(cancelled.texts()).toContain('DA');
+  });
+
   it('letters a photo-less peer from their name at the corner size, never the id', () => {
     const { tree, texts } = render({ state: state({ video: true }), peerName: 'P1' });
     expect(texts()).toContain('?');

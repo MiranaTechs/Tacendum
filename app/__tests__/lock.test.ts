@@ -205,3 +205,113 @@ describe('duress-session no-ops', () => {
     expect(await lock.verify('123456')).toEqual({ verdict: 'real' });
   });
 });
+
+describe('clearAll under a rejecting secret store (AD-1, 2026-09-03)', () => {
+  const crypto = jest.requireMock('tacendum-crypto') as {
+    deleteSecret: jest.Mock;
+  };
+  const shippedDelete = crypto.deleteSecret.getMockImplementation();
+
+  /** Both stores reject a delete they cannot complete — SecretStore.kt throws
+   * `secret delete failed` on a failed unlink, TacendumCryptoImpl.swift throws
+   * on any Keychain status but success/notFound — and the global mock never
+   * does, which is why this half of the contract had no coverage. Rule 4: the
+   * simulated error names no key and no value. */
+  function rejectDeleteOf(target: string): void {
+    crypto.deleteSecret.mockImplementation(async (key: string) => {
+      if (key === target) throw new Error('secret delete failed');
+      keychain.delete(key);
+    });
+    // The recorded calls below must be the WIPE's, not the setup's — this mock
+    // is module-scoped and nothing else in this file clears it.
+    crypto.deleteSecret.mockClear();
+  }
+
+  afterEach(() => {
+    if (shippedDelete) crypto.deleteSecret.mockImplementation(shippedDelete);
+  });
+
+  test('a refusal on the code leaves the lock OFF, not enabled-with-no-code', async () => {
+    await lock.setup('123456');
+    rejectDeleteOf('lock.passcode');
+
+    // Past the gate the sweep is best-effort, so this resolves.
+    await expect(lock.disable()).resolves.toBeUndefined();
+
+    // The dangerous half-state — `lock.enabled` standing over no stored code,
+    // which `verify` answers `{verdict:'real'}` for ANY input — is the one
+    // outcome that must be unreachable. The old wipe order produced exactly
+    // it: passcode deleted first, then the abort.
+    expect(keychain.get('lock.enabled')).toBeUndefined();
+    expect((await lock.status()).enabled).toBe(false);
+  });
+
+  test('one refusal does not abort the sweep — every other key is still attempted', async () => {
+    await lock.setup('123456');
+    await lock.setAutolock(300);
+    for (let i = 0; i < 5; i++) await lock.verify('999999');
+    expect(keychain.get('lock.failCount')).toBe('5');
+    rejectDeleteOf('lock.passcode');
+
+    await lock.disable();
+
+    // `lock.passcode` is the inert residue the refusal leaves behind; every
+    // key after it in the sweep is gone rather than stranded by an abort.
+    expect([...keychain.keys()].filter(k => k.startsWith('lock.'))).toEqual([
+      'lock.passcode',
+    ]);
+    expect(crypto.deleteSecret).toHaveBeenCalledWith('lock.autolockSec');
+    expect(crypto.deleteSecret).toHaveBeenCalledWith('lock.failCount');
+    expect(crypto.deleteSecret).toHaveBeenCalledWith('lock.lockedUntil');
+  });
+
+  test('the residual code cannot open anything, and the next setup overwrites it', async () => {
+    await lock.setup('123456');
+    rejectDeleteOf('lock.passcode');
+    await lock.disable();
+    if (shippedDelete) crypto.deleteSecret.mockImplementation(shippedDelete);
+
+    // Nothing consults a passcode while the lock is off, and re-enabling
+    // replaces it rather than inheriting it.
+    await lock.setup('246800');
+    expect(keychain.get('lock.passcode')).toBe('246800');
+    expect(await lock.verify('123456')).toEqual({
+      verdict: 'fail',
+      attemptsLeft: 4,
+    });
+  });
+
+  test('a refusal on the GATE changes nothing at all, and rejects', async () => {
+    await lock.setup('123456');
+    await lock.setAutolock(300);
+    rejectDeleteOf('lock.enabled');
+
+    await expect(lock.disable()).rejects.toThrow();
+
+    // The gate is deleted first and alone precisely so its failure is total:
+    // the lock is untouched and still works, which is what makes the
+    // "Nothing was changed" the caller shows true.
+    expect((await lock.status()).enabled).toBe(true);
+    expect((await lock.status()).autolockSec).toBe(300);
+    expect(await lock.verify('123456')).toEqual({ verdict: 'real' });
+    expect(await lock.verify('654321')).toEqual({ verdict: 'duress' });
+    // And nothing past the gate was swept on the way out.
+    expect(crypto.deleteSecret).not.toHaveBeenCalledWith('lock.passcode');
+  });
+
+  test('no lock error carries a key name or a code (rule 4)', async () => {
+    await lock.setup('123456');
+    rejectDeleteOf('lock.enabled');
+    await lock.disable().then(
+      () => {
+        throw new Error('expected a rejection');
+      },
+      (err: unknown) => {
+        const text = String(err instanceof Error ? err.message : err);
+        expect(text).not.toContain('123456');
+        expect(text).not.toContain('654321');
+        expect(text).not.toContain('lock.');
+      },
+    );
+  });
+});

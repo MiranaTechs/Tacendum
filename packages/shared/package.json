@@ -12,6 +12,7 @@
     "./group-envelope": "./src/group-envelope.ts",
     "./msgid": "./src/msgid.ts",
     "./pacing": "./src/pacing.ts",
+    "./rounds": "./src/rounds.ts",
     "./call-session": "./src/call-session.ts"
   },
   "scripts": {

@@ -19,6 +19,11 @@ export * from './ai-origin.js';
 // The pairwise consent edge DTO + cap, through the
 // barrel on the same rule.
 export * from './consent.js';
+// The paper recovery kit's preimages, constants and wire shapes, exported
+// through the barrel on the same rule.
+// Nothing behind this line is reachable from the wire yet: there is no route,
+// no handler and no server import — see the file's own header.
+export * from './recovery.js';
 
 /**
  * Wire-protocol frame types, REST DTOs, and the message envelope format

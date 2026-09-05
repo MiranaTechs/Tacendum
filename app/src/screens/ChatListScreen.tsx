@@ -11,6 +11,7 @@ import {
   // paste target is the whole point of an id.
   Clipboard,
   FlatList,
+  Linking,
   Pressable,
   StyleSheet,
   Text,
@@ -27,6 +28,13 @@ import { messaging } from '../messaging';
 import { isNamingSettled, namingNudgeDue, skipNaming } from '../naming';
 import { NAMING_COPY } from '../namingCopy';
 import { shareIdMessage } from '../peerId';
+import {
+  dismissSoftUpdate,
+  isSoftUpdateDismissed,
+  storeUrl,
+  updateGate,
+} from '../updateGate';
+import { UPDATE_COPY } from '../updateGateCopy';
 import { personName, sanitizeDisplayName } from '../person';
 import { useTheme } from '../theme';
 import { timeLabel } from '../time';
@@ -357,7 +365,7 @@ const ConversationRow = React.memo(function ConversationRowBody({
       >
         {/* A person is a circle; a room is the Quiet Room's walled square
             with a doorway (RoomMark). The monogram mechanism inside is
-            the — initials of the room's name, or the ULID's tail when it
+            the initials of the room's name, or the ULID's tail when it
             has none — but the SHAPE is the signal: in a list mixing both,
             room-ness must not depend on reading the name. */}
         {room ? (
@@ -1001,14 +1009,14 @@ function NamingNudge({
  * Never in a duress session: one exists only under a lock that is on. */
 const LOCK_NUDGE_COPY = {
   title: 'Add a lock code',
-  body: 'Your chats are only as private as this phone’s lock. A lock code of your own is asked for whenever Tacendum opens.',
+  body: `Your chats are only as private as this ${DEVICE_NOUN}’s lock. A lock code of your own is asked for whenever Tacendum opens.`,
   where: 'Turn it on in Settings → App Lock, whenever you like.',
   open: 'Open Settings',
   skip: 'Not now',
   infoLabel: 'What a lock code does',
   infoLines: [
-    'With App Lock on, Tacendum asks for its own code when it opens and after it has been in the background — on top of the phone’s passcode.',
-    'The code never leaves this phone. Forgetting it means setting the app up again, so pick one you will remember.',
+    `With App Lock on, Tacendum asks for its own code when it opens and after it has been in the background — on top of the ${DEVICE_NOUN}’s passcode.`,
+    `The code never leaves this ${DEVICE_NOUN}. Forgetting it means setting the app up again, so pick one you will remember.`,
   ],
 } as const;
 
@@ -1021,6 +1029,22 @@ async function lockNudgeDue(): Promise<boolean> {
 
 function settleLockNudge(): Promise<void> {
   return setSecret(LOCK_NUDGE_KEY, '1');
+}
+
+/**
+ * The store build the soft update card is owed for, or null.
+ *
+ * Read straight off the gate singleton rather than through `checkNow`, which
+ * is the right shape (this list must not dial anything) and was, on its own,
+ * how a real session's answer reached the decoy: the singleton outlives a
+ * relock. The getter it reads now refuses a non-real session, and `relock()`
+ * clears the answer as well, so the card can only ever be raised by the
+ * session that earned it.
+ */
+async function softUpdateDue(): Promise<number | null> {
+  const latest = updateGate.softLatestBuild;
+  if (latest === undefined) return null;
+  return (await isSoftUpdateDismissed(latest)) ? null : latest;
 }
 
 function LockNudge({
@@ -1087,6 +1111,77 @@ function LockNudge({
           label={LOCK_NUDGE_COPY.skip}
           onPress={onSkip}
           testID="lock-nudge-skip"
+        />
+      </View>
+    </View>
+  );
+}
+
+/**
+ * The soft update card. The gate said this build
+ * still works and a newer one is on the store, so this is a nudge and never
+ * a wall: the naming nudge's slot and shape, one quiet card, dismissible.
+ *
+ * DISMISSED PER `latestBuild`, not per install. A flag would silence every
+ * future release after one "Not now"; the VALUE means the next release asks
+ * exactly once more, and the one after that once more again.
+ *
+ * Never in a duress session, for free: the gate refuses to check there, so
+ * there is no decision for this card to render.
+ */
+function UpdateNudge({
+  placement,
+  url,
+  onSkip,
+}: {
+  placement: 'empty' | 'list';
+  /** The store link, when the policy carried one. No link, no button —
+   * the same rule the update wall follows. */
+  url: string | undefined;
+  onSkip: () => void;
+}) {
+  const t = useTheme();
+  return (
+    <View
+      testID="update-nudge"
+      style={[
+        styles.nudge,
+        placement === 'empty'
+          ? styles.nudgeEmpty
+          : [styles.nudgeList, { marginHorizontal: t.layout.gutter }],
+        {
+          borderRadius: t.radius.drawer,
+          backgroundColor: t.color.paperSheet,
+          borderColor: t.color.lineSoft,
+          borderWidth: t.hairline,
+        },
+      ]}
+    >
+      <Text
+        accessibilityRole="header"
+        style={[t.type.sectionTitle, { color: t.color.inkStrong }]}
+      >
+        {UPDATE_COPY.nudgeTitle}
+      </Text>
+      <Text
+        style={[t.type.compactBody, styles.nudgeBody, { color: t.color.inkBody }]}
+      >
+        {UPDATE_COPY.nudgeBody}
+      </Text>
+      <View style={styles.nudgeActions}>
+        {url ? (
+          <TextAction
+            label={UPDATE_COPY.nudgeOpen}
+            onPress={() => {
+              void Linking.openURL(url).catch(() => undefined);
+            }}
+            testID="update-nudge-open"
+          />
+        ) : null}
+        <TextAction
+          label={UPDATE_COPY.nudgeSkip}
+          onPress={onSkip}
+          testID="update-nudge-skip"
         />
       </View>
     </View>
@@ -1380,6 +1475,11 @@ export function ChatListScreen({
   // answer arrives to hide it.
   const [nudge, setNudge] = useState(false);
   const [lockNudge, setLockNudge] = useState(false);
+  /** The store build the soft update card is owed for, or null. Read in the
+   * same pass and committed in the same batch as the other two, so the
+   * three answers land together and no card paints for a frame before a
+   * higher-priority one arrives to hide it. */
+  const [softUpdate, setSoftUpdate] = useState<number | null>(null);
   useEffect(() => {
     let live = true;
     void (async () => {
@@ -1392,14 +1492,33 @@ export function ChatListScreen({
           )
         : false;
       const lockDue = await lockNudgeDue().catch(() => false);
+      const softLatest = await softUpdateDue();
       if (!live) return;
       setNudge(naming);
       setLockNudge(lockDue);
+      setSoftUpdate(softLatest);
     })();
+    // The gate's answer can arrive AFTER this list mounted — the foreground
+    // check is throttled to once per six hours and lands whenever it lands
+    // — so the card is re-read on a decision change rather than at mount
+    // only. The other two nudges have no such event: their answers are on
+    // disk before the list exists.
+    const off = updateGate.subscribe(() => {
+      void (async () => {
+        const softLatest = await softUpdateDue();
+        if (live) setSoftUpdate(softLatest);
+      })();
+    });
     return () => {
       live = false;
+      off();
     };
   }, [profile]);
+  const skipSoftUpdate = useCallback(() => {
+    const latest = softUpdate;
+    setSoftUpdate(null);
+    if (latest !== null) void dismissSoftUpdate(latest).catch(() => undefined);
+  }, [softUpdate]);
   const settleNudge = useCallback(() => {
     setNudge(false);
     void skipNaming().catch(() => undefined);
@@ -1457,6 +1576,15 @@ export function ChatListScreen({
             <NamingNudge placement="list" onAdd={addName} onSkip={settleNudge} />
           ) : lockNudge ? (
             <LockNudge placement="list" onOpen={openAppLock} onSkip={skipLockNudge} />
+          ) : softUpdate !== null ? (
+            // Last in the chain on purpose: naming and the lock code are
+            // one-time asks about this account's own safety, and a newer
+            // build on the store can wait a launch behind either.
+            <UpdateNudge
+              placement="list"
+              url={storeUrl(updateGate.policy)}
+              onSkip={skipSoftUpdate}
+            />
           ) : null}
           {filtering ? <FilterField value={query} onChange={setQuery} /> : null}
           {/* The room entry lives with the list, not behind the + : a room
@@ -1494,6 +1622,8 @@ export function ChatListScreen({
       query,
       settleNudge,
       skipLockNudge,
+      skipSoftUpdate,
+      softUpdate,
       t,
     ],
   );
@@ -1645,6 +1775,12 @@ export function ChatListScreen({
                     placement="empty"
                     onOpen={openAppLock}
                     onSkip={skipLockNudge}
+                  />
+                ) : softUpdate !== null ? (
+                  <UpdateNudge
+                    placement="empty"
+                    url={storeUrl(updateGate.policy)}
+                    onSkip={skipSoftUpdate}
                   />
                 ) : null
               }

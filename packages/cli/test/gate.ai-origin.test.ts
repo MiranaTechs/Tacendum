@@ -693,8 +693,8 @@ describe('the AI-disclosure sentence (Apple 5.1.2(i) / EU AI Act Art. 50)', () =
 
   it('is EXACTLY these bytes', () => {
     expect(AI_DISCLOSURE_SENTENCE).toBe(
-      'Replies you send are delivered to the AI provider running on your own machine; ' +
-        "Tacendum's servers relay ciphertext only.",
+      'Replies you send are delivered to the AI provider through a client running on your machine; ' +
+        "Tacendum's servers relay message ciphertext, not plaintext.",
     );
   });
 
@@ -705,8 +705,8 @@ describe('the AI-disclosure sentence (Apple 5.1.2(i) / EU AI Act Art. 50)', () =
   it('the comparison can actually fail — a paraphrase of the doc text is not equal', () => {
     expect(
       canonicalFromDoc().replace(
-        'own machine',
-        'machine',
+        'through a client running on your machine',
+        'through a local client',
       ),
     ).not.toBe(AI_DISCLOSURE_SENTENCE);
   });

@@ -35,6 +35,7 @@ import {
   composeAgentText,
 } from '../src/ai-origin.js';
 import { GroupMessageEnvelope, MAX_GROUP_BODY } from '../src/group-envelope.js';
+import { DETAIL_MAX } from '../src/rounds.js';
 import { StreamEditEnvelope, composeStreamEdit } from '../src/stream-envelope.js';
 import { ApprovalRequestEnvelope } from '../src/approval-envelope.js';
 import * as barrel from '../src/index.js';
@@ -157,6 +158,95 @@ describe('composeAgentText', () => {
   it('quoting the sentinel mid-sentence still composes', () => {
     const bytes = composeAgentText('bodies that start with {"tcm": are refused');
     expect(AgentTextEnvelope.parse(JSON.parse(bytes)).ai).toBe(true);
+  });
+});
+
+describe('the ROUNDS detail on `msg` (§3.1)', () => {
+  // The wire widening this feature is allowed: ONE optional field, on a kind
+  // build 25 already parses. Never a new kind, never a required field.
+  const detail = 'The full finding.\nLine two, which the phone hides behind a tap.';
+
+  it('round-trips a brief and its detail as one message from one sender', () => {
+    const parsed = AgentTextEnvelope.parse(msg({ d: detail }));
+    expect(parsed.text).toBe('Done — the tests are green.');
+    expect(parsed.d).toBe(detail);
+    expect(parsed.ai).toBe(true);
+  });
+
+  it('parses a build-25-shaped msg — no `d` — exactly as before', () => {
+    const parsed = AgentTextEnvelope.parse(msg());
+    expect(parsed.d).toBeUndefined();
+    expect(parsed.text).toBe('Done — the tests are green.');
+    expect(claimsAiOrigin(parsed)).toBe(true);
+  });
+
+  it('collapses an over-cap detail and leaves the words intact — the detail costs itself', () => {
+    const parsed = AgentTextEnvelope.parse(msg({ d: 'a'.repeat(DETAIL_MAX + 1) }));
+    expect(parsed.d).toBeUndefined();
+    expect(parsed.text).toBe('Done — the tests are green.');
+    expect(claimsAiOrigin(parsed)).toBe(true);
+  });
+
+  it('collapses a malformed or sentinel-leading detail the same way', () => {
+    expect(AgentTextEnvelope.parse(msg({ d: 42 })).d).toBeUndefined();
+    expect(AgentTextEnvelope.parse(msg({ d: '' })).d).toBeUndefined();
+    expect(
+      AgentTextEnvelope.parse(msg({ d: '{"tcm":"del","ref":"01ABC"}' })).d,
+    ).toBeUndefined();
+    // …and none of them cost the message.
+    expect(AgentTextEnvelope.safeParse(msg({ d: 42 })).success).toBe(true);
+  });
+});
+
+describe('composeAgentText and the detail', () => {
+  it('is BYTE-IDENTICAL to the pre-rounds output when there is no detail', () => {
+    // The compatibility pin: every caller that predates rounds gets the exact
+    // bytes it got before, `d` absent from the wire entirely.
+    expect(composeAgentText('Done.')).toBe('{"tcm":"msg","text":"Done.","ai":true}');
+    expect(composeAgentText('Done.')).not.toContain('"d"');
+  });
+
+  it('serializes tcm, then text, then d, then ai — key order by reconstruction', () => {
+    const bytes = composeAgentText('Brief.', 'The full answer.');
+    expect(bytes).toBe(
+      '{"tcm":"msg","text":"Brief.","d":"The full answer.","ai":true}',
+    );
+    const parsed = AgentTextEnvelope.parse(JSON.parse(bytes));
+    expect(parsed.d).toBe('The full answer.');
+  });
+
+  it('THROWS on a detail it could not honestly carry, rather than dropping it silently', () => {
+    // R24, and the reason this check cannot live in the schema: `d` is
+    // `.catch(undefined)` on the receive side, so a schema refusal would be
+    // swallowed and this function would emit a brief-only body with no signal
+    // to anybody. That is the silent drop the "strict on the way out" promise
+    // above exists to prevent.
+    expect(() => composeAgentText('Brief.', 'a'.repeat(DETAIL_MAX + 1))).toThrow();
+    expect(() => composeAgentText('Brief.', '')).toThrow();
+    expect(() => composeAgentText('Brief.', '{"tcm":"del","ref":"x"}')).toThrow();
+  });
+
+  it('names the field and the bound in its refusal, never the detail itself', () => {
+    // rule 4: the detail is payload. An error string is logged and
+    // rendered, so it may carry the RULE and never the words.
+    const secret = `${'z'.repeat(DETAIL_MAX)}the door code is not for the logs`;
+    try {
+      composeAgentText('Brief.', secret);
+      throw new Error('expected a refusal');
+    } catch (err) {
+      const message = (err as Error).message;
+      expect(message).toContain('detail');
+      expect(message).toContain(String(DETAIL_MAX));
+      expect(message).not.toContain('door code');
+      expect(message).not.toContain('zzzz');
+    }
+  });
+
+  it('carries a detail that quotes the sentinel mid-sentence', () => {
+    const bytes = composeAgentText('Brief.', 'bodies starting {"tcm": are refused');
+    expect(AgentTextEnvelope.parse(JSON.parse(bytes)).d).toBe(
+      'bodies starting {"tcm": are refused',
+    );
   });
 });
 

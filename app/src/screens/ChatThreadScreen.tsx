@@ -66,6 +66,10 @@ import {
 } from '../messageSound';
 import { MENTION_MARK,
   VOICE_MAX_SECONDS,
+  // THE detail reader (§3.1), envelope.ts's own: the round pass
+  // and the disclosure both ask IT what a body's full answer is, and this
+  // screen never re-parses rendered text for one.
+  detailText,
   displayText,
   encodeEnvelope,
   isCarrierEnvelope,
@@ -146,7 +150,18 @@ import { CALL_CAP_COPY } from './GroupCallScreen';
 // and the card's grey-out read one clock arithmetic.
 import { ApprovalCard, approvalDeadline } from '../ui/ApprovalCard';
 import { AgentBadge } from '../ui/AgentBadge';
+import { DetailDisclosure } from '../ui/DetailDisclosure';
 import { AGENT_COPY } from '../machine';
+// ROUNDS (§3.2): the join is a PURE function over the built list
+// plus a resolver, so the whole priority order is testable without a screen.
+import {
+  ROUND_COPY,
+  roomAnchorKey,
+  roundHeaderTestID,
+  roundRanges,
+  rowKey,
+  type RoundRange,
+} from '../rounds';
 
 interface Props {
   peerId: string;
@@ -1192,6 +1207,13 @@ interface ThreadItem {
    * open. Set on exactly one item, placed above the first of them; `row` is
    * then a placeholder carrying that row's ts. */
   divider?: number;
+  /** Present when this item is a ROUND HEADER (§3.2): the
+   * synthetic full-width line over the first answer of a round, produced by
+   * the round pass exactly as `divider` is. `row` is then a placeholder
+   * carrying the first member's ts, and it is NEVER written to the
+   * database — a round is a client-side reading of messages that stand on
+   * their own, joined on a reply reference this phone resolved itself. */
+  round?: RoundRange;
   /** The row's body, parsed ONCE per data change and carried here so the
    * grouping pass, the quote resolver and the mounted row all read the
    * same answer (each used to parse it again). Null for plain text and
@@ -1211,11 +1233,22 @@ interface ThreadItem {
 function threadKey(item: ThreadItem): string {
   return item.divider != null
     ? 'unread-divider'
-    : item.approval
-      ? `approval:${item.approval.q}`
-      : item.call
-        ? `call:${item.call.cid}`
-        : `${item.row.msgId}:${item.row.direction}`;
+    : // A round header's own namespace (§3.2): its anchor key is
+      // built from a peer-chosen msgId, so without one it could collide with
+      // the very row it stands over. The placeholder's msgId carries the
+      // namespace AND the first member, because the anchor key alone is NOT
+      // unique per item: `close()` drops the open round on any outbound,
+      // system or non-agent row and the next qualifying row re-opens under
+      // the SAME anchor, so one turn answered, interrupted and answered
+      // again yields two headers — and two identical keyExtractor values is
+      // a VirtualizedList reusing one cell for two different items.
+      item.round
+      ? item.row.msgId
+      : item.approval
+        ? `approval:${item.approval.q}`
+        : item.call
+          ? `call:${item.call.cid}`
+          : `${item.row.msgId}:${item.row.direction}`;
 }
 
 /** The placeholder behind a call item. Empty body: every envelope parse on it
@@ -1244,6 +1277,69 @@ function approvalPlaceholderRow(a: db.ApprovalRow): db.MessageRow {
     status: 'received' as db.MessageStatus,
     deletedAt: null,
   };
+}
+
+/** The placeholder behind a round header — `callPlaceholderRow`'s scheme
+ * again: empty body, so every envelope parse on it yields null and every
+ * message-only path falls through harmlessly. Its ts is the first member's,
+ * so a day label above it stays truthful. Never written to the database. */
+function roundPlaceholderRow(
+  first: db.MessageRow,
+  anchorKey: string,
+): db.MessageRow {
+  return {
+    // Namespaced by the anchor AND identified by the FIRST MEMBER, which is
+    // stable data rather than an index (a requery shifts indices, and this
+    // string is the list key). Two rounds can share one anchor; no two can
+    // share a first member.
+    msgId: `round:${anchorKey}:${rowKey(first.msgId, first.direction)}`,
+    peerId: first.peerId,
+    direction: 'in',
+    body: '',
+    ts: first.ts,
+    status: 'received' as db.MessageStatus,
+    deletedAt: null,
+  };
+}
+
+/**
+ * Whether a row's AUTHENTICATED sender is an agent — the AI badge's one
+ * question, stated ONCE here because two
+ * surfaces now ask it: the bubble's badge and spoken attribution, and the
+ * round pass's membership test (§3.2, "the round is not a third
+ * source of that signal").
+ *
+ * Two sources and ONLY these two:
+ *
+ *  - the machine record: the AUTHENTICATED sender — in a room the
+ *    row's authorId, in a 1:1 the thread's peer — looked up in
+ *    machine_peers, the app's memory of the server's own adopt/revoke
+ *    answers. It KEEPS the badge against a lying client that omits the
+ *    marker: a class is never shed by silence.
+ *  - the row's `ai` column: the sender-claimed in-envelope marker,
+ *    recorded AT ARRIVAL like `outsider`. It GAINS the
+ *    badge on a phone with no record — the paired-never-adopted 1:1, and a
+ *    stranger's phone in a room — honest as sender-claimed, which D5
+ *    records is the most this wire can say.
+ *
+ * Never the words, never a shared name, never a render-time body parse — a
+ * body that merely LOOKS marked cannot badge a row that arrived unmarked, and
+ * cannot join a round either. Inbound only: my own sends are a person typing
+ * on this phone.
+ */
+function aiSenderOf(
+  row: db.MessageRow,
+  ctx: {
+    inRoom: boolean;
+    isAgentId: (id: string) => boolean;
+    peerIsAgent: boolean;
+  },
+): boolean {
+  if (row.direction === 'out') return false;
+  if (row.ai === 1) return true;
+  return ctx.inRoom
+    ? row.authorId != null && ctx.isAgentId(row.authorId)
+    : ctx.peerIsAgent;
 }
 
 /** The placeholder behind the unread divider — the same scheme: empty body,
@@ -1300,6 +1396,14 @@ function buildItems(
   /** The open's unread window, or null while unknown — no divider is drawn
    * against a guess. */
   unreadWindow: UnreadWindow | null,
+  /** What the round pass (§3.2) needs and cannot derive here:
+   * who is an agent, and which stored row a reply reference resolves to. */
+  round: {
+    aiSender: (row: db.MessageRow) => boolean;
+    /** The anchor's list key, or null when the row carries no reply ref or
+     * the ref does not resolve against rows this phone holds. */
+    anchorKey: (row: db.MessageRow, envelope: Envelope | null) => string | null;
+  },
 ): ThreadItem[] {
     // Screenshot notices render as full-width system rows that ignore every
     // grouping flag — so they must be transparent to direction runs, like the
@@ -1368,6 +1472,30 @@ function buildItems(
     );
     const firstUnread = unread.indexOf(true);
     const unreadCount = unread.filter(Boolean).length;
+    // THE ROUND PASS (§3.2). Computed over ROWS, before any item
+    // is pushed, so the ranges index the same list the grouping flags were
+    // computed from. Calls and approval cards join `system` here for the
+    // reason they join it above: they are events, they break a run, and they
+    // are never the human turn a round answers.
+    const rounds = roundRanges(
+      rows.map((r, i) => ({
+        msgId: r.msgId,
+        direction: r.direction,
+        system: system[i] || !!callAt[i] || !!approvalAt[i],
+        aiSender: round.aiSender(r),
+        // The AUTHENTICATED author, beside `aiSender` and from the same kind
+        // of source — the row's column, never the body. The header counts
+        // DISTINCT values of it, so one agent answering twice is one agent
+        // and a 1:1 (every authorId null, one peer) grows no header at all.
+        authorId: r.authorId ?? null,
+        arrivedAt: r.arrivedAt ?? null,
+      })),
+      (_item, i) => round.anchorKey(rows[i]!, envelopes[i] ?? null),
+    );
+    /** Row index → the round that STARTS there, so the header can be emitted
+     * in one pass beside the divider. */
+    const roundAt = new Map<number, RoundRange>();
+    for (const r of rounds) roundAt.set(r.first, r);
     const items: ThreadItem[] = [];
     rows.forEach((row, i) => {
       const prev = rows[i - 1];
@@ -1381,6 +1509,11 @@ function buildItems(
         !!prev &&
         !system[i] &&
         !system[i - 1] &&
+        // A round header stands between them (§3.2): the run
+        // ends here, so the first answer of a round keeps its own author
+        // label and its own corner instead of being tucked under a bubble
+        // the header has already separated it from.
+        !roundAt.has(i) &&
         prev.direction === row.direction &&
         // In a room, direction alone lies: two inbound neighbours can be two
         // different PEOPLE, and grouping them would hide the second author's
@@ -1394,6 +1527,9 @@ function buildItems(
         !!next &&
         !system[i] &&
         !system[i + 1] &&
+        // The same break, seen from the row above it — so THIS row is last in
+        // its group and keeps the clock label the header never prints.
+        !roundAt.has(i + 1) &&
         next.direction === row.direction &&
         (next.authorId ?? null) === (row.authorId ?? null) &&
         after >= 0 &&
@@ -1401,6 +1537,9 @@ function buildItems(
         sameDay(next.ts, row.ts);
       const lastInGroup = !groupedAfter;
       const newDay = !prev || !sameDay(prev.ts, row.ts);
+      // Whichever full-width line lands here FIRST takes the day label with
+      // it, so the eye reads the date, then the line, then the message.
+      let dayTaken = false;
       if (i === firstUnread) {
         // The divider takes the day label with it, so the eye reads the
         // date, then "N new messages", then the message — never the line
@@ -1415,6 +1554,25 @@ function buildItems(
           newDay,
           showClock: false,
         });
+        dayTaken = true;
+      }
+      const roundHere = roundAt.get(i);
+      if (roundHere) {
+        // THE DIVIDER WINS THE SLOT (§3.2): when both land on the
+        // same row the divider is emitted first, then the header, then the
+        // row. A round must never hide the row the divider points at — which
+        // is also why the BRIEFS are visible by default and only the details
+        // are collapsed.
+        items.push({
+          row: roundPlaceholderRow(row, roundHere.anchorKey),
+          envelope: null,
+          round: roundHere,
+          firstInGroup: true,
+          lastInGroup: true,
+          newDay: dayTaken ? false : newDay,
+          showClock: false,
+        });
+        dayTaken = true;
       }
       items.push({
         row,
@@ -1423,7 +1581,7 @@ function buildItems(
         envelope: envelopes[i] ?? null,
         firstInGroup: !groupedBefore,
         lastInGroup,
-        newDay: i === firstUnread ? false : newDay,
+        newDay: dayTaken ? false : newDay,
         // Groups end at every direction change, so a quick exchange inside
         // one minute otherwise prints the same clock label four times. A
         // system row prints no clock, so it never suppresses a neighbor's.
@@ -2201,6 +2359,10 @@ export function ChatThreadScreen({
     dividerScrolled.current = false;
     if (flashTimer.current) clearTimeout(flashTimer.current);
     setFlashKey(null);
+    // And every open full answer: the keys are `${msgId}:${direction}` and
+    // msgIds are PEER-CHOSEN, so a key carried across a peer switch could
+    // open a different conversation's bubble on arrival.
+    setExpandedDetails(new Set());
     // Back to "not answered": the previous thread's roomness must not gate —
     // or ungate — this one's receipts for even one render.
     setGroup(null);
@@ -2605,7 +2767,12 @@ export function ChatThreadScreen({
   }, [rows]);
 
   const quotedFor = useCallback(
-    ({ row, envelope }: ThreadItem): db.MessageRow | undefined => {
+    // Narrower than ThreadItem on purpose: the round pass asks the SAME
+    // resolver about a row it has not built an item for yet, and a second
+    // copy of this arithmetic is exactly what §6 rule 5 forbids.
+    ({ row, envelope }: Pick<ThreadItem, 'row' | 'envelope'>):
+      | db.MessageRow
+      | undefined => {
       if (envelope?.tcm !== 'reply') return undefined;
       // `ofs` is the REPLIER's authorship claim: what they wrote is my 'in'
       // row when the reply came from them, and my 'out' row when it is mine.
@@ -2614,6 +2781,63 @@ export function ChatThreadScreen({
     },
     [byKey],
   );
+
+  /**
+   * THE ROUND'S REF ARM (§3.2): which stored row an answer
+   * answers, as a list key — or null when it answers nothing this phone
+   * holds.
+   *
+   * The ref is MATCHED AGAINST ROWS, never trusted as a label, which is what
+   * makes the round key authenticated rather than sender-chosen: the row it
+   * resolves to has a sender the ratchet already vouched for.
+   *
+   * TWO ARMS, because a room ref and a 1:1 ref are different things. A ROOM
+   * ref names its author outright (`${authorId}.${m}`), so the side comes from
+   * the author — `rounds.ts:roomAnchorKey`. Resolving a room ref through
+   * `ofs` instead looks right on the OWNER's phone, where the human turn is an
+   * out row, and silently misses on every other member's, where the same turn
+   * is inbound; the arm then degrades to the window arm with every owner-side
+   * test still green. A 1:1 ref carries no author, so it keeps `quotedFor` —
+   * the same resolver the quote box uses, asked once.
+   */
+  const roundAnchorKey = useCallback(
+    (row: db.MessageRow, envelope: Envelope | null): string | null => {
+      if (envelope?.tcm !== 'reply') return null;
+      if (group !== null) {
+        const key = roomAnchorKey(envelope.ref, me?.userId ?? null);
+        return key !== null && byKey.has(key) ? key : null;
+      }
+      const anchor = quotedFor({ row, envelope });
+      return anchor ? rowKey(anchor.msgId, anchor.direction) : null;
+    },
+    [group, me?.userId, byKey, quotedFor],
+  );
+
+  /** Membership in a round, asked of the same rule the badge asks (§3.2). */
+  const roundAiSender = useCallback(
+    (row: db.MessageRow): boolean =>
+      aiSenderOf(row, { inRoom: group !== null, isAgentId, peerIsAgent }),
+    [group, isAgentId, peerIsAgent],
+  );
+
+  /**
+   * Which rows have their FULL ANSWER open, by `${msgId}:${direction}`
+   * (§3.2). Held on the SCREEN, not inside the disclosure:
+   * a thread requeries on every receipt, reaction and download tick, and
+   * state inside the row would close every open detail each time one landed.
+   * A Set, so the memo comparator is one `has` per row.
+   */
+  const [expandedDetails, setExpandedDetails] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const onToggleDetail = useCallback((row: db.MessageRow) => {
+    const key = rowKey(row.msgId, row.direction);
+    setExpandedDetails(current => {
+      const next = new Set(current);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
+  }, []);
 
   // The chip must show what the row says NOW: the peer can retract or rewrite
   // the message being answered while the composer holds it. Dropping a
@@ -2685,8 +2909,13 @@ export function ChatThreadScreen({
       merged.map(e => e.a),
       envelopes,
       unreadWindow,
+      { aiSender: roundAiSender, anchorKey: roundAnchorKey },
     );
-  }, [rows, calls, approvals, unreadWindow]);
+    // The two round callbacks are memoised on what they read (the room
+    // anchor, my id, the row map, the machine record), so a requery that
+    // changes none of those leaves this memo's identity alone — which is
+    // what keeps a tick from remounting every row (ChatThread.scrollpin).
+  }, [rows, calls, approvals, unreadWindow, roundAiSender, roundAnchorKey]);
 
   /** The items as of this render, for handlers that must not re-identify on
    * every requery (a tapped quote resolves its index at tap time). */
@@ -2736,6 +2965,10 @@ export function ChatThreadScreen({
       const index = itemsRef.current.findIndex(
         it =>
           it.divider == null &&
+          // A round header is a synthetic item too, and its placeholder's
+          // msgId is built from a peer-chosen one — so it is excluded by
+          // KIND here, exactly as the other placeholders are.
+          it.round == null &&
           !it.call &&
           !it.approval &&
           it.row.msgId === target.msgId &&
@@ -2831,7 +3064,15 @@ export function ChatThreadScreen({
     reactions: unknown;
     approvalNow: number;
     streamTick: number;
-  }>({ items: null, attachments: null, reactions: null, approvalNow: 0, streamTick: 0 });
+    expandedDetails: ReadonlySet<string> | null;
+  }>({
+    items: null,
+    attachments: null,
+    reactions: null,
+    approvalNow: 0,
+    streamTick: 0,
+    expandedDetails: null,
+  });
   {
     const prev = scrollAttribution.current;
     const contentChanged =
@@ -2839,11 +3080,26 @@ export function ChatThreadScreen({
       prev.attachments !== attachments ||
       prev.reactions !== reactions;
     const tickChanged =
-      prev.approvalNow !== approvalNow || prev.streamTick !== streamTick;
+      prev.approvalNow !== approvalNow ||
+      prev.streamTick !== streamTick ||
+      // OPENING A FULL ANSWER is the same class as a tick, and the sharpest
+      // case of it (§3.2): the disclosure grows the bubble by
+      // hundreds of points, fires this resize, and — pinned — would scroll
+      // the list to the end away from the very words the person just asked
+      // to read. Nothing arrived; a row already on glass got taller.
+      (prev.expandedDetails !== null &&
+        prev.expandedDetails !== expandedDetails);
     // Content wins a mixed render: a genuinely new row while pinned scrolls
     // even when a tick rode the same commit.
     tickOnlyRepaint.current = tickChanged && !contentChanged;
-    scrollAttribution.current = { items, attachments, reactions, approvalNow, streamTick };
+    scrollAttribution.current = {
+      items,
+      attachments,
+      reactions,
+      approvalNow,
+      streamTick,
+      expandedDetails,
+    };
   }
 
 
@@ -3996,6 +4252,25 @@ export function ChatThreadScreen({
               marginBottom={8}
             />
           </View>
+        ) : item.round ? (
+          // THE ROUND HEADER (§3.2), on the unread divider's
+          // ruled geometry and ahead of every bubble path for the approval
+          // card's reason: a synthetic item must never reach MessageRow.
+          // It says only how many agents answered — never that the relay
+          // ordered, attributed or coordinated anything, because it did not.
+          <View
+            testID={roundHeaderTestID(item.round.anchorKey)}
+            accessible
+            accessibilityRole="header"
+            accessibilityLabel={ROUND_COPY.header(item.round.n)}
+          >
+            <RuledLabel
+              label={ROUND_COPY.header(item.round.n)}
+              minHeight={31}
+              marginTop={8}
+              marginBottom={8}
+            />
+          </View>
         ) : item.approval ? (
           // Ahead of every bubble path, like the call chip: an approval row
           // must never reach MessageRow, whose fallback prints row.body.
@@ -4075,6 +4350,12 @@ export function ChatThreadScreen({
           onEdit={startEdit}
           quoted={quoted}
           quotedAuthor={quotedAuthor}
+          // The full answer's open/closed state lives on the SCREEN, so it
+          // survives this row's re-memo and the thread's next requery.
+          expanded={expandedDetails.has(
+            `${item.row.msgId}:${item.row.direction}`,
+          )}
+          onToggleDetail={onToggleDetail}
           onReveal={revealQuoted}
           flashed={flashKey === `${item.row.msgId}:${item.row.direction}`}
           overlay={overlays.get(item.row.msgId)}
@@ -4124,6 +4405,8 @@ export function ChatThreadScreen({
       startEdit,
       quotedFor,
       overlays,
+      expandedDetails,
+      onToggleDetail,
     ],
   );
 
@@ -6065,6 +6348,11 @@ interface MessageRowProps {
   /** Who wrote `quoted`, resolved by the parent the way every author label
    * is — "You", or my name for them. Undefined with no `quoted`. */
   quotedAuthor: string | undefined;
+  /** This row's FULL ANSWER is open (§3.2). Screen-held, so a
+   * requery cannot close it. Always false for a row with no detail. */
+  expanded: boolean;
+  /** Open or close this row's full answer. */
+  onToggleDetail: (row: db.MessageRow) => void;
   /** Tapping the quote: scroll to and flash the quoted row. */
   onReveal: (row: db.MessageRow) => void;
   /** This row was just revealed by a tapped quote: wash it pine. */
@@ -6137,7 +6425,13 @@ function sameRowProps(a: MessageRowProps, b: MessageRowProps): boolean {
     a.quoted?.deletedAt !== b.quoted?.deletedAt ||
     a.quotedAuthor !== b.quotedAuthor ||
     a.onReveal !== b.onReveal ||
-    a.flashed !== b.flashed
+    a.flashed !== b.flashed ||
+    // Without these two the memo goes stale and the disclosure does not open
+    // (§3.9) — the defect this comparator's own header warns
+    // about. The detail's CONTENT is free: `x.row.body` is already compared
+    // below, and the detail rides in the body.
+    a.expanded !== b.expanded ||
+    a.onToggleDetail !== b.onToggleDetail
   ) {
     return false;
   }
@@ -6269,6 +6563,8 @@ function MessageRowInner({
   onEdit,
   quoted,
   quotedAuthor,
+  expanded,
+  onToggleDetail,
   onReveal,
   flashed,
   overlay,
@@ -6300,11 +6596,12 @@ function MessageRowInner({
    * sender the local fold said was OUT — fold lag on a newly added agent,
    * no adversary required — used to lose both the badge and the spoken
    * attribution with it.
+   *
+   * The RULE itself lives in `aiSenderOf` above, because the round pass asks
+   * the same question of the same row and a round must not become a third
+   * source of this signal (§3.2).
    */
-  const aiSender =
-    !out &&
-    (row.ai === 1 ||
-      (inRoom ? row.authorId != null && isAgentId(row.authorId) : peerIsAgent));
+  const aiSender = aiSenderOf(row, { inRoom, isAgentId, peerIsAgent });
 
   if (row.deletedAt) {
     // Retracted, but not erased from the conversation: a hole where a message
@@ -6979,8 +7276,34 @@ function MessageRowInner({
     ? []
     : linkRuns(spokenWords).flatMap(run => (run.kind === 'link' ? [run] : []));
 
+  /**
+   * THE FULL ANSWER carried by this row, or null (§3.1). Read
+   * through envelope.ts's `detailText` — the one reader — so the brief on
+   * glass and the detail behind the tap can never disagree about what a body
+   * is. Structured rows are excluded outright: a photo, voice note, file or
+   * location has no words to stand above a disclosure.
+   */
+  const detail = isStructured ? null : detailText(row.body);
+  /**
+   * Reading the full answer is not an outbound act, so it survives
+   * `interactionsOff` — which withdraws the rail, the reaction chips, the
+   * retry and the reply arrow, every one of them a way to SEND something.
+   * A blocked or unreviewed peer's message is still a message to read.
+   */
+  const detailAction =
+    detail === null
+      ? []
+      : [
+          {
+            name: 'detail',
+            label: expanded ? ROUND_COPY.hideDetail : ROUND_COPY.showDetail,
+          },
+        ];
+
   const a11yActions = interactionsOff
-    ? undefined
+    ? detailAction.length > 0
+      ? detailAction
+      : undefined
     : [
         // React works in rooms too: sendReaction fans the same carrier to
         // every member, addressed by the row's own the design key.
@@ -6996,10 +7319,16 @@ function MessageRowInner({
         ...(quoted && !quoted.deletedAt
           ? [{ name: 'reveal', label: 'Go to the quoted message' }]
           : []),
+        // The bubble is ONE element, so the disclosure's own tap is not
+        // reachable through VoiceOver either — the same reason the quote
+        // gets an action, and the same remedy. The label comes from
+        // ROUND_COPY, never a re-typed literal.
+        ...detailAction,
         { name: 'delete', label: 'Delete for me' },
       ];
   const onA11yAction = (name: string) => {
     if (name === 'react') onLongPress(row, index);
+    if (name === 'detail' && detail !== null) onToggleDetail(row);
     if (name === 'reveal' && quoted && !quoted.deletedAt) onReveal(quoted);
     if (name.startsWith('link:')) {
       const link = bodyLinks[Number(name.slice('link:'.length))];
@@ -7367,6 +7696,20 @@ function MessageRowInner({
               >
                 {COPY.edited}
               </Text>
+            ) : null}
+            {detail !== null ? (
+              // THE FULL ANSWER, inside the bubble and UNDER the words
+              // (§3.2): the brief and the detail are one message
+              // written by one model under one sender, so the disclosure
+              // belongs to the bubble rather than beside it. Visible by
+              // default is the BRIEF; only the detail is collapsed.
+              <DetailDisclosure
+                detail={detail}
+                expanded={expanded}
+                onToggle={() => onToggleDetail(row)}
+                out={out}
+                msgId={row.msgId}
+              />
             ) : null}
           </View>
         )}

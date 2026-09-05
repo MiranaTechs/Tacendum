@@ -11,6 +11,16 @@ interface Props {
   /** Monogram size; defaults to a readable fraction of the disc. */
   monogramSize?: number;
   /**
+   * Letters to draw instead of the derived ones.
+   *
+   * The call surfaces refuse `personName`'s id fallback BY VALUE (`tileName`)
+   * and letter such a peer `?`. They cannot express that through
+   * `displayName`: the sentinel would letter as its own initials, and `null`
+   * would fall through to two characters of the id. Those are precisely the
+   * two outcomes the refusal exists to prevent.
+   */
+  monogramOverride?: string;
+  /**
    * Set only where the disc is the whole element (a profile hero). Left unset,
    * the avatar is hidden from VoiceOver so a conversation row does not
    * announce its monogram letters before the person's name.
@@ -29,6 +39,7 @@ export function Avatar({
   photoB64,
   size,
   monogramSize,
+  monogramOverride,
   accessibilityLabel,
 }: Props) {
   const t = useTheme();
@@ -69,7 +80,7 @@ export function Avatar({
           ]}
           allowFontScaling={false}
         >
-          {monogram(peerId, displayName)}
+          {monogramOverride ?? monogram(peerId, displayName)}
         </Text>
       </View>
     );

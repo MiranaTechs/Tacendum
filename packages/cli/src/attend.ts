@@ -26,8 +26,11 @@ import { AI_DISCLOSURE_SENTENCE, markAgentBody, markerShapeOk } from './ai-origi
 import { cmdService, listAccounts, statusOf, type ServiceIo } from './service.js';
 import {
   APPROVAL_POLICIES,
+  GEMINI_CREDENTIAL_NAMES,
   codexHomeDir,
   driverFor,
+  geminiCredentialPresent,
+  geminiHomeDir,
   type ApprovalPolicy,
   type DriverIo,
   type SessionFactory,
@@ -35,9 +38,19 @@ import {
   type SteerableTurn,
 } from './attend-drivers.js';
 import { parseKeyPath, scanTomlStructure, splitTomlLines } from './toml-keys.js';
+import { operatorGeminiModel } from './hostconfig.js';
 import { CLAUDE_SDK_INSTALL_STEP, claudeSdkInstalled } from './claude-sdk.js';
 import { readMcpAskStepOver } from './mcp-ask.js';
-import { sendRoomMessage, roomRefAuthor } from './room-commands.js';
+import { roomAgentAuthorIdsStrict, roomRefAuthor, sendRoomMessage } from './room-commands.js';
+import { personLabel, roomLabel, mentionNames } from './room-render.js';
+import { RD_LENGTH } from '@tacendum/shared/group-envelope';
+import {
+  BRIEF_MAX,
+  capDetail,
+  detailTruncationMarker,
+  roundDetailStrict,
+  stripWireControls,
+} from '@tacendum/shared/rounds';
 import { FileGroupStore } from './rooms.js';
 import {
   foldRoster,
@@ -78,8 +91,11 @@ import {
  */
 
 export interface AttendConfig {
-  /** Which adapter drives the turn. */
-  host: 'claude' | 'codex';
+  /** Which adapter drives the turn. One member of `ATTEND_HOSTS` — the set
+   * `attend enable` validates and `driverFor` is total over, so widening the
+   * set and widening this field are the same edit (§3.8 added
+   * gemini). */
+  host: AttendHost;
   /** ABSOLUTE agent binary path, resolved at enable time — the launchd PATH
    * has never seen nvm or Herd (mcp-install.ts records the lesson). */
   bin: string;
@@ -99,6 +115,20 @@ export interface AttendConfig {
    * had. Never set for claude-host configs.
    */
   codexModel?: string;
+  /**
+   * The model gemini turns pin via `-m <name>`, captured from the OPERATOR's
+   * own `~/.gemini/settings.json` (`model.name`) at enable time
+   * (`hostconfig.ts:operatorGeminiModel`). Exists for `codexModel`'s exact
+   * reason: the isolated `GEMINI_CLI_HOME` (§3.8) drops a
+   * user-level settings key, so without the capture every reply would come
+   * from gemini's built-in default at a different price and quality with
+   * nothing in the reply saying so. Absent when the operator's settings pin
+   * no model, or none this reader can state as an argv word: gemini's own
+   * default is then the behaviour they already had. Never set for a
+   * claude- or codex-host config, and never emitted when the operator's own
+   * caps already name a model (attend-drivers.ts `capsPinAModel`).
+   */
+  geminiModel?: string;
   /**
    * WHICH codex driver runs the turn — OPT-IN, PER ACCOUNT, and absent
    * means the exec driver exactly as before. `"app-server"` selects the duplex JSON-RPC driver
@@ -250,6 +280,54 @@ export interface AttendConfig {
    * sibling.
    */
   roomTriggerArmedAt?: Record<string, number>;
+  /**
+   * THE ROUNDS FLAG (§3.9): the rooms — by gid — where the
+   * owner turned ROUNDS on. Written by `attend rounds <account> <gid> on|off`,
+   * `attend triggers`' grammar exactly and for its exact reason (a mutable
+   * per-room list is the wrong thing to restate through enable's whole-profile
+   * rewrite). DEFAULT OFF; absent, empty and malformed all read as "no room"
+   * (`roundsGids` is the one reader, `roundsArm` the one parser).
+   *
+   * WHAT FLIPPING A ROOM ON MEANS, stated at the field because this is a
+   * capability grant an operator will read back months later. In a room that
+   * is ON:
+   *
+   *  1. this agent's turn prompt gains the room's roster, the AUTHOR of every
+   *     quoted row, and the sibling agents' answers to the current round —
+   *     context this agent did not have before;
+   *  2. its own answer is composed as a `reply` carrying a BRIEF (what the
+   *     phone shows) and a DETAIL (the full finding, behind a tap);
+   *  3. that answer additionally keeps the legs of the crew-mate agents the
+   *     ROOM OWNER's roster classes as integrations — a delivery widening,
+   *     never an addressing one: agents still cannot start each other's turns
+   *     (a structured mention authored by a classed agent is inert in
+   *     `triggers` regardless of this flag), and the human stays the hub.
+   *
+   * The widening applies ONLY in a room this account's own owner owns whose
+   * only human member is that owner (`crewMateAgentIds`).
+   * In a room with a second human the flag stays on and does nothing: a
+   * co-member's words reach this agent under their own per-agent consent edge,
+   * and this feature will not spend that edge on another agent.
+   *
+   * RE-RUNNING `attend enable` DROPS THIS LIST, exactly as it drops its
+   * `roomTriggers` sibling — the fail-closed direction, a re-statement turning
+   * rounds OFF and never ON.
+   */
+  rounds?: string[];
+  /**
+   * WHEN each room was flipped ON (gid → epoch ms), written by the same
+   * `attend rounds` command in the same act and read by the same one parser.
+   * PROSPECTIVE, never retroactive, and the reason is sharper here than for
+   * `roomTriggerArmedAt`: rows banked while rounds was OFF were sent under the
+   * OLD audience rule, and their authors did not know they would be read as
+   * context by a sibling agent. The prompt's context window never reaches back
+   * across this stamp (§3.3).
+   *
+   * Fail closed both ways: a gid in `rounds` with no finite positive stamp
+   * here reads as OFF, and re-running `on` for an already-open room keeps the
+   * ORIGINAL stamp (idempotence must not re-date a grant).
+   */
+  roundsArmedAt?: Record<string, number>;
   /** Attend's own pinned session key for bare messages, minted at enable. */
   ownSession: string;
   /**
@@ -517,8 +595,20 @@ const GID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 export function roomTriggerArm(
   cfg: Pick<AttendConfig, 'roomTriggers' | 'roomTriggerArmedAt'> | null,
 ): ReadonlyMap<string, number> {
-  const raw = cfg?.roomTriggers;
-  const stamps = cfg?.roomTriggerArmedAt;
+  return armedGids(cfg?.roomTriggers, cfg?.roomTriggerArmedAt);
+}
+
+/**
+ * The per-room grant parser both flags share — ONE implementation, because
+ * `rounds`/`roundsArmedAt` (§3.9) is specified as mirroring
+ * `roomTriggers`/`roomTriggerArmedAt` field for field INCLUDING every
+ * fail-closed read, and a second hand-copied parser is exactly how two
+ * "identical" grants come to disagree about a hand-edited file. The
+ * behaviour is unchanged from the one this replaced: a non-array list, a
+ * non-string member, a non-ULID gid, a missing/non-finite/non-positive stamp
+ * all simply vanish from the map, and a vanished gid means OFF.
+ */
+function armedGids(raw: unknown, stamps: unknown): ReadonlyMap<string, number> {
   const out = new Map<string, number>();
   if (!Array.isArray(raw)) return out;
   for (const gid of raw) {
@@ -534,6 +624,27 @@ export function roomTriggerArm(
     out.set(gid, at);
   }
   return out;
+}
+
+/**
+ * The one parser of the ROUNDS grant, `roomTriggerArm`'s
+ * shape exactly — see `armedGids` for why that is one function and not two.
+ * Shared by the composer, the audience widening, the prompt block, the
+ * once-per-round guard and the `attend rounds` read-back, so what the command
+ * SHOWS is provably what the composer READS.
+ */
+export function roundsArm(
+  cfg: Pick<AttendConfig, 'rounds' | 'roundsArmedAt'> | null,
+): ReadonlyMap<string, number> {
+  return armedGids(cfg?.rounds, cfg?.roundsArmedAt);
+}
+
+/** The gid set view of the rounds grant — `roundsArm`'s keys, kept as a named
+ * reader because the read-back surfaces list rooms, not stamps. */
+export function roundsGids(
+  cfg: Pick<AttendConfig, 'rounds' | 'roundsArmedAt'> | null,
+): ReadonlySet<string> {
+  return new Set(roundsArm(cfg).keys());
 }
 
 /** The gid set view of the same grant — `roomTriggerArm`'s keys, kept as a
@@ -563,6 +674,25 @@ export interface RoomTriggerGate {
   /** Is `peer` IN `gid`'s roster fold RIGHT NOW? Unloadable room, unreadable
    * store, unanchored gid all answer false (fail closed). */
   memberOf(gid: string, peer: string): boolean;
+  /**
+   * Does `gid`'s own record say `peer` is an AGENT — the fold's `integration`
+   * classes ∪ the marker half (`room-commands.ts:roomAgentAuthorIds`)?
+   *a structured mention authored by a known agent is
+   * INERT, room flag or no room flag. This is the written-down half of the
+   * loop guard, and it is what makes "agents cannot start each other's turns"
+   * survive the sibling widening — an answer that lands in a sibling's spool
+   * must never be able to start that sibling's turn.
+   *
+   * FAIL-CLOSED TO TRUE, and the asymmetry with `memberOf` (which fails to
+   * FALSE) is deliberate and must not be "fixed" for symmetry: both directions
+   * here mean NO TURN, so both fail closed. A read this client cannot complete
+   * must not admit a turn it cannot prove was authored by a human.
+   *
+   * OPTIONAL, so a hand-built gate in a test that predates rounds keeps the
+   * behaviour it had; the real builder (`roomTriggerGate`) always supplies it,
+   * so no shipped path is missing the clause.
+   */
+  agentAuthor?(gid: string, peer: string): boolean;
 }
 
 /**
@@ -585,12 +715,20 @@ export interface RoomTriggerGate {
  * spends the OWNER's budget, still runs at the room capability floor,
  * still queues-never-steers.
  *
- * Agent-to-agent chaining stays REFUSED in effect
- * without a class clause this client could not honestly write — a peer's
- * account class is unknowable here (machine.ts records why): no agent lane
- * composes a structured mention (no CLI mention-compose — a deliberate rule), so a
- * turn triggered by a co-member's mention cannot cascade into another, and
- * the hourly budget backstops whatever a modified client tries.
+ * Agent-to-agent chaining stays REFUSED, and since it is
+ * refused BY A CLAUSE rather than only in effect. The old text here said a
+ * peer's account class is unknowable to this client; that stopped being true
+ * at the roster-class ruling (2026-08-16), which gave this client
+ * `fold.classes`, and `room-commands.ts:roomAgentAuthorIds` already reads it.
+ * So the D3 arm now refuses a structured mention whose AUTHOR this room's own
+ * record calls an agent — the fold's `integration` classes ∪ the marker half —
+ * regardless of the room flag, and a read that fails answers "agent" (no
+ * turn). The structural half stands unchanged beside it: no agent lane
+ * composes a structured mention (ruling 5: no CLI mention-compose surface),
+ * and the hourly budget backstops whatever a modified client tries. Rounds
+ * needs the written-down clause because it widens DELIVERY — a sibling's
+ * answer now lands in this agent's spool — while widening addressing not at
+ * all, and the clause is what keeps those two facts independent.
  *
  * ROOM ROWS: an OWNER-authored `grp.msg` row is admitted iff the
  * STRUCTURED mention envelope named this account (`men`, ruled: rendered
@@ -636,6 +774,14 @@ export function triggers(
   ) {
     return false;
   }
+  // THE CLASS CLAUSE, and it sits FIRST among the D3
+  // operands on purpose: a mention this room's own record says an agent
+  // wrote is inert whatever the flag, the stamp or the fold says next. Only
+  // this arm carries it — the OWNER branch above needs none, because
+  // `row.peer === ownerUserId` there and an owner is human-class by
+  // construction (`crew adopt` refuses a human-class member), so
+  // a second read "for symmetry" would buy nothing and could only fail.
+  if (rooms.agentAuthor?.(row.grp, row.peer) === true) return false;
   const armed = rooms.armedAt.get(row.grp);
   return (
     armed !== undefined &&
@@ -650,6 +796,42 @@ interface Cursor {
   lastId?: string;
   /** Its append timestamp — the recovery key if the row ages out. */
   lastTs?: number;
+  /**
+   * ROUND KEYS ALREADY ANSWERED — the HUMAN row's §5.3 key
+   * `${authorId}.${m}`, one per round this agent has taken a turn for.
+   *
+   * A LIST, NOT A WATERMARK, and that is load-bearing: two rooms interleave,
+   * and a single watermark would let room B's turn erase room A's guard.
+   * Bounded FIFO, newest kept (`ROUND_GUARD_KEEP`).
+   *
+   * WRITTEN BEFORE THE SPAWN (R20). The at-most-once rail's direction: a crash
+   * after the write costs one unanswered round, a crash before it costs a
+   * duplicate — and a duplicate is the outcome this guard exists to prevent,
+   * because an agent turn has effects and repeating one is a second execution.
+   */
+  rounds?: string[];
+}
+
+/** Newest-kept bound on `Cursor.rounds`. Sixty-four rounds is far past any
+ * window in which a re-presented row could still be the same conversation,
+ * and it keeps the cursor a small file. */
+export const ROUND_GUARD_KEEP = 64;
+
+/**
+ * The §5.3 round key of a spooled row, or null when this build cannot key it.
+ *
+ * `${row.peer}.${row.rm}`: the peer is the AUTHENTICATED sender (`frame.from`,
+ * rule 16's authority) and `rm` is the room message id R17 persists — together
+ * the compound row key every member of the room derives for that message, and
+ * exactly the `ref` an answer to it carries.
+ *
+ * A row with no `rm` (an older spool row, a redelivery from before this build)
+ * is NOT keyable, and a row this build cannot key is a row this build cannot
+ * claim to have deduplicated — so it is neither guarded nor recorded, and the
+ * old behaviour is the fallback. That is at-least honest.
+ */
+export function roundKeyOf(row: MessageRecord): string | null {
+  return row.grp !== undefined && row.rm !== undefined ? `${row.peer}.${row.rm}` : null;
 }
 
 function loadJson<T>(path: string): T | null {
@@ -661,7 +843,14 @@ function loadJson<T>(path: string): T | null {
 }
 
 /** Rows after the cursor, in append order. */
-export function pendingRows(account: string, ownerUserId: string): MessageRecord[] {
+export function pendingRows(
+  account: string,
+  ownerUserId: string,
+  /** Passed by the PASS alone (see `roomTriggerGate`): a status read must not
+   * write, and this is the only channel through which an agent-class read —
+   * blind or clear — reaches the journal. */
+  onClassRead?: (gid: string, blind: boolean) => void,
+): MessageRecord[] {
   const cursor = loadJson<Cursor>(cursorPath(account)) ?? {};
   const rows = new MessageLog(account).read({ dir: 'in' }).reverse(); // append order
   let start = 0;
@@ -684,7 +873,7 @@ export function pendingRows(account: string, ownerUserId: string): MessageRecord
   // predicate and none can drift wider than the others. An unreadable or
   // absent config yields the empty map: every room OFF, today's behaviour.
   // Built ONCE per sweep (the gate memoizes each flagged room's fold).
-  const gate = roomTriggerGate(account, loadAttendConfig(account));
+  const gate = roomTriggerGate(account, loadAttendConfig(account), onClassRead);
   return rows.slice(start).filter(r => triggers(r, ownerUserId, selfUserId, gate));
 }
 
@@ -703,11 +892,63 @@ export function pendingRows(account: string, ownerUserId: string): MessageRecord
 export function roomTriggerGate(
   account: string,
   cfg: Pick<AttendConfig, 'roomTriggers' | 'roomTriggerArmedAt'> | null,
+  /**
+   * Told the outcome of the AGENT-CLASS read, once per gid, `blind` true when
+   * the room's own record could not be read (§3.5's
+   * operational-cost clause, S7). Told on the CLEAR read too, so the note can
+   * be retracted: a signal that only ever sets would make one transient
+   * failure permanent. The failure is invisible otherwise:
+   * under a transient room-file or spool read error the class clause makes a
+   * legitimate human co-member's D3 mentions inert, and the only symptom is
+   * an agent that has quietly stopped answering. The callback exists rather
+   * than a write here because `attendState` is a PURE READER and reaches this
+   * builder through `pendingRows` — only the pass passes a writer.
+   */
+  onClassRead?: (gid: string, blind: boolean) => void,
 ): RoomTriggerGate {
   const armedAt = roomTriggerArm(cfg);
   const folds = new Map<string, GroupFold | null>();
+  const agents = new Map<string, ReadonlySet<string> | null>();
   return {
     armedAt,
+    /**
+     * Memoized per gid exactly as `memberOf` is, so one
+     * spool sweep reads each flagged room once, and built from
+     * `roomAgentAuthorIds` — the SAME union (fold `integration` classes ∪ the
+     * `ai` marker record) the room send path prunes by, so "who is an agent
+     * here" cannot mean two things on one machine.
+     *
+     * FAIL-CLOSED TO TRUE: a read this client cannot complete answers "agent"
+     * and refuses the turn. Note `roomAgentAuthorIds` itself fails OPEN to the
+     * empty set on its own internal fold error (its documented rule: a failure
+     * must never widen EXCLUSION into dropping a leg a message was owed), so
+     * what this arm can observe is a throw out of it — an unreadable spool.
+     * The two directions are consistent, not contradictory: there, failing
+     * open costs a leg; here, failing closed costs a turn, and each picks the
+     * cheap side of its own trade.
+     */
+    agentAuthor(gid, peer) {
+      let known = agents.get(gid);
+      if (known === undefined) {
+        // `roomAgentAuthorIdsStrict`, NOT `roomAgentAuthorIds`: the pruning
+        // reader swallows a failed class read into ∅, which would make this
+        // clause's documented fail-closed direction unreachable and turn a
+        // read failure into fail-OPEN (∅ ⇒ `has(peer)` false ⇒ the mention
+        // triggers). The strict reader is the same union, reporting the
+        // failure instead of hiding it. The `catch` stays as the belt.
+        try {
+          known = roomAgentAuthorIdsStrict(account, gid);
+        } catch {
+          known = null;
+        }
+        agents.set(gid, known);
+        // Told on EVERY first read of a gid, blind or not: a note that can
+        // only be set and never retracted turns a transient read error into
+        // a permanent operator signal pointing at a stale gid.
+        onClassRead?.(gid, known === null);
+      }
+      return known === null || known.has(peer);
+    },
     memberOf(gid, peer) {
       let fold = folds.get(gid);
       if (fold === undefined) {
@@ -1293,7 +1534,12 @@ export type AttendOutcome =
    * mcp-ask.ts): the parked tool call is its consumer, so no turn, nothing
    * sent, and the cursor holds until the park claims the row (it becomes a
    * stepped-over covered row) or the ask's deadline frees it. */
-  | 'mcp-parked';
+  | 'mcp-parked'
+  /** The round this batch belongs to was already answered:
+   * its §5.3 key is on the cursor's list, so no turn ran, no token was spent,
+   * and the cursor stepped over the rows. A round is N answers to one human
+   * turn — one of them from this agent, and exactly one. */
+  | 'round-done';
 
 /** What was handed to a turn that had not finished when the journal was
  * last written — the LIVE-TURN view of the journal file. */
@@ -1355,7 +1601,68 @@ interface JournalFile {
    * steered list's own rule); it is never printed anywhere.
    */
   streamAnchor?: string;
+  /**
+   * ROUNDS' OWN LINE (§3.4), newest 32 (`ROUND_JOURNAL_KEEP`).
+   *
+   * THE CLASSIFICATION ONLY — never any of the text, never a length, never a
+   * hash. Rule 4 has no "just a little" clause: a length is a measurement of
+   * the payload and a hash is a commitment to it. `key` is the §5.3 round key
+   * `${authorId}.${m}` — two ULIDs, the same id class the `steered` list and
+   * `roomDebt.gid` already keep in this 0600 file, and it is never printed
+   * anywhere.
+   *
+   * `split` is WHERE THE BRIEF CAME FROM, and it is recorded HERE and NOWHERE
+   * ELSE — not on the wire, not in the reply, not in any operator copy — so
+   * that the derivation is diagnosable without ever being claimed. On the
+   * `derived` path the brief is a clipped first paragraph the model wrote; the
+   * word `summary` is not utterable for it (R12).
+   */
+  rounds?: RoundJournalEntry[];
+  /**
+   * The room whose AGENT-CLASS read failed, and when (§3.5).
+   * One word and a gid — `roomDebt.gid` already carries a gid, so this is no
+   * rule-4 change: no peer, no text, no length. It exists because the
+   * fail-closed class clause is otherwise SILENT: under a transient room-file
+   * or spool read failure a legitimate human co-member's D3 mentions go inert
+   * and the only symptom is an agent that has stopped answering. The runbook
+   * names that symptom in the operator's words.
+   */
+  classBlind?: { gid: string; at: number };
 }
+
+/** One round's classification. See `JournalFile.rounds`. */
+export interface RoundJournalEntry {
+  /** The §5.3 round key `${humanAuthorId}.${m}` this answer answered. */
+  key: string;
+  /** Which arm of §3.4's grammar produced the brief. `formatted` = BRIEF
+   * lines and a separator; `half` = BRIEF lines, no separator; `derived` =
+   * the fail-open first paragraph, or the step-7b rescue of an empty
+   * extraction. Never called a summary anywhere (R12). */
+  split: 'formatted' | 'half' | 'derived';
+  /** What became of the detail. `truncated` still SENT one, with the visible
+   * marker; `dropped` sent the brief alone (R22 — a schema refusal after
+   * truncation, or the composed wrapper measuring over `MAX_BODY_BYTES`);
+   * `none` means the answer had no second half to disclose. */
+  detail: 'sent' | 'truncated' | 'dropped' | 'none';
+  /** Present when the triggering row carried no `rm`, so no §5.3 ref could be
+   * built and the answer went out as bare text exactly as it does today —
+   * never a guessed ref (§3.2). `key` is then `''` (there was none to name)
+   * and `detail` reads `none`, because on this arm there is no envelope and so
+   * no `d` field that could have been dropped.
+   *
+   * `unsendable` is the second reason an answer went out as bare text: the
+   * brief itself is a string the receiver's `bodyText` refuses (it begins
+   * with the envelope sentinel), so composing the `reply` inner would have
+   * produced a wrapper no phone can parse — see `BoundRoundAnswer.unsendable`.
+   * `key` is then the round's key when the row carried one, because the round
+   * WAS answered; only the envelope was withheld. */
+  ref?: 'unavailable' | 'unsendable';
+}
+
+/** Newest-kept bound on `JournalFile.rounds`. A journal is a diagnostic, not
+ * a history: 32 rounds is several days of a busy crew room and still one
+ * short file. */
+export const ROUND_JOURNAL_KEEP = 32;
 
 /**
  * THE JOURNAL IS NOW READ, AND WHAT IT SAYS IS "DO NOT RE-RUN THIS".
@@ -1416,6 +1723,26 @@ function readJournalFile(account: string): JournalFile {
     ...(typeof j.streamAnchor === 'string' && j.streamAnchor !== ''
       ? { streamAnchor: j.streamAnchor }
       : {}),
+    ...(Array.isArray(j.rounds)
+      ? {
+          rounds: j.rounds
+            .filter(
+              (v): v is RoundJournalEntry =>
+                v !== null &&
+                typeof v === 'object' &&
+                typeof (v as RoundJournalEntry).key === 'string' &&
+                typeof (v as RoundJournalEntry).split === 'string' &&
+                typeof (v as RoundJournalEntry).detail === 'string',
+            )
+            .slice(-ROUND_JOURNAL_KEEP),
+        }
+      : {}),
+    ...(j.classBlind !== null &&
+    typeof j.classBlind === 'object' &&
+    typeof j.classBlind.gid === 'string' &&
+    typeof j.classBlind.at === 'number'
+      ? { classBlind: { gid: j.classBlind.gid, at: j.classBlind.at } }
+      : {}),
     ...(debtOk
       ? {
           roomDebt: {
@@ -1437,7 +1764,9 @@ function writeJournalFile(account: string, f: JournalFile): void {
     (f.steered?.length ?? 0) === 0 &&
     (f.midTurn?.length ?? 0) === 0 &&
     f.roomDebt === undefined &&
-    f.streamAnchor === undefined;
+    f.streamAnchor === undefined &&
+    (f.rounds?.length ?? 0) === 0 &&
+    f.classBlind === undefined;
   if (empty) {
     try {
       rmSync(journalPath(account), { force: true });
@@ -1456,6 +1785,12 @@ function writeJournalFile(account: string, f: JournalFile): void {
       ...((f.midTurn?.length ?? 0) > 0 ? { midTurn: f.midTurn } : {}),
       ...(f.roomDebt !== undefined ? { roomDebt: f.roomDebt } : {}),
       ...(f.streamAnchor !== undefined ? { streamAnchor: f.streamAnchor } : {}),
+      // Bounded on the way OUT as well as on the way in, so no path can grow
+      // the list past its keep (a diagnostic, never a history).
+      ...((f.rounds?.length ?? 0) > 0
+        ? { rounds: (f.rounds as RoundJournalEntry[]).slice(-ROUND_JOURNAL_KEEP) }
+        : {}),
+      ...(f.classBlind !== undefined ? { classBlind: f.classBlind } : {}),
     }),
     { mode: 0o600 },
   );
@@ -1485,6 +1820,46 @@ function unnoteSteered(account: string, id: string): void {
 }
 
 /**
+ * ROUNDS' one journal writer (§3.4). Preserves every other field
+ * exactly as `noteSteered` does — the live turn's `upTo` is what makes a
+ * restart find its lists — and keeps the newest `ROUND_JOURNAL_KEEP` entries.
+ *
+ * WHAT IS WRITTEN IS THE CLASSIFICATION, and the caller is responsible for
+ * handing this function nothing else: no brief, no detail, no length, no
+ * hash. That obligation is asserted rather than assumed — the gate reads this
+ * file's BYTES back after a full pass and fails if any byte of the fixture's
+ * prompt, brief or detail appears in it.
+ */
+function noteRound(account: string, entry: RoundJournalEntry): void {
+  const f = readJournalFile(account);
+  writeJournalFile(account, {
+    ...f,
+    rounds: [...(f.rounds ?? []), entry].slice(-ROUND_JOURNAL_KEEP),
+  });
+}
+
+/** The agent-class read that failed, recorded once per pass (§3.5, S7). One
+ * word and a gid; `sessionTag` is what any operator-facing sentence derives
+ * from it, never this raw value. */
+function noteClassBlind(account: string, gid: string, at: number): void {
+  const f = readJournalFile(account);
+  if (f.classBlind?.gid === gid) return; // already standing for this room
+  writeJournalFile(account, { ...f, classBlind: { gid, at } });
+}
+
+/** The counterpart: a CLEAR read of the gid the note names retracts it. A
+ * note that never retracts turns a transient room-file error into a permanent
+ * signal, and the runbook item it feeds would then point at a room that has
+ * been readable for weeks. A note standing for a DIFFERENT gid is left alone
+ * — it is that room's signal, not this one's. */
+function clearClassBlind(account: string, gid: string): void {
+  const f = readJournalFile(account);
+  if (f.classBlind?.gid !== gid) return;
+  const { classBlind: _dropped, ...rest } = f;
+  writeJournalFile(account, rest);
+}
+
+/**
  * Retire the live-turn half and prune both id lists to the rows that are
  * STILL PENDING (`keep`) — the one write shape every journal-settling path
  * shares, so none of them can invent a second retention rule. `add` merges
@@ -1511,6 +1886,12 @@ function settleJournal(
     steered,
     midTurn,
     ...(f.roomDebt !== undefined ? { roomDebt: f.roomDebt } : {}),
+    // The rounds classifications and the class-blind note survive the
+    // retirement for `roomDebt`'s reason: neither names a spool row, so the
+    // cursor is not what settles them. They age out by their own bound and by
+    // the next failed read respectively.
+    ...(f.rounds !== undefined ? { rounds: f.rounds } : {}),
+    ...(f.classBlind !== undefined ? { classBlind: f.classBlind } : {}),
   });
 }
 
@@ -2052,6 +2433,446 @@ function carryContextLine(refText: string): string {
     : `[replying to: "${head}"]`;
 }
 
+
+/**
+ * ---------------------------------------------------------------------------
+ * ROUNDS (§3.3) — the prompt block, the split, the bounds.
+ * ---------------------------------------------------------------------------
+ *
+ * A ROUND is one human turn plus the agents' answers to it. Each answer is a
+ * BRIEF (what the phone shows) and a DETAIL (the full finding, behind a tap,
+ * read in full by the sibling agents), written by the SAME model in the SAME
+ * message under ONE ratchet-authenticated sender. Nothing here splits an
+ * answer across messages and nothing recombines one.
+ *
+ * THE NOUNS ARE brief, detail AND full answer (R12). The word "summary" is
+ * not utterable on this path: on the fail-open arm the brief is a clipped
+ * first paragraph the model wrote, and calling that a summary would claim a
+ * reading that never happened. Nothing here may imply the relay orders,
+ * attributes, verifies or coordinates a round — the relay sees N independent
+ * 1:1 legs and nothing else.
+ *
+ * RULE 4 GOVERNS EVERY LINE OF THE PROMPT BLOCK: it rides inside the prompt
+ * to the host and nowhere else — never a log line, never an audit field,
+ * never an error message, never a test snapshot printed on failure.
+ */
+
+/** One member of the room, as the prompt block names them. */
+export interface RoundMember {
+  /** `room-render.ts:personLabel`'s output — never a second name resolver. */
+  label: string;
+  /** The ROOM OWNER's roster class says integration (R15). Never the sender's
+   * own `ai` marker: a label derived from a sender's claim would let a member
+   * relabel a human. */
+  agent: boolean;
+}
+
+/** The inputs the prompt block is composed from. Pure data, so the block is
+ * testable — and byte-stability-pinnable — without a spool or a room file. */
+export interface RoundPromptInput {
+  /** `room-render.ts:roomLabel`'s output. Not a second implementation. */
+  roomLabel: string;
+  members: readonly RoundMember[];
+  /** The rows this turn answers, oldest first, each with its AUTHOR. The text
+   * is the spooled row's own, `MID_TURN_MARKER` prefix included where the
+   * journal marked one — unchanged from what a non-rounds turn would carry. */
+  asks: readonly { label: string; text: string }[];
+  /** Sibling answers already in this round, oldest first, bounded by the
+   * caller (`ROUND_SIBLING_ROWS`). `brief` is the spooled row text; `detail`
+   * is the disclosed half when this build holds one. */
+  siblings: readonly { label: string; brief: string; detail?: string }[];
+}
+
+/** How many sibling rows the block carries. Six is the bound; it is not
+ * configurable in v1, and it is what keeps a round's prompt bounded by
+ * construction rather than by a model's patience. */
+export const ROUND_SIBLING_ROWS = 6;
+
+/** The tolerance on the sibling window's lower bound (§3.3). A sibling row's
+ * `ts` is stamped on the SENDING machine (`Math.min(frame.ts, Date.now())`),
+ * so a crew-mate whose clock trails this one would otherwise be excluded from
+ * its own round. A minute is wider than any skew a crew tolerates elsewhere
+ * and far narrower than the quiet spell the floor exists to cut off. */
+export const ROUND_SIBLING_SKEW_MS = 60_000;
+
+/**
+ * THE PROMPT BLOCK, byte-for-byte (§3.3).
+ *
+ * Every line obeys the `MID_TURN_MARKER` byte-stability discipline: no
+ * markdown the chat degrader would rewrite, no link shape (`[x](y)` needs the
+ * `]` to hug a `(`, and no line here does), no leading list or heading mark,
+ * no line that is only hyphens (`plainForChat` deletes `^[ \t]*-{3,}[ \t]*$`),
+ * no run of three newlines, and no leading or trailing whitespace. Pinned by a
+ * test asserting `capChatHead(plainForChat(block), ATTEND_REPLY_CAP) === block`
+ * for a representative block.
+ *
+ * THE FORMAT INSTRUCTION IS ONE PHYSICAL LINE, and the three hyphens appear
+ * INSIDE PARENTHESES MID-SENTENCE on purpose: a bare `---` line here would be
+ * deleted by `plainForChat`'s line-anchored rule before the model ever saw the
+ * instruction telling it to write one.
+ *
+ * THE AUTHOR LINE IS MANDATORY ON EVERY QUOTED ROW. A room row's spooled text
+ * is `[room] words` — it names the room and not the speaker — so without this
+ * no agent could tell a human from a sibling, which is the one distinction a
+ * round is made of. The author is `row.peer`: authenticated, resolved through
+ * `personLabel`, never a name a body claimed.
+ */
+export function roundsPromptBlock(input: RoundPromptInput): string {
+  const lines: string[] = [`[room: ${input.roomLabel}]`];
+  const members = input.members.map(m => (m.agent ? `${m.label} (AI agent)` : m.label));
+  if (members.length > 0) lines.push(`[members: ${members.join(', ')}]`);
+  // ASKS BEFORE SIBLINGS — §3.3's stated order, and the chronological one: a
+  // sibling's answer is only legible AFTER the question it answers, and the
+  // human/sibling distinction is the one thing a round is made of. Pinned by
+  // INDEX in gate.rounds.test.ts, not by `toContain`, so a re-ordering fails.
+  for (const ask of input.asks) {
+    lines.push(`[${ask.label} asked:]`);
+    lines.push(ask.text);
+  }
+  for (const sibling of input.siblings) {
+    lines.push(`[${sibling.label} (AI agent) already answered:]`);
+    lines.push(sibling.brief);
+    if (sibling.detail !== undefined && sibling.detail !== '') lines.push(sibling.detail);
+  }
+  lines.push(
+    '[format: answer with one or more lines beginning BRIEF: followed by a line containing ' +
+      'only three hyphens (---) followed by everything else. The BRIEF lines are what the ' +
+      `phone shows: standalone, under ${BRIEF_MAX} characters. Everything after the hyphens ` +
+      'is the detail, revealed by a tap and read in full by the other agents in this room.]',
+  );
+  return lines.join('\n');
+}
+
+/** What the split found, before any bound is applied. */
+export interface SplitRoundAnswer {
+  brief: string;
+  detail?: string;
+  /** `formatted` — BRIEF line(s) and a separator. `half` — BRIEF line(s), no
+   * separator. `derived` — neither: the brief is the first paragraph, and the
+   * detail is the WHOLE output. Recorded in the journal and NOWHERE else. */
+  how: 'formatted' | 'half' | 'derived';
+}
+
+/** A BRIEF line. CASE-SENSITIVE, deliberately: a case-insensitive match would
+ * capture prose ("brief: I looked at the failing test…"). Up to three leading
+ * spaces are tolerated, because models indent. The capture is `(.*)`, so a
+ * bare `BRIEF:` yields an empty brief — see `boundRoundAnswer`'s step 7b. */
+const BRIEF_LINE_RE = /^[ \t]{0,3}BRIEF:[ \t]?(.*)$/;
+
+/** The separator: three or more hyphens alone on a line, up to three spaces
+ * of indent. `plainForChat` deletes exactly this shape, which is why the
+ * split runs on RAW stdout and never after the degrader. */
+const ROUND_SEPARATOR_RE = /^[ \t]{0,3}-{3,}[ \t]*$/;
+
+/** The text up to the first blank line — the fail-open brief's source, and
+ * step 7b's. */
+function firstParagraph(text: string): string {
+  const out: string[] = [];
+  for (const line of text.split(/\r\n|\r|\n/)) {
+    if (line.trim() === '') {
+      if (out.length > 0) break;
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
+/**
+ * §3.4's GRAMMAR, exactly, on RAW `turn.stdout` — BEFORE `plainForChat`.
+ *
+ * The degrader strips fence rails, heading marks and horizontal rules, which
+ * is precisely the scaffolding a model uses to delimit the two halves: a split
+ * after the degrader is a split on rubble. Pure and exported so the gate can
+ * hammer every arm of it without a spawn.
+ *
+ * FAIL-OPEN IS THE DEFAULT ARM (R5). Any shape this grammar does not
+ * recognise still produces an answer: the brief is the first paragraph and the
+ * detail is the WHOLE output — not the remainder — because on that arm the
+ * brief is DERIVED rather than extracted, so the detail must stay complete or
+ * the reader loses the words the brief was clipped from.
+ */
+export function splitRoundAnswer(stdout: string): SplitRoundAnswer {
+  const lines = stdout.split(/\r\n|\r|\n/);
+  let at = 0;
+  while (at < lines.length && (lines[at] as string).trim() === '') at += 1;
+  const briefs: string[] = [];
+  while (at < lines.length) {
+    const match = BRIEF_LINE_RE.exec(lines[at] as string);
+    if (match === null) break;
+    briefs.push((match[1] as string).trim());
+    at += 1;
+  }
+  if (briefs.length === 0) {
+    // The fail-open arm, and the whole output is the detail.
+    return { brief: firstParagraph(stdout), detail: stdout, how: 'derived' };
+  }
+  const brief = briefs.join(' ').trim();
+  // Blank lines between the last brief line and the separator are allowed and
+  // dropped; anything else means there is no separator.
+  let probe = at;
+  while (probe < lines.length && (lines[probe] as string).trim() === '') probe += 1;
+  if (probe < lines.length && ROUND_SEPARATOR_RE.test(lines[probe] as string)) {
+    return { brief, detail: lines.slice(probe + 1).join('\n'), how: 'formatted' };
+  }
+  // Half-formatted: everything after the last brief line is the detail, and it
+  // may be empty — which means no `d` at all.
+  return { brief, detail: lines.slice(at).join('\n'), how: 'half' };
+}
+
+/**
+ * The literal prefix `parseEnvelope` routes on, and the one `bodyText`
+ * refuses at the head of a rendered body. Declared HERE rather than imported:
+ * every file that needs it declares its own (`render.ts:40`,
+ * `room-commands.ts:858`, `call.ts:52`, and the shared package's four), which
+ * is this codebase's settled shape for a two-token wire constant — a mirror
+ * is what makes a drift visible, and `gate.rounds.test.ts` pins this one
+ * against the shipped refusal rather than against another copy of the string.
+ */
+const ENVELOPE_SENTINEL = '{"tcm":';
+
+/** The bounded answer, and what became of its detail. */
+export interface BoundRoundAnswer {
+  brief: string;
+  detail?: string;
+  how: SplitRoundAnswer['how'];
+  /** The journal's classification. `truncated` still SENT a detail, with the
+   * visible marker. */
+  state: RoundJournalEntry['detail'];
+  /**
+   * COMPOSE-STRICT (§6 rule 4): the brief this answer would carry as the
+   * `reply` inner's `text` is one the RECEIVER'S schema refuses, so no
+   * envelope may be composed from it at all and `brief` is `''`. Today that
+   * is exactly one shape — a brief beginning with the envelope sentinel,
+   * which `app/src/envelope.ts:bodyText` refines against — and it is
+   * REACHABLE from ordinary model output: `plainForChat` unwraps inline
+   * backticks, so a `BRIEF:` line quoting an envelope in code ticks arrives
+   * here as a bare sentinel. Composed anyway, `parseEnvelope` would return
+   * null on every phone and the brief, the detail AND the reply linkage
+   * would all be lost for a turn already recorded ANSWERED, with no retry.
+   * Distinct from a brief that merely funnelled to empty: that one is not a
+   * rounds answer at all, this one is a rounds answer this build refuses to
+   * put on the wire, and the journal says so.
+   */
+  unsendable?: true;
+}
+
+/**
+ * THE BOUNDS (§3.4), applied to a split. Pure and exported for the same
+ * reason the split is.
+ *
+ * The BRIEF crosses `capChatHead(plainForChat(x), BRIEF_MAX)` — the same
+ * funnel `ATTEND_REPLY_CAP` governs, at 280 instead of 2 000 (R14) — with
+ * `stripWireControls` first, because the brief crosses the same two escaping
+ * levels as the detail and pays the same seven wire bytes per control
+ * character (R23).
+ *
+ * The DETAIL crosses `capDetail`, NOT `capChatHead`: `capChatHead`'s ` …`
+ * reads as prose trailing off, and R4 requires the cut to be visible AS a cut.
+ * `capDetail` normalizes before it truncates and fits its marker inside
+ * `DETAIL_MAX`.
+ *
+ * THREE RULES DECIDE WHETHER A DETAIL IS SENT AT ALL:
+ *
+ *  - RULE 10: a detail equal to the brief is dropped. A disclosure control
+ *    revealing the same words is a lie about there being more.
+ *  - STEP 7b: a brief that funnels to EMPTY beside a detail that exists is
+ *    DERIVED from the detail's first paragraph rather than dropped. A model
+ *    that writes a bare `BRIEF:` line, then `---`, then its finding would
+ *    otherwise produce an empty body — which is not sent (`body !== ''`)
+ *    while the turn is nonetheless recorded ANSWERED under at-most-once, so
+ *    the whole finding would be lost and never re-run.
+ *  - R22: a detail that fails `roundDetailStrict` AFTER truncation (the
+ *    surviving head begins with the envelope sentinel, or normalization left
+ *    nothing) is DROPPED and the answer is sent brief-only. The check is
+ *    `roundDetailStrict.safeParse(...).success === false` and never a
+ *    `.success` test against the permissive `roundDetail`, which by
+ *    construction can never report failure (R24) — that branch would be
+ *    unreachable, which is worse than absent.
+ */
+export function boundRoundAnswer(split: SplitRoundAnswer): BoundRoundAnswer {
+  const briefOf = (text: string): string =>
+    capChatHead(plainForChat(stripWireControls(text)), BRIEF_MAX);
+  let brief = briefOf(split.brief);
+  let how = split.how;
+  const raw = split.detail === undefined ? '' : capDetail(plainForChat(split.detail));
+  const detail: string | undefined = raw === '' ? undefined : raw;
+  if (detail !== undefined && brief === '') {
+    // Step 7b. The derivation is marked HERE and nowhere else: not on the
+    // wire, not in the reply, not in any copy.
+    brief = briefOf(firstParagraph(split.detail as string));
+    how = 'derived';
+  }
+  if (brief.startsWith(ENVELOPE_SENTINEL)) {
+    // COMPOSE-STRICT. An envelope this build cannot PARSE it must not
+    // COMPOSE (`room-commands.ts:encodeGroup`'s stated invariant, §6 rule 4),
+    // and `text` is the field that decides whether the wrapper parses at all:
+    // R22's `roundDetailStrict` guards `d`, which is the half a phone can
+    // afford to lose. Retry step 7b's derivation FIRST, so a detail is not
+    // thrown away with the brief; only a derivation that is itself refused
+    // gives up, and then the whole answer takes today's bare-text path with
+    // `ref: 'unsendable'` in the journal.
+    const derived = split.detail === undefined ? '' : briefOf(firstParagraph(split.detail));
+    if (derived === '' || derived.startsWith(ENVELOPE_SENTINEL)) {
+      return { brief: '', how, state: 'none', unsendable: true };
+    }
+    brief = derived;
+    how = 'derived';
+  }
+  if (detail !== undefined && detail === brief) return { brief, how, state: 'none' };
+  if (detail === undefined) return { brief, how, state: 'none' };
+  if (!roundDetailStrict.safeParse(detail).success) return { brief, how, state: 'dropped' };
+  return {
+    brief,
+    detail,
+    how,
+    state: detail.endsWith(detailTruncationMarker()) ? 'truncated' : 'sent',
+  };
+}
+
+/**
+ * The prompt block's INPUTS, gathered off this machine's own records — the
+ * room file's fold, the peer-names store, and the spool. Returns null when any
+ * of it cannot be read, and null means today's prompt: a turn that ran without
+ * this block yesterday still runs today, which is the honest degradation. This
+ * function is the ONLY place the block's data comes from, and rule 4 covers
+ * every value it returns — none of it may be logged, printed or put in an
+ * error.
+ *
+ * THE CLASS COMES FROM THE FOLD ALONE (R15), never `roomAgentAuthorIds`' union:
+ * the marker half is a sender's own claim, and an `(AI agent)` label derived
+ * from a claim would let a member relabel a human inside another agent's
+ * prompt. It is the same authority the sibling AUDIENCE is fixed to.
+ *
+ * THE WINDOW NEVER REACHES BACK ACROSS THE ARMING STAMP: rows banked while
+ * rounds was OFF were sent under the old audience rule, and their authors did
+ * not know they would be read as context by anybody. It is ALSO floored at
+ * THIS round's first ask (minus `ROUND_SIBLING_SKEW_MS`), so a PREVIOUS
+ * round's answers are never rendered under "already answered:" beside a
+ * question they predate. Within those two floors the window is the newest
+ * `ROUND_SIBLING_ROWS`.
+ */
+function roundsPromptFor(
+  account: string,
+  gid: string,
+  armedAt: number,
+  group: readonly MessageRecord[],
+  bodyOf: (row: MessageRecord) => string,
+): string | null {
+  try {
+    const profile = readProfile(account);
+    if (profile.kind !== 'ok' || typeof profile.profile.userId !== 'string') return null;
+    const selfId = profile.profile.userId;
+    const store = FileGroupStore.load(account, gid);
+    const owner = store.getOwner();
+    if (owner === undefined) return null;
+    const fold = foldRoster(owner, store.listSlots(), ownerOnlyPolicy);
+    const names = mentionNames(account, selfId);
+    const agentIds = new Set(
+      fold.members.filter(id => fold.classes[id] === 'integration' && id !== selfId),
+    );
+    const covered = new Set(group.map(r => r.id));
+    // THE WINDOW IS FLOORED AT THIS ROUND (§3.3: "the spooled rows since the
+    // LAST ANSWERED ROUND for this room"). Without it, after a quiet spell the
+    // newest six agent rows are a PREVIOUS round's answers and the block
+    // asserts to the model that they "already answered" the question they
+    // predate. The floor is the first ask row of this group, minus a
+    // tolerance: a sibling's `ts` is persisted as `Math.min(frame.ts,
+    // Date.now())` on ITS machine, so a crew-mate whose clock trails by
+    // seconds would otherwise drop out of its own round. One minute is far
+    // wider than any skew a crew tolerates elsewhere and far narrower than
+    // the quiet spell this bound exists for; it is not configurable.
+    const firstAsk = group[0]?.ts;
+    const floor = Math.max(
+      armedAt,
+      typeof firstAsk === 'number' && Number.isFinite(firstAsk)
+        ? firstAsk - ROUND_SIBLING_SKEW_MS
+        : armedAt,
+    );
+    const siblings = new MessageLog(account)
+      .read({ dir: 'in' })
+      .filter(
+        r =>
+          r.grp === gid &&
+          r.text !== '' &&
+          r.red !== true &&
+          Number.isFinite(r.ts) &&
+          r.ts >= floor &&
+          agentIds.has(r.peer) &&
+          !covered.has(r.id),
+      )
+      .slice(0, ROUND_SIBLING_ROWS)
+      .reverse()
+      .map(r => {
+        // `detail` is a later field on `MessageRecord` (§1.1): this
+        // path composes the wire, and the reading side is threaded through
+        // the spool afterwards. Read through a widening rather than left out,
+        // so the block is COMPLETE the moment that field lands and the only
+        // change here is the removal of this cast — leaving it out would have
+        // shipped a prompt that silently carried briefs only.
+        const detail = (r as MessageRecord & { detail?: string }).detail;
+        // CLIPPED TO `DETAIL_MAX` at the site (§3.3), by the same `capDetail`
+        // the composer bounds its own detail with — idempotent, so a value
+        // that arrived already bounded is unchanged, and K7 (prompt bloat) is
+        // bounded by six rows times one cap however the field is filled.
+        return {
+          label: personLabel(names, r.peer),
+          brief: r.text,
+          ...(typeof detail === 'string' && detail !== ''
+            ? { detail: capDetail(detail) }
+            : {}),
+        };
+      });
+    return roundsPromptBlock({
+      roomLabel: roomLabel(store),
+      members: fold.members.map(id => ({
+        label: personLabel(names, id),
+        agent: fold.classes[id] === 'integration',
+      })),
+      asks: group.map(r => ({ label: personLabel(names, r.peer), text: bodyOf(r) })),
+      siblings,
+    });
+  } catch {
+    /* no profile, no room file, an unreadable spool — today's prompt */
+    return null;
+  }
+}
+
+/**
+ * THE COMPOSED-SIZE GUARD (R23, §3.4) — the belt beside `stripWireControls`'
+ * braces. Answers whether the `grp.msg` wrapper this answer will become fits
+ * `send.ts:MAX_BODY_BYTES`, measured on the FINAL wire bytes: the inner body
+ * as `sendRoomMessage` will mark it (`markAgentBody`, idempotent, so measuring
+ * a marked copy and sending the unmarked one is the same measurement), inside
+ * a wrapper of the same SHAPE `sendRoomMessage` composes — the same seven keys
+ * in the same order, with maximal stand-ins for the three values this function
+ * cannot know yet (`m` and `rd` are minted inside the fan-out, `sq` is the
+ * per-author counter). Stand-ins are the exact widths of the real values, and
+ * `sq`'s is deliberately wider than any counter a room will reach.
+ *
+ * WHY THE BELT EXISTS AT ALL. `send.ts:assertBodyWithinCap` throws
+ * `EXIT.USAGE`; the pass maps `EXIT.USAGE` to `refused: 'no-room'`; the owner
+ * is then told "this account is not in that room any more" — while the turn is
+ * already recorded ANSWERED under at-most-once, so no retry follows. An
+ * over-cap body would therefore lose the answer AND report a false reason.
+ * `room-commands.ts`'s own `MAX_GROUP_BODY` check does not catch it: that
+ * measures the INNER body, which stays under 20 000 in the overflow case.
+ * This path must not be reachable, and this is what makes "must not" a check
+ * rather than a hope.
+ */
+export function roundWrapperFits(inner: string): boolean {
+  const wrapper = JSON.stringify({
+    tcm: 'grp.msg',
+    g: 'Z'.repeat(26),
+    m: 'Z'.repeat(26),
+    rd: 'Z'.repeat(RD_LENGTH),
+    sq: 999_999_999,
+    b: markAgentBody(inner, false),
+    ai: true,
+  });
+  return Buffer.byteLength(wrapper, 'utf8') <= MAX_BODY_BYTES;
+}
+
 /**
  * THE SAME-PROCESS SEAL QUEUE (the e2e stream gate's release blocker,
  * scripts/e2e-stream.sh a8): every sealed emission a pass performs for one
@@ -2231,7 +3052,10 @@ async function attendPass(
   const owedDebt = readJournalFile(account).roomDebt;
   if (owedDebt !== undefined) await settleRoomDebt(owedDebt);
 
-  const batch = pendingRows(account, owner);
+  const batch = pendingRows(account, owner, (gid, blind) => {
+    if (blind) noteClassBlind(account, gid, now);
+    else clearClassBlind(account, gid);
+  });
   const batchIds = new Set(batch.map(r => r.id));
   if (batch.length === 0) {
     // A journal with nothing left to cover is spent: its rows — the turn's
@@ -2248,10 +3072,54 @@ async function attendPass(
     return 'idle';
   }
 
+  // The cursor's ROUND-KEY LIST rides through every advance.
+  // It is written BEFORE the spawn, and the cursor advances AFTER
+  // the turn, so an advance that rebuilt the file from `{lastId, lastTs}`
+  // alone would erase the guard the same pass had just written — the round
+  // would be answerable twice, which is the whole thing the guard prevents.
   const advanceTo = (row: MessageRecord): void => {
+    const rounds = loadJson<Cursor>(cursorPath(account))?.rounds;
     writeFileAtomic(
       cursorPath(account),
-      JSON.stringify({ lastId: row.id, lastTs: row.ts } satisfies Cursor),
+      JSON.stringify({
+        lastId: row.id,
+        lastTs: row.ts,
+        ...(Array.isArray(rounds) && rounds.length > 0
+          ? { rounds: rounds.filter((v): v is string => typeof v === 'string') }
+          : {}),
+      } satisfies Cursor),
+      { mode: 0o600 },
+    );
+  };
+  /** The answered-round keys, fail-open to none: a cursor that will not read
+   * guards nothing, which is the behaviour every build before this had. */
+  const answeredRounds = (): string[] => {
+    const raw = loadJson<Cursor>(cursorPath(account))?.rounds;
+    return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string') : [];
+  };
+  /** Record round keys as answered, BEFORE the spawn (R20), in the same write
+   * that would otherwise be the cursor's — `lastId`/`lastTs` are preserved
+   * untouched, because the cursor itself must not move mid-turn.
+   *
+   * EVERY keyable row of the group, not just the one the composed `ref`
+   * names. A batch may group two human room messages under one route; ONE
+   * turn answers both, so both are answered. Recording only the last would
+   * leave a later redelivery of the FIRST row unguarded — a second turn and a
+   * second answer to a message already answered, which is the exact duplicate
+   * this guard exists to prevent. */
+  const noteRoundKeys = (keys: readonly string[]): void => {
+    if (keys.length === 0) return;
+    const cursor = loadJson<Cursor>(cursorPath(account)) ?? {};
+    const kept = [...answeredRounds().filter(k => !keys.includes(k)), ...keys].slice(
+      -ROUND_GUARD_KEEP,
+    );
+    writeFileAtomic(
+      cursorPath(account),
+      JSON.stringify({
+        ...(cursor.lastId !== undefined ? { lastId: cursor.lastId } : {}),
+        ...(cursor.lastTs !== undefined ? { lastTs: cursor.lastTs } : {}),
+        rounds: kept,
+      } satisfies Cursor),
       { mode: 0o600 },
     );
   };
@@ -2536,6 +3404,42 @@ async function attendPass(
     return 'unroutable';
   }
 
+  // ROUNDS, RESOLVED ONCE for this pass (§3.9): the flag is
+  // per-room and read through the ONE parser every rounds surface reads, so
+  // what `attend rounds` shows is what this composes against. A room that is
+  // OFF — and every 1:1 route — takes every path below exactly as it did
+  // before this feature existed.
+  const roundsOn = head.kind === 'room' && roundsGids(cfg).has(head.gid);
+  // The ROUND KEY is the §5.3 key of the LAST row of this group: the group is
+  // the leading run of rows sharing one route, so its last row is the human
+  // turn this answer answers and the row the cursor is about to advance to.
+  // Null when the row carries no `rm` — an older spool row, or a redelivery
+  // from before this build — and a row this build cannot key is a row it
+  // cannot claim to have deduplicated, so it is neither guarded nor recorded.
+  const roundKey = roundsOn ? roundKeyOf(last) : null;
+  // EVERY keyable row this turn is about to answer. The group is the leading
+  // run of rows sharing one route and ONE turn answers all of them, so all of
+  // them are guarded — consulting or recording `last` alone leaves a
+  // redelivery of an earlier row of the same batch free to spawn a second
+  // turn and post a second answer. `roundKey` above stays the row the
+  // composed `ref` names: the answer answers the turn the human last took.
+  const roundKeys = roundsOn
+    ? group.map(roundKeyOf).filter((k): k is string => k !== null)
+    : [];
+  // R2(b) — REPLY ONCE PER ROUND, consulted AFTER the route resolved and
+  // BEFORE the token is taken: a round already answered spends no turn and no
+  // token. The list lives beside the cursor rather than inside `triggers()`,
+  // which is a PURE predicate over a row and must stay one — four readers
+  // call it (`pendingRows`, the steer poller, `settleTurn`, `attendState`) and
+  // a stateful clause there would make them disagree about what is pending.
+  // `takeTurnToken`/`turnsPerHour` stay the backstop (R2c), never the brake.
+  if (roundKeys.length > 0) {
+    const answered = answeredRounds();
+    if (roundKeys.some(k => answered.includes(k))) {
+      advanceTo(last);
+      return 'round-done';
+    }
+  }
   if (!takeTurnToken(account, cfg, now)) {
     await reply('Attend is at its hourly turn limit. It resumes within the hour.');
     advanceTo(last);
@@ -2550,16 +3454,28 @@ async function attendPass(
   // queue saying so, and it is exactly the "and say so" half of the honest
   // sentence the enable copy states.
   const midTurnMarked = new Set(readJournalFile(account).midTurn ?? []);
-  const joined = group
-    .map(b => {
-      const body = respondTextOf(b) ?? b.text;
-      return midTurnMarked.has(b.id) ? `${MID_TURN_MARKER}\n${body}` : body;
-    })
-    .join('\n\n');
+  const bodyOf = (b: MessageRecord): string => {
+    const body = respondTextOf(b) ?? b.text;
+    return midTurnMarked.has(b.id) ? `${MID_TURN_MARKER}\n${body}` : body;
+  };
+  const joined = group.map(bodyOf).join('\n\n');
   // A carry turn's prompt is the owner's words behind ONE context line
   // quoting the row they replied to (`carryContextLine` holds the rules) —
-  // composed here and handed to the host, never logged.
-  const prompt = head.kind === 'carry' ? `${carryContextLine(head.refText)}\n${joined}` : joined;
+  // composed here and handed to the host, never logged (rule 4).
+  // A ROUNDS ROOM TURN carries §3.3's block INSTEAD of the bare join: the
+  // roster with agent/human labels, the AUTHOR of every quoted row, the
+  // sibling answers so far, and the format instruction. `MID_TURN_MARKER`
+  // still prefixes a mid-turn arrival inside it (`bodyOf`, unchanged). A block
+  // that cannot be built is null and the bare join stands — today's prompt.
+  // RULE 4: none of this is logged, printed, or put in an error.
+  const roundsPrompt =
+    roundsOn && head.kind === 'room'
+      ? roundsPromptFor(account, head.gid, roundsArm(cfg).get(head.gid) ?? 0, group, bodyOf)
+      : null;
+  const prompt =
+    head.kind === 'carry'
+      ? `${carryContextLine(head.refText)}\n${joined}`
+      : (roundsPrompt ?? joined);
   // The spawn seam stays the SUPERVISOR's: `AttendIo.runTurn` keeps its
   // meaning (HOW to spawn a child) and the driver is handed it as
   // `DriverIo.spawn` (WHAT to spawn) — kept separate on purpose, because
@@ -2620,7 +3536,18 @@ async function attendPass(
     // issued, fail, and never clear it. Validate the driver BEFORE any key
     // exists; the unrecognised value falls through to the fresh-route arm,
     // where the refusing turn stores nothing.
-    if (cfg.host === 'claude' && (cfg.claudeDriver ?? 'subprocess') === 'subprocess') {
+    // GEMINI JOINS THE PINNED ARM, and it must (§3.8): its own
+    // route CREATES a session at a pinned id (`--session-id=<own>`), exactly
+    // as claude's does, so falling through to the fresh arm below would run
+    // every ROOM turn inside `cfg.ownSession` — the operator's own 1:1
+    // transcript. That is the leak this arm exists to prevent, in both
+    // directions: room words becoming 1:1 context, and private words becoming
+    // context the next room turn fans out. codex exec is different and
+    // genuinely fresh: its own form emits NO target at all.
+    if (
+      (cfg.host === 'claude' && (cfg.claudeDriver ?? 'subprocess') === 'subprocess') ||
+      cfg.host === 'gemini'
+    ) {
       const cur = loadRoomSessions(account)[head.gid] ?? {};
       const existing = cur.key !== undefined ? hostSessionKey(cur.key) : undefined;
       const key = existing ?? randomUUID();
@@ -2724,6 +3651,17 @@ async function attendPass(
             // real id arrives on a frame — claiming `ownSession` up front
             // would write a ledger row for a transcript that never exists.
             // `saidSess` picks the captured key up after the turn instead.
+            //
+            // A GEMINI OWN TURN CARRIES NONE EITHER, and that is a choice
+            // rather than an omission (§3.8). It CAN pin
+            // `ownSession` at creation, so a sess row would resolve — but a
+            // routed session route gets NO startup recovery (the operator's
+            // session is never re-created under its own id), and gemini's
+            // session store prunes at 30 days, so an aged-out key would
+            // hard-fail every reply with nothing to do about it. With no
+            // sess, a reply takes the carry fallback: a fresh OWN-route turn,
+            // which resumes the very same pinned transcript through
+            // `turnArgv`'s own form AND keeps the driver's one 42-recovery.
             undefined;
 
   /**
@@ -3603,6 +4541,12 @@ async function attendPass(
   // different turn owns.
   delete priorJournal.streamAnchor;
   writeJournalFile(account, { ...priorJournal, upTo: last.id, startedAt: now });
+  // THE ROUND KEY IS WRITTEN BEFORE THE SPAWN, beside the
+  // journal write and for the same reason: the at-most-once rail's direction.
+  // A crash after this write costs one unanswered round; a crash before it
+  // costs a DUPLICATE answer, which is the outcome the guard exists to
+  // prevent. The cursor itself does not move — only its round list grows.
+  noteRoundKeys(roundKeys);
 
   // THE TURN IS THE DRIVER'S — argv shape, refusal classification and any
   // startup-refusal recovery are host property (attend-drivers.ts). The pass
@@ -3774,7 +4718,13 @@ async function attendPass(
   // touch the config — writing it there would wedge the real own session on
   // the next bare message.
   if (head.kind === 'room') {
-    if (cfg.host === 'claude' && roomSessKey !== undefined && turn.ownExists !== undefined) {
+    // The same two hosts the pinned arm above admits — the observation is
+    // about a session THIS turn pinned, and only those two pin one.
+    if (
+      (cfg.host === 'claude' || cfg.host === 'gemini') &&
+      roomSessKey !== undefined &&
+      turn.ownExists !== undefined
+    ) {
       saveRoomSession(account, head.gid, { key: roomSessKey, started: turn.ownExists });
     }
   } else if (turn.ownExists !== undefined && turn.ownExists !== (cfg.ownSessionStarted === true)) {
@@ -3857,6 +4807,11 @@ async function attendPass(
   // 20,000-char MAX_GROUP_BODY, so the fan-out's own bound can never refuse
   // what the funnel passed.
   const body = funnel(turn.stdout);
+  // THE SPLIT RUNS ON RAW STDOUT (§3.4), before the funnel — `plainForChat`
+  // strips exactly the scaffolding the model delimits the halves with. The
+  // funnelled `body` above is untouched and still decides emptiness (step 9)
+  // and every non-rounds path, byte for byte.
+  const roundAnswer = roundsOn ? boundRoundAnswer(splitRoundAnswer(turn.stdout)) : null;
   if (head.kind === 'room' && body !== '') {
     // THE ANSWER GOES INTO THE ROOM — the one thing the room path carries.
     // Everything else attend says (excuses, failures, this partial-failure
@@ -3864,7 +4819,74 @@ async function attendPass(
     // and the owner is the only party who can act on any of it.
     const roomSend =
       io.sendRoomReply ?? ((g: string, b: string) => realSendRoomReply(account, g, b));
-    const sent = await roomSend(head.gid, body);
+    // A ROUNDS ANSWER is composed as a `reply` inner (R3): `ref` the human
+    // row's §5.3 key, `ofs` false because the quoted message is the human's
+    // and never the replier's, `text` the brief, `d` the detail. NOT a `msg`:
+    // `render.ts:maySpool` admits a `grp.msg` whose inner is '' / `reply` /
+    // `mention` and NOT `msg`, so a `msg` inner would never reach a sibling's
+    // spool at all — that absence is load-bearing and must be left alone.
+    // The `ai` marker is `sendRoomMessage`'s (`opts.ai`), which marks the
+    // WRAPPER and, the body being an envelope, the inner too — one marking
+    // site, unchanged.
+    let roomBody = body;
+    if (roundAnswer !== null && roundAnswer.unsendable === true) {
+      // COMPOSE-STRICT REFUSAL (see `BoundRoundAnswer.unsendable`). The words
+      // outrank the shape: the answer still goes to the room as today's bare
+      // text, and the journal records that no envelope was composed. No copy
+      // changes and nothing of the brief is logged — one classification word.
+      noteRound(account, {
+        key: roundKey ?? '',
+        split: roundAnswer.how,
+        detail: 'none',
+        ref: 'unsendable',
+      });
+    } else if (roundAnswer !== null && roundAnswer.brief !== '') {
+      let state = roundAnswer.state;
+      if (roundKey === null) {
+        // No `rm` on the triggering row (an older spool row, a redelivery from
+        // before this build): the answer goes out as bare text exactly as it
+        // does today. NEVER a guessed ref — a ref that names the wrong row is
+        // worse on every phone than no ref at all.
+        // `detail: 'none'` and not `'dropped'`: nothing was withheld — there
+        // is no envelope on this arm at all, so no `d` field existed to fill.
+        // `ref: 'unavailable'` is what says why.
+        noteRound(account, {
+          key: '',
+          split: roundAnswer.how,
+          detail: 'none',
+          ref: 'unavailable',
+        });
+      } else {
+        const compose = (detail?: string): string =>
+          JSON.stringify({
+            tcm: 'reply',
+            ref: roundKey,
+            ofs: false,
+            text: roundAnswer.brief,
+            ...(detail === undefined ? {} : { d: detail }),
+          });
+        let inner = compose(roundAnswer.detail);
+        if (!roundWrapperFits(inner)) {
+          // R23's belt: re-compose brief-only rather than let the fan-out
+          // refuse the whole answer. `assertBodyWithinCap` throws EXIT.USAGE,
+          // which this pass maps to `refused: 'no-room'` and reports to the
+          // owner as "not in that room any more" — for a turn already recorded
+          // ANSWERED, with no retry behind it.
+          inner = compose(undefined);
+          state = 'dropped';
+        }
+        if (roundWrapperFits(inner)) {
+          roomBody = inner;
+          noteRound(account, { key: roundKey, split: roundAnswer.how, detail: state });
+        } else {
+          // Unreachable by the arithmetic (a brief-only wrapper is ~1 300
+          // bytes against 16 384) and handled anyway: the words outrank the
+          // shape, so the bare funnelled text goes instead of nothing.
+          noteRound(account, { key: roundKey, split: roundAnswer.how, detail: 'dropped' });
+        }
+      }
+    }
+    const sent = await roomSend(head.gid, roomBody);
     if (sent.refused !== undefined) {
       await reply(
         'The answer could not be posted: this account is not in that room any more ' +
@@ -4192,7 +5214,18 @@ export async function realSendRoomReply(
     // body is itself an envelope, INSIDE it too. This is the room
     // lane's one marking site: bare funneled text stays bare, so every
     // pre-marker member still renders the words.
-    sent = await sendRoomMessage(account, gid, body, undefined, undefined, { ai: true });
+    // `siblings` — ROUNDS R1's audience widening (§3.6), read
+    // HERE from the room's own flag rather than passed down the io seam, so
+    // the widening is a property of the room the transport is posting to and
+    // not of whatever called it. OFF for every room the owner has not turned
+    // rounds on, and `crewMateAgentIds` answers ∅ for every room that is not
+    // this owner's own crew room (R15) or that holds a second human (R26) —
+    // three independent fail-closed reads before one extra leg exists.
+    const siblings = roundsGids(loadAttendConfig(account)).has(gid);
+    sent = await sendRoomMessage(account, gid, body, undefined, undefined, {
+      ai: true,
+      ...(siblings ? { siblings: true } : {}),
+    });
   } catch (err) {
     // The fold's refusal and the no-such-room refusal are conversations the
     // pass answers honestly 1:1 — never faults. Anything else (a lock, the
@@ -4225,9 +5258,22 @@ export async function realSendRoomReply(
   return { m: sent.m, delivered: sent.delivered, skipped: sent.skipped, failed: sent.failed };
 }
 
-/** The hosts attend can drive. Not the same set as hooks.ts's HOOK_HOSTS:
- * gemini and cursor notify but have no headless resume this can spawn. */
-export const ATTEND_HOSTS = ['claude', 'codex'] as const;
+/**
+ * The hosts attend can drive. Still not the same set as hooks.ts's
+ * HOOK_HOSTS: `cursor` notifies but has no headless resume this can spawn,
+ * so it stays notify-only.
+ *
+ * CORRECTED 2026-09-04 (§3.8). This comment used to say
+ * gemini had "no headless resume this can spawn", which is false as of
+ * gemini-cli v0.58.0: it is headless on non-TTY stdio and takes
+ * `--resume=<id>` / `--session-id=<id>`. gemini therefore joins the set with
+ * its own spawn-seam driver — API-key only, exit-code classified, isolated
+ * home — and `attend enable --host gemini` prints the unmeasured-host notice
+ * until §3.8's measurement table is filled. The binary is absent on the
+ * machine this was written on, so every claim about it here is read from the
+ * documented interface, never observed.
+ */
+export const ATTEND_HOSTS = ['claude', 'codex', 'gemini'] as const;
 export type AttendHost = (typeof ATTEND_HOSTS)[number];
 
 /** Ceiling on `--turns`. Not a policy about cost — a bound that keeps the
@@ -4303,6 +5349,19 @@ function operatorCodexModel(): string | undefined {
  *                                    the typed read-only sandbox)
  *   claude  `--permission-mode plan` (subprocess argv; the sdk driver
  *                                    translates it to the typed option)
+ *   gemini  `--approval-mode plan`   (spawn argv — §3.8)
+ *
+ * THE GEMINI ARM IS EXPLICIT, NEVER A FALL-THROUGH. Falling through to the
+ * claude branch would emit `--permission-mode plan` to a binary that has no
+ * such flag: a usage error on every room turn, which the operator reads as
+ * the host's fault. Two honest limits on what the flag buys, stated because
+ * a floor that is described as more than it is stops being a floor: gemini
+ * can silently demote `plan` to `default` (an untrusted folder, or
+ * `general.plan.enabled` false — §3.8 M9 is the measurement that would tell
+ * us), and the real floor in headless is the `ask_user` → DENY translation,
+ * not the flag. What the floor does guarantee is that `--approval-mode yolo`
+ * and `auto_edit` in the operator's 1:1 caps never reach a room turn: every
+ * word the model whitelist does not recognise is REPLACED.
  *
  * These happen to be `attend enable`'s DEFAULT profiles, and that is a
  * coincidence, not a coupling: the default is the operator's starting
@@ -4330,8 +5389,14 @@ export function roomCapsFloor(
   host: AttendConfig['host'],
   operatorCaps: readonly string[] = [],
 ): string[] {
-  const floor = host === 'codex' ? ['-s', 'read-only'] : ['--permission-mode', 'plan'];
-  const modelFlags = host === 'codex' ? ['-m', '--model'] : ['--model'];
+  const floor =
+    host === 'codex' ? ['-s', 'read-only']
+    : host === 'gemini' ? ['--approval-mode', 'plan']
+    : ['--permission-mode', 'plan'];
+  // gemini takes `-m` and `--model`, like codex exec; claude takes `--model`
+  // alone (`-m` is not its flag, and carrying it would hand the parser a word
+  // this whitelist never inspected).
+  const modelFlags = host === 'claude' ? ['--model'] : ['-m', '--model'];
   const carried: string[] = [];
   for (let i = 0; i < operatorCaps.length; i += 1) {
     const word = operatorCaps[i] as string;
@@ -4536,6 +5601,17 @@ export function cmdAttendEnable(
     if (host === 'claude' && opts.driver !== 'subprocess' && opts.driver !== 'sdk') {
       throw new CliError(EXIT.USAGE, '--driver for claude takes one of: subprocess, sdk');
     }
+    // gemini has ONE driver — the spawn seam (§3.8) — so
+    // there is no vocabulary to state. Refused rather than ignored: the
+    // write below lands `--driver` on the host's OWN field, and a silently
+    // ignored word here used to mean a gemini profile could be saved
+    // carrying `claudeDriver`, a field no gemini turn ever reads.
+    if (host === 'gemini') {
+      throw new CliError(
+        EXIT.USAGE,
+        '--driver does not apply to gemini — it has one driver, the spawn seam',
+      );
+    }
   }
   const claudeSdk = host === 'claude' && opts.driver === 'sdk';
   /**
@@ -4578,6 +5654,34 @@ export function cmdAttendEnable(
           'instead. Nothing was saved.',
       );
     }
+  }
+  /**
+   * GEMINI'S ENABLE-TIME CREDENTIAL GATE — FAIL CLOSED (§3.8,
+   * R9), the claude sdk key check's sibling and for a sharper reason: the
+   * FAQ fragments recorded beside `geminiCredentialPresent`
+   * (attend-drivers.ts, read 2026-09-03) name an API key as the supported
+   * method for third-party tools, so a gemini profile enabled with no key in
+   * sight would configure a host whose every turn is refused at the spawn.
+   *
+   * PRESENCE IN THIS SHELL, and the same predicate the driver applies later
+   * — one rule, two gates — reading the environment and never a value. The
+   * turn-time gate is the one that judges what attend's own environment
+   * resolves, because nothing checked here survives to launchd unchanged.
+   *
+   * Only `GEMINI_API_KEY` is accepted while §3.8 M7 (the Vertex triple's
+   * exact names) is owed: refusing too much is recoverable, accepting a
+   * credential shape nobody verified is not.
+   */
+  if (host === 'gemini' && !geminiCredentialPresent(io.env ?? process.env)) {
+    throw new CliError(
+      EXIT.ERROR,
+      `the gemini host runs on an operator-supplied API key only, and ` +
+        `${GEMINI_CREDENTIAL_NAMES.join(' or ')} is not set in this shell. A cached ` +
+        `Google-account sign-in is not accepted for this host: Google's Gemini CLI FAQ ` +
+        `names a Vertex AI or Google AI Studio API key as the supported method for ` +
+        `third-party tools. Export the key where attend will run and re-run this ` +
+        `command (no value is read or printed here). Nothing was saved.`,
+    );
   }
   // `--approval-policy` binds to the app-server driver's typed thread
   // settings and to nothing else — exec has NO approval surface, so a policy
@@ -4739,12 +5843,23 @@ export function cmdAttendEnable(
   // Captured BEFORE the config is written, so the file never says "enabled"
   // while the model question is still open (see `operatorCodexModel`).
   const codexModel = host === 'codex' ? operatorCodexModel() : undefined;
+  // The gemini sibling, captured for the same reason and at the same moment
+  // (hostconfig.ts:operatorGeminiModel; every failure reads as unpinned).
+  const geminiModel = host === 'gemini' ? operatorGeminiModel() : undefined;
   const cfg: AttendConfig = {
     host,
-    bin: opts.bin ?? resolve(host === 'codex' ? 'codex' : 'claude'),
+    // The binary each host is named by on PATH — one map, so a third host
+    // cannot silently resolve to a second host's binary the way a
+    // two-armed ternary made it do.
+    bin: opts.bin ?? resolve(host),
     workdir: opts.workdir ?? process.cwd(),
-    caps: opts.caps ?? (host === 'codex' ? ['-s', 'read-only'] : ['--permission-mode', 'plan']),
+    caps:
+      opts.caps ??
+      (host === 'codex' ? ['-s', 'read-only']
+      : host === 'gemini' ? ['--approval-mode', 'plan']
+      : ['--permission-mode', 'plan']),
     ...(codexModel === undefined ? {} : { codexModel }),
+    ...(geminiModel === undefined ? {} : { geminiModel }),
     // Written only when STATED, all of them: absent has a meaning of its
     // own (the exec/subprocess driver; the untrusted default) and a field
     // this command invented would turn the operator's silence into a claim
@@ -4783,6 +5898,75 @@ export function cmdAttendEnable(
       : host === 'codex'
         ? 'read-only profile'
         : 'plan-profile';
+  if (host === 'gemini') {
+    /**
+     * THE GEMINI READ-BACK. Everything it says that is not measured, it says
+     * is not measured (R21): the binary is absent on the machine this was
+     * written on, so `attend enable --host gemini` carries the
+     * UNMEASURED-HOST NOTICE naming §3.8's table until every row is filled.
+     * No hidden flag and no environment escape hatch turns it off — a notice
+     * an operator can silence is a notice that stops being true.
+     *
+     * The isolated home is named, `GEMINI_CLI_TRUST_WORKSPACE` is named
+     * because setting it is a capability decision rather than a tidy-up, and
+     * the API-key-only posture is stated with what it costs the operator:
+     * these turns bill their key per token. The disclosure and marker
+     * paragraphs are the SHARED ones — the same two sentences both other
+     * hosts speak, never re-typed here.
+     */
+    const geminiHome = geminiHomeDir(account);
+    try {
+      // Best-effort, so the sentence below names a directory that exists;
+      // the driver creates it on demand at 0700 either way.
+      mkdirSync(geminiHome, { recursive: true, mode: 0o700 });
+    } catch {
+      /* the driver creates it on demand */
+    }
+    report.emit(
+      {
+        ok: true,
+        action: 'attend-enabled',
+        account,
+        host,
+        workdir: cfg.workdir,
+        geminiHome,
+        // The FACT of a pin, never the name — `codexModelPinned`'s rule.
+        geminiModelPinned: cfg.geminiModel !== undefined,
+        unmeasuredHost: true,
+        ...(cfg.markerMinAppBuild === undefined
+          ? {}
+          : { markerMinAppBuild: cfg.markerMinAppBuild }),
+      },
+      `${account}: attend is configured (gemini, ${profileWord}). ` +
+        `Turns run on an operator-supplied API key only: every turn bills the ` +
+        `${GEMINI_CREDENTIAL_NAMES.join(' or ')} that attend's environment resolves, per ` +
+        `token, and a start that resolves no key is refused before anything is spawned. ` +
+        `attend never supplies a Google-account sign-in, and points this host at a home ` +
+        `that holds none — Google's Gemini CLI FAQ names an API key as the supported ` +
+        `method for third-party tools. Whether that is enough to stop gemini resolving a ` +
+        `cached sign-in of its own is one of the open measurements (M8). ` +
+        disclosureReadBack() +
+        markerReadBack(cfg.markerMinAppBuild) +
+        `Replies sent while a turn runs arrive at the next turn, marked as having arrived ` +
+        `mid-turn. attend points every gemini turn at its own home, so that your personal ` +
+        `gemini settings and MCP servers should not ride a phone-triggered turn — what ` +
+        `GEMINI_CLI_HOME actually moves is one of the open measurements (M5, M6):
+` +
+        `  GEMINI_CLI_HOME=${geminiHome}
+` +
+        `That home is user-level only — a project's own .gemini directory, GEMINI.md ` +
+        `and .env still load from the workdir — and attend sets GEMINI_CLI_TRUST_WORKSPACE ` +
+        `for its own home, which the documented interface says is what stops a turn ` +
+        `failing folder trust (M9). THIS HOST IS UNMEASURED: the gemini binary is not ` +
+        `installed where this was built, so the driver is written against the documented ` +
+        `v0.58.0 interface and ` +
+        `proved against a fake binary. Treat the measurements above as open ` +
+        `until you have run them on this host; expect to have read them ` +
+        `before trusting a gemini turn. Then supervise it with: ` +
+        `tacendum attend service install ${account}`,
+    );
+    return;
+  }
   if (host === 'codex') {
     // THE SIGN-IN ASK, STATED PLAINLY. Codex turns
     // run under an attend-owned CODEX_HOME so the operator's global config,
@@ -5106,6 +6290,107 @@ export function cmdAttendTriggers(
 }
 
 /**
+ * `tacendum attend rounds <account> [<room-gid> on|off]` — the owner's
+ * per-room ROUNDS grant: with a gid and a verb it flips
+ * whether that room's turns compose brief+detail answers and whether this
+ * agent's answers additionally reach its crew-mate agents; bare, it reads the
+ * list back. `AttendConfig.rounds` holds the field's full contract (default
+ * OFF, fail-closed reads, the enable-rewrite reset); this command is its ONLY
+ * writer.
+ *
+ * `attend triggers`' grammar and shape exactly, deliberately — a per-room
+ * mutable list is the wrong thing to restate through `enable`'s whole-profile
+ * rewrite, and an operator who has learned one of these commands has learned
+ * both. Every other config field rides through untouched.
+ *
+ * BOTH EMISSIONS STATE WHAT THE GRANT COSTS, because this is the one moment
+ * the operator is provably reading: the answer shape changes, and the agent's
+ * own answer reaches its crew-mates. Neither sentence says "summary" (R12),
+ * neither implies the relay orders or attributes anything, and the widening is
+ * stated with its condition rather than as a blanket.
+ */
+export function cmdAttendRounds(
+  account: string,
+  gid: string | null,
+  verb: string | null,
+  report: Reporter,
+): void {
+  const cfg = loadAttendConfig(account);
+  if (cfg === null) {
+    throw new CliError(
+      EXIT.ERROR,
+      'attend is not enabled for this account — tacendum attend enable comes first',
+    );
+  }
+  if (gid === null) {
+    // The read-back through the SAME reader the composer uses, so what this
+    // prints is what the turn reads.
+    const open = [...roundsGids(cfg)].sort();
+    report.emit(
+      { ok: true, action: 'attend-rounds', account, rooms: open },
+      open.length === 0
+        ? `${account}: rounds is off in every room (the default — one answer, no detail, ` +
+            `no crew-mate delivery)`
+        : `${account}: rounds is on in ${open.length} room${open.length === 1 ? '' : 's'}:\n  ` +
+            `${open.join('\n  ')}\n` +
+            `In those rooms this agent answers with a brief and a detail, and its answers ` +
+            `also reach the crew-mate agents your roster classes as integrations.`,
+    );
+    return;
+  }
+  // SHAPE ONLY, never membership — `attend triggers`' rule verbatim: rooms are
+  // client-side state this command must not depend on holding, and a gid for a
+  // room this machine has not accepted simply never matches a row. The
+  // rejected value is not echoed (rule 4).
+  if (!GID_RE.test(gid)) {
+    throw new CliError(
+      EXIT.USAGE,
+      'that is not a room id — a gid is 26 characters of Crockford base32 ' +
+        '(tacendum room list <account> prints them)',
+    );
+  }
+  if (verb !== 'on' && verb !== 'off') {
+    throw new CliError(EXIT.USAGE, 'usage: tacendum attend rounds <account> <room-gid> on|off');
+  }
+  const open = new Set(roundsGids(cfg));
+  if (verb === 'on') open.add(gid);
+  else open.delete(gid);
+  // The arming stamps ride the same write, `attend triggers`' rule exactly: ON
+  // dates the grant NOW unless the room already holds a stamp (an idempotent
+  // re-`on` must not re-date what it did not change), OFF drops the stamp with
+  // the gid, and stamps for gids the set no longer holds are swept so the two
+  // fields cannot drift apart under their only writer.
+  const stamps: Record<string, number> = {};
+  const prior = roundsArm(cfg);
+  for (const g of open) {
+    const at = prior.get(g);
+    stamps[g] = at !== undefined ? at : Date.now();
+  }
+  const next: AttendConfig = { ...cfg };
+  if (open.size === 0) {
+    delete next.rounds;
+    delete next.roundsArmedAt;
+  } else {
+    next.rounds = [...open].sort();
+    next.roundsArmedAt = stamps;
+  }
+  saveAttendConfig(account, next);
+  report.emit(
+    { ok: true, action: 'attend-rounds', account, gid, state: verb },
+    verb === 'on'
+      ? `${account}: room ${gid} — rounds is on. Answers in that room carry a brief (what ` +
+          `a phone shows) and a detail (the full answer, behind a tap), and this agent's ` +
+          `answers also reach the crew-mate agents your roster classes as integrations — ` +
+          `delivery only: agents still cannot start each other's turns. Only messages sent ` +
+          `from now on are read as context. In a room with a second person the switch stays ` +
+          `on and the crew-mate delivery does not apply. Re-running attend enable turns ` +
+          `rounds off everywhere.`
+      : `${account}: room ${gid} — rounds is off (one answer, no detail, no crew-mate ` +
+          `delivery, the default)`,
+  );
+}
+
+/**
  * ---------------------------------------------------------------------------
  * `tacendum attend status [<account>]` — ONE PURE READER.
  * ---------------------------------------------------------------------------
@@ -5235,6 +6520,19 @@ export type AttendState =
        * already print, so log hygiene is untouched.
        */
       roomTriggerRooms: string[];
+      /**
+       * The rounds grant, read through the ONE reader the
+       * composer and `attend rounds` both use (`roundsGids`), for the reason
+       * `roomTriggerRooms` exists at all (the 2026-08-15 remediation: it
+       * "was the only grant absent from status"). Rounds is the second
+       * durable, per-room, operator-granted capability on this account and it
+       * changes who this agent's answers are DELIVERED to — a durable fact
+       * this pure reader must state. Sorted gids; empty is the default (OFF
+       * per room). Gids are room identifiers, not message ids — the same
+       * value `attend rounds` and `room list` already print, so rule 4 is
+       * untouched.
+       */
+      roundsRooms: string[];
       /** The marker attestation (`attend enable --marker`), read with
        * the send path's own shape gate (`markerShapeOk`) — the operator's
        * claim about their phone, verbatim; absent means bare text leaves
@@ -5446,6 +6744,7 @@ export function attendState(account: string, io: AttendStateIo = {}): AttendStat
     // attestation through the send path's own shape gate — both read-backs,
     // never re-derivations (see the fields' comments).
     roomTriggerRooms: [...roomTriggerGids(cfg)].sort(),
+    roundsRooms: [...roundsGids(cfg)].sort(),
     ...(markerShapeOk(cfg.markerMinAppBuild)
       ? { markerMinAppBuild: cfg.markerMinAppBuild as number }
       : {}),
@@ -5655,6 +6954,22 @@ export function cmdAttendStatus(
             `Run once: CODEX_HOME=${codexHomeDir(account)} codex login`,
         );
       }
+    }
+    if (s.host === 'gemini') {
+      // The two facts that decide whether every turn will refuse, and neither
+      // is visible from host/caps/session alone: the API-key-only requirement
+      // (the claude sdk arm prints exactly this for its own key), and the
+      // unmeasured state that `enable` announced once and never again. No new
+      // state field — both are properties of the host, not of this config.
+      lines.push(
+        `  runs on an operator-supplied API key only (${GEMINI_CREDENTIAL_NAMES.join(' or ')} ` +
+          'where attend runs) — a start that resolves no key refuses the turn before ' +
+          'anything is spawned',
+      );
+      lines.push(
+        '  THIS HOST IS UNMEASURED: the gemini driver is written against the ' +
+          'documented interface and proved against a fake binary',
+      );
     }
     if (s.host === 'claude') {
       // The driver, read back verbatim like caps (the codex block's rule):

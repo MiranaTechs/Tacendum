@@ -28,9 +28,12 @@ const KEY_ENABLED = 'lock.enabled';
 const KEY_AUTOLOCK = 'lock.autolockSec';
 const KEY_FAILS = 'lock.failCount';
 const KEY_LOCKED_UNTIL = 'lock.lockedUntil';
-const ALL_KEYS = [
+/**
+ * Everything `clearAll` wipes AFTER the gate. `lock.enabled` is deliberately
+ * NOT in this list — it is deleted first and on its own, see `clearAll`.
+ */
+const POST_GATE_KEYS = [
   KEY_CODE,
-  KEY_ENABLED,
   KEY_AUTOLOCK,
   KEY_FAILS,
   KEY_LOCKED_UNTIL,
@@ -118,9 +121,41 @@ export async function disable(): Promise<void> {
   await clearAll();
 }
 
-/** Unconditional wipe of lock state — the real sign-out path only. */
+/**
+ * Unconditional wipe of lock state — the real sign-out path only.
+ *
+ * The wipe is ordered, and the order is the safety property (AD-1,
+ * 2026-09-03). It used to be one unguarded loop over a key list that put
+ * `lock.passcode` BEFORE `lock.enabled`, so a single rejecting delete —
+ * SecretStore.kt throws `secret delete failed` on a failed unlink, and the
+ * iOS store throws on any Keychain status but success/notFound — aborted the
+ * loop having removed the code and left the flag. `verify` answers that
+ * half-state `{ verdict: 'real' }` for ANY input (see the branch below, which
+ * is the never-brick-the-user net and stays exactly as it is): the fix is to
+ * make its precondition unreachable from here.
+ *
+ * So: `lock.enabled` is a GATE. It goes first, alone, and a rejection there
+ * propagates before anything else is touched — nothing was deleted, the lock
+ * still works, and the caller's "nothing was changed" is true. Past the gate
+ * the lock already reads as off, so the remaining keys are swept
+ * best-effort — every one attempted, no early abort — and a key the store
+ * refuses to drop is left as inert residue (`status` reads disabled, the next
+ * `setup` overwrites the code) rather than turned into a failure the UI would
+ * have to describe. Reporting one there would make the disable flow claim
+ * "nothing was changed" over a lock that IS off and leave its toggle reading
+ * on, which is a worse lie than the residue.
+ *
+ * Rule 4: nothing here names a key or a value in an error.
+ */
 export async function clearAll(): Promise<void> {
-  for (const key of ALL_KEYS) await deleteSecret(key);
+  await deleteSecret(KEY_ENABLED);
+  for (const key of POST_GATE_KEYS) {
+    try {
+      await deleteSecret(key);
+    } catch {
+      // Inert residue behind a lock that is already off; see above.
+    }
+  }
   cooldownShadow = null;
 }
 

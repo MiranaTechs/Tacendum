@@ -93,10 +93,35 @@ describe('README', () => {
   // blank and the tarball explains nothing.
   const readmePath = join(pkgRoot, 'README.md');
 
-  it('exists and tells a stranger how to install', () => {
+  it('exists and tells a stranger how to install — a route that WORKS today', () => {
     expect(existsSync(readmePath)).toBe(true);
     const readme = readFileSync(readmePath, 'utf8');
-    expect(readme).toContain('npm install -g @tacendum/cli');
+    // The registry install is the intended one and is NOT available: `npm view
+    // @tacendum/cli version` answers 404 (checked 2026-09-03). This assertion
+    // used to pin the bare `npm install -g @tacendum/cli` line, which made the
+    // suite the guardian of the one flatly false claim on the product's front
+    // door — the reader who follows it gets an error, not a CLI. So the line
+    // may still appear, but only carrying its disclaimer, and a route that
+    // works must appear beside it.
+    expect(readme).toContain('not yet published to npm');
+    expect(readme).toContain('npm pack');
+    expect(readme).toContain('npm install -g ./tacendum-cli-<version>.tgz');
+    // Publication day is meant to be a one-line edit, so the disclaimer and
+    // the registry line stay adjacent: whoever deletes one must see the other.
+    const disclaimer = readme.indexOf('not yet published to npm');
+    const registryLine = readme.indexOf('npm install -g @tacendum/cli');
+    expect(registryLine).toBeGreaterThan(-1);
+    expect(Math.abs(registryLine - disclaimer)).toBeLessThan(200);
+  });
+
+  it('tells the reader how to check what they installed (M2 is why --version says more than a number)', () => {
+    const readme = readFileSync(readmePath, 'utf8');
+    // version.ts: `--version` prints version, commit and SOURCE_URL, and a
+    // build.mjs stamp may carry `-dirty`. An install path that does not say
+    // how to verify the artifact leaves the AGPL §6 surface undiscovered.
+    expect(readme).toContain('tacendum --version');
+    expect(readme).toContain('-dirty');
+    expect(readme).toContain('dist/LICENSE');
   });
 
   it('states the licence and the exit-2 guarantee', () => {
@@ -131,6 +156,65 @@ describe('README', () => {
     // the retention clock that purges bodies — not read-only.
     expect(readme).toContain('no send tool');
     expect(readme.toLowerCase()).not.toContain('read-only tools');
+  });
+
+  it('qualifies "no send tool" with the two opt-in flags that add one (mcp.ts:23-39)', () => {
+    const readme = readFileSync(readmePath, 'utf8');
+    // "no send tool" unqualified was true only of the DEFAULT launch:
+    // mcp-notify.ts:345 registers tacendum_notify_owner under --notify-owner
+    // and mcp-ask.ts:408 registers tacendum_ask_owner under --ask-owner.
+    // A reader who configures either and still believes the README is a
+    // reader whose agent can send.
+    expect(readme).toContain('--notify-owner');
+    expect(readme).toContain('tacendum_notify_owner');
+    expect(readme).toContain('--ask-owner');
+    expect(readme).toContain('tacendum_ask_owner');
+    // The flag decides what a host sees; the server decides what may be sent.
+    expect(readme).toContain('the flag is not the enforcement');
+    // mcp.ts:233-239 (ShapedMessage): provenance first, sender-controlled
+    // `body` LAST and alone. The injection defence is that structure, not a
+    // wrapper string — §2 records why a wrapper does not hold.
+    expect(readme).toContain('structured records');
+    expect(readme).toContain('`body` last and alone');
+  });
+
+  it('states §2 honestly: omitting a tool is not access control', () => {
+    const readme = readFileSync(readmePath, 'utf8');
+    // mcp.ts:16-18 records the review verdict verbatim in substance: a
+    // client-side allowlist is theatre because the hosts that matter have a
+    // shell, so `tacendum send` is one command away. The README is where a
+    // reader decides how much the MCP surface protects them.
+    expect(readme).toContain('not access control');
+    expect(readme).toContain('`tacendum send`');
+    // ws.ts:1574-1577 — write-once bind, read-time resolution to the owner's
+    // whole device group. Both halves are what "bound to you" actually means.
+    expect(readme).toContain('written once at pairing and never');
+    expect(readme).toContain('device group');
+    // No claim the code does not enforce. The client sandboxes nothing.
+    expect(readme).not.toContain('sandbox');
+    expect(readme).not.toContain('cannot exfiltrate');
+  });
+
+  it('surfaces the report-to-you loop, not just the notify half', () => {
+    const readme = readFileSync(readmePath, 'utf8');
+    // main.ts:1677/1687/1716 — sync, inbox and doctor are the durable half of
+    // the product ("a machine that reports to you"), and were one-liners in a
+    // trailing list while setup/notify/run/credential each had a worked
+    // example. A command a reader never sees is a command a reader never runs.
+    for (const heading of [
+      '### `tacendum sync`',
+      '### `tacendum inbox`',
+      '### `tacendum doctor`',
+    ]) {
+      expect(readme).toContain(heading);
+    }
+    // msglog.ts's retention policy is a data-loss-shaped surprise if unsaid:
+    // reading marks read, and marking read schedules the body's purge.
+    expect(readme).toContain('**Reading marks read, and marking read is');
+    expect(readme).toContain('--peek');
+    expect(readme).toContain('--purge');
+    // doctor.ts: a check that cannot run is a FAIL, and doctor never repairs.
+    expect(readme).toContain('observes and never repairs');
   });
 
   it("run's drop-in claim carries its one exception: child exit 2 becomes 1", () => {
@@ -187,7 +271,7 @@ describe('build.mjs artifact', () => {
   );
 });
 
-describe('build reproducibility (external scan', () => {
+describe('build reproducibility (external scan)', () => {
   // The scan built the public artifact twice and got two different checksums:
   // build-info.json embedded the WALL CLOCK, so identical source produced
   // distinguishable artifacts — and nothing refused to pack a tree whose
@@ -491,7 +575,7 @@ describe('build-stamp resolveCommit: the stamp must never name a stranger\'s com
     expect(resolveCommit(bare)).toBeNull();
   });
 
-  it('uncommitted change inside the artifact inputs stamps <sha>-dirty (external scan', () => {
+  it('uncommitted change inside the artifact inputs stamps <sha>-dirty (external scan)', () => {
     const home = join(scratch, 'dirty-home');
     const pkg = join(home, 'packages', 'cli');
     mkdirSync(pkg, { recursive: true });
@@ -698,7 +782,7 @@ describe('the bundle ignores a repointed workspace symlink (MEDIUM 3)', () => {
   );
 });
 
-describe('packaging never honors TACENDUM_BUILD_OUTDIR (artifact-integrity bypass, external review', () => {
+describe('packaging never honors TACENDUM_BUILD_OUTDIR (artifact-integrity bypass, external review)', () => {
   // The bypass, reproduced against HEAD before the fix: `TACENDUM_BUILD_OUTDIR=<scratch>
   // npm pack` ran prepack, which built and validated the SCRATCH directory —
   // clean-output recreation, readdir allowlist, input attestation, stamp, all
@@ -827,7 +911,7 @@ describe('packaging never honors TACENDUM_BUILD_OUTDIR (artifact-integrity bypas
   });
 });
 
-describe('the bypass end to end: prepack with the override refuses; without it, dist/ is rebuilt (external review', () => {
+describe('the bypass end to end: prepack with the override refuses; without it, dist/ is rebuilt (external review)', () => {
   // The pre-fix reproduction, now required to FAIL: a scratch monorepo with
   // the REAL build scripts, a stale dist/ parked exactly as an attacker (or
   // an earlier build) would leave it, and a prepack run with the override

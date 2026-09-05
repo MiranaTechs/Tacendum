@@ -139,7 +139,7 @@ const definitions: CreateTableCommandInput[] = [
     // Pairwise consent edges: one row per directed
     // (human -> agent) authorization plus the per-human `#count` control
     // row. NO index, ever — a GSI on agentId would answer "who consented to
-    // this agent", the enumeration D6.2 refuses to every caller. No TTL:
+    // this agent", the enumeration this schema refuses to every caller. No TTL:
     // an edge is durable authorization state, deleted by its writer or with
     // its writer's account.
     TableName: TABLES.consentEdges,

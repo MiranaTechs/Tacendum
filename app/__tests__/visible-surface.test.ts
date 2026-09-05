@@ -128,6 +128,19 @@ const ROUTE_MATRIX: ReadonlyArray<{
   { route: { name: 'accountUsername' }, cover: true, coverWithCall: true, workspace: true, redeem: true, land: true, disclose: [] },
   { route: { name: 'discover' }, cover: true, coverWithCall: true, workspace: true, redeem: true, land: true, disclose: [] },
   { route: { name: 'recover' }, cover: true, coverWithCall: true, workspace: false, redeem: false, land: true, disclose: [] },
+  // The update wall (§9 rule 9 a fourth time): an
+  // EMPTY screen with a title, a sentence and two controls, standing in
+  // front of a workspace that was never opened. Exempt from the capture
+  // cover with locked/landing/loading for their reason — there is nothing
+  // on it to read, and covering it would leave a mirroring person no way to
+  // reach the store button. Register-class to every other consumer: it
+  // proves no workspace (`messaging.start` is never reached from here) and
+  // redeems no push tap, since a consumed intent would have no thread to
+  // land in. A call overlay covers it as it covers every route (§3.8).
+  // `land: false` with the lock screen, and for the same shape of reason:
+  // an intent consumed on `chats` a moment before the wall went up must not
+  // resolve INTO the wall and open a thread on top of it.
+  { route: { name: 'updateRequired' }, cover: false, coverWithCall: true, workspace: false, redeem: false, land: false, disclose: [] },
 ];
 
 const OVERLAY_STATES: ReadonlyArray<{ label: string; overlays: OverlayFacts }> = [
@@ -137,14 +150,15 @@ const OVERLAY_STATES: ReadonlyArray<{ label: string; overlays: OverlayFacts }> =
   { label: 'both call overlays', overlays: { call: true, groupCall: true } },
 ];
 
-test('the matrix covers the whole 22-name Route union, each name once', () => {
+test('the matrix covers the whole 23-name Route union, each name once', () => {
   // 20 → 21: accountPhone joined THROUGH the module
-  // (a new name in the union, no fifth consumer). 21 → 22:
-  // accountUsername, the same way.
+  // (§9 rule 9 — a new name in the union, no fifth consumer). 21 → 22:
+  // accountUsername, the same way. 22 → 23: updateRequired, the same way
+  // again.
   const names = ROUTE_MATRIX.map(c => c.route.name);
-  expect(names).toHaveLength(22);
-  expect(new Set(names).size).toBe(22);
-  // Compile-time: the union has no 23rd name the table missed.
+  expect(names).toHaveLength(23);
+  expect(new Set(names).size).toBe(23);
+  // Compile-time: the union has no 24th name the table missed.
   const all: SurfaceRouteName[] = names;
   expect(all).toBeDefined();
 });

@@ -897,20 +897,47 @@ export function mentionWhoOf(body: string): string[] {
  * owed.
  */
 export function roomAgentAuthorIds(account: string, gid: string): Set<string> {
-  const ids = roomAiAuthorIds(account, gid);
+  // ONE implementation, two dispositions of the SAME read: the strict reader
+  // below reports a class read it could not complete, and this fail-OPEN
+  // pruning caller answers it with the marker half — byte-identical to the
+  // behaviour this function had before the strict variant existed.
+  return roomAgentAuthorIdsStrict(account, gid) ?? roomAiAuthorIds(account, gid);
+}
+
+/**
+ * The SAME union as `roomAgentAuthorIds`, with the one difference that makes
+ * a fail-CLOSED caller possible: a class read this client could not complete
+ * answers `null` instead of being swallowed into `∅`.
+ *
+ * The distinction is not cosmetic. `roomAgentAuthorIds` fails OPEN because
+ * its caller is the send path's PRUNING, where a read failure must never
+ * widen exclusion into dropping a leg a message was owed. `attend.ts`'s
+ * class clause is the opposite trade: a read it cannot
+ * complete must not admit a turn it cannot prove was authored by a human, so
+ * it fails CLOSED to "agent" — and it can only do that if the failure is
+ * VISIBLE. Folding both into `try { … } catch { … }` here is what made that
+ * documented direction unreachable in the first place.
+ *
+ * `null` means exactly "the room's own record could not be read": the store
+ * would not load, has no owner, or the roster would not fold. The marker
+ * half (`roomAiAuthorIds`) keeps its own documented fail-open to ∅ — it is a
+ * spool scan, not the authority — so a marker-only answer is a successful
+ * read, not a blind one.
+ */
+export function roomAgentAuthorIdsStrict(account: string, gid: string): Set<string> | null {
   try {
     const store = FileGroupStore.load(account, gid);
     const owner = store.getOwner();
-    if (owner !== undefined) {
-      const fold = foldRoster(owner, store.listSlots(), ownerOnlyPolicy);
-      for (const [memberId, cls] of Object.entries(fold.classes)) {
-        if (cls === 'integration') ids.add(memberId);
-      }
+    if (owner === undefined) return null;
+    const fold = foldRoster(owner, store.listSlots(), ownerOnlyPolicy);
+    const ids = roomAiAuthorIds(account, gid);
+    for (const [memberId, cls] of Object.entries(fold.classes)) {
+      if (cls === 'integration') ids.add(memberId);
     }
+    return ids;
   } catch {
-    /* no readable room file ⇒ the marker half is the whole answer */
+    return null;
   }
-  return ids;
 }
 
 /**
@@ -1083,10 +1110,87 @@ export function roomContentRecipients(
   recipients: readonly string[],
   body: string,
   agents: ReadonlySet<string>,
+  /**
+   * ROUNDS R1's sibling widening (§3.6): agent ids whose leg is
+   * KEPT even though this frame neither addresses nor owns them. Empty by
+   * default, so every caller that does not ask for it gets today's pruning
+   * byte for byte.
+   *
+   * A UNION AT THE CALLER, never a clause inside `roomAddressedAgents`: the
+   * addressed-or-owned predicate is a product-wide rule and the
+   * app runs its mirror, so widening it here would put a second, CLI-only
+   * meaning into a shared rule. The set is computed by `crewMateAgentIds`,
+   * from the room OWNER's roster classes and nothing a sender claimed
+   * (R15), and it is empty for every room that is not this owner's crew
+   * (R26). Human legs are untouched in either direction — this filter only
+   * ever removes ids in `agents`, so `keep` can only ever fail to remove
+   * one.
+   */
+  keep: ReadonlySet<string> = new Set<string>(),
 ): string[] {
   if (agents.size === 0) return [...recipients];
   const addressed = roomAddressedAgents(account, body, agents);
-  return recipients.filter(id => !(agents.has(id) && !addressed.has(id)));
+  return recipients.filter(id => !(agents.has(id) && !addressed.has(id) && !keep.has(id)));
+}
+
+/**
+ * ROUNDS' SIBLING AUDIENCE (§3.6): the crew-mate
+ * agents whose legs a rounds answer keeps — the agent members the ROOM
+ * OWNER's roster classes as integrations, in a room owned by THIS account's
+ * own owner whose only human member is that owner.
+ *
+ * Two fail-closed reads and no server call. Every failure answers ∅, which is
+ * today's behaviour and the safe one.
+ *
+ *  - THE OWNER MUST BE OURS (R15). says agents ride only in
+ *    rooms their own owner created, and says one crew per owner,
+ *    so a room whose owner is this agent's `ownerUserId` is by the ruled
+ *    admission model a room of that owner's crew. Any other room — a room
+ *    someone else owns — keeps today's pruning entire.
+ *  - THE CLASS COMES FROM THE FOLD, NEVER THE MARKER (R15). `roomAgentAuthorIds`
+ *    is the union of the fold classes and the `ai` marker half; the marker
+ *    half is a SENDER'S OWN CLAIM, fine for PRUNING (a false marker costs the
+ *    liar their own legs) and wrong for WIDENING, where it would let any
+ *    member manufacture a sibling and receive traffic the owner never
+ *    authorized. So this reads `fold.classes` alone.
+ *  - CREW-ONLY, AND THIS IS A CONSENT BOUNDARY, NOT A NICETY (R26). If the
+ *    fold holds any human member other than the owner, the answer is ∅. A
+ *    non-owner human co-member H is admitted to agent A by the D3 arm under
+ *    H's own PER-AGENT consent edge (per agent); H's words
+ *    then sit in A's turn prompt, and A's answer may restate them. Widening
+ *    that answer to sibling agent B would deliver H's words to an agent H
+ *    granted no edge to. Failing closed is one extra condition on a roster
+ *    this function has already loaded, and it is what makes the amendment's
+ *    "no human is affected" sentence true as written. The residual is
+ *    stated rather than assumed away: rounds is UNAVAILABLE in a room with a
+ *    second human — the switch stays on and the widening simply does not
+ *    apply.
+ *  - SELF IS NEVER A SIBLING: an agent does not need its own answer.
+ */
+export function crewMateAgentIds(account: string, gid: string): Set<string> {
+  const empty = new Set<string>();
+  try {
+    const profile = loadProfile(account);
+    const store = FileGroupStore.load(account, gid);
+    const owner = store.getOwner();
+    if (owner === undefined) return empty;
+    if (owner !== profile.ownerUserId) return empty;
+    const fold = foldRoster(owner, store.listSlots(), ownerOnlyPolicy);
+    const mates = new Set<string>();
+    for (const memberId of fold.members) {
+      if (fold.classes[memberId] === 'integration') {
+        if (memberId !== profile.userId) mates.add(memberId);
+        continue;
+      }
+      // A member the owner's roster does not class as an integration is a
+      // human. The owner themself is the one such member rounds allows.
+      if (memberId !== owner) return empty;
+    }
+    return mates;
+  } catch {
+    /* no profile, no room file, a fold that throws — today's behaviour */
+  }
+  return empty;
 }
 
 export async function sendRoomMessage(
@@ -1104,7 +1208,13 @@ export async function sendRoomMessage(
    * text stays bare: it has no field to carry the claim, and wrapping it
    * would freeze "Unsupported message" onto every pre-marker member's
    * phone (group-envelope.ts holds the whole argument). */
-  opts: { attach?: string | undefined; ai?: boolean } = {},
+  /** `siblings` — ROUNDS R1's widening (§3.6), set ONLY by
+   * attend's `realSendRoomReply` and only for a room the owner turned rounds
+   * ON. True keeps the legs of the crew-mate agents `crewMateAgentIds`
+   * returns, in addition to the agents this frame already addresses or owns;
+   * every other caller, and every room that read answers ∅, fans out exactly
+   * as it did before. It never touches a human leg in either direction. */
+  opts: { attach?: string | undefined; ai?: boolean; siblings?: boolean } = {},
 ): Promise<RoomSendOutcome> {
   const selfId = loadProfile(account).userId;
   const store = loadRoom(account, groupId);
@@ -1185,6 +1295,10 @@ export async function sendRoomMessage(
     fold.members.filter(id => id !== selfId),
     inner,
     roomAgentAuthorIds(account, groupId),
+    // ROUNDS R1: the sibling widening, read from the OWNER's roster classes
+    // (never the `ai` marker) and empty unless this is the owner's own
+    // crew room with no second human in it (R15/R26 — `crewMateAgentIds`).
+    opts.siblings === true ? crewMateAgentIds(account, groupId) : undefined,
   );
   const { sendable, skipped } = splitSendable(stores, audience);
   const legs = await mintLegs(sendable, () => body);

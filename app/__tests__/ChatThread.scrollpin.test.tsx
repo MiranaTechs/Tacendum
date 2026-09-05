@@ -436,3 +436,97 @@ describe('"New messages" is a newest-arrival compare, not a row count', () => {
     await unmount(tree);
   });
 });
+
+/**
+ * ROUNDS (§3.2 step 5). Opening a full answer grows the
+ * bubble, which fires `onContentSizeChange` — the exact seam this file exists
+ * for. A disclosure is a REPAINT of a row already on glass, so rule 1
+ * applies to it unchanged: it must never take the list away from the person
+ * who just tapped it, and a new row after it must still follow.
+ */
+describe('a full answer opening is a repaint, not new content', () => {
+  const DETAILED = ulid('DETAIL');
+  const ANCHOR_OUT = ulid('MYTURN');
+
+  function withDetail(): void {
+    rows = [
+      messageRow({
+        msgId: ANCHOR_OUT,
+        direction: 'out',
+        status: 'sent',
+        body: 'status?',
+        ts: 1_000,
+      }),
+      messageRow({
+        msgId: DETAILED,
+        ts: 2_000,
+        arrivedAt: 2_000,
+        ai: 1,
+        body: JSON.stringify({
+          tcm: 'reply',
+          ref: ANCHOR_OUT,
+          ofs: false,
+          text: 'Two findings.',
+          d: 'The first is the cursor guard.',
+        }),
+      }),
+    ];
+  }
+
+  test('expanding the detail and resizing does not scroll the list away', async () => {
+    withDetail();
+    approvals = [];
+    const tree = await renderThread();
+    scrollToEnd.mockClear();
+
+    await ReactTestRenderer.act(async () => {
+      tree.root
+        .findAll(n => n.props.testID === `detail-${DETAILED}` && n.props.onPress)[0]!
+        .props.onPress();
+    });
+    // The revealed block is on glass, so the height really did change.
+    expect(
+      tree.root.findAll(
+        n =>
+          typeof n.type === 'string' &&
+          n.props.testID === `detail-body-${DETAILED}`,
+      ),
+    ).toHaveLength(1);
+    await resize(tree);
+
+    expect(scrollToEnd).not.toHaveBeenCalled();
+    await unmount(tree);
+  });
+
+  test('a genuinely new row still follows after a detail was opened', async () => {
+    withDetail();
+    approvals = [];
+    const tree = await renderThread();
+    await ReactTestRenderer.act(async () => {
+      tree.root
+        .findAll(n => n.props.testID === `detail-${DETAILED}` && n.props.onPress)[0]!
+        .props.onPress();
+    });
+    scrollToEnd.mockClear();
+
+    rows = [...rows, messageRow({ msgId: ulid('AFTER'), body: 'and one more', ts: 3_000 })];
+    await ReactTestRenderer.act(async () => {
+      for (const cb of changeListeners) cb();
+      jest.advanceTimersByTime(200); // past REFRESH_DEBOUNCE_MS
+    });
+    await ReactTestRenderer.act(async () => {});
+    await resize(tree);
+
+    expect(scrollToEnd).toHaveBeenCalled();
+    // The detail survived the requery: the open/closed state is the SCREEN's,
+    // not the row's, so a receipt cannot close what somebody just opened.
+    expect(
+      tree.root.findAll(
+        n =>
+          typeof n.type === 'string' &&
+          n.props.testID === `detail-body-${DETAILED}`,
+      ),
+    ).toHaveLength(1);
+    await unmount(tree);
+  });
+});
