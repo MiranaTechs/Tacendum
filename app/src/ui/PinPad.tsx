@@ -43,7 +43,10 @@ export function PinPad({ value, onChange, onSubmit, disabled, submitLabel }: Pro
   return (
     <View accessibilityLabel="Passcode keypad">
       <View
-        style={styles.dots}
+        style={[
+          styles.dots,
+          { gap: t.space.s5, marginBottom: t.space.s8, minHeight: t.space.s6 },
+        ]}
         accessibilityLabel={`${value.length} digits entered`}
         accessibilityLiveRegion="polite"
       >
@@ -64,7 +67,10 @@ export function PinPad({ value, onChange, onSubmit, disabled, submitLabel }: Pro
         ))}
       </View>
       {KEY_ROWS.map(row => (
-        <View key={row.join()} style={styles.row}>
+        <View
+          key={row.join()}
+          style={[styles.row, { gap: t.space.s5, marginBottom: t.space.s5 }]}
+        >
           {row.map(key => {
             const isDelete = key === 'del';
             const isSubmit = key === 'submit';
@@ -108,6 +114,12 @@ export function PinPad({ value, onChange, onSubmit, disabled, submitLabel }: Pro
                 ]}
               >
                 <Text
+                  // A data grid, not prose: past about 1.6x the digits stop
+                  // fitting three to a row at all, and this is the screen you
+                  // cannot skip. The ULID row in primitives.tsx caps the same
+                  // way for the same reason. The box below grows too, so the
+                  // glyph has somewhere to go.
+                  maxFontSizeMultiplier={1.6}
                   style={[
                     t.type.verificationCode,
                     {
@@ -140,24 +152,30 @@ function announceCount(count: number): void {
   }
 }
 
+/**
+ * Structure only. Every step is spent from the scale at the call site above
+ * (the dot row's 28 and 14 were off it; they are now s8 and s6), and the key
+ * box is a floor rather than a size — see the key style for why.
+ */
 const styles = StyleSheet.create({
   dots: {
     flexDirection: 'row',
     justifyContent: 'center',
-    gap: 12,
-    marginBottom: 28,
-    minHeight: 14,
   },
   dot: { width: 13, height: 13 },
   row: {
     flexDirection: 'row',
     justifyContent: 'center',
-    gap: 12,
-    marginBottom: 12,
   },
   key: {
-    width: 84,
-    height: 60,
+    // Three fixed numbers were doing three jobs. The height clipped the glyph
+    // at accessibility sizes (~68pt of type in a 60pt box at 3.1x); the width
+    // overflowed a 320pt window (3 x 84 + 2 x 12 + gutters); so the box takes
+    // a floor and the row divides the width. maxWidth keeps the ceiling the
+    // fixed size used to be, so a pad on a wide pane is still a keypad.
+    flex: 1,
+    maxWidth: 84,
+    minHeight: 60,
     alignItems: 'center',
     justifyContent: 'center',
   },

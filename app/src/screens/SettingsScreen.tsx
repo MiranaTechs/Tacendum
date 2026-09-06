@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  BackHandler,
   Linking,
   Platform,
   Pressable,
@@ -25,6 +26,7 @@ import {
 import { FIELD_MODE_COPY } from '../fieldModeCopy';
 import { LINKING_COPY } from '../linkingCopy';
 import * as lock from '../lock';
+import { LOSS_COPY } from '../lossCopy';
 import { messageSoundEnabled, setMessageSound } from '../messageSound';
 import {
   previewLevel,
@@ -56,7 +58,13 @@ import {
 import { ChoiceRow } from '../ui/ChoiceRow';
 import { InfoDisclosure } from '../ui/InfoDisclosure';
 import { PinPad } from '../ui/PinPad';
-import { InlineError, InlineNotice, RuledLabel, ScreenHeader } from '../ui/primitives';
+import {
+  InlineError,
+  InlineNotice,
+  PrimaryButton,
+  RuledLabel,
+  ScreenHeader,
+} from '../ui/primitives';
 
 /**
  * Minimal Settings surface hosting the App Lock section.
@@ -77,6 +85,27 @@ import { InlineError, InlineNotice, RuledLabel, ScreenHeader } from '../ui/primi
  * "Code" now means one thing: the App Lock code below.
  */
 
+/**
+ * Auto-lock help is exported separately for each platform so both versions
+ * remain testable even though COPY selects one at module load.
+ *
+ * iOS keeps the app foregrounded during its photo picker and permission
+ * prompts. Android backgrounds it, so immediate auto-lock also locks during
+ * those actions. No excursion latch suppresses that lock; the help must
+ * describe this behavior and change if the behavior changes.
+ * Neither version names a particular kind of device.
+ */
+export const AUTOLOCK_INFO_LINES = {
+  ios:
+    'Right away locks Tacendum the moment you leave it. Choosing a photo or ' +
+    'answering a system prompt does not count as leaving.',
+  android:
+    'Right away locks Tacendum the moment you leave it — including while you ' +
+    'choose a photo or answer a system prompt, because those hand the screen ' +
+    'to another app for a moment. If that gets in your way, one minute is ' +
+    'the smaller step.',
+} as const;
+
 const COPY = {
   title: 'Settings',
   // The two account entries. The LABELS live in the
@@ -92,12 +121,31 @@ const COPY = {
   enableRow: 'Turn on App Lock',
   changeRow: 'Change code',
   resetDecoysRow: 'Rebuild decoy conversations',
+  /** Lock now. Not destructive, so it sits above the irreversible
+   * row and needs no confirmation — but it DOES end a call, and a control
+   * that takes something away without saying so is the defect this deck
+   * spends most of its length avoiding. */
+  lockNowRow: 'Lock now',
+  lockNowNote: 'Locking now also ends a call in progress.',
   disableRow: 'Turn off App Lock',
   autolockLabel: 'Auto-lock',
   autolockOptions: [
     { label: 'Right away', value: 0 },
     { label: '1 min', value: 60 },
     { label: '5 min', value: 300 },
+  ],
+  /** The ⓘ beside Auto-lock. Its label says what the disclosure is
+   * ABOUT, the house rule for every ⓘ in this app. */
+  autolockInfoLabel: 'When Tacendum locks itself',
+  autolockInfo: [
+    Platform.OS === 'android'
+      ? AUTOLOCK_INFO_LINES.android
+      : AUTOLOCK_INFO_LINES.ios,
+    // True on both platforms, so it is not an arm: the timed choices are a
+    // grace period, not a weaker lock, and the sentence says the lock still
+    // happens either way.
+    'One minute and five minutes give you that long to come back without ' +
+      'typing your code again. Tacendum locks on its own either way.',
   ],
   enterPrompt: 'Choose a code — 4 to 10 digits',
   confirmPrompt: 'Enter the same code again',
@@ -115,11 +163,21 @@ const COPY = {
   explain: `Unlock with your code and Tacendum opens your conversations. Enter the same code backwards and it opens a decoy instead — invented people, unreadable messages — while your real conversations stay sealed.\n\nThere is no way to recover a forgotten code. You would have to delete and reinstall Tacendum on this ${DEVICE_NOUN}, which also loses this identity — nobody can restore it.`,
   confirmEnable: 'Turn on App Lock',
   confirmChange: 'Use this code',
+  /** What the commit control says while `setupDecoy()` fabricates the whole
+   * decoy workspace. The ellipsis is the character, matching
+   * `namingCopy`'s 'Saving…' and LinkedDevices' 'Working…'. */
+  commitBusy: 'Setting up…',
   enabled: 'App Lock is on.',
   changed: 'Code changed.',
   disabled: 'App Lock is off.',
   decoysRebuilt: 'Decoy conversations rebuilt.',
   cancel: 'Cancel',
+  /** The way out of a step you only READ. 'Cancel' is right on the PIN
+   * steps, where a person started something that can be abandoned; on the
+   * Licences notice and the loss page nothing was started, and asking
+   * someone to cancel a thing they did not start misstates the action.
+   * 'Done' simply returns from the read-only page. */
+  done: 'Done',
   failed: 'Something went wrong. Nothing was changed — try again.',
   /** A row's write failed: the chip has already snapped back, so the
    * sentence says only what is true. */
@@ -129,6 +187,17 @@ const COPY = {
    * paragraph explains the row it hangs under. */
   infoLabel: 'What this changes',
   shotLabel: 'Screenshots and recordings',
+  /** The link disclosure. `linkRuns.stripTracking` makes the
+   * address that OPENS differ from the address that is SHOWN — a good
+   * difference, and one a person must be TOLD about rather than discover,
+   * because an app quietly editing an address before opening it is exactly
+   * the kind of thing this product refuses to do silently. One line, beside
+   * the section's other teaching copy. */
+  linksLabel: 'Links',
+  linksNote:
+    'Tacendum takes the tracking tags off a link before it opens — the ones ' +
+    'that tell a site which message you came from. The rest of the address ' +
+    'is untouched, and the link you see is the one you were sent.',
   screenSection: 'SCREEN',
   blankLabel: 'Hide messages while the screen is shared or recorded',
   blankOptions: [
@@ -376,6 +445,41 @@ const COPY = {
         'conversation you are reading, and never during a call. Your ' +
         `${DEVICE_NOUN}’s notification settings and its silent switch decide first: ` +
         'Off here only takes a sound away. Calls ring on their own.',
+  /**
+   * Android notification channels control sounds and vibration outside the
+   * app. This screen controls only its in-app tone; users manage channel
+   * behavior in system settings.
+   *
+   * Linking.openSettings() opens the app-info page, so the adjacent help
+   * directs users to Notifications from there. Keep the wording aligned
+   * with that destination rather than promising a direct channel page.
+   * The copy remains available to both platform test suites while the
+   * control renders only on Android.
+   */
+  notifSettingsRow: 'Notification settings',
+  /* The door first, because that is the only part of this note the row above
+   * does not already say: `soundNote`'s Android arm two rows up has already
+   * told this reader that closed-app sounds follow the system's own settings
+   * for Tacendum. Repeating that in full here made the note read like a
+   * second copy of the same paragraph and buried the one new fact, which is
+   * where the button lands. */
+  notifSettingsNote:
+    'Opens Tacendum’s settings, where notifications are listed — sounds, ' +
+    'vibration and how loudly a notification arrives are set there, not here.',
+  ringLabel: 'Calls that take over the screen',
+  /* NO THIRD SENTENCE. The draft ended 'The button above opens the setting.'
+   * and it was false: the button above is `openSettings()`, which lands on
+   * the app-info page, while the full-screen ring is the USE_FULL_SCREEN_INTENT
+   * app-op behind its own special-app-access page — the app's own Kotlin
+   * carries a separate intent for it (`CallNotifications.kt`, the ring's
+   * 'Allow full-screen ring' action). Sending a reader to the button above
+   * would land them where the setting is not, and would contradict the note
+   * two rows up on the same screen. If the sharper door is wanted it rides
+   * the booked `sendIntent` device check, with its own row and its own
+   * sentence — not with this wording. */
+  ringFullScreenNote:
+    'An incoming call takes over the screen only if the system allows it. ' +
+    'Without that, a call arrives as a banner you tap.',
   appearanceSection: 'APPEARANCE',
   appearanceLabel: 'Theme',
   appearanceOptions: [
@@ -394,7 +498,8 @@ type Flow =
   | { step: 'enter'; mode: 'enable' | 'change' }
   | { step: 'confirm'; mode: 'enable' | 'change'; first: string }
   | { step: 'explain'; mode: 'enable' | 'change'; code: string }
-  | { step: 'licenses' };
+  | { step: 'licenses' }
+  | { step: 'loss' };
 
 interface Props {
   onBack: () => void;
@@ -409,6 +514,14 @@ interface Props {
    * passes it, and a dark binary never renders the row that would call
    * it. */
   onOpenAccountUsername?: () => void;
+  /**
+   * App.tsx supplies the same relock() used for background locking, so this
+   * action ends calls, closes the workspace, restores the database target
+   * and routes to the lock screen through the existing teardown.
+   * Render the row only when the callback exists: a visible control must
+   * have an action, including when this screen is mounted independently.
+   */
+  onLockNow?: () => void;
 }
 
 export function SettingsScreen({
@@ -416,10 +529,11 @@ export function SettingsScreen({
   onOpenLinkedDevices,
   onOpenAccountEmail,
   onOpenAccountUsername,
+  onLockNow,
 }: Props) {
   const t = useTheme();
   /**
-   * FIELD MODE in a DURESS session (rule 16). `fieldMode.ts` writes nothing
+   * FIELD MODE in a DURESS session. `fieldMode.ts` writes nothing
    * there, so the four rows a coerced tap moves live in React state alone —
    * and React state does not survive closing Settings and opening it again,
    * while every one of those rows DOES survive in a real session. That
@@ -464,7 +578,7 @@ export function SettingsScreen({
   const [relayAll, setRelayAll] = useState(
     () => duressRows?.relayEveryCall ?? alwaysRelayEnabled(),
   );
-  // §10.6, read the same way and for the same reason: the Keychain read
+  // Read the loaded setting for the same reason: the Keychain read
   // happens at init and on every real unlock, so the row starts from the
   // loaded preference rather than from this component's idea of the default.
   const [silenceUnknown, setSilenceUnknown] = useState(
@@ -527,6 +641,54 @@ export function SettingsScreen({
     setFlow(next);
   };
 
+  /** Read by the system-back handler, which is registered once and must see
+   * which step is open — and reach the current `toFlow` — at the moment of
+   * the press, not at subscription. */
+  const flowRef = useRef(flow);
+  const toFlowRef = useRef(toFlow);
+  flowRef.current = flow;
+  toFlowRef.current = toFlow;
+
+  useEffect(() => {
+    // ANDROID SYSTEM BACK returns to the App Lock menu instead of leaving
+    // Settings. This is the worst
+    // case the sweep exists for: half way through entering a new passcode —
+    // one digit in, or on the confirm step with the first code already
+    // typed — the press that means "undo this step" popped the route and
+    // landed the person on Profile with the whole ceremony discarded, and
+    // the sub-step's own Cancel is the only thing that ever put them back.
+    //
+    // ONE STEP OR ALL OF THEM? All of them, to `menu`, because that is what
+    // the screen's OWN controls do: every CancelLink and every DoneLink on
+    // these sub-steps goes straight to `menu`, none of them walks back one.
+    // A back button with a motion the visible controls do not have would be
+    // a second, invisible navigation model.
+    //
+    // The licences page and the loss page are the same `flow` and so the
+    // same case — they are pages this screen shows in place of its menu,
+    // and back returns to the menu, exactly as their Done does.
+    //
+    // MID-COMMIT, THE PRESS IS SWALLOWED. `busyRef` guards a commit that may
+    // be building a whole decoy workspace; yielding would pop the route out
+    // from under it. It consumes the press and changes nothing, the way
+    // Register refuses mid-flight.
+    //
+    // With the menu showing it yields (`false`) and the router pops as it
+    // always did. Refs, not state: registered once, and a press can land
+    // before a state has flushed. On iOS `BackHandler` is inert, so this
+    // registers unconditionally.
+    const subscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      () => {
+        if (flowRef.current.step === 'menu') return false;
+        if (busyRef.current) return true;
+        toFlowRef.current({ step: 'menu' });
+        return true;
+      },
+    );
+    return () => subscription.remove();
+  }, []);
+
   /**
    * Hand a policy or source URL to the system browser.
    *
@@ -545,6 +707,23 @@ export function SettingsScreen({
     }
   };
 
+  /**
+   * Open the system's own settings page for Tacendum.
+   *
+   * Swallowed the way `openExternal` above is swallowed, and for the same
+   * reason: the only realistic failure is a system with no such page, at
+   * which point an error banner on a settings screen helps nobody. The note
+   * under the row already says what this opens, so a silent no-op is the
+   * quietest possible wrong answer rather than a lie.
+   */
+  const openSystemSettings = async () => {
+    try {
+      await Linking.openSettings();
+    } catch {
+      // Intentionally silent — see above.
+    }
+  };
+
   const submitPin = async () => {
     if (busyRef.current) return;
     busyRef.current = true;
@@ -558,7 +737,7 @@ export function SettingsScreen({
         // only the real verdict opens the change / disable / rebuild
         // doors — otherwise whoever holds the duress code could change
         // the real lock. A DURESS session keeps accepting both, as
-        // everything here does (rule 16): the coerced change must look
+        // everything here does: the coerced change must look
         // like it worked.
         if (session.mode === 'real' && result.verdict !== 'real') return setError(COPY.wrong);
         if (flow.next === 'change') return toFlow({ step: 'enter', mode: 'change' });
@@ -912,9 +1091,18 @@ export function SettingsScreen({
               person reaches — while every row it governs stays exactly where
               it has always been. It is a statement ABOUT those rows, not a
               replacement for them, so it is a section of one. */}
+          {/* EVERY SECTION LABEL ON THIS SCREEN PASSES `heading`
+             , and nothing else on it does. This is the longest
+              scroll in the app, and without the role the rotor's Headings
+              navigator offered no stops at all — reaching APPEARANCE meant
+              swiping past every row above it. The prop is opt-in because the
+              same component draws the thread's date dividers, where a
+              heading per day would flood the very navigator this is meant to
+              make useful; each screen passes it for its own sections. */}
           {flow.step === 'menu' && enabled !== null && (
             <>
               <RuledLabel
+                heading
                 label={FIELD_MODE_COPY.sectionLabel}
                 marginTop={24}
                 marginBottom={12}
@@ -972,70 +1160,136 @@ export function SettingsScreen({
             </>
           )}
 
-          <RuledLabel
-            label={COPY.lockSection}
-            // Gated on the SAME condition as the FIELD MODE block above, or
-            // the first paint of every Settings open shows APP LOCK at the
-            // top with the wider gap and the section pops in above it once
-            // `lock.status()` resolves.
-            marginTop={flow.step === 'menu' && enabled !== null ? 32 : 24}
-            marginBottom={12}
-          />
-          {notice ? <InlineNotice message={notice} tone="pine" marginTop={0} /> : null}
-
+          {/* THE LABEL AND THE NOTICE RIDE THE SHEET'S OWN GUARD.
+              Both used to render unconditionally, so tapping Open-source
+              licenses printed APP LOCK across the top of the AGPL notice and
+              a stale "App Lock is on." painted over the PIN flow — a heading
+              for a feature you are not looking at, and a sentence about a
+              step you have already left. The FIELD MODE block above was
+              always gated this way; this is the same condition, not a new
+              one. */}
           {flow.step === 'menu' && enabled !== null && (
-            <View
-              style={[
-                styles.sheet,
-                {
-                  marginHorizontal: -t.layout.gutter,
-                  backgroundColor: t.color.paperSheet,
-                  borderColor: t.color.lineSoft,
-                  borderTopWidth: t.hairline,
-                  borderBottomWidth: t.hairline,
-                },
-              ]}
-            >
-              {!enabled ? (
-                <MenuRow
-                  label={COPY.enableRow}
-                  testID="settings-lock-enable"
-                  onPress={() => toFlow({ step: 'enter', mode: 'enable' })}
-                  first
-                />
-              ) : (
-                <>
+            <>
+              <RuledLabel
+                heading
+                label={COPY.lockSection}
+                // The branch is kept verbatim: inside this guard it always
+                // resolves to 32, and keeping it means the spacing cannot
+                // silently change if the guard is ever loosened again.
+                marginTop={flow.step === 'menu' && enabled !== null ? 32 : 24}
+                marginBottom={12}
+              />
+              {notice ? (
+                <InlineNotice message={notice} tone="pine" marginTop={0} />
+              ) : null}
+              <View
+                style={[
+                  styles.sheet,
+                  {
+                    marginHorizontal: -t.layout.gutter,
+                    backgroundColor: t.color.paperSheet,
+                    borderColor: t.color.lineSoft,
+                    borderTopWidth: t.hairline,
+                    borderBottomWidth: t.hairline,
+                  },
+                ]}
+              >
+                {!enabled ? (
                   <MenuRow
-                    label={COPY.changeRow}
-                    testID="settings-lock-change"
-                    onPress={() => toFlow({ step: 'current', next: 'change' })}
+                    label={COPY.enableRow}
+                    testID="settings-lock-enable"
+                    onPress={() => toFlow({ step: 'enter', mode: 'enable' })}
                     first
                   />
-                  <RowRule />
-                  <ChoiceRow
-                    label={COPY.autolockLabel}
-                    options={COPY.autolockOptions}
-                    value={autolockSec}
-                    onChange={sec => void chooseAutolock(sec)}
-                    testIDPrefix="settings-autolock"
-                    error={rowErrorFor('autolock')}
+                ) : (
+                  <>
+                    <MenuRow
+                      label={COPY.changeRow}
+                      testID="settings-lock-change"
+                      onPress={() => toFlow({ step: 'current', next: 'change' })}
+                      first
+                    />
+                    <RowRule />
+                    <ChoiceRow
+                      label={COPY.autolockLabel}
+                      options={COPY.autolockOptions}
+                      value={autolockSec}
+                      onChange={sec => void chooseAutolock(sec)}
+                      testIDPrefix="settings-autolock"
+                      // 'Right away' means
+                      // something different on each platform, and the row
+                      // must say which one this build is.
+                      info={{
+                        label: COPY.autolockInfoLabel,
+                        lines: COPY.autolockInfo,
+                      }}
+                      error={rowErrorFor('autolock')}
+                    />
+                    <RowRule />
+                    <MenuRow
+                      label={COPY.resetDecoysRow}
+                      testID="settings-lock-reset-decoys"
+                      onPress={() => toFlow({ step: 'current', next: 'reset' })}
+                    />
+                    {/* LOCK NOW, above the irreversible row: the
+                        drawer doctrine this app follows everywhere else is
+                        reversible above irreversible, and locking is the
+                        most reversible thing here — you type your code and
+                        you are back. Rendered only when App.tsx has handed
+                        down its `relock`, and identical in both sessions
+                        with no `session.mode` branch: a coerced tap locks
+                        the decoy exactly as it locks the real workspace,
+                        and the lock screen that comes back is already
+                        pixel-identical for both codes. */}
+                    {onLockNow ? (
+                      <>
+                        <RowRule />
+                        <MenuRow
+                          label={COPY.lockNowRow}
+                          testID="settings-lock-now"
+                          onPress={onLockNow}
+                        />
+                        <Text
+                          testID="settings-lock-now-note"
+                          style={[
+                            t.type.compactBody,
+                            styles.rowNote,
+                            { color: t.color.inkMuted },
+                          ]}
+                        >
+                          {COPY.lockNowNote}
+                        </Text>
+                      </>
+                    ) : null}
+                    <RowRule />
+                    <MenuRow
+                      label={COPY.disableRow}
+                      testID="settings-lock-disable"
+                      onPress={() => toFlow({ step: 'current', next: 'disable' })}
+                      danger
+                    />
+                  </>
+                )}
+              </View>
+              {/* "One code, two doors", RE-READABLE. These exact
+                  strings used to render only at `flow.step === 'explain'` —
+                  inside the enable/change ceremony — so re-reading how the
+                  second door works meant entering your current code and
+                  inventing a new one twice. That is the wrong thing to ask
+                  of someone who is checking, under pressure, what the
+                  reversed code does. Zero new copy: the same two strings, at
+                  a second site, behind the section ⓘ. Only while the lock is
+                  on, because with it off there is no second door yet. */}
+              {enabled ? (
+                <View style={styles.sectionInfo}>
+                  <InfoDisclosure
+                    label={COPY.explainTitle}
+                    lines={[COPY.explain]}
+                    testID="settings-lock-info"
                   />
-                  <RowRule />
-                  <MenuRow
-                    label={COPY.resetDecoysRow}
-                    testID="settings-lock-reset-decoys"
-                    onPress={() => toFlow({ step: 'current', next: 'reset' })}
-                  />
-                  <RowRule />
-                  <MenuRow
-                    label={COPY.disableRow}
-                    testID="settings-lock-disable"
-                    onPress={() => toFlow({ step: 'current', next: 'disable' })}
-                    danger
-                  />
-                </>
-              )}
-            </View>
+                </View>
+              ) : null}
+            </>
           )}
 
           {flow.step === 'menu' && (
@@ -1045,6 +1299,7 @@ export function SettingsScreen({
                   landed — routes, screens, back mapping and DEPTH already live
                   in App.tsx; each entry here is exactly one line. */}
               <RuledLabel
+                heading
                 label={COPY.accountSection}
                 marginTop={32}
                 marginBottom={12}
@@ -1085,9 +1340,25 @@ export function SettingsScreen({
                     />
                   </>
                 ) : null}
+                {/* "If this is lost or taken", at the foot of the
+                    section that already holds the account: a second
+                    IN-SCREEN step, the Licenses idiom, never a route — so
+                    `visibleSurface.ts` and its matrix do not move for a page
+                    of four paragraphs. The honest inventory of what a lost
+                    device costs is true of this build today and is written
+                    down in four places, none of them reachable after
+                    registration; this is the one place a person can read it
+                    before the day rather than on it. */}
+                <RowRule />
+                <MenuRow
+                  label={LOSS_COPY.row}
+                  testID="settings-loss"
+                  onPress={() => toFlow({ step: 'loss' })}
+                />
               </View>
 
               <RuledLabel
+                heading
                 label={COPY.screenSection}
                 marginTop={32}
                 marginBottom={12}
@@ -1139,12 +1410,24 @@ export function SettingsScreen({
                   lines={[COPY.shotNote]}
                   testID="settings-shot-info"
                 />
+                {/* Beside the screenshot truth, because both are statements
+                    about what this app does with what is on the glass and
+                    what leaves it. The address that opens is not
+                    always the address that was typed, and a person who is
+                    never told that would find out from a browser's address
+                    bar and reasonably wonder what else was edited. */}
+                <InfoDisclosure
+                  label={COPY.linksLabel}
+                  lines={[COPY.linksNote]}
+                  testID="settings-links-info"
+                />
               </View>
 
               {/* The design. Its own section rather than a row under SCREEN: this one
                   is about what leaves the phone over the network, not about
                   what is on the glass. */}
               <RuledLabel
+                heading
                 label={COPY.callsSection}
                 marginTop={32}
                 marginBottom={12}
@@ -1185,6 +1468,7 @@ export function SettingsScreen({
               </View>
 
               <RuledLabel
+                heading
                 label={COPY.notificationsSection}
                 marginTop={32}
                 marginBottom={12}
@@ -1238,9 +1522,49 @@ export function SettingsScreen({
                   testIDPrefix="settings-sound"
                   info={{ label: COPY.infoLabel, lines: [COPY.soundNote] }}
                 />
+                {/* ANDROID ONLY, and last in the section:
+                    everything above is a setting this screen owns, and this
+                    is the one row that admits what it cannot. On iOS the
+                    sound switch above really does govern the extension's
+                    banner sound, so the note would be false and the row
+                    would answer a question the platform does not ask. */}
+                {Platform.OS === 'android' ? (
+                  <>
+                    <RowRule />
+                    <MenuRow
+                      label={COPY.notifSettingsRow}
+                      testID="settings-notification-settings"
+                      onPress={() => void openSystemSettings()}
+                    />
+                    <Text
+                      testID="settings-notification-settings-note"
+                      style={[
+                        t.type.compactBody,
+                        styles.rowNote,
+                        { color: t.color.inkMuted },
+                      ]}
+                    >
+                      {COPY.notifSettingsNote}
+                    </Text>
+                  </>
+                ) : null}
               </View>
+              {/* The full-screen ring, disclosed rather than discovered: the
+                  call module's own code owes a Settings line for this state
+                  and this is it. Section-level, beside the row that opens
+                  the place the permission lives. */}
+              {Platform.OS === 'android' ? (
+                <View style={styles.sectionInfo}>
+                  <InfoDisclosure
+                    label={COPY.ringLabel}
+                    lines={[COPY.ringFullScreenNote]}
+                    testID="settings-ring-info"
+                  />
+                </View>
+              ) : null}
 
               <RuledLabel
+                heading
                 label={COPY.appearanceSection}
                 marginTop={32}
                 marginBottom={12}
@@ -1270,6 +1594,7 @@ export function SettingsScreen({
               </View>
 
               <RuledLabel
+                heading
                 label={COPY.aboutSection}
                 marginTop={32}
                 marginBottom={12}
@@ -1353,7 +1678,43 @@ export function SettingsScreen({
               >
                 {COPY.licensesBody}
               </Text>
-              <CancelLink onPress={() => toFlow({ step: 'menu' })} />
+              <DoneLink onPress={() => toFlow({ step: 'menu' })} />
+            </View>
+          )}
+
+          {flow.step === 'loss' && (
+            <View style={styles.pinFlow}>
+              <Text style={[t.type.sectionTitle, { color: t.color.inkStrong }]}>
+                {LOSS_COPY.title}
+              </Text>
+              {/* Four paragraphs, each one checked against the module that
+                  owns its truth (see lossCopy.ts). Identical in both
+                  sessions with no `session.mode` branch: what a lost device
+                  costs is the same fact whichever code opened the app, and
+                  a page that read differently under coercion would be a
+                  discriminator for nothing. */}
+              <View testID="settings-loss-body">
+                {LOSS_COPY.lines.map(line => (
+                  <Text
+                    key={line}
+                    style={[
+                      t.type.body,
+                      styles.lossLine,
+                      { color: t.color.inkBody },
+                    ]}
+                  >
+                    {line}
+                  </Text>
+                ))}
+              </View>
+              <View style={styles.sectionInfo}>
+                <InfoDisclosure
+                  label={LOSS_COPY.infoLabel}
+                  lines={LOSS_COPY.infoLines}
+                  testID="settings-loss-info"
+                />
+              </View>
+              <DoneLink onPress={() => toFlow({ step: 'menu' })} />
             </View>
           )}
 
@@ -1396,24 +1757,22 @@ export function SettingsScreen({
               >
                 {COPY.explain}
               </Text>
-              <Pressable
-                accessibilityRole="button"
-                testID="settings-lock-commit"
-                disabled={busy}
+              {/* PrimaryButton, not a bare Pressable: `commit`
+                  awaits `setupDecoy()`, which fabricates a whole decoy
+                  workspace of chats, rooms, messages and vault items. With a
+                  static label the person tapped and nothing visibly happened
+                  for as long as that took. This is the control every other
+                  long action in the app already uses — spinner, busy label
+                  and `accessibilityState.busy` for VoiceOver. */}
+              <PrimaryButton
+                label={
+                  flow.mode === 'enable' ? COPY.confirmEnable : COPY.confirmChange
+                }
+                busy={busy}
+                busyLabel={COPY.commitBusy}
                 onPress={() => void commit()}
-                style={({ pressed }) => [
-                  styles.commit,
-                  {
-                    minHeight: t.layout.buttonHeight,
-                    borderRadius: t.radius.button,
-                    backgroundColor: pressed ? t.color.pinePressed : t.color.pine,
-                  },
-                ]}
-              >
-                <Text style={[t.type.button, { color: t.color.onPine }]}>
-                  {flow.mode === 'enable' ? COPY.confirmEnable : COPY.confirmChange}
-                </Text>
-              </Pressable>
+                testID="settings-lock-commit"
+              />
               <CancelLink onPress={() => toFlow({ step: 'menu' })} />
             </View>
           )}
@@ -1479,13 +1838,27 @@ function RowRule() {
   );
 }
 
-function CancelLink({ onPress }: { onPress: () => void }) {
+/**
+ * The quiet link that leaves a step. One shape, two words: the PIN steps back
+ * OUT of something a person started, and the two read-only steps (the
+ * Licences notice, the loss page) are simply finished with. The testIDs stay
+ * distinct so a suite can tell which one a step is offering.
+ */
+function StepLink({
+  label,
+  testID,
+  onPress,
+}: {
+  label: string;
+  testID: string;
+  onPress: () => void;
+}) {
   const t = useTheme();
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={COPY.cancel}
-      testID="settings-pin-cancel"
+      accessibilityLabel={label}
+      testID={testID}
       onPress={onPress}
       style={({ pressed }) => [
         styles.cancel,
@@ -1497,9 +1870,21 @@ function CancelLink({ onPress }: { onPress: () => void }) {
       ]}
     >
       <Text style={[t.type.buttonCompact, { color: t.color.pine }]}>
-        {COPY.cancel}
+        {label}
       </Text>
     </Pressable>
+  );
+}
+
+function CancelLink({ onPress }: { onPress: () => void }) {
+  return (
+    <StepLink label={COPY.cancel} testID="settings-pin-cancel" onPress={onPress} />
+  );
+}
+
+function DoneLink({ onPress }: { onPress: () => void }) {
+  return (
+    <StepLink label={COPY.done} testID="settings-step-done" onPress={onPress} />
   );
 }
 
@@ -1523,14 +1908,17 @@ const styles = StyleSheet.create({
   // (`sectionInfo` below); without it this sits flush against the ⓘ that
   // ends the ChoiceRow.
   needsLock: { paddingHorizontal: 16, paddingBottom: 10, marginTop: 10 },
+  /** A note hung under a MenuRow inside a sheet (Lock now's cost). Aligned
+   * with ChoiceRow's own horizontal padding, like `needsLock` above — the
+   * two are the same idiom and must not drift apart. */
+  rowNote: { paddingHorizontal: 16, paddingBottom: 10, marginTop: 2 },
   prompt: { marginBottom: 16, textAlign: 'center' },
   explain: { marginTop: 12, marginBottom: 24 },
+  /** One paragraph of the loss page. The same rhythm as `explain` above,
+   * split per line because these are four separate claims and reading them
+   * as one block hides that. */
+  lossLine: { marginTop: 16 },
   versionLine: { marginTop: 12, textAlign: 'center' },
-  commit: {
-    alignSelf: 'stretch',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
   cancel: {
     marginTop: 16,
     paddingHorizontal: 16,

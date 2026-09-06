@@ -19,7 +19,7 @@
 import React from 'react';
 import { StyleSheet, Text } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
-import { DISAPPEAR_OPTIONS } from '../src/blocking';
+import { DISAPPEAR_OPTIONS_ROOM } from '../src/blocking';
 import * as db from '../src/db';
 import { encodeEnvelope } from '../src/envelope';
 import { messaging } from '../src/messaging';
@@ -683,7 +683,7 @@ test('after leaving, the timer chips are disabled for VoiceOver and the eye, and
   const tree = await renderProfile(BEN);
   expect(has(tree, 'room-left-note')).toBe(true); // the fixture reached `out`
 
-  for (const option of DISAPPEAR_OPTIONS) {
+  for (const option of DISAPPEAR_OPTIONS_ROOM) {
     const c = chip(tree, `room-timer-${option.seconds}`);
     expect(c.props.disabled).toBe(true);
     expect(c.props.accessibilityState.disabled).toBe(true);
@@ -707,4 +707,30 @@ test('while in the room the chips are live and the leaving line is absent', asyn
   expect(c.props.accessibilityState).toEqual({ selected: true, disabled: false });
   expect(has(tree, 'room-timer-locked')).toBe(false);
   expect(renderedText(tree)).not.toContain(ROOM_COPY.timerLeft);
+});
+
+// Build 27: the 1:1 list gained '4 weeks'; a room did NOT, because
+// GroupSettingsEnvelope caps `s` at seven days and every shipped client
+// refuses 2419200 on a strict parse. This test is the render-side half of
+// that split — blocking.disappear.test.ts is the wire-side half.
+test('five chips in a room, wrapping, and never a four-week one', async () => {
+  installRoomDb();
+  const tree = await renderProfile(BEN);
+
+  expect(DISAPPEAR_OPTIONS_ROOM).toHaveLength(5);
+  for (const option of DISAPPEAR_OPTIONS_ROOM) {
+    expect(chip(tree, `room-timer-${option.seconds}`)).toBeDefined();
+  }
+  // The one the room wire refuses is not on the screen to press.
+  expect(
+    tree.root.findAll(n => n.props?.testID === 'room-timer-2419200'),
+  ).toHaveLength(0);
+
+  const row = tree.root.find(
+    n => n.props?.testID === 'room-timer-row' && typeof n.type === 'string',
+  );
+  const style = StyleSheet.flatten(row.props.style);
+  expect(style.flexDirection).toBe('row');
+  // THE CONTRACT: the row wraps, so no type size can push a chip off the edge.
+  expect(style.flexWrap).toBe('wrap');
 });

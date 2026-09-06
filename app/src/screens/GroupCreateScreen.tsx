@@ -447,6 +447,8 @@ export function GroupCreateScreen({ profile, onBack, onOpenRoom }: Props) {
           onBlur={() => setFocused(false)}
           placeholder={COPY.namePlaceholder}
           placeholderTextColor={t.color.inkMuted}
+          keyboardAppearance={t.scheme}
+          selectionColor={t.color.pine}
           accessibilityLabel={COPY.nameLabel}
           autoCorrect={false}
           // The wire bound (group-envelope's name schema), enforced where

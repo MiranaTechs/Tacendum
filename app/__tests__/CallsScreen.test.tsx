@@ -235,3 +235,26 @@ test('rows take the glyph kit, the row disc and a 44pt redial — no typographic
   )[0]!;
   expect(StyleSheet.flatten(name.props.style).fontSize).toBe(theme.type.rowTitle.fontSize);
 });
+
+test('the time sits on one line and never gives up width to the name', async () => {
+  // The redial moving out of the row made the time a THIRD
+  // flex child of `styles.row`, beside a name column that is `flex: 1`. A
+  // flex child measured against the space left over wraps when there is not
+  // much of it, which at large Dynamic Type is the ordinary case — so the
+  // row grows a second line for a timestamp.
+  const { StyleSheet, Text } = require('react-native') as typeof import('react-native');
+  const theme = (require('../src/theme') as typeof import('../src/theme')).themeTokens();
+  const tree = await renderCalls();
+
+  const times = tree.root.findAll(
+    n =>
+      n.type === Text &&
+      StyleSheet.flatten(n.props.style)?.fontSize === theme.type.timeStatus.fontSize &&
+      typeof n.props.children === 'string',
+  );
+  expect(times).not.toHaveLength(0);
+  for (const time of times) {
+    expect(time.props.numberOfLines).toBe(1);
+    expect(StyleSheet.flatten(time.props.style).flexShrink).toBe(0);
+  }
+});

@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  BackHandler,
   // Deprecated in core but still shipped (the StartChatScreen trade): a
   // paste target is the whole point of an id.
   Clipboard,
@@ -35,8 +36,14 @@ import {
   InlineError,
   InlineNotice,
   ScreenHeader,
+  TextAction,
 } from '../ui/primitives';
+import { QrPanel } from '../ui/QrPanel';
 import { shareWithAnchor } from '../ui/shareWithAnchor';
+// The QR's two words come from the Start a chat deck, never from a second
+// literal here: it is the same action on two screens, and the same action
+// must never get two different sentences.
+import { COPY as START_CHAT_COPY } from './StartChatScreen';
 
 interface Props {
   profile: ProfileRow;
@@ -162,6 +169,10 @@ export function ProfileScreen({
   } | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  /** Your code, behind one tap. Closed on entry, and closed is what keeps
+   * the panel lazy — an encode failure must not reach the screen that also
+   * holds Delete account. */
+  const [qrOpen, setQrOpen] = useState(false);
   const [confirmingSignOut, setConfirmingSignOut] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
   /** The re-entrancy latch, synchronous where the STATE above is not: two
@@ -176,7 +187,7 @@ export function ProfileScreen({
   /**
    * Whether App Lock guards the delete: read at mount and again when the
    * panel opens; the session override wins over the Keychain so a duress
-   * session tells ONE story (rule 16). `null` until read — the confirm
+   * session tells ONE story. `null` until read — the confirm
    * waits for the answer rather than guessing. */
   const [deleteLockOn, setDeleteLockOn] = useState<boolean | null>(null);
   const [deleteCode, setDeleteCode] = useState('');
@@ -247,6 +258,71 @@ export function ProfileScreen({
     setSaveError(null);
     setFocused(null);
   };
+
+  /** Read by the system-back handler, which is registered once and must see
+   * what is open — and reach the current Cancel — at the moment of the
+   * press, not at subscription. */
+  const editingRef = useRef(false);
+  const savingRef = useRef(false);
+  const confirmingSignOutRef = useRef(false);
+  const cancelEditRef = useRef(cancelEdit);
+  editingRef.current = editing;
+  savingRef.current = saving;
+  confirmingSignOutRef.current = confirmingSignOut;
+  cancelEditRef.current = cancelEdit;
+
+  useEffect(() => {
+    // ANDROID SYSTEM BACK closes what is open before it leaves the profile
+    //. The router's handler (App.tsx)
+    // pops the route on every press, and the edit form is the case that
+    // makes this a defect rather than a preference: while editing, the
+    // header's Back is REPLACED by Cancel, so the system button is the only
+    // other exit on the screen — and it left the profile altogether,
+    // discarding the draft on the way out. Now it does what the Cancel that
+    // took Back's place does.
+    //
+    // THE CONFIRMATION FIRST. Editing and the sign-out panel cannot both be
+    // open — `openEdit` closes the panel — but the order is stated rather
+    // than assumed, because the panel is the layered question and the form
+    // is the page under it.
+    //
+    // MID-FLIGHT, THE PRESS IS SWALLOWED. Both surfaces disable their own
+    // Cancel while a save or a sign-out is in flight, and the system button
+    // has to refuse the same way (RegisterScreen's precedent):
+    // yielding here would pop the route out from under a delete that is
+    // still running. It consumes the press and changes nothing.
+    //
+    // The sign-out half reads `signingOutRef` — the file's own synchronous
+    // latch — and not a mirror of the `signingOut` STATE. That is the same
+    // reason the latch exists at all: `confirmSignOut` sets it and only then
+    // asks React to render, so a press landing in that tick reads `false`
+    // from any state mirror and closes the panel while `deleteAccount` runs.
+    // The latch is cleared in every failure branch and only the success path
+    // leaves it set, where the account is gone and the screen with it.
+    //
+    // With nothing open it yields (`false`) and the router pops as it always
+    // did. Refs, not state: registered once, and a press can land before a
+    // state has flushed. On iOS `BackHandler` is inert, so this registers
+    // unconditionally.
+    const subscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      () => {
+        if (confirmingSignOutRef.current) {
+          if (signingOutRef.current) return true;
+          setConfirmingSignOut(false);
+          setSignOutError(null);
+          return true;
+        }
+        if (editingRef.current) {
+          if (savingRef.current) return true;
+          cancelEditRef.current();
+          return true;
+        }
+        return false;
+      },
+    );
+    return () => subscription.remove();
+  }, []);
 
   const choosePhoto = async (source: PickSource) => {
     try {
@@ -549,6 +625,8 @@ export function ProfileScreen({
                   maxLength={NAME_MAX}
                   placeholder={COPY.namePlaceholder}
                   placeholderTextColor={t.color.inkMuted}
+                  keyboardAppearance={t.scheme}
+                  selectionColor={t.color.pine}
                   accessibilityLabel={COPY.nameLabel}
                   autoCapitalize="words"
                   autoCorrect={false}
@@ -582,6 +660,8 @@ export function ProfileScreen({
                   numberOfLines={3}
                   placeholder={COPY.aboutPlaceholder}
                   placeholderTextColor={t.color.inkMuted}
+                  keyboardAppearance={t.scheme}
+                  selectionColor={t.color.pine}
                   accessibilityLabel={COPY.aboutLabel}
                   testID="profile-about-input"
                   style={[
@@ -734,6 +814,42 @@ export function ProfileScreen({
                     anchorRef: shareAnchor,
                   }}
                 />
+                {/* The picture of the same id, under the written one — the
+                    order this product uses everywhere: the 26 characters
+                    survive a phone call, the picture survives a text.
+                    Mounted only while open (QrPanel's own property), and the
+                    panel brings its own helper, share action and ⓘ, so
+                    nothing here explains the picture a second time. */}
+                {/* The sheet is full-bleed, so this block re-adds the
+                    column's gutter like every other child of it — the panel
+                    is a bordered, rounded card and its own width maths
+                    subtracts a gutter it expects to be there. The disclosure
+                    keeps 8pt less, because TextAction spends 8pt of its own
+                    on the pressed wash: net, its LABEL starts on the same
+                    column as the ID label above it. */}
+                <View
+                  testID="profile-qr-disclosure"
+                  style={{ paddingHorizontal: t.layout.gutter - 8 }}
+                >
+                  <TextAction
+                    label={
+                      qrOpen ? START_CHAT_COPY.qrHide : START_CHAT_COPY.qrShow
+                    }
+                    onPress={() => setQrOpen(open => !open)}
+                    testID="profile-show-qr"
+                  />
+                </View>
+                {qrOpen ? (
+                  <View
+                    testID="profile-qr-inset"
+                    style={{
+                      paddingHorizontal: t.layout.gutter,
+                      paddingBottom: t.space.s5,
+                    }}
+                  >
+                    <QrPanel id={profile.userId} />
+                  </View>
+                ) : null}
               </View>
 
               {/* Settings entry: the same full-bleed sheet idiom as the

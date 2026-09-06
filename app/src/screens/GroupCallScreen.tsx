@@ -22,7 +22,6 @@ import {
 } from '../components/CallControls';
 import { CallTile, tileName } from '../ui/CallTile';
 import { useTheme, type Theme } from '../theme';
-import { useReduceMotion } from '../useReduceMotion';
 
 /**
  * The small-group call screen.
@@ -79,7 +78,7 @@ const MIN_TILE_WIDTH = 140;
  * columns made tall, narrow cells stacked three deep under a short screen, so the count
  * is read off the width the grid actually has: as many tiles across as `MIN_TILE_WIDTH`
  * allows, never fewer than two and never more than there are tiles. A phone in
- * landscape puts a six-way call in one row of five; a tablet held upright keeps §9's
+ * landscape puts a six-way call in one row of five; a tablet held upright keeps the same
  * shape because upright is upright, whatever the width. Without a frame (a caller that
  * has none to give) the answer is the upright one.
  *
@@ -226,7 +225,6 @@ export function GroupCallScreen(props: GroupCallScreenProps): React.JSX.Element 
   // absolute-fill overlay inside the root provider, so the provider's frame
   // IS the window, in the coordinate system the insets describe.
   const frame = useSafeAreaFrame();
-  const reduceMotion = useReduceMotion();
   const [tick, setTick] = useState(() => now());
   const styles = useMemo(() => makeStyles(t), [t]);
 
@@ -382,7 +380,12 @@ export function GroupCallScreen(props: GroupCallScreenProps): React.JSX.Element 
         <View style={styles.statusRow}>
           <Text
             style={styles.status}
-            accessibilityLiveRegion={reduceMotion ? 'none' : 'polite'}
+            // Always spoken. This screen imports no `Animated`
+            // at all and read `useReduceMotion()` for this one line: there is
+            // no animation here to accommodate, and switching the live region
+            // off took the call's status away from the people most likely to
+            // have Reduce Motion on.
+            accessibilityLiveRegion="polite"
           >
             {status}
           </Text>

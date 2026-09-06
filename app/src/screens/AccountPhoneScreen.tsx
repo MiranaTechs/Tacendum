@@ -1,5 +1,6 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  BackHandler,
   Linking,
   Pressable,
   ScrollView,
@@ -32,35 +33,19 @@ interface Props {
 }
 
 /**
- * The phone-number + discoverability surface —
- * AccountEmailScreen's SIBLING, deliberately not surgery on it: that
- * screen stays email-specific with its decisions exactly as
- * landed, and this one carries the phone class through its own deck
- * (accountsPhoneCopy.ts) and its own state machine (accountsPhone.ts).
+ * Phone attachment and discoverability use their own copy and state machine.
+ * PHONE_UI_ENABLED gates both this screen and its Settings entry, including
+ * programmatic navigation.
  *
- * DARK BEHIND `PHONE_UI_ENABLED`:
- * while the build pin is false this screen renders NOTHING,
- * even entered programmatically — no store binary shows phone UI before
- * the declarations that flip WITH the binary that turns it on. Its
- * one-line Settings row is additionally DEFERRED behind the devices
- * program's Settings reservation (the honest-ledger pattern).
+ * Numbers must include their country code; malformed input is rejected locally
+ * without guessing or changing it. Discovery consent is separate from email
+ * consent, and the help text explains that phone hashes resist leaks but do
+ * not hide the roughly 10^10 phone-number search space from the server.
  *
- * Honesty rules on this glass, beyond the email screen's:
- *  - entry is country-code-explicit: the + is part of the number,
- *    and a malformed number is refused LOCALLY with its own sentence —
- *    never repaired, never guessed, never blamed on the server;
- *  - the toggle's teaching copy is at FULL sharpness (a ~10^10
- *    keyspace: leak-resistance, never server-blindness) and states the
- *    per-class fact (this switch never moves the email one);
- *  - the attach form carries the US toll-free registration's DIGITAL_FORM
- *    opt-in as a SEPARATE, UNCHECKED consent checkbox: the send affordance
- *    is disabled until it is checked, the checked state is plain component
- *    state living per SCREEN VISIT (never persisted — every visit to this
- *    form starts unchecked), its sentence is ONE deck string the carrier
- *    registration quotes byte-for-byte, and the Terms / Privacy policy
- *    links sit BESIDE the checkbox as their own tappable references (the
- *    toll-free review criteria list their absence at the opt-in as a
- *    denial reason).
+ * SMS consent starts unchecked on each visit and gates sending. It is separate
+ * from discovery consent and is not persisted. The carrier's opt-in sentence
+ * stays beside independently tappable Terms and Privacy links so opening a
+ * policy cannot change consent.
  */
 /** Whether a code requested at `requestedAt` can still be entered — the
  * AccountEmailScreen helper, per class. */
@@ -92,6 +77,28 @@ export function AccountPhoneScreen({ onBack }: Props) {
    * When THIS mount last sent a code — the email screen's memory, per class;
    * the row carries the same moment after the refresh. */
   const [sentAt, setSentAt] = useState<number | null>(null);
+
+  /** Read by the system-back handler, which is registered once and must see
+   * what is open at the moment of the press, not at subscription. */
+  const unlinkRef = useRef(false);
+  unlinkRef.current = confirmingUnlink;
+
+  useEffect(() => {
+    // Android Back dismisses the unlink confirmation before leaving for
+    // Settings. This listener mounts after the router's, so React Native asks
+    // it first and stops when it returns true. With no confirmation open,
+    // return false for normal navigation. The ref keeps the once-registered
+    // handler current. BackHandler is inert on iOS.
+    const subscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      () => {
+        if (!unlinkRef.current) return false;
+        setConfirmingUnlink(false);
+        return true;
+      },
+    );
+    return () => subscription.remove();
+  }, []);
 
   const refresh = useCallback(() => {
     void db
@@ -199,7 +206,7 @@ export function AccountPhoneScreen({ onBack }: Props) {
   // another code" stays live from the same row.
   const codeWindowOpen =
     pending && codeWindowOpenAt(identifier?.pendingRequestedAt ?? null, Date.now());
-  // The boundary re-render (the email screen's timer), ABOVE the dark-pin
+  // The boundary re-render (the email screen's timer), ABOVE the feature-gate
   // return: a hook after a conditional return breaks the rules of hooks.
   const [, setClockTick] = useState(0);
   useEffect(() => {
@@ -222,8 +229,8 @@ export function AccountPhoneScreen({ onBack }: Props) {
     return () => clearTimeout(timer);
   });
 
-  // THE BUILD-PIN GATE, on the surface itself as well as its doors: a dark build
-  // renders NOTHING here even when the route is entered programmatically.
+  // Gate the screen itself so programmatic navigation cannot expose disabled
+  // phone features.
   if (!PHONE_UI_ENABLED) return null;
 
   return (
@@ -262,6 +269,8 @@ export function AccountPhoneScreen({ onBack }: Props) {
               onChangeText={setNumberDraft}
               placeholder={ACCOUNTS_PHONE_COPY.numberPlaceholder}
               placeholderTextColor={t.color.inkMuted}
+              keyboardAppearance={t.scheme}
+              selectionColor={t.color.pine}
               accessibilityLabel={ACCOUNTS_PHONE_COPY.numberTitle}
               autoCapitalize="none"
               autoCorrect={false}
@@ -319,11 +328,8 @@ export function AccountPhoneScreen({ onBack }: Props) {
                 {ACCOUNTS_PHONE_COPY.smsConsentLabel}
               </Text>
             </Pressable>
-            {/* THE POLICY LINKS, ADJACENT TO THE OPT-IN (toll-free review
-                criteria: their absence at the opt-in point is a denial
-                reason): their OWN tappable references BESIDE the checkbox,
-                deliberately outside its press target — tapping Terms or
-                Privacy must never toggle consent. */}
+            {/* Terms and Privacy sit beside the SMS opt-in as independent
+                press targets: opening a policy must never toggle consent. */}
             <View style={styles.consentPolicyRow}>
               <TextAction
                 label={ACCOUNTS_PHONE_COPY.smsConsentTermsLabel}
@@ -353,7 +359,7 @@ export function AccountPhoneScreen({ onBack }: Props) {
               disabled={busy || numberDraft.trim() === '' || !smsConsent || resendWait > 0}
               testID="account-number-request"
             />
-            {/* TEACHING, behind the ⓘ (house style): the phone class's
+            {/* The help text behind ⓘ explains the phone class's
                 recipient budget — the email surface's pattern at this
                 class's own numbers (3/day, one per minute). Never in the
                 error banner: the refusal stays collapsed by design. */}
@@ -369,6 +375,8 @@ export function AccountPhoneScreen({ onBack }: Props) {
                   onChangeText={setCodeDraft}
                   placeholder={ACCOUNTS_PHONE_COPY.codePlaceholder}
                   placeholderTextColor={t.color.inkMuted}
+                  keyboardAppearance={t.scheme}
+                  selectionColor={t.color.pine}
                   accessibilityLabel={ACCOUNTS_PHONE_COPY.codePlaceholder}
                   keyboardType="number-pad"
                   maxLength={6}
@@ -408,9 +416,9 @@ export function AccountPhoneScreen({ onBack }: Props) {
               {ACCOUNTS_PHONE_COPY.numberVerified(identifier!.phone!)}
             </Text>
 
-            {/* The PHONE class's the design consent toggle — DEFAULT OFF, its own
-                row (made structural by the per-class migration). */}
-            <RuledLabel label={ACCOUNTS_PHONE_COPY.discoverableTitle} />
+            {/* Phone discovery consent defaults off and has its own persisted
+                row, independent of the other discovery classes. */}
+            <RuledLabel label={ACCOUNTS_PHONE_COPY.discoverableTitle} heading />
             {identifier!.restoredAt != null ? (
               <InlineNotice
                 tone="quiet"
@@ -429,6 +437,15 @@ export function AccountPhoneScreen({ onBack }: Props) {
                 onValueChange={toggleDiscoverable}
                 disabled={busy}
                 accessibilityLabel={ACCOUNTS_PHONE_COPY.discoverableLabel}
+                // Explicit theme colors keep the switch consistent on iOS.
+                // Pine against inset paper gives on/off contrast of 4.8:1 in
+                // light mode and 8.9:1 in dark mode, so state remains visible
+                // without relying only on knob position. The ink knob is
+                // legible on both tracks; pineWash would give only 1.05:1
+                // contrast and make the on track lighter than the off track.
+                trackColor={{ false: t.color.paperInset, true: t.color.pine }}
+                thumbColor={t.color.inkStrong}
+                ios_backgroundColor={t.color.paperInset}
                 testID="number-discoverable-toggle"
               />
             </View>

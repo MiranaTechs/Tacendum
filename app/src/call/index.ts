@@ -18,6 +18,13 @@ import { personName, sanitizeDisplayName } from '../person';
 import { session } from '../session';
 import { nextMsgId } from '../msgid';
 import { CallController } from './controller';
+// The refusal type, re-exported so the shell can name it. `placeCall` throws
+// it, App.tsx has to tell "you blocked them" from "their safety number
+// changed" to say why a Call button did nothing, and it imports the call
+// module from this barrel — so the alternative was App.tsx becoming the first
+// production module outside `src/call/` to reach into `controller.ts`. One
+// line here keeps that boundary where it is.
+export { CallRefusedError } from './controller';
 import { callMetricDrain, callMetricLifecycle } from './metrics';
 import {
   GroupCallCoordinator,
@@ -925,6 +932,13 @@ export function resetAlwaysRelayForDuress(): void {
 
 export async function setAlwaysRelay(on: boolean): Promise<void> {
   alwaysRelay = on;
+  // A COERCED TAP MOVES THE ROW AND NOTHING ELSE — the `setReadReceipts`
+  // rule, placed above the native apply as well as the write because neither
+  // is a thing a session opened with the reversed code may do to the owner's
+  // phone. The in-memory value moved first, so the chip is indistinguishable
+  // from a real session's (rule 16), and `loadAlwaysRelay` re-reads the
+  // Keychain on every REAL unlock.
+  if (session.mode === 'duress') return;
   // Applied NOW, not at the next credential refresh — which could be hours
   // away, during which the setting would be on and doing nothing.
   void callController().applyRelayPolicy();
@@ -1007,6 +1021,10 @@ export async function setSilenceUnknownCallers(on: boolean): Promise<void> {
   // open, where the reverse would leave the row showing a setting that is not
   // the one deciding whether the phone rings.
   silenceUnknownCallers = on;
+  // A COERCED TAP MOVES THE ROW AND WRITES NOTHING — the `setAlwaysRelay`
+  // rule. Turning this off is the one of the six that opens the owner's phone
+  // to anyone holding their id, and it would hold until they noticed.
+  if (session.mode === 'duress') return;
   await setSecret(SILENCE_UNKNOWN_KEY, on ? '1' : '0');
 }
 
@@ -1613,6 +1631,15 @@ export async function uploadPushTokens(): Promise<void> {
  */
 export async function withdrawPushTokens(): Promise<void> {
   await setPushTokensAllowed(false);
+  // A COERCED TAP STOPS HERE, and this is the sharpest of the six duress
+  // guards. The line above moved a session-scoped shadow and nothing else
+  // (pushConsent.ts), so what remains below is the part that would reach the
+  // owner: the delete carries their bearer token, and `api.ts` refuses every
+  // duress request with a network error — which is what made this row a
+  // one-tap discriminator. A real session's tap succeeds silently; a coerced
+  // one raised `COPY.pushFailed` every single time. Returning before the
+  // network is what makes the two renders the same.
+  if (session.mode === 'duress') return;
   if (alertRetryTimer) {
     clearTimeout(alertRetryTimer);
     alertRetryTimer = null;
@@ -1632,6 +1659,13 @@ export async function withdrawPushTokens(): Promise<void> {
  */
 export async function restorePushTokens(): Promise<void> {
   await setPushTokensAllowed(true);
+  // The other half of the guard in `withdrawPushTokens`, and belt over
+  // braces: `uploadPushTokens` already refuses without a real verdict, but on
+  // a RELOCK into duress that latch is still true from the real session that
+  // just ended — the window `adoptPushRegistration({ real: false })` exists
+  // to close. Refusing here as well means a coerced tap cannot spend the
+  // retry budget or put the owner's bearer on the wire under either reading.
+  if (session.mode === 'duress') return;
   alertRetriesLeft = ALERT_RETRY_BUDGET;
   await uploadPushTokens();
 }

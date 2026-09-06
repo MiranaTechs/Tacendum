@@ -478,6 +478,132 @@ describe('the room signal (a person is a circle; a room is a walled square)', ()
   });
 });
 
+/**
+ * One query for rooms, not one per row.
+ *
+ * `refresh` ran `listChats` and then a `getGroup` PER ROW, beside
+ * `unreadCounts`, `unreadRoomBodies` and `listBlockedPeers`: N+4 reads on the
+ * screen a person looks at most, re-run inside every 80 ms notify window
+ * while a backlog drains. The rate was coalesced; the cost per refresh was
+ * not. One `listGroups` now answers for every row at once.
+ *
+ * What must NOT change is the press-time re-check: `deleteChat` on a room id
+ * strands the room's queued fan-out legs, so the delete routing reads the
+ * anchor again at the moment of the press. That one is a correctness gate,
+ * not render cost, and the second case here holds it in place.
+ */
+describe('the anchors are read in bulk', () => {
+  const recorder = () => sqlite.__sqlite.instances.get('tacendum.sqlite')!;
+  /** Every statement the screen ran since the last clear. */
+  const statements = (): string[] =>
+    recorder().execute.mock.calls.map((c: unknown[]) => String(c[0]));
+  const perRowReads = () =>
+    statements().filter(s => s.includes('FROM groups WHERE groupId = ?'));
+  const bulkReads = () =>
+    statements().filter(s => /FROM groups\s*$/.test(s.replace(/\s+$/, '')));
+
+  test('a mixed list costs ONE anchor read, whatever the row count', async () => {
+    await db.upsertChat(BEN, 'Ben');
+    await db.upsertChat(CARA, 'Cara');
+    const { groupId } = await createRoom(ME, 'Kitchen', [BEN]);
+    await flush();
+
+    recorder().execute.mockClear();
+    const tree = await render(listScreen());
+
+    // Precondition: three rows really are on screen, so "one read" is a
+    // saving rather than a list that failed to load.
+    expect(byId(tree, `chat-${groupId}`).length).toBeGreaterThan(0);
+    expect(byId(tree, `chat-${BEN}`).length).toBeGreaterThan(0);
+    expect(byId(tree, `chat-${CARA}`).length).toBeGreaterThan(0);
+
+    expect(bulkReads().length).toBe(1);
+    expect(perRowReads()).toEqual([]);
+
+    // And the room is still a room: the map is built from the same three
+    // columns, so nothing downstream can tell where they came from.
+    expect(byId(tree, `chat-${groupId}`)[0].findAllByType(RoomMark).length).toBe(
+      1,
+    );
+    expect(byId(tree, `chat-${BEN}`)[0].findAllByType(Avatar).length).toBe(1);
+
+    await ReactTestRenderer.act(() => {
+      tree.unmount();
+    });
+  });
+
+  test('a draining backlog stays at one anchor read per refresh', async () => {
+    await db.upsertChat(BEN, 'Ben');
+    await createRoom(ME, 'Kitchen', [BEN]);
+    await flush();
+    const tree = await render(listScreen());
+
+    recorder().execute.mockClear();
+    jest.useFakeTimers();
+    await ReactTestRenderer.act(async () => {
+      (messaging as unknown as { notify: () => void }).notify();
+      jest.advanceTimersByTime(80);
+    });
+    jest.useRealTimers();
+    await ReactTestRenderer.act(async () => {
+      await flush();
+    });
+
+    expect(bulkReads().length).toBe(1);
+    expect(perRowReads()).toEqual([]);
+
+    await ReactTestRenderer.act(() => {
+      tree.unmount();
+    });
+  });
+
+  test('the delete routing still re-checks the anchor at press time', async () => {
+    await db.upsertChat(BEN, 'Ben');
+    const { groupId } = await createRoom(ME, 'Kitchen', [BEN]);
+    await flush();
+    const tree = await render(listScreen());
+
+    recorder().execute.mockClear();
+    await ReactTestRenderer.act(async () => {
+      byId(tree, `chat-${groupId}`)[0].props.onLongPress();
+    });
+    await ReactTestRenderer.act(async () => {
+      byId(tree, `chat-delete-${groupId}`)[0].props.onPress();
+    });
+    await ReactTestRenderer.act(async () => {
+      byId(tree, `chat-delete-confirm-${groupId}`)[0].props.onPress();
+      await flush();
+    });
+
+    // The single-row read is BACK here, deliberately: it is what stops
+    // deleteChat stranding the room's queued fan-out legs.
+    expect(perRowReads().length).toBeGreaterThan(0);
+
+    await ReactTestRenderer.act(() => {
+      tree.unmount();
+    });
+  });
+
+  test('a row whose anchor is missing still renders as a person', async () => {
+    // The quiet posture every enhancement on this screen takes. A room-shaped
+    // id with no anchor row is what a half-torn-down delete leaves behind.
+    await db.upsertChat(BEN, 'Ben');
+    const orphan = pad('ORPH');
+    await db.upsertChat(orphan);
+    await flush();
+
+    const tree = await render(listScreen());
+    const row = byId(tree, `chat-${orphan}`)[0];
+    expect(row).toBeTruthy();
+    expect(row.findAllByType(RoomMark).length).toBe(0);
+    expect(row.findAllByType(Avatar).length).toBe(1);
+
+    await ReactTestRenderer.act(() => {
+      tree.unmount();
+    });
+  });
+});
+
 describe('deleting a room', () => {
   test('routes to deleteGroup, never deleteChat — and the queued legs are GONE, while 1:1 envelopes and the way back survive', async () => {
     const groupId = await roomWithQueuedLegs();
@@ -548,6 +674,35 @@ describe('deleting a room', () => {
 
     deleteGroupSpy.mockRestore();
     deleteChatSpy.mockRestore();
+    await ReactTestRenderer.act(() => {
+      tree.unmount();
+    });
+  });
+});
+
+describe('the room delete confirmation admits the calls', () => {
+  test('the room line says the room\u2019s calls go, and the anchored sentence is unchanged', async () => {
+    await db.upsertChat(BEN, 'Ben');
+    const { groupId } = await createRoom(ME, 'Kitchen', [BEN]);
+    await flush();
+
+    const tree = await render(listScreen());
+    await ReactTestRenderer.act(async () => {
+      byId(tree, `chat-${groupId}`)[0].props.onLongPress();
+    });
+    await ReactTestRenderer.act(async () => {
+      byId(tree, `chat-delete-${groupId}`)[0].props.onPress();
+    });
+
+    const shown = renderedText(tree);
+    // The room's existing confirmation sentence stays unchanged.
+    expect(shown).toContain('The other members keep');
+    // The new fact, on its own line, naming no device.
+    expect(shown).toContain('The room\u2019s calls here go too.');
+    expect(byId(tree, `chat-delete-calls-${groupId}`).length).toBeGreaterThan(0);
+    // And the 1:1 wording never reaches a room.
+    expect(shown).not.toContain('Your calls with them go too.');
+
     await ReactTestRenderer.act(() => {
       tree.unmount();
     });

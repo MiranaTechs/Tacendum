@@ -1,5 +1,6 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  BackHandler,
   ScrollView,
   StyleSheet,
   Switch,
@@ -29,21 +30,11 @@ interface Props {
 }
 
 /**
- * The email + discoverability surface (the design
- * attach/verify/unlink flows, the consent toggle, and the
- * downgrade). The Settings row that OPENS this screen landed under a
- * scoped override — the route,
- * screen, and back mapping were already in place, so the entry was the
- * promised one line.
- *
- * Honesty rules on this glass:
- *  - the code-sent line promises only what this device knows (the wire's
- *    200 is uniform by design);
- *  - the toggle renders the LOCAL consent record and defaults OFF — a
- *    freshly verified identifier is not findable until its owner throws
- *    this switch, and the teaching copy states what ON discloses plus the honest weakness in plain words;
- *  - the refusal sentences say the server deliberately collapsed the
- *    reason, instead of guessing one.
+ * Email attachment, verification, unlinking, discoverability, and downgrade.
+ * A uniform success response does not prove delivery or server-side consent:
+ * the code-sent notice describes the request, and the toggle shows this
+ * device's consent record, defaulting off. Refusal copy preserves the server's
+ * deliberately collapsed reasons instead of guessing which limit applied.
  */
 /** Whether a code requested at `requestedAt` can still be entered: inside
  * the server's 5-minute window, and never for a clock that moved
@@ -70,6 +61,38 @@ export function AccountEmailScreen({ onBack }: Props) {
    * once the refresh lands, and a duress session's row may not — so the
    * countdown starts from whichever is later. */
   const [sentAt, setSentAt] = useState<number | null>(null);
+
+  /** Read by the system-back handler, which is registered once and must see
+   * what is open at the moment of the press, not at subscription. */
+  const unlinkRef = useRef(false);
+  const downgradeRef = useRef(false);
+  unlinkRef.current = confirmingUnlink;
+  downgradeRef.current = confirmingDowngrade;
+
+  useEffect(() => {
+    // Android Back dismisses one confirmation before the router leaves this
+    // screen. Both can be open, so unlinking one address takes precedence over
+    // downgrading the whole account. This listener mounts after the router's;
+    // React Native asks the newest listener first and stops at the first true.
+    // With neither question open, return false to allow normal navigation.
+    // Refs keep the once-registered handler current without resubscribing.
+    // BackHandler is inert on iOS, so registration is unconditional.
+    const subscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      () => {
+        if (unlinkRef.current) {
+          setConfirmingUnlink(false);
+          return true;
+        }
+        if (downgradeRef.current) {
+          setConfirmingDowngrade(false);
+          return true;
+        }
+        return false;
+      },
+    );
+    return () => subscription.remove();
+  }, []);
 
   const refresh = useCallback(() => {
     void db
@@ -228,6 +251,8 @@ export function AccountEmailScreen({ onBack }: Props) {
               onChangeText={setEmailDraft}
               placeholder={ACCOUNTS_COPY.emailPlaceholder}
               placeholderTextColor={t.color.inkMuted}
+              keyboardAppearance={t.scheme}
+              selectionColor={t.color.pine}
               accessibilityLabel={ACCOUNTS_COPY.emailTitle}
               autoCapitalize="none"
               autoCorrect={false}
@@ -258,7 +283,7 @@ export function AccountEmailScreen({ onBack }: Props) {
               disabled={busy || emailDraft.trim() === '' || resendWait > 0}
               testID="account-email-request"
             />
-            {/* TEACHING, behind the ⓘ (house style): the recipient budget
+            {/* The help text behind ⓘ explains the recipient budget
                 the uniform answer deliberately hides — a tap past 5/day or
                 inside the minute sends nothing and answers the same, so the
                 numbers sit HERE beside the button. Never in the error
@@ -276,6 +301,8 @@ export function AccountEmailScreen({ onBack }: Props) {
                   onChangeText={setCodeDraft}
                   placeholder={ACCOUNTS_COPY.codePlaceholder}
                   placeholderTextColor={t.color.inkMuted}
+                  keyboardAppearance={t.scheme}
+                  selectionColor={t.color.pine}
                   accessibilityLabel={ACCOUNTS_COPY.codePlaceholder}
                   keyboardType="number-pad"
                   maxLength={6}
@@ -318,8 +345,8 @@ export function AccountEmailScreen({ onBack }: Props) {
             {/* The consent toggle — DEFAULT OFF. What it renders is the
                 LOCAL consent record; the wire's 204 is uniform by design
                 and is never treated as a receipt. */}
-            <RuledLabel label={ACCOUNTS_COPY.discoverableTitle} />
-            {/* The restored-placeholder honesty:
+            <RuledLabel label={ACCOUNTS_COPY.discoverableTitle} heading />
+            {/* The restored consent is a placeholder:
                 a recovery restored the server-side consent, which this
                 device cannot read back — until the owner throws the switch
                 the row is a placeholder, and this sentence says so. */}
@@ -341,14 +368,22 @@ export function AccountEmailScreen({ onBack }: Props) {
                 onValueChange={toggleDiscoverable}
                 disabled={busy}
                 accessibilityLabel={ACCOUNTS_COPY.discoverableLabel}
+                // Explicit theme colors keep the switch consistent on iOS.
+                // Pine against inset paper gives on/off contrast of 4.8:1 in
+                // light mode and 8.9:1 in dark mode, so state remains visible
+                // without relying only on knob position. The ink knob is
+                // legible on both tracks; pineWash would give only 1.05:1
+                // contrast and make the on track lighter than the off track.
+                trackColor={{ false: t.color.paperInset, true: t.color.pine }}
+                thumbColor={t.color.inkStrong}
+                ios_backgroundColor={t.color.paperInset}
                 testID="discoverable-toggle"
               />
             </View>
             {/* PER-CLASS truth on the email toggle too: with the phone class live, "by this email or
-                anything else" would overpromise — the pin-gated variant
+                anything else" would overpromise — the feature-gated variant
                 scopes the sentence to THIS class and says the per-class mirror.
-                Pin false (every release binary until phone ships): the
-                landed lines, byte-for-byte — the recoverScopeBoth pattern. */}
+                When phone UI is disabled, the email-only wording applies. */}
             <InfoDisclosure
               label={ACCOUNTS_COPY.discoverableExplainLabel}
               lines={
@@ -388,10 +423,11 @@ export function AccountEmailScreen({ onBack }: Props) {
 
         {/* Downgrade to anonymous: offered whenever anything
             account-shaped exists to shed. */}
-        <RuledLabel label={ACCOUNTS_COPY.downgradeTitle} />
-        {/* The downgrade names EVERY identifier it removes: the dissolve takes the phone claim and the local
-            phone row too, so the pin-gated variant discloses the class
-            pair. Pin false: the landed email-only sentences. */}
+        <RuledLabel label={ACCOUNTS_COPY.downgradeTitle} heading />
+        {/* The downgrade names every identifier it removes: it takes the
+            phone claim and the local
+            phone row too, so the feature-gated variant discloses the class
+            pair. When phone UI is disabled, only email is named. */}
         <Text style={[t.type.compactBody, { color: t.color.inkBody }]}>
           {PHONE_UI_ENABLED
             ? ACCOUNTS_PHONE_COPY.downgradeIntroBoth

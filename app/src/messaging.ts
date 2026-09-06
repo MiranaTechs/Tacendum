@@ -1563,6 +1563,17 @@ class MessagingService {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;
     }
+    // The disappearing-message re-sweep, under the same rule as the retry
+    // timer above: a wake armed by this session must not reach the next
+    // workspace's rows. The generation check inside the callback already
+    // refuses; this is what stops the wake existing at all.
+    if (this.expirySweepTimer) {
+      clearTimeout(this.expirySweepTimer);
+      this.expirySweepTimer = null;
+    }
+    // The deadline goes with the handle, or the next session's first wake
+    // would be compared against a moment from the last one.
+    this.expirySweepDueAt = 0;
     // Per-workspace room state, cleared under rules 15/16 exactly as
     // `identityChanged` is: a decoy session must not inherit the real
     // session's skip banners, and a resume timer aimed at this generation's
@@ -3379,22 +3390,82 @@ class MessagingService {
   }
 
   /**
+   * The pending re-sweep, and the longest it is allowed to sleep.
+   *
+   * The sweep below runs on thread-open and on foreground, which is enough
+   * for a week and a lie for five minutes: between two looks nothing runs at
+   * all, so the shortest option would have meant "gone whenever you next
+   * happen to open this". One bounded timeout, armed by the pass that armed
+   * the rows, closes that — the rows this pass stamped come due exactly
+   * `seconds` from now, so that is when the next pass runs.
+   *
+   * A DAY IS THE CEILING, and not for taste. `setTimeout` takes a 32-bit
+   * delay; four weeks is 2,419,200,000 ms, past 2^31-1, and a delay that
+   * overflows fires IMMEDIATELY — the option where the wake matters least
+   * would have been the one that spun. Past a day the open/foreground passes
+   * cover it anyway, which is what they have always been enough for.
+   */
+  private expirySweepTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * When the pending wake above is due, in epoch ms — 0 when none is pending.
+   *
+   * There is ONE handle and many threads, so the rule is SOONEST WINS:
+   * `setTimeout` will not report its own deadline, so the moment is kept here
+   * and a pending wake is replaced only by an earlier one. Without it, opening
+   * a five-minute thread and then a four-week one replaced a five-minute wake
+   * with a day-long one, and a foreground pass — which reads no thread and so
+   * has no timer of its own — cancelled whatever was pending outright.
+   */
+  private expirySweepDueAt = 0;
+  private static readonly EXPIRY_SWEEP_MAX_MS = 24 * 60 * 60 * 1000;
+
+  /**
    * Start the clock on what is now on screen, then remove whatever is already
    * past its time. Called when a thread is opened and when the app comes
    * forward — the two moments a person is actually looking.
+   *
+   * Then arm one wake for when what was just stamped comes due (see the field
+   * above). Single-shot, never a heartbeat, replaced only by a SOONER wake,
+   * and cleared by `stop()`. The wake re-enters with NO peer: it sweeps, and
+   * it must never re-arm — expiry is stamped at READ time (`db.armExpiry`'s
+   * own rule), so a background pass that armed anything would start the clock
+   * on a message nobody has looked at.
    */
   async sweepDisappearing(peerId?: string): Promise<void> {
     const gen = this.generation;
+    let armedFor = 0;
     if (peerId !== undefined) {
       const chat = await db.getChat(peerId);
       const seconds = chat?.disappearSec ?? 0;
       if (seconds > 0 && !this.stale(gen)) {
         await db.armExpiry(peerId, seconds, Date.now());
+        armedFor = seconds;
       }
     }
     if (this.stale(gen)) return;
     const removed = await db.sweepExpired(Date.now());
     if (removed > 0 && !this.stale(gen)) this.notify();
+    if (armedFor > 0 && !this.stale(gen)) {
+      const delay = Math.min(
+        armedFor * 1000,
+        MessagingService.EXPIRY_SWEEP_MAX_MS,
+      );
+      const dueAt = Date.now() + delay;
+      // Soonest wins. A five-minute thread opened before a four-week one keeps
+      // its own wake; the later, longer pass has nothing due before it.
+      if (this.expirySweepTimer === null || dueAt < this.expirySweepDueAt) {
+        if (this.expirySweepTimer !== null) {
+          clearTimeout(this.expirySweepTimer);
+        }
+        this.expirySweepDueAt = dueAt;
+        this.expirySweepTimer = setTimeout(() => {
+          this.expirySweepTimer = null;
+          this.expirySweepDueAt = 0;
+          if (this.stale(gen)) return;
+          void this.sweepDisappearing();
+        }, delay);
+      }
+    }
   }
 
   /**

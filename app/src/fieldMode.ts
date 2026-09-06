@@ -455,10 +455,11 @@ let duressBefore: FieldModeState | null = null;
 
 /**
  * The mode this shadow was last synchronised with. `session.setMode` clears
- * `lockUi` but knows nothing about this module, and the App.tsx duress block
- * that would call `resetFieldModeForDuress()` is outside this cluster's
- * paths — so the shadow resets itself lazily, on the first read after a mode
- * change, and is correct with or without that line.
+ * `lockUi` but knows nothing about this module, so the shadow resets itself
+ * lazily, on the first read after a mode change. That lazy reset stays: the
+ * App.tsx duress block now calls `resetFieldModeForDuress()` beside the other
+ * reset calls, and this is what keeps the module
+ * correct on any path that reaches it without one.
  */
 let shadowMode: SessionMode = 'real';
 

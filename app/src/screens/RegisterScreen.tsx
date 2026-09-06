@@ -49,47 +49,30 @@ interface Props {
 }
 
 /**
- * Every visible string, in one place — verbatim from the identity-redesign
- * mockup, with ONE recorded amendment: the
- * two "only way anyone reaches you" sentences gained the consent-gated
- * findability clause deliberately (the
- * product carries opt-in find-by-email, and the phone class joins under
- * the build pin, so an unconditional "only way" would ship false in the
- * same release that flips the declarations; the correction is scoped to
- * the classes THIS binary can actually link, via `OPTIONAL_REACH`).
+ * Registration explains recovery limits before account creation. The consent
+ * checkbox arms the button, and the confirmation sheet restates consequences
+ * already visible on the page rather than introducing new ones.
  *
- * THE RECOVERY SENTENCE IS STILL THE POINT OF THIS SCREEN
- * (cost table row 3), and the redesign makes the
- * person SAY SO before the button will fire: the agreement sentence sits in
- * its own consent card, the checkbox that carries it arms the button, and the
- * confirm sheet restates the two consequences one last time before the key is
- * made. Restates, never introduces — both sheet rows compress copy already on
- * the main screen.
- *
- * Said plainly and without alarm — no warning icon, no danger colour. Nothing
- * has gone wrong; this is how the product works, and a screen that flinches
- * while saying so teaches people to skip it.
+ * Reachability copy includes only identifier classes enabled in this binary:
+ * opt-in discovery means sharing an ID is not always the sole way to be found.
+ * These are normal product constraints, so the copy uses explanatory styling
+ * instead of warning icons or danger colors.
  */
 
-/** The identifier classes a person could LATER link and consent to be found
- * by — the one fragment the reach sentences interpolate. Follows the build pin, so a false-pin binary never names the
- * phone class its declarations do not carry (the four-surfaces rule), and
- * the pin-ON binary tells the whole truth in its own release. */
+/** The reachability sentence names only identifier classes enabled by the
+ * feature flags, matching the classes a person can link and make findable. */
 const OPTIONAL_REACH = PHONE_UI_ENABLED ? 'an email or phone number' : 'an email';
 
-/** The username class rides the same rule under ITS pin (the pin-flip
- * build): a parenthetical after the linkable classes, so a
- * pin-OFF binary's sentence is byte-identical to the one it shipped before,
- * and the pin-ON binary names every class a person can actually be found by. */
+/** Add username discovery only when its feature is enabled; otherwise retain
+ * the reachability wording for the linkable identifier classes alone. */
 const OPTIONAL_HANDLE = USERNAME_UI_ENABLED ? ', or choose a username,' : '';
 
 const COPY = {
   eyebrow: 'YOUR IDENTITY',
   title: 'Create your identity',
-  // Every sentence that names the device
-  // speaks the platform's language via `DEVICE_NOUN` — same facts, same
-  // consent, per device. On an iPhone every rendering is the mockup's
-  // sentence, verbatim.
+  // DEVICE_NOUN names the current platform while preserving the same
+  // registration facts and consent requirements across devices.
+  // On an iPhone every rendering retains the established registration copy.
   lead: `No account to set up. Your identity is a key — and this ${DEVICE_NOUN} is about to make it for you.`,
   /** Three facts: glyph + bold one-liner + teaching copy behind ⓘ. */
   facts: [
@@ -118,9 +101,8 @@ const COPY = {
       testID: 'register-info-server',
     },
   ],
-  // The consent moment. App Store 5.1.1(ii) wants consent for collection, and
-  // the honest version here is a sentence the person has actively agreed to —
-  // the checkbox is the arming action, not decoration.
+  // Require active agreement to the collection disclosure before enabling
+  // account creation; the checkbox records that consent.
   consentLabel: 'BEFORE YOU CREATE IT',
   agree: `I understand: if I lose this ${DEVICE_NOUN}, my identity can’t be recovered — not even by Tacendum.`,
   noRecoveryLabel: 'Why there is no recovery',
@@ -162,8 +144,8 @@ const COPY = {
     },
   ],
   notYet: 'Not yet',
-  /** The links themselves. Reachable in-app, which is what 5.1.1(i) asks for
-   * and what the About section in Settings also provides. */
+  /** Policy links stay reachable in-app before account creation, as they are
+   * afterward through Settings. */
   privacyLink: 'Privacy policy',
   termsLink: 'Terms',
   // Backend detail never reaches this screen. There is exactly one thing a
@@ -176,8 +158,7 @@ const COPY = {
   // The one failure where "try again" would be a lie. The identity key is
   // gone — a restore to a new device brings the chats but deliberately not
   // the key — and nothing can bring it back, so the copy says what is true
-  // instead of pointing at the connection. Ships unchanged — out of the
-  // redesign's scope.
+  // instead of pointing at the connection.
   identityLost:
     `This ${DEVICE_NOUN} no longer has the identity key these conversations belong to. ` +
     `The key never leaves the ${DEVICE_NOUN} it was made on and can’t be restored — ` +
@@ -199,7 +180,7 @@ function failureMessage(err: unknown): string {
     return COPY.identityLost;
   }
   // The per-IP auth bucket is the only abuse control left once identities are
-  // free to mint (cost table row 2), so being throttled is an ordinary
+  // free to mint, so being throttled is an ordinary
   // outcome worth naming — waiting actually fixes it, unlike everything else.
   if (err instanceof ApiRequestError && err.code === 'rate_limited') {
     return COPY.rateLimited;
@@ -208,22 +189,19 @@ function failureMessage(err: unknown): string {
 }
 
 /**
- * One screen, one action — now with the consent said out loud. There is no
+ * Registration creates an account only after explicit consent. There is no
  * phone field, no code field and no PIN step, because there is no phone
  * number, no SMS and no registration lock — the keypair is the account.
  *
  * The flow: the checkbox arms the button; the button presents an in-tree
- * confirm sheet (the app's first hovering surface, kept honest — a scrim and
- * a paperLayer slab, no RN Modal, no shadow); the sheet's own button performs
+ * confirm sheet (an in-tree scrim and paperLayer slab); the sheet's own button performs
  * the one create call and routes into the app.
  */
 export function RegisterScreen({ onRegistered, onBack }: Props) {
   const t = useTheme();
-  // The PANE's width. Register is a full-window route at
-  // every width (a pinned fact), so this answers the window today — the point
-  // is that content sizing reads the pane axis, uniformly, everywhere. The
-  // sheet's slide math below keeps its WINDOW height read: panes span the
-  // window's full height.
+  // Size content from the pane width even though this route spans the full
+  // window. The sheet animation uses window height because panes span the
+  // window vertically.
   const width = usePaneWidth();
   const gutter =
     width <= t.layout.narrowWidth ? t.layout.gutterNarrow : t.layout.gutterWide;
@@ -315,9 +293,8 @@ export function RegisterScreen({ onRegistered, onBack }: Props) {
     outputRange: ['0deg', '90deg'],
   });
 
-  // A running timing keeps its own timer — BrandMark's lesson. Left alive
-  // past this screen, a mid-flight tick or reveal ticks against a torn-down
-  // tree.
+  // Stop animation timers on unmount so an in-flight tick or reveal cannot
+  // update a torn-down tree.
   useEffect(
     () => () => {
       tick.stopAnimation();
@@ -368,19 +345,31 @@ export function RegisterScreen({ onRegistered, onBack }: Props) {
    * it (an edge swipe mid-flight), and its answer must not touch the state
    * of a screen that is gone. */
   const mounted = useRef(true);
+  /** Read by the system-back handler, which is registered once and must see
+   * whether the sheet is up — and reach the current `dismissSheet` — at the
+   * moment of the press, not at subscription. */
+  const sheetRef = useRef(false);
+  const dismissSheetRef = useRef(dismissSheet);
+  sheetRef.current = sheet;
+  dismissSheetRef.current = dismissSheet;
   useEffect(() => {
-    // Hardware back (Android) while the create call is in flight: the sheet
-    // already refuses its scrim and "Not yet" mid-flight, and the system
-    // button has to refuse the same way — otherwise the app router pops to
-    // landing, the call resolves against a torn-down screen, and
-    // `onRegistered` teleports the person in from nowhere. RN asks the most
-    // recent subscriber first and stops at the first `true`, so this answers
-    // before the router's own handler; idle, it yields (`false`) and the
-    // router pops as it always did. The REF is read, not the state — a tap
-    // can land before the state has flushed.
+    // Android Back follows the scrim and "Not yet" dismissal rules. Consume
+    // it while creation is busy so the route remains available for the result.
+    // Otherwise dismiss the open sheet through dismissSheet, preserving the
+    // checked consent and restoring focus to Create after the sheet unmounts.
+    // Busy comes first because a refused dismissal must still consume Back.
+    // With no sheet open, return false for normal router navigation.
+    // React Native asks the newest listener first and stops at true; this
+    // screen registers after the router. Refs keep the once-registered
+    // handler current, including activations before state has flushed.
     const subscription = BackHandler.addEventListener(
       'hardwareBackPress',
-      () => busyRef.current,
+      () => {
+        if (busyRef.current) return true;
+        if (!sheetRef.current) return false;
+        dismissSheetRef.current();
+        return true;
+      },
     );
     return () => {
       mounted.current = false;
@@ -454,7 +443,7 @@ export function RegisterScreen({ onRegistered, onBack }: Props) {
             {COPY.lead}
           </Text>
 
-          {/* Three facts: glyph + bold one-liner + ⓘ. All ship closed. */}
+          {/* Three facts: glyph + bold one-liner + ⓘ. All start closed. */}
           <View style={styles.facts}>
             {COPY.facts.map((fact, i) => (
               <View key={fact.line} style={styles.fact}>
@@ -501,10 +490,8 @@ export function RegisterScreen({ onRegistered, onBack }: Props) {
               accessibilityState={{ checked: agreed }}
               accessibilityLabel={COPY.agree}
               testID="register-consent"
-              // The CallPicker anatomy this row cites keeps a 56pt row floor;
-              // here the floor is the 44pt target — without it, two wrapped
-              // 21pt lines put the screen's one legally load-bearing control
-              // under the minimum.
+              // Keep a 44pt minimum target even when the consent text wraps;
+              // two 21pt lines alone would leave the checkbox row too short.
               style={[styles.agreeRow, { minHeight: t.layout.touchTarget }]}
             >
               <View
@@ -600,17 +587,20 @@ export function RegisterScreen({ onRegistered, onBack }: Props) {
 
           {explainMounted ? (
             <Animated.View style={{ opacity: reveal }}>
-              <RuledLabel label={COPY.hiw[0].label} marginTop={24} />
+              {/* The three how-it-works sections are rotor stops; the
+                  consent label above is NOT — it introduces the one card a
+                  person must read in order, not a section to skip to. */}
+              <RuledLabel label={COPY.hiw[0].label} marginTop={24} heading />
               <KeyFlowDiagram />
               <Text style={[t.type.compactBody, styles.hiwBody, { color: t.color.inkMuted }]}>
                 {COPY.hiw[0].body}
               </Text>
-              <RuledLabel label={COPY.hiw[1].label} marginTop={24} />
+              <RuledLabel label={COPY.hiw[1].label} marginTop={24} heading />
               <ReachingYouDiagram />
               <Text style={[t.type.compactBody, styles.hiwBody, { color: t.color.inkMuted }]}>
                 {COPY.hiw[1].body}
               </Text>
-              <RuledLabel label={COPY.hiw[2].label} marginTop={24} />
+              <RuledLabel label={COPY.hiw[2].label} marginTop={24} heading />
               <IfLostDiagram />
               <Text style={[t.type.compactBody, styles.hiwBody, { color: t.color.inkMuted }]}>
                 {COPY.hiw[2].body}
@@ -678,7 +668,7 @@ function Tile({ t, children }: { t: Theme; children: React.ReactNode }) {
 }
 
 /**
- * The confirm sheet: the app's first hovering surface, kept honest. An
+ * The confirm sheet uses an
  * in-tree absolutely-positioned View plus scrim — no RN Modal, no shadow.
  * Depth is scrim + paperLayer (house ladder ground → layer → sheet; the tiles
  * inside step up to paperSheet) + a top hairline, top radius 16, no grabber:
@@ -689,9 +679,8 @@ function Tile({ t, children }: { t: Theme; children: React.ReactNode }) {
  *
  * The register route mounts inside App's root SafeAreaView (edges top +
  * bottom), so the host backs that padding out with negative offsets — the
- * scrim and sheet must reach the physical display edges, and the designer
- * note's "14px bottom padding grows by the home-indicator inset" assumes a
- * sheet that touches the bottom. The host, not the sheet, carries
+ * scrim and sheet must reach the physical display edges while the bottom
+ * padding includes the home-indicator inset. The host, not the sheet, carries
  * accessibilityViewIsModal: UIKit ignores only the SIBLINGS of the flagged
  * view, and the page behind is a sibling of the host. The sheet caps its
  * height under the status area and scrolls its rows, so at accessibility
@@ -748,7 +737,7 @@ function ConfirmSheet({
     if (tag != null) AccessibilityInfo.setAccessibilityFocus(tag);
   }, []);
 
-  // Ink at 32% — the one translucency the approved sheet spec adds.
+  // Ink at 32% dims the page while keeping the modal sheet distinct.
   const scrim =
     t.scheme === 'dark' ? 'rgba(0,0,0,0.32)' : 'rgba(18,26,21,0.32)';
 

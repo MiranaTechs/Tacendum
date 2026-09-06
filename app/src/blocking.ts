@@ -347,17 +347,72 @@ export const BLOCK_COPY = {
 
 /* ── disappearing messages ────────────────────────────────── */
 
+export interface DisappearOption {
+  label: string;
+  seconds: number;
+}
+
 /**
- * The timer choices. Short options first because they are the ones people
- * reach for deliberately; a week exists so "on" does not have to mean "gone
- * before I read it on a bad day".
+ * The timer choices for a 1:1. Short options first because they are the ones
+ * people reach for deliberately; a week exists so "on" does not have to mean
+ * "gone before I read it on a bad day", and four weeks is the far end the
+ * wire itself draws (`envelope.ts` caps `TimerEnvelope.s` there, because
+ * beyond four weeks "disappearing" stops meaning anything a person can hold
+ * in their head).
+ *
+ * Five minutes is the short end, and 30 seconds is deliberately refused: the
+ * sentence above argues against the very short end, and half a minute turns a
+ * setting BOTH people live under into a trap for the slower reader.
+ *
+ * Five minutes only ships because the expiry sweep now arms a bounded wake
+ * for the moment the rows it stamped come due (`messaging.sweepDisappearing`).
+ * Without that, this option would have meant "gone whenever you next open the
+ * thread", which is an affordance making a claim the build does not keep.
  */
-export const DISAPPEAR_OPTIONS: ReadonlyArray<{ label: string; seconds: number }> = [
+export const DISAPPEAR_OPTIONS_PEER: ReadonlyArray<DisappearOption> = [
   { label: 'Off', seconds: 0 },
+  { label: '5 minutes', seconds: 5 * 60 },
   { label: '1 hour', seconds: 60 * 60 },
   { label: '1 day', seconds: 24 * 60 * 60 },
   { label: '1 week', seconds: 7 * 24 * 60 * 60 },
+  { label: '4 weeks', seconds: 28 * 24 * 60 * 60 },
 ];
+
+/**
+ * Seven days: where the ROOM's wire stops.
+ *
+ * A mirror of `TIMER_MAX_SECONDS`, which `packages/shared/src/group-envelope`
+ * binds `GroupSettingsEnvelope.s` to and does not export. Mirrored rather
+ * than imported, and then CHECKED: `blocking.disappear.test.ts` feeds this
+ * exact value and the next second to the shipped room schema, so a drift in
+ * either direction goes red in a test rather than in a room where a setting
+ * silently fails to travel.
+ *
+ * Stated as the CAP and never as a slice index. The room list used to be
+ * `DISAPPEAR_OPTIONS_PEER.slice(0, 5)`, which encodes the ceiling as a
+ * POSITION: inserting a '30 minutes' option anywhere in the 1:1 list would
+ * have quietly dropped '1 week' from every room, with nothing to catch it.
+ */
+export const ROOM_TIMER_MAX_SECONDS = 7 * 24 * 60 * 60;
+
+/**
+ * The same choices in a room, stopping where the ROOM's wire stops.
+ *
+ * Two lists rather than one, and the reason is a schema and not taste:
+ * `GroupSettingsEnvelope.s` is bound to `TIMER_MAX_SECONDS`, SEVEN DAYS
+ * (`packages/shared/src/group-envelope.ts`), while a 1:1 timer is capped at
+ * four weeks. A "4 weeks" chip in a room would emit `s: 2419200`, which every
+ * client — build 26 included, with no OTA to fix it — refuses on a strict
+ * `.parse()`: the setting would silently not travel. Room timers also merge
+ * by MINIMUM, so a four-week slot could never be the room's answer anyway.
+ *
+ * `blocking.disappear.test.ts` feeds every option here through the shipped
+ * schema its own screen sends it through, and feeds four weeks to the room
+ * schema as the falsifier. Raising the room's ceiling is a client-first wire
+ * change with its own release; it is not done by editing this array.
+ */
+export const DISAPPEAR_OPTIONS_ROOM: ReadonlyArray<DisappearOption> =
+  DISAPPEAR_OPTIONS_PEER.filter(o => o.seconds <= ROOM_TIMER_MAX_SECONDS);
 
 export const DISAPPEAR = {
   title: 'Disappearing messages',
@@ -378,8 +433,44 @@ export const DISAPPEAR = {
   failed: 'Tacendum couldn’t change that. Try again.',
 } as const;
 
-/** How a timer reads in a sentence, for the status line. */
+/**
+ * The units the fallback below spends, largest first. Every label this file
+ * authors is an exact multiple of one of them, so the fallback reproduces the
+ * authored labels rather than competing with them.
+ */
+const DISAPPEAR_UNITS: ReadonlyArray<[number, string]> = [
+  [7 * 24 * 60 * 60, 'week'],
+  [24 * 60 * 60, 'day'],
+  [60 * 60, 'hour'],
+  [60, 'minute'],
+  [1, 'second'],
+];
+
+/**
+ * How a timer reads in a sentence, for the status line.
+ *
+ * Resolved over the UNION of the two lists — a value set on either surface
+ * has to read in words wherever it is shown, and the peer list is the union
+ * because the room list is its prefix.
+ *
+ * The fallback is words too, never `300s`. A timer is a SHARED setting: the
+ * value on this screen may have been chosen on a build this one has never
+ * seen, and the sentence that reports it is read by someone deciding whether
+ * to type something. It is the LARGEST unit the value divides exactly, so
+ * nothing is rounded into a claim — ninety seconds reads "90 seconds", not
+ * "2 minutes", because a minute and a half is not two minutes and neither
+ * person picked either number.
+ */
 export function disappearLabel(seconds: number | null | undefined): string | null {
   if (!seconds || seconds <= 0) return null;
-  return DISAPPEAR_OPTIONS.find(o => o.seconds === seconds)?.label ?? `${seconds}s`;
+  const authored = DISAPPEAR_OPTIONS_PEER.find(o => o.seconds === seconds);
+  if (authored) return authored.label;
+  for (const [size, unit] of DISAPPEAR_UNITS) {
+    if (seconds % size !== 0) continue;
+    const n = seconds / size;
+    return `${n} ${unit}${n === 1 ? '' : 's'}`;
+  }
+  // Unreachable: the last unit is one second and the value is a positive
+  // integer. Kept so a non-integer from a future wire still reads as words.
+  return `${seconds} seconds`;
 }

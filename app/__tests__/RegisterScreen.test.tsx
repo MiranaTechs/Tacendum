@@ -109,8 +109,10 @@ const settle = (ms: number) =>
     await new Promise<void>(resolve => setTimeout(() => resolve(), ms));
   });
 
-afterEach(() => {
-  tree?.unmount();
+afterEach(async () => {
+  await ReactTestRenderer.act(async () => {
+    tree?.unmount();
+  });
   jest.clearAllMocks();
   jest.restoreAllMocks();
 });
@@ -686,10 +688,18 @@ describe('hardware back while the create call is in flight', () => {
     // Idle: the app's own router answers (register pops to landing).
     expect(back()).toBe(false);
     await openSheet();
+    // Back dismisses the sheet while preserving the screen and its consent.
+    await ReactTestRenderer.act(async () => {
+      expect(back()).toBe(true);
+    });
+    expect(has('register-sheet')).toBe(false);
+    expect(stateOf('register-consent').checked).toBe(true);
     expect(back()).toBe(false);
 
     // Mid-flight there is nothing safe to walk away to — the sheet already
     // refuses its scrim and "Not yet"; the system button refuses the same.
+    // Consent remains ticked, so reopen without toggling it again.
+    await press('create-identity');
     await press('register-sheet-confirm');
     expect(stateOf('register-sheet-confirm').busy).toBe(true);
     expect(back()).toBe(true);
@@ -714,7 +724,9 @@ describe('hardware back while the create call is in flight', () => {
     await render();
     await openSheet();
     await press('register-sheet-confirm');
-    tree.unmount();
+    await ReactTestRenderer.act(async () => {
+      tree.unmount();
+    });
     await ReactTestRenderer.act(async () => {
       reject(new Error('offline'));
     });

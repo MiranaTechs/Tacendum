@@ -241,6 +241,8 @@ jest.mock('tacendum-call', () => {
   };
   const calls = [];
   const dismissals = [];
+  /** Every missed-call notice op, in order — see postMissedCall below. */
+  const missed = [];
   /**
    * The placeholder CallKitCenter would have ringing, modelled so the guard
    * above has something to guard. `null` when nothing is pending.
@@ -291,6 +293,28 @@ jest.mock('tacendum-call', () => {
       return undefined;
     }),
     endCall: jest.fn(async () => undefined),
+    /**
+     * THE MISSED-CALL NOTICES, and the answer that takes one down.
+     *
+     * Without these mocks missed-call notices could not be tested: `postMissedCallNotice` and
+     * `clearMissedCallNotices` are both TOTAL by design — a module without
+     * the method costs the notice, never the row — so a mock missing them
+     * made "the notice was posted" and "the method does not exist here"
+     * the same green. Recorded in `__call.missed` so a suite can say which
+     * of the two it saw. `call/index.ts` reaches these through
+     * `missedCallBridge`, which is what a test spies on; these exist so the
+     * unspied path is the real shape rather than a TypeError.
+     */
+    postMissedCall: jest.fn(async (peerId, displayName) => {
+      missed.push({ op: 'post', peerId, displayName });
+    }),
+    clearMissedCall: jest.fn(async peerId => {
+      missed.push({ op: 'clear', peerId });
+    }),
+    /** CallKit's "answered elsewhere" acknowledgement for a reported call. */
+    answerReportedCall: jest.fn(async sid => {
+      missed.push({ op: 'answer', sid });
+    }),
     getVoipToken: jest.fn(async () => 'voip-token'),
     /**
      * PUSHKIT, FAITHFULLY — and this mock emitting NOTHING is why an
@@ -356,6 +380,8 @@ jest.mock('tacendum-call', () => {
       reported: calls,
       /** Every dismissal asked for, in order — `{peerId, reason, cid}`. */
       dismissals,
+      /** Every missed-call notice op, in order — `{op, peerId, …}`. */
+      missed,
       emit,
       /**
        * A VoIP push, WITH NATIVE'S OWN BOOKKEEPING.
@@ -379,6 +405,7 @@ jest.mock('tacendum-call', () => {
         listeners.clear();
         calls.length = 0;
         dismissals.length = 0;
+        missed.length = 0;
         pendingPush = null;
       },
     },

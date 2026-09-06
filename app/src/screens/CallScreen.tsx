@@ -379,7 +379,7 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
    * `connectedAt`) correctly stays on the disc.
    *
    * Before either, the person is drawn the way an audio call draws them: one
-   * centred disc, at the size §10.3 designed, over the pine ground. No scrim
+   * centred disc over the pine ground. No scrim
    * and no blur is added to the connected case instead; theme.ts rules
    * scrims out of the product outright.
    */
@@ -413,8 +413,36 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
 
   if (state.name === 'idle' || !call) return null;
 
+  // Apply the id-refusal rule used by PeerFace and PeerBackdrop to the three
+  // places that spell or SPEAK the name: the header line and the two video
+  // labels. App.tsx's fallback for a peer who has never shared a name is
+  // `personName(peerId)` — the shortId fragment — so an unnamed caller was
+  // read out as characters of their account id on the one surface a stranger
+  // holding the phone sees.
+  const shownName = tileName(call.peerId, peerName);
+
   return (
-    <View style={styles.root} accessibilityViewIsModal accessibilityLabel="Call">
+    <View
+      style={styles.root}
+      accessibilityViewIsModal
+      // A video call announces as one: the camera being on is
+      // exactly the fact a blind person cannot check for themselves.
+      // IncomingCallScreen already names the kind; this screen did not.
+      //
+      // OWED, A DEVICE READING. This label sits on a View with no
+      // `accessible`, which RN defaults to FALSE — the same rule that made
+      // QualityBars' 'Connection poor' unreachable a few files over. The
+      // difference is that a modal CONTAINER's label may be spoken as the
+      // window's name on focus rather than as an element, which is why
+      // IncomingCallScreen.tsx:76-79 has always been written this way and why
+      // `accessible` must NOT be added here: it would collapse the whole call
+      // screen — every control, the peer, the status — into one element.
+      // Until VoiceOver on a device settles whether the container label is
+      // spoken at all, this is a label that may be reaching nobody. If it is
+      // not spoken, the kind belongs on a real element instead: appended to
+      // the status line below, which is already a live region.
+      accessibilityLabel={isVideo ? 'Video call' : 'Call'}
+    >
       <StatusBar barStyle="light-content" />
 
       {/* The remote video fills the screen. It renders nothing until a track
@@ -428,7 +456,7 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
           onPress={() => setSwapped(v => !v)}
           accessibilityRole="button"
           accessibilityLabel={
-            swapped ? 'Your video, full screen' : `${peerName}'s video, full screen`
+            swapped ? 'Your video, full screen' : `${shownName}'s video, full screen`
           }
           accessibilityHint="Tap to swap the two videos"
         >
@@ -452,7 +480,7 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
           )}
           {/* Before the call connects: the audio layout's disc, over the pine
               ground, so the surface is neither black nor mistakable for the
-              far camera. `PeerFace` applies CallTile's rule 2 itself, so a
+              far camera. `PeerFace` also refuses account IDs, so a
               "name" that is really the peer's id cannot letter this surface
               and the raw name goes down. */}
           {!swapped && !mediaEstablished && (
@@ -504,7 +532,7 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
             onPress={() => setSwapped(v => !v)}
             accessibilityRole="button"
             accessibilityLabel={
-              swapped ? `${peerName}'s video, small` : 'Your video, small'
+              swapped ? `${shownName}'s video, small` : 'Your video, small'
             }
             accessibilityHint="Tap to swap the two videos"
             // The drag, for someone who cannot drag: VoiceOver consumes the
@@ -576,14 +604,19 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
           </Pressable>
         )}
         <Text style={styles.peer} numberOfLines={1}>
-          {peerName}
+          {shownName}
         </Text>
         <View style={styles.statusRow}>
           <Text
             style={styles.status}
-            // The pulse is a static state when Reduce Motion is on; the label
-            // still changes, so nothing is lost, only the animation.
-            accessibilityLiveRegion={reduceMotion ? 'none' : 'polite'}
+            // NOTHING HERE ANIMATES, AND A LIVE REGION IS NOT MOTION
+            //. This used to read `reduceMotion ? 'none' :
+            // 'polite'`, explained as "the pulse is a static state when
+            // Reduce Motion is on" — there is no pulse, and there never was.
+            // The branch meant that a person who asked for less animation
+            // stopped being told when their call went Ringing → Connected →
+            // Reconnecting, which is the one thing this line exists to say.
+            accessibilityLiveRegion="polite"
           >
             {statusLabel(state)}
           </Text>

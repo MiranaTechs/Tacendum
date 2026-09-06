@@ -2,6 +2,7 @@ import React, { useEffect } from 'react';
 import {
   AccessibilityInfo,
   ActivityIndicator,
+  Platform,
   Pressable,
   StyleSheet,
   Text,
@@ -246,6 +247,7 @@ export function RuledLabel({
   minHeight,
   height,
   role = 'utilityLabel',
+  heading = false,
 }: {
   label: string;
   marginTop?: number;
@@ -255,11 +257,34 @@ export function RuledLabel({
   /** @deprecated Alias of minHeight — a ruled row must be able to grow. */
   height?: number;
   role?: 'utilityLabel' | 'timeStatus';
+  /**
+   * Offer this row to the VoiceOver rotor's Headings navigator — a section
+   * label on a long scroll (Settings has eight, and reaching Appearance
+   * otherwise means swiping past every row above it).
+   *
+   * It makes the row an accessibility ELEMENT as well as giving it the role,
+   * and it has to: a View is not enumerable unless `accessible` says so, and
+   * RN never derives that from the role (`View.js` maps `aria-*` and nothing
+   * else). A header trait alone is a stop the rotor never offers and a node
+   * TalkBack never focuses — it focuses the Text inside and says nothing
+   * about a heading. Making the row the element is the shape the thread's
+   * unread divider and round header already use, and the label VoiceOver
+   * reads is composed from the Text within.
+   *
+   * Opt-in, and it must stay opt-in: this same component draws the thread's
+   * date dividers and Register's consent labels, where a heading per day
+   * would flood the rotor the prop exists to make useful. Each screen owner
+   * passes it for its own sections.
+   */
+  heading?: boolean;
 }) {
   const t = useTheme();
   const floor = minHeight ?? height;
   return (
     <View
+      {...(heading
+        ? ({ accessible: true, accessibilityRole: 'header' } as const)
+        : {})}
       style={[
         styles.ruledRow,
         { marginTop, marginBottom },
@@ -443,7 +468,14 @@ export function InlineError({
   // accessibilityLiveRegion is Android-only; on iOS an appearing error is
   // silent unless it is announced explicitly. Queueing keeps the announcement
   // from being dropped when it lands during a route change or a keystroke.
+  //
+  // iOS ONLY, for the same reason: on Android the live region below already
+  // reads this node to TalkBack, and RN maps the announce to
+  // TYPE_ANNOUNCEMENT, so an ungated call is the same error spoken twice.
+  // The app's own precedent, twice: PinPad.tsx's announceCount and
+  // CallScreen.tsx both announce only on iOS, with this note beside them.
   useEffect(() => {
+    if (Platform.OS !== 'ios') return;
     AccessibilityInfo.announceForAccessibilityWithOptions(message, {
       queue: true,
     });
@@ -506,8 +538,12 @@ export function InlineNotice({
 }) {
   const t = useTheme();
   // accessibilityLiveRegion is Android-only, so without this every notice in
-  // the app is silent on iOS.
+  // the app is silent on iOS — and iOS is therefore the only platform that
+  // should fire it. On Android the live region speaks this node already and
+  // the announce (TYPE_ANNOUNCEMENT) would speak over it. Same gate, same
+  // reason, as InlineError above and PinPad's announceCount.
   useEffect(() => {
+    if (Platform.OS !== 'ios') return;
     AccessibilityInfo.announceForAccessibilityWithOptions(message, {
       queue: true,
     });

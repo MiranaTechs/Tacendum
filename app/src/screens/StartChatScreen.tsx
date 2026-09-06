@@ -55,7 +55,15 @@ interface Props {
   onFindByEmail: () => void;
 }
 
-const COPY = {
+/**
+ * Every visible string on this screen.
+ *
+ * EXPORTED, and for one reason: `ProfileScreen` shows the same QR under
+ * the same words. The same action must never get two different sentences,
+ * so the other screen reads THIS property rather than spelling a second
+ * literal that matches until someone rewords one of them.
+ */
+export const COPY = {
   title: 'Start a chat',
   // Reworded with the code that changed the fact: find-by-email exists now — typed, single, consent-gated —
   // so "no search" would be a lie on the very screen that offers it. The
@@ -146,12 +154,9 @@ const COPY = {
   qrHide: 'Hide QR code',
 } as const;
 
-/** The door's three sentences under the username pin (build 24 — testers
- * could not find find-by-username: this row said "Find by email"
- * while the room it opens offers a Username chip). The literals live in the
- * username deck and are chosen by the build pin, the RegisterScreen
- * OPTIONAL_HANDLE pattern, so a pin-OFF binary renders the landed sentences
- * above byte-for-byte. */
+/** The discovery label must describe the identifier classes offered by
+ * its destination. Select the username-enabled copy with the same feature
+ * flag as the destination, keeping the disabled variant unchanged. */
 function findDoorCopy(): { label: string; helper: string; noDirectory: string } {
   return USERNAME_UI_ENABLED
     ? {
@@ -335,7 +340,48 @@ export function StartChatScreen({ profile, onBack, onOpenChat, onFindByEmail }: 
     }
     void (async () => {
       try {
+        // TWO READS BEFORE THE WRITE, because this screen's most likely
+        // repeat use is scanning someone you already have.
+        //
+        // A ROOM FIRST. A room's conversation row IS its ULID (pushnav.ts),
+        // so an upsert here would put a person-shaped row over a room — the
+        // shape the chat list already routes around when it deletes, because
+        // it strands queued fan-out legs. A room is opened, never created,
+        // and never named on this screen.
+        const room = await db.getGroup(peerId);
+        if (room !== null) {
+          setError(null);
+          onOpenChat(peerId);
+          return;
+        }
+        // A PERSON I HAVE ALREADY NAMED. Asking "Who is this?" with an empty
+        // field about someone named months ago is a question with no useful
+        // answer; `saveName` would have written nothing anyway.
+        const existing = await db.getChat(peerId);
+        if (existing?.localName) {
+          // The upsert still runs, and it is not a formality. A row an
+          // inbound message opened — or one that predates the column —
+          // carries no provenance at all, and `db.upsertChat` COALESCEs the
+          // column so this "fills in only where nothing was recorded" (its
+          // own words). Skipping it here would leave scanning the only way to
+          // record a mark and never let a scan record one, on the release
+          // where the peer profile started SAYING how a chat began. No
+          // display name is offered, so the row's own name is untouched, and
+          // an origin already on disk cannot be restated.
+          await db.upsertChat(peerId, undefined, draftSource);
+          setError(null);
+          onOpenChat(peerId);
+          return;
+        }
+        // Everything else is the old path: an unnamed row still gets the
+        // naming step, because that is the case where asking helps. The
+        // upsert is harmless on a row that exists (introducedBy is COALESCEd,
+        // so a re-scan can never restate a discovery origin).
         await db.upsertChat(peerId, undefined, draftSource);
+        // Prefilled with the name they shared, when they have shared one:
+        // the answer is usually "yes, that one", and typing it again is work
+        // this screen can do for the person.
+        setNameDraft(existing?.displayName ?? '');
       } catch {
         setError(COPY.errorLocal);
         return;
@@ -345,7 +391,7 @@ export function StartChatScreen({ profile, onBack, onOpenChat, onFindByEmail }: 
       // belongs to — a bare ULID in the list is unrecognisable a week later.
       setNaming(peerId);
     })();
-  }, [draftId, draftSource, profile.userId]);
+  }, [draftId, draftSource, onOpenChat, profile.userId]);
 
   const readFromCamera = useCallback(() => {
     if (picking) return;
@@ -500,7 +546,7 @@ export function StartChatScreen({ profile, onBack, onOpenChat, onFindByEmail }: 
           {naming === null ? (
             <>
               {/* THE SCANNER LEADS: the QR
-                  hand-off is the lead rail (§4), so reading their code is the
+                  hand-off is the lead rail, so reading their code is the
                   first thing on the page; the field below — no longer focused
                   on entry — is the second way in, and says so.
                   Same height, radius, fill and border weight as that field, so
@@ -591,11 +637,13 @@ export function StartChatScreen({ profile, onBack, onOpenChat, onFindByEmail }: 
                   onSubmitEditing={startChat}
                   placeholder={COPY.idPlaceholder}
                   placeholderTextColor={t.color.inkMuted}
+                  keyboardAppearance={t.scheme}
+                  selectionColor={t.color.pine}
                   accessibilityLabel={COPY.idLabel}
                   autoCapitalize="characters"
                   autoComplete="off"
                   autoCorrect={false}
-                  // No autoFocus: QR is the lead rail (§4), and a keyboard on
+                  // No autoFocus: QR is the lead rail, and a keyboard on
                   // entry covered the scanner, the photo door, Find by email
                   // and the person's own ID.
                   clearButtonMode="while-editing"
@@ -747,6 +795,8 @@ export function StartChatScreen({ profile, onBack, onOpenChat, onFindByEmail }: 
                 onSubmitEditing={saveName}
                 placeholder={COPY.namePlaceholder}
                 placeholderTextColor={t.color.inkMuted}
+                keyboardAppearance={t.scheme}
+                selectionColor={t.color.pine}
                 accessibilityLabel={COPY.nameLabel}
                 autoCapitalize="words"
                 autoCorrect={false}

@@ -111,13 +111,20 @@ describe('QrPanel draws the id', () => {
     });
   });
 
-  test('the ink is the theme tokens, resolved — never a literal in the module', async () => {
-    const t = themeTokens();
+  test('the ink is the light tokens, resolved — never a literal in the module', async () => {
+    const t = themeTokens('light');
     const tree = await render(<QrPanel id={ID} />);
 
     const [text, , darkHex, lightHex] = nativeQr.encodePng.mock.calls[0];
     // Asserted against the tokens rather than '#121A15'/'#FAFCF7' so a theme
     // edit moves the QR with it instead of silently passing.
+    //
+    // Re-cut 2026-09-05: this pinned a theme-DERIVED pair, read from whatever
+    // palette the render happened to be under — and jest renders under light,
+    // so the assertion was green while the dark palette handed the encoder a
+    // contrast-inverted code no scanner could read. The pair is now fixed at
+    // the light palette in both modes (QrPanel.tsx's QR_DARK_HEX), so this
+    // names the mode explicitly and QrPanel.dark.test.tsx holds the other half.
     expect(darkHex).toBe(t.color.inkStrong);
     expect(lightHex).toBe(t.color.paperSheet);
     // And the payload is still the bare id, all the way down to the native call.

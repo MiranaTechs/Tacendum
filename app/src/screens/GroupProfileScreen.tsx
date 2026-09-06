@@ -1,6 +1,7 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AccessibilityInfo,
+  BackHandler,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -18,7 +19,7 @@ import {
   verdictFor,
   GROUP_MAX_MEMBERS,
 } from '@tacendum/shared/group-fold';
-import { DISAPPEAR, DISAPPEAR_OPTIONS, disappearLabel } from '../blocking';
+import { DISAPPEAR, DISAPPEAR_OPTIONS_ROOM, disappearLabel } from '../blocking';
 import * as db from '../db';
 import { DEVICE_NOUN } from '../deviceNoun';
 import { messaging } from '../messaging';
@@ -117,7 +118,7 @@ export const ROOM_COPY = {
 
   /** The share-history offer. Sharing NOTHING is
    * the effortless path: it is the first action, it needs no decision, and
-   * dismissing the panel shares nothing. Rule 2 — sharing is a deliberate act
+   * dismissing the panel shares nothing. Sharing is a deliberate act
    * with a stated extent, never a consequence of adding someone. */
   shareTitle: (name: string) => `Send ${name} some of what was said before?`,
   /** Says the cost plainly, because the people whose words move cannot be
@@ -336,6 +337,51 @@ export function GroupProfileScreen({
   const [candidates, setCandidates] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
+
+  /** Read by the system-back handler, which is registered once and must see
+   * what is open at the moment of the press, not at subscription. */
+  const confirmingRef = useRef<Confirming>('none');
+  const busyRef = useRef(false);
+  confirmingRef.current = confirming;
+  busyRef.current = busy;
+
+  useEffect(() => {
+    // ANDROID SYSTEM BACK closes the question that is open before it leaves
+    // the room. The router's handler
+    // (App.tsx) pops the route on every press, so backing out of Leave,
+    // Delete room, Delete for everyone or Remove somebody threw the person
+    // out of the roster instead, question dropped. RN asks the most recent
+    // subscriber first and stops at the first `true`; the router subscribed
+    // once at app mount and this screen mounts later, so it is asked first.
+    //
+    // ONE CASE, NOT FOUR, because `confirming` is one state: this screen
+    // asks at most one of these questions at a time by construction (each
+    // control sets the state the others read), and Remove even carries the
+    // member it is about so two Remove controls cannot share one open
+    // question. There is no ordering to state because there is never a
+    // second thing open.
+    //
+    // MID-FLIGHT, THE PRESS IS SWALLOWED. Every one of these confirmations
+    // disables its own Cancel while the write is going (`busy`), and the
+    // system button refuses the same way: a leave or a delete for
+    // everyone must not have the route
+    // popped out from under it.
+    //
+    // With nothing open it yields (`false`) and the router pops as it always
+    // did. Refs, not state: registered once, and a press can land before a
+    // state has flushed. On iOS `BackHandler` is inert, so this registers
+    // unconditionally.
+    const subscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      () => {
+        if (confirmingRef.current === 'none') return false;
+        if (busyRef.current) return true;
+        setConfirming('none');
+        return true;
+      },
+    );
+    return () => subscription.remove();
+  }, []);
   /** Who was just added and is being offered history, or null. Cleared by
    * every exit including "Send nothing", so the offer cannot linger and be
    * answered later against a roster that has moved on. */
@@ -1321,8 +1367,11 @@ export function GroupProfileScreen({
                 ? ROOM_COPY.timerOff
                 : ROOM_COPY.timerStatus(effectiveLabel)}
             </Text>
-            <View style={styles.timerRow}>
-              {DISAPPEAR_OPTIONS.map(option => {
+            {/* Five chips, wrapping — the room list stops one short of the
+                1:1 list because the room wire does. Pinned as a contract in
+                GroupProfile.test.tsx. */}
+            <View style={styles.timerRow} testID="room-timer-row">
+              {DISAPPEAR_OPTIONS_ROOM.map(option => {
                 const active = option.seconds === mySlotSeconds;
                 // Off for good once I have left: the chips say so to
                 // VoiceOver AND to the eye — a recessed surface with muted
@@ -1518,7 +1567,7 @@ export function GroupProfileScreen({
                   <Text style={[t.type.bodyStrong, { color: t.color.inkStrong }]}>
                     {ROOM_COPY.deleteEveryoneConfirmTitle}
                   </Text>
-                  {/* Rule 22's sentence, verbatim: best-effort on other
+                  {/* Deletion is best-effort on other
                       people's devices, never a guarantee. */}
                   <Text
                     style={[t.type.compactBody, styles.sectionLine, { color: t.color.inkBody }]}

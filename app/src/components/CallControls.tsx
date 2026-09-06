@@ -75,7 +75,15 @@ export function QualityBars({
   const label =
     level >= 3 ? 'Connection good' : level === 2 ? 'Connection fair' : 'Connection poor';
   return (
-    <View style={{ flexDirection: 'row', gap: 3, marginTop: 6 }} accessibilityLabel={label}>
+    <View
+      style={{ flexDirection: 'row', gap: 3, marginTop: 6 }}
+      // `accessible` is what makes the label reachable at all: RN's View
+      // defaults it FALSE, so three bars with a label on them were never a
+      // stop for VoiceOver and "Connection poor" was very likely never
+      // spoken. One element, so the three bars read once.
+      accessible
+      accessibilityLabel={label}
+    >
       {[1, 2, 3].map(bar => (
         <View
           key={bar}
@@ -165,6 +173,12 @@ export function ControlButton({
       {...(accessibilityHint ? { accessibilityHint } : {})}
       {...(testID ? { testID } : {})}
       // 44×44 regardless of Dynamic Type; the glyph may grow, the target may not.
+      //
+      // DISABLED IS A RECESSED SURFACE, NEVER OPACITY (see
+      // primitives.tsx:173). The disabled arm used to be `opacity: 0.4`,
+      // which took the glyph under the contrast floor; it now empties the
+      // disc to its `mediaLine` edge and mutes the icon. `pressed` keeps its
+      // dip — a finger on a control is feedback, not a state.
       style={({ pressed }) => [
         {
           minWidth: 44,
@@ -173,12 +187,17 @@ export function ControlButton({
           alignItems: 'center',
           justifyContent: 'center',
           borderRadius: 22,
-          opacity: disabled ? 0.4 : pressed ? 0.7 : 1,
-          backgroundColor: danger
-            ? theme.color.danger
-            : active
-              ? theme.color.mediaInk
-              : theme.color.mediaLine,
+          opacity: pressed ? 0.7 : 1,
+          ...(disabled
+            ? { borderWidth: 1, borderColor: theme.color.mediaLine }
+            : null),
+          backgroundColor: disabled
+            ? 'transparent'
+            : danger
+              ? theme.color.danger
+              : active
+                ? theme.color.mediaInk
+                : theme.color.mediaLine,
         },
       ]}
     >
@@ -187,21 +206,19 @@ export function ControlButton({
         // the wash and the danger disc, `mediaBlack` on an active (filled)
         // one. The icons hide themselves from VoiceOver, so the button still
         // reads once, by its label.
+        // Muted on a disabled disc, the other half of the recession above.
+        const ink = disabled
+          ? theme.color.mediaInkMuted
+          : danger || !active
+            ? theme.color.mediaInk
+            : theme.color.mediaBlack;
         const Icon = CONTROL_GLYPHS[glyph];
         if (Icon) {
-          return (
-            <Icon
-              size={22}
-              color={danger || !active ? theme.color.mediaInk : theme.color.mediaBlack}
-            />
-          );
+          return <Icon size={22} color={ink} />;
         }
         return (
           <Text
-            style={{
-              color: danger || !active ? theme.color.mediaInk : theme.color.mediaBlack,
-              fontSize: 18,
-            }}
+            style={{ color: ink, fontSize: 18 }}
             // The glyph is decoration; the button already has a proper label, and
             // reading "✕" aloud helps nobody.
             accessibilityElementsHidden

@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Image, StyleSheet, Text, View } from 'react-native';
 import { DEVICE_NOUN } from '../deviceNoun';
 import * as qr from '../qr';
-import { useTheme } from '../theme';
+import { themeTokens, useTheme } from '../theme';
 import { usePaneWidth } from '../windowClass';
 import { InlineError, TextAction } from './primitives';
 import { shareWithAnchor } from './shareWithAnchor';
@@ -40,6 +40,31 @@ const COPY = {
   imageHint: 'Your ID in picture form. The same ID is written out above.',
 } as const;
 
+/**
+ * The code's own ink and paper — the LIGHT palette, in both modes.
+ *
+ * A QR is a printed artefact, not a themed surface. Read from the dark
+ * tokens these become #E9EFE9 on #1C221E: pale modules on a near-black quiet
+ * zone, a contrast-inverted code. Both of this product's scanners are its own
+ * and are inversion-blind (AVCaptureMetadataOutput; ZXing's
+ * RGBLuminanceSource), and deep links are refused, so the system camera
+ * cannot complete the exchange either — in dark mode the app's primary way of
+ * adding a person simply stopped working. Printing the code on paper in both
+ * modes is the on-brand answer, not a compromise: every scannable code in the
+ * world looks like this.
+ *
+ * Module constants, not render values: they are the encode effect's deps, so
+ * fixing them here is also what stops a theme flip from restarting a draw of
+ * a code somebody is currently pointing a phone at.
+ *
+ * Measured on the light palette: inkStrong on paperSheet is 17.17:1. Pine —
+ * this system's *action* colour — is 6.34:1, needlessly marginal for a cheap
+ * decoder pointed at a recompressed screenshot at an angle, which is why the
+ * ink is the strong one and not the brand one.
+ */
+const QR_DARK_HEX = themeTokens('light').color.inkStrong;
+const QR_LIGHT_HEX = themeTokens('light').color.paperSheet;
+
 /** The square the panel draws at, before the viewport gets a say. */
 const QR_SIDE = 176;
 /** Below this the code stops being scannable off a screen at all. */
@@ -66,18 +91,17 @@ export function QrPanel({ id }: { id: string }) {
   /** The share button, so the iPad popover points at it. */
   const shareAnchor = useRef<View>(null);
 
-  // The ink is passed in from the theme, never held by qr.ts or the native
-  // module: inkStrong on paperSheet measures 17.17:1, and pine — this
-  // system's *action* colour — is 6.34:1, needlessly marginal for a cheap
-  // decoder pointed at a recompressed screenshot at an angle.
-  const darkHex = t.color.inkStrong;
-  const lightHex = t.color.paperSheet;
-
+  // The ink is passed in from the module's own constants, never held by qr.ts
+  // or the native module — see QR_DARK_HEX above for why they are the light
+  // palette's and not this render's.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const next = await qr.encodeSelfQr(id, { darkHex, lightHex });
+        const next = await qr.encodeSelfQr(id, {
+          darkHex: QR_DARK_HEX,
+          lightHex: QR_LIGHT_HEX,
+        });
         if (cancelled) return;
         setDrawn(next);
         setError(null);
@@ -90,7 +114,8 @@ export function QrPanel({ id }: { id: string }) {
     return () => {
       cancelled = true;
     };
-  }, [id, darkHex, lightHex]);
+    // The id alone: the ink is constant, so this runs once per person.
+  }, [id]);
 
   // The share file goes when the panel does — not when Share.share resolves,
   // because AirDrop keeps reading it after the sheet dismisses. Unmount is the

@@ -31,6 +31,7 @@ import ReactTestRenderer from 'react-test-renderer';
 import { StyleSheet, Text } from 'react-native';
 import * as db from '../src/db';
 import { messaging } from '../src/messaging';
+import { spellId } from '../src/person';
 import { ChatListScreen } from '../src/screens/ChatListScreen';
 import { themeTokens } from '../src/theme';
 
@@ -67,7 +68,12 @@ const PROFILE: db.ProfileRow = {
 
 const SAM = '01SAMZ3NDEKTSV4RRFFQ69G5FA';
 
-function chatRow(peerId: string, name: string, lastMessageAt: number | null) {
+function chatRow(
+  peerId: string,
+  /** Null is a real row: a peer who has never shared a card. */
+  name: string | null,
+  lastMessageAt: number | null,
+) {
   return {
     peerId,
     displayName: name,
@@ -96,6 +102,9 @@ const chatRows: { rows: ChatRows } = { rows: [] };
  * answers only when the test says so — the one lever that makes two
  * refreshes commit out of order. */
 const hold: { on: boolean; reads: HeldRead[] } = { on: false, reads: [] };
+/** What `unreadCounts` answers with. Its statement is the only one in the
+ * module carrying `COUNT(*) AS n`, so the match cannot catch a neighbour. */
+const unreadRows: { rows: { peerId: string; n: number }[] } = { rows: [] };
 
 beforeEach(async () => {
   await db.close();
@@ -105,6 +114,7 @@ beforeEach(async () => {
   chatRows.rows = [chatRow(SAM, 'Sam', T0)];
   hold.on = false;
   hold.reads = [];
+  unreadRows.rows = [];
 
   const instance = sqlite.instances.get('tacendum.sqlite')!;
   const base = instance.execute.getMockImplementation()!;
@@ -118,6 +128,7 @@ beforeEach(async () => {
         hold.reads.push({ resolve: rows => resolve({ rows }) });
       });
     }
+    if (s.includes('COUNT(*) AS n')) return { rows: unreadRows.rows };
     return base(s, params);
   });
 });
@@ -328,6 +339,89 @@ describe('chat list — rows are memoised', () => {
     expect(rendersOf(SAM)).toBeGreaterThan(samBefore);
     expect(rendersOf(KIM)).toBe(kimBefore);
 
+    await unmount(tree);
+  });
+});
+
+/**
+ * The delete confirmation describes everything removed.
+ *
+ * deleteChat now purges the conversation's 1:1 call log with it,
+ * because a chatless person degraded to a bare id fragment in Calls and
+ * stayed one tap from redial. The confirmation has to admit what it takes.
+ *
+ * The existing confirmation sentence stays unchanged; the additional fact
+ * uses a second line that names no device.
+ */
+describe('the delete confirmation admits the calls', () => {
+  test('a second line under the existing sentence, which is unchanged', async () => {
+    const tree = await renderList();
+    await press(tree, `chat-more-${SAM}`);
+    await press(tree, `chat-delete-${SAM}`);
+
+    const shown = texts(tree);
+    // The anchored sentence, still exactly itself.
+    expect(shown).toContain('Tacendum has no copy to restore.');
+    // And the new one, by identity.
+    expect(shown).toContain('Your calls with them go too.');
+    // It is its own line, not a rewrite of the first.
+    expect(has(tree, `chat-delete-calls-${SAM}`)).toBe(true);
+    // No device noun rides in on it.
+    const line = tree.root.find(
+      n => n.props.testID === `chat-delete-calls-${SAM}`,
+    ).props.children as string;
+    expect(line).not.toMatch(/phone|device|iphone|tablet/i);
+
+    await unmount(tree);
+  });
+
+  test('the line belongs to the confirmation, not the row', async () => {
+    const tree = await renderList();
+    expect(has(tree, `chat-delete-calls-${SAM}`)).toBe(false);
+    await press(tree, `chat-more-${SAM}`);
+    // The drawer alone does not claim it either — only the confirm step.
+    expect(has(tree, `chat-delete-calls-${SAM}`)).toBe(false);
+    await unmount(tree);
+  });
+});
+
+/**
+ * A stranger who has never shared a name is their id, and a
+ * screen reader said those eight ULID characters as invented words. The
+ * row's SPOKEN label now spells the tail; the visible text is untouched, so
+ * the two channels still name the same person.
+ */
+describe('chat list — an unnamed peer is spoken as an id', () => {
+  const NOBODY = '01N0B0DYZ3NDEKTSV4RRFFQ69G';
+
+  test('the unread row spells the id tail while its visible text is unchanged', async () => {
+    chatRows.rows = [chatRow(NOBODY, null, T0)];
+    unreadRows.rows = [{ peerId: NOBODY, n: 1 }];
+    const tree = await renderList();
+
+    const row = byId(tree, `chat-${NOBODY}`)[0]!;
+    const spoken = String(row.props.accessibilityLabel);
+    // Said: "ID ending 6 9 G 5" — the tail, spaced for a voice.
+    expect(spoken).toContain('ID ending');
+    expect(spoken).toContain(spellId(NOBODY.slice(-8)));
+    // Not said: the run-together tail a screen reader turns into a word.
+    expect(spoken).not.toContain(NOBODY.slice(-8));
+    // The falsifier for "the label just became the visible string": it did
+    // not — the ellipsis abbreviation is a visual mark and never spoken.
+    expect(spoken).not.toContain('…');
+
+    // Shown, unchanged: the same eight characters under the ellipsis.
+    expect(texts(tree)).toContain(`…${NOBODY.slice(-8)}`);
+
+    await unmount(tree);
+  });
+
+  test('a named peer is spoken by name, exactly as before', async () => {
+    unreadRows.rows = [{ peerId: SAM, n: 1 }];
+    const tree = await renderList();
+    const spoken = String(byId(tree, `chat-${SAM}`)[0]!.props.accessibilityLabel);
+    expect(spoken).toContain('Sam');
+    expect(spoken).not.toContain('ID ending');
     await unmount(tree);
   });
 });

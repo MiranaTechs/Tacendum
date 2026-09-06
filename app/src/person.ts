@@ -77,6 +77,38 @@ export function personName(
   );
 }
 
+/**
+ * The same precedence as `personName`, for a LABEL a screen reader speaks
+ * aloud.
+ *
+ * `personName`'s fallback is `shortId`, and a screen reader says eight ULID
+ * characters as invented words — so the first thing a VoiceOver user heard
+ * about a stranger who had never shared a name was gibberish, on the row
+ * that introduces them. `spellId` was written for exactly this and had only
+ * ever been pointed at the reader's OWN id.
+ *
+ * LABEL ONLY. The visible text stays `personName`, so the two can never
+ * disagree about who this is: it is the same eight characters, said
+ * differently. And `personRef` is deliberately untouched — prose already has
+ * the right fallback ("them"), and "Ask ID ending 6 9 G 5 F A V to send it
+ * again" would be worse than what it does now.
+ */
+export function spokenPersonName(
+  peerId: string,
+  sharedName?: string | null,
+  localName?: string | null,
+): string {
+  // Sanitized per layer, exactly as personName does it: a name that is all
+  // marks must fall through as if it were absent, here too, or a hostile
+  // card could leave a row with no spoken identity at all.
+  const name =
+    sanitizeDisplayName(localName) || sanitizeDisplayName(sharedName);
+  if (name) return name;
+  // The tail without the ellipsis: "…" is a visual abbreviation mark, and
+  // there is nothing for a voice to do with it.
+  return `ID ending ${spellId(peerId.slice(-SHORT_ID_LENGTH))}`;
+}
+
 /** Whether the peer has actually shared a name (an id fallback is not one). */
 export function hasSharedName(displayName?: string | null): boolean {
   return (displayName ?? '').trim() !== '';

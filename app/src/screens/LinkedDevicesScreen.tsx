@@ -219,7 +219,7 @@ export function LinkedDevicesScreen({
                 accessibilityRole="button"
                 // Announced the way it is shown: the own device is
                 // "This device", and the class reaches the label only
-                // through the P3 slot-word chokepoint — never the raw
+                // through the shared slot label helper — never the raw
                 // token.
                 accessibilityLabel={`${
                   device.userId === profile.userId
@@ -258,7 +258,12 @@ export function LinkedDevicesScreen({
 
         {detail.name === 'device' && (
           <>
-            <RuledLabel label={LINKING_COPY.slotLabel(detail.device.class)} />
+            {/* The detail sheet's one section label, so the rotor can land
+                on it instead of swiping the id character by character. */}
+            <RuledLabel
+              label={LINKING_COPY.slotLabel(detail.device.class)}
+              heading
+            />
             <Text
               style={[t.type.utilityData, { color: t.color.inkStrong }]}
               accessibilityLabel={spellId(detail.device.userId)}

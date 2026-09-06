@@ -113,6 +113,8 @@ export function NamingScreen({ profile, onDone }: Props) {
           onBlur={() => setFocused(false)}
           placeholder={NAMING_COPY.placeholder}
           placeholderTextColor={t.color.inkMuted}
+          keyboardAppearance={t.scheme}
+          selectionColor={t.color.pine}
           accessibilityLabel={NAMING_COPY.fieldLabel}
           autoCapitalize="words"
           autoCorrect={false}

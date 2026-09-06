@@ -32,6 +32,7 @@ import { getSecret, hasIdentity } from 'tacendum-crypto';
 // thread, the send path and the in-call Add picker.
 import { foldRoster } from '@tacendum/shared/group-fold';
 import {
+  type CallState,
   type ClientPolicyResponse,
   smallGroupCallParticipantCap,
 } from '@tacendum/shared';
@@ -90,6 +91,12 @@ import {
   adoptPushRegistration,
   adoptWorkspaceForCalling,
   callController,
+  // The refusal type, from the BARREL: `placeCall` throws it, and telling
+  // "you blocked them" from "their safety number changed" is what lets a
+  // Call button say why it did nothing. Reaching into
+  // `call/controller` for it would make this the first production module
+  // outside `src/call/` to do so.
+  CallRefusedError,
   disposeGroupCall,
   endCallOnQuiesce,
   ensurePermissions,
@@ -114,6 +121,9 @@ import {
   useCallState,
   useGroupCallState,
 } from './src/call';
+// The sentences a refused call shows. Pure, and the class-to-sentence map is
+// total over `CallRefusedError`'s own reason union.
+import { CALL_REFUSAL_FOR } from './src/callRefusalCopy';
 // A cid is a ULID, and msgid.ts already owns the app's generator — including
 // its pre-fetched entropy pool. A second one here would be a second place for
 // randomness to be got wrong.
@@ -135,7 +145,8 @@ import {
   loadTypingIndicators,
   resetTypingIndicatorsForDuress,
 } from './src/typingIndicators';
-import { loadPushConsent } from './src/pushConsent';
+import { resetFieldModeForDuress } from './src/fieldMode';
+import { loadPushConsent, resetPushConsentForDuress } from './src/pushConsent';
 import { accountGone, onAccountGone } from './src/reauth';
 import { screenSecurity } from './src/screenSecurity';
 import { session } from './src/session';
@@ -186,7 +197,13 @@ function CoverBrand() {
   return <BrandMark size={20} />;
 }
 
-type Route =
+/**
+ * The router's route union. Exported for `App.routes.test.tsx` alone — the
+ * TOTALITY test builds one concrete route per name, and a hand-kept copy of
+ * the union inside the test would be exactly the drift that test exists to
+ * catch. Nothing outside this file routes.
+ */
+export type Route =
   | { name: 'loading' }
   | { name: 'locked' }
   | { name: 'landing' }
@@ -194,7 +211,7 @@ type Route =
   // build do you still talk to" came back above this binary's. A ROUTE and
   // not a modal, because nothing behind it ran — the workspace opening
   // returns before `messaging.start`, so there is no workspace to dismiss
-  // back into. Joined THROUGH the visible-surface module (§9 rule 9).
+  // back into. Joined THROUGH the visible-surface module .
   | { name: 'updateRequired' }
   | { name: 'register' }
   | { name: 'chats' }
@@ -202,32 +219,41 @@ type Route =
   | { name: 'newChat' }
   | { name: 'newRoom' }
   | { name: 'thread'; peerId: string; from?: 'chats' | 'calls' }
-  | { name: 'profile' }
-  | { name: 'settings' }
-  // Device linking: the roster, the scan side, and the
+  // ORIGINS. These three are pushed from more than one place, and
+  // until this field existed the table below guessed — so a profile opened
+  // on the Calls tab dropped a person on Chats, and the App Lock nudge sent
+  // someone from the chat list into a Profile screen they never asked for.
+  // A FIELD on an existing name, never a new name: `visibleSurface.ts`
+  // classifies by route name and its 23-cell matrix must not move.
+  | { name: 'profile'; from?: 'chats' | 'calls' }
+  | { name: 'settings'; from?: 'chats' | 'profile' }
+  // Device linking : the roster, the scan side, and the
   // new-device confirm surface. Joined THROUGH the visible-surface module
-  // — ordinary workspace surfaces to all four consumers.
-  | { name: 'linkedDevices' }
-  | { name: 'linkDevice' }
-  | { name: 'linkConfirm' }
-  // Identifier + discovery + recovery: the email
-  // surface (opened from Settings), the find-by-email surface (entered from
+  //  — ordinary workspace surfaces to all four consumers.
+  // THE SETTINGS ORIGIN RIDES THROUGH. Every surface below is
+  // entered from Settings, and each carries the origin SETTINGS itself was
+  // entered with. Without it the first Back was right and the second was
+  // wrong — chat list, App Lock nudge, Settings, Linked devices, Back, Back
+  // and a person is on a Profile screen they never asked for, which is the
+  // sentence the `settings` case exists to prevent, one level down.
+  | { name: 'linkedDevices'; from?: 'chats' | 'profile' }
+  | { name: 'linkDevice'; from?: 'chats' | 'profile' }
+  | { name: 'linkConfirm'; from?: 'chats' | 'calls' }
+  // Identifier, discovery and recovery: the email surface (opened from
+  // Settings), the find-by-email surface (entered from
   // Start a chat), and the recovery surface (entered from Landing — BESIDE
   // registration, never in it; `from` remembers which door, so back agrees
   // with it).
-  | { name: 'accountEmail' }
-  // The phone surface: AccountEmailScreen's SIBLING,
-  // dark behind the build-pinned PHONE_UI_ENABLED (the screen
-  // renders nothing while the pin is false). Its one-line Settings row is
-  // DEFERRED: no Settings row mounts it yet, so until the phone
-  // surfaces ship the route is reachable programmatically only.
-  | { name: 'accountPhone' }
-  // The username surface: the identifier
+  | { name: 'accountEmail'; from?: 'chats' | 'profile' }
+  // The phone surface renders nothing while PHONE_UI_ENABLED is false.
+  // It has no Settings row and is reachable programmatically only.
+  | { name: 'accountPhone'; from?: 'chats' | 'profile' }
+  // The username surface : the identifier
   // siblings' sibling, dark behind the build-pinned USERNAME_UI_ENABLED —
   // the screen renders nothing while the pin is false, and its Settings row
   // renders only under the same pin, so a dark binary has neither the door
   // nor the room.
-  | { name: 'accountUsername' }
+  | { name: 'accountUsername'; from?: 'chats' | 'profile' }
   | { name: 'discover' }
   | { name: 'recover'; from?: 'landing' | 'chats' }
   | {
@@ -290,9 +316,7 @@ const PANE_PROJECTED: ReadonlySet<Route['name']> = new Set<Route['name']>([
  * let a future pre-workspace surface (a sign-in step, an onboarding page)
  * arrive with the window silently allowed over it. `full` is exactly the set
  * `visibleSurface.ts` calls NO_WORKSPACE — restated rather than imported
- * because that module's derived facts have exactly four consumers by plan
- * and this gate is not a fifth: it is a render
- * condition, not a security fact — and App.callminimize.test.tsx pins the two
+ * because this is a render condition, not a security fact — and App.callminimize.test.tsx pins the two
  * equal in both directions through `provesWorkspaceOpen`. The full
  * `CallScreen` is the surface proven over the lock route
  * (visible-surface.test.ts); a call that is on glass over any `full`
@@ -332,6 +356,43 @@ export const CALL_OVERLAY_SURFACE: Record<Route['name'], 'full' | 'window'> = {
 /** Whether the minimized call window may be on glass over this route now. */
 function callOverlayAllowed(routeName: Route['name']): boolean {
   return session.mode !== 'duress' && CALL_OVERLAY_SURFACE[routeName] === 'window';
+}
+
+/**
+ * Is a call surface holding the WHOLE screen right now?
+ *
+ * This is the render conditions below, restated as one predicate, because
+ * Android's Back has to answer the same question they do: if the person
+ * cannot see the router, a press that moves the router is a navigation they
+ * cannot see either — the exact defect the 1:1 minimize was written to stop,
+ * which it stopped for two states out of eight and for the 1:1 machine only.
+ *
+ * Pure and exported so `back.android.test.ts` can walk every state name
+ * rather than fight the real machine into each one. It says nothing about
+ * whether Back SHOULD be consumed — `goBack` decides that, and only after
+ * offering the minimize.
+ */
+export function callSurfaceOwnsGlass(now: {
+  call: CallState;
+  callMinimized: boolean;
+  overlayAllowed: boolean;
+  groupCallLive: boolean;
+}): boolean {
+  // A small-group session has exactly one shape — the full screen. It has no
+  // window to go to, so while it is live it owns the glass. (Whether it
+  // should GAIN a minimize is a separate and larger question.)
+  if (now.groupCallLive) return true;
+  if (now.call.name === 'idle' || now.call.call === null) return false;
+  // The 1:1 call is in the small draggable window exactly when the render
+  // slot below puts it there; in every other live state the surface on glass
+  // is the full `CallScreen`, or the full `IncomingCallScreen` for the ring.
+  const windowed =
+    now.callMinimized &&
+    now.overlayAllowed &&
+    (now.call.name === 'connected' ||
+      now.call.name === 'reconnecting' ||
+      now.call.name === 'ending');
+  return !windowed;
 }
 
 function App() {
@@ -482,7 +543,7 @@ function AppContent() {
     // completes. It shipped guarded by `session.mode === 'real' && route !==
     // 'locked'` ("same guards as the original") — but that pair is
     // the RESUME guard, where it is load-bearing because resume() DIALS: a
-    // socket behind the lock is what rule 14 forbids, and duress is
+    // socket must not run behind the lock, and duress is
     // network-silent. pause() points the other way — it only ever
     // CLOSES, and self-guards on `this.token` for never-started and stopped
     // sessions. Duress cannot make it speak: messaging is never STARTED in a
@@ -531,7 +592,7 @@ function AppContent() {
   // `prevCallName` effect above, keyed on the session's opaque identity so a
   // glare swap (one session replaced by another) is not an end. Unconditional
   // for the same reasons that effect is; the 1:1 machine is consulted so two
-  // shapes never pause under each other (R11 makes that a corner, not a case).
+  // shapes never pause under each other.
   const prevGroupSessionKey = useRef(groupSessionKey);
   useEffect(() => {
     const was = prevGroupSessionKey.current;
@@ -699,7 +760,7 @@ function AppContent() {
       ? 'calls'
       : 'chats';
   /** The conversation the open detail surface is ABOUT — the list pane's
-   * highlight (B1's selectedPeerId). A room's conversation row IS its ULID, so groupProfile highlights through groupId. In
+   * highlight (`selectedPeerId`). A room's conversation row IS its ULID, so groupProfile highlights through groupId. In
    * compact this is only ever read while the list itself is the route,
    * where no detail is open and it is undefined by construction. */
   const selectedPeerId =
@@ -901,7 +962,7 @@ function AppContent() {
       db.beginUnlock('real');
       session.setMode('real');
       // A duress session may have flipped the blank setting in memory; the
-      // real session re-reads the persisted truth (rule 15/16 family).
+      // real session re-reads the persisted truth.
       await screenSecurity.reloadSetting();
       if (!openingIsCurrent(generation)) return;
       // Same rule, same place: re-read on every REAL unlock so a duress
@@ -1200,11 +1261,11 @@ function AppContent() {
       // answer back. Not mirrored on the real arm: there the latch is about to
       // be overwritten from the workspace the verdict just legitimised, and
       // blanking it would pull the id out from under an in-flight cold answer
-      // that the real verdict has just made valid — rule 3 over symmetry.
+      // that the real verdict has just made valid.
       setSelfAccountId(null);
       session.setMode('duress');
-      // THE TWIN OF THE LINE IN `enterRealWorkspace`, and rule 15's third
-      // clause: "no socket, no REST call, no push registration". `api.ts`
+      // As in enterRealWorkspace, the verdict also gates push registration.
+      // Duress allows no socket, REST call or push registration. `api.ts`
       // refuses everything from the line above onward, so this is belt over
       // braces — but it is the belt that matters on a RELOCK into duress,
       // where the latch is still true from the real session that just ended
@@ -1215,6 +1276,12 @@ function AppContent() {
       resetReadReceiptsForDuress();
       resetTypingIndicatorsForDuress();
       resetPreviewLevelForDuress();
+      // The one with the most to give away: Off in that row says this phone
+      // deleted the token that wakes it, which is a fact about the OWNER, and
+      // a coercer can read it in a glance. The module keeps a session-scoped
+      // shadow rather than the real value, and this is what puts the shadow
+      // back to the shipped default for each new coerced session.
+      resetPushConsentForDuress();
       // Costs nothing to hide: the decoy file has no call history, so every
       // peer in a duress session reads as never-called and the first-call
       // default relays regardless of what this says.
@@ -1224,6 +1291,13 @@ function AppContent() {
       // and a phone that stays silent while somebody is standing over it
       // discloses nothing about who was trying to reach its owner.
       resetSilenceUnknownCallersForDuress();
+      // Last of the eight, because Field Mode is the composite of four of
+      // them: its shadow is what a coerced On or Off moves, and starting a
+      // session from the previous coercer's taps would show them a state
+      // nobody in this session put there. The module resets that shadow
+      // lazily on its first read as well; resetting here also makes the
+      // workspace boundary explicit before any setting is read.
+      resetFieldModeForDuress();
       // FIRST, and awaited: while this marker exists the extension may render
       // a real message's contents, and a duress session must not be able to do
       // that.
@@ -1361,7 +1435,7 @@ function AppContent() {
     await endCallOnQuiesce();
     messaging.stop();
     // The small-group session goes with the socket, and for the same reason
-    // rule 14 stops messaging here: whatever workspace opens next must not
+    // messaging stops here: whatever workspace opens next must not
     // inherit a live roster, N leg services or an armed re-offer timer from
     // the session that was running before the lock. A duress unlock is the
     // case that matters — a timer firing into it would reach native media
@@ -1813,7 +1887,8 @@ function AppContent() {
       const name = routeRef.current.name;
       if (name === 'chats' || name === 'calls') {
         offerHopOwed.current = false;
-        setRoute({ name: 'linkConfirm' });
+        // The home surface it arrived over is the one Back returns to.
+        setRoute({ name: 'linkConfirm', from: name });
       }
     });
   }, []);
@@ -1842,7 +1917,8 @@ function AppContent() {
         const name = routeRef.current.name;
         if (name !== 'chats' && name !== 'calls') return;
         offerHopOwed.current = false;
-        setRoute({ name: 'linkConfirm' });
+        // Same rule as the notice-time hop: back to the home it landed on.
+        setRoute({ name: 'linkConfirm', from: name });
       })
       .catch(() => undefined);
     return () => {
@@ -1871,6 +1947,9 @@ function AppContent() {
             profileRef.current &&
             (routeRef.current.name === 'chats' || routeRef.current.name === 'calls')
           ) {
+            // UNMARKED on purpose: this roster opened ITSELF over a home
+            // surface, so there is no Settings visit behind it to return
+            // to. Back goes where it always did — Settings, then Profile.
             setRoute({ name: 'linkedDevices' });
           }
         })
@@ -1908,19 +1987,53 @@ function AppContent() {
     // and only for the states the window can show; otherwise Back means
     // what it always meant here.
     const live = callRef.current;
+    const overlayAllowed = callOverlayAllowed(routeRef.current.name);
     if (
       (live.name === 'connected' || live.name === 'reconnecting') &&
       live.call !== null &&
       !callMinimizedRef.current &&
-      callOverlayAllowed(routeRef.current.name)
+      overlayAllowed
     ) {
       setCallMinimized(true);
+      return true;
+    }
+    // AND WHERE THERE IS NOTHING TO MINIMIZE TO, BACK STILL STOPS HERE
+    // . The minimize above covered two
+    // states of the 1:1 machine; a group session, a call still ringing out,
+    // and an incoming ring all put a full-screen surface on glass with no
+    // window to put it in, and all three fell through to `backDestination`
+    // and popped the route the call was covering. Consumed, changing
+    // nothing: hanging up is how a call ends.
+    if (
+      callSurfaceOwnsGlass({
+        call: live,
+        callMinimized: callMinimizedRef.current,
+        overlayAllowed,
+        groupCallLive: groupCall().view !== null,
+      })
+    ) {
       return true;
     }
     const destination = backDestination(routeRef.current);
     if (!destination) return false;
     setRoute(destination);
     return true;
+  }, []);
+
+  /**
+   * A screen's own Back chevron, popped through the ONE table.
+   *
+   * The table's docstring already says every case mirrors the visible
+   * control on that screen — but nothing enforced it, and two props
+   * restated a destination in their own words until the words drifted. A
+   * chevron takes the route it is rendering and asks the table; a root
+   * (which no chevron renders on) is left alone rather than navigated to
+   * nowhere. Deliberately NOT `goBack`: this is a press on a control the
+   * person can see, so it never means "minimize the call".
+   */
+  const popRoute = useCallback((from: Route) => {
+    const destination = backDestination(from);
+    if (destination) setRoute(destination);
   }, []);
 
   useEffect(() => {
@@ -1963,12 +2076,22 @@ function AppContent() {
         profile={profile}
         selectedPeerId={selectedPeerId}
         onOpenChat={peerId => setRoute({ name: 'thread', peerId })}
-        onOpenProfile={() => setRoute({ name: 'profile' })}
+        onOpenProfile={() => setRoute({ name: 'profile', from: 'chats' })}
         onStartChat={() => setRoute({ name: 'newChat' })}
         onStartRoom={() => setRoute({ name: 'newRoom' })}
-        // The App Lock nudge's "Open Settings": the lock lives on the
-        // Settings surface, so that is where the door goes.
-        onOpenAppLock={() => setRoute({ name: 'settings' })}
+        // The App Lock nudge's "Open Settings": the lock
+        // lives on the Settings surface, so that is where the door goes —
+        // and `from` is what brings the person back HERE afterwards.
+        onOpenAppLock={() => setRoute({ name: 'settings', from: 'chats' })}
+        // The Field Mode line under the title, and the seventh
+        // push site. A setting somebody turned on before walking somewhere
+        // and then cannot find is a setting they are carrying blind, so the
+        // line that names it is also the way back to it. Same destination
+        // and same `from` as the nudge above — one screen, two doors, one
+        // way out — and the line renders its words either way: absent this
+        // prop the screen deliberately offers no control, which is the
+        // LockNudge's rule that nothing may promise a route it was not given.
+        onOpenSettings={() => setRoute({ name: 'settings', from: 'chats' })}
       />
     ));
   const callsSurface = profile && (
@@ -1977,20 +2100,27 @@ function AppContent() {
       // corner, as the Chats tab above — the screen renders it only when
       // BOTH are given, and nothing gave them.
       profile={profile}
-      onOpenProfile={() => setRoute({ name: 'profile' })}
+      onOpenProfile={() => setRoute({ name: 'profile', from: 'calls' })}
       onOpenChat={peerId => setRoute({ name: 'thread', peerId, from: 'calls' })}
-      onCall={(peerId, kind) => {
-        void (async () => {
-          // Same shape as the thread's call button: permission asked at
-          // the moment of the call, a denied camera downgrades to audio.
+      // THE REASON IS RESOLVED, NOT DISCARDED. Permission is
+      // still asked at the moment of the call and a denied camera still
+      // downgrades to audio — but a denied MICROPHONE, a blocked peer or a
+      // changed safety number used to end here in `return;` and an empty
+      // catch, which is what made every row's redial a dead button: no
+      // ring, no error, no screen. The screen holds the sentence and
+      // renders it under its header.
+      onCall={async (peerId, kind) => {
+        try {
           const permission = await ensurePermissions(kind === 'video');
-          if (!permission.ok) return;
+          if (!permission.ok) return permission.reason ?? null;
           await callController().placeCall(peerId, await nextMsgId(), permission.video);
-        })().catch(() => {
-          // placeCall REFUSES calls to blocked peers and peers whose
-          // safety number changed — history rows stay redialable and
-          // the refusal must not surface as an unhandled rejection.
-        });
+          return null;
+        } catch (err) {
+          // The CLASS is the contract; its `message` is written for a log
+          // ('peer is blocked') and is never what a person reads.
+          if (err instanceof CallRefusedError) return CALL_REFUSAL_FOR[err.reason];
+          return null;
+        }
       }}
     />
   );
@@ -2103,8 +2233,7 @@ function AppContent() {
                 }
               })();
             }}
-            // Recovery sits BESIDE registration (item 3,
-            // §9 rule 3): its own door, its own screen — the register flow
+            // Recovery has its own entry and screen so registration
             // stays identifier-free, structurally.
             onRecover={() => setRoute({ name: 'recover', from: 'landing' })}
           />
@@ -2268,9 +2397,12 @@ function AppContent() {
         {route.name === 'profile' && profile && (
           <ProfileScreen
             profile={profile}
-            onBack={() => setRoute({ name: 'chats' })}
+            // The chevron reads the SAME table the edge swipe and Android's
+            // hardware back read: a hard-coded destination here is
+            // how the three of them came to disagree.
+            onBack={() => popRoute(route)}
             onProfileChanged={p => setProfile(p)}
-            onOpenSettings={() => setRoute({ name: 'settings' })}
+            onOpenSettings={() => setRoute({ name: 'settings', from: 'profile' })}
             onSignedOut={() => {
               setProfile(null);
               setRoute({ name: 'landing' });
@@ -2280,10 +2412,30 @@ function AppContent() {
 
         {route.name === 'settings' && (
           <SettingsScreen
-            onBack={() => setRoute({ name: 'profile' })}
-            onOpenLinkedDevices={() => setRoute({ name: 'linkedDevices' })}
-            onOpenAccountEmail={() => setRoute({ name: 'accountEmail' })}
-            onOpenAccountUsername={() => setRoute({ name: 'accountUsername' })}
+            // Same table, same reason: Settings is reached from two doors.
+            onBack={() => popRoute(route)}
+            // Each row hands the sub-screen the origin THIS surface was
+            // entered with, so the way out is the way in however deep it goes.
+            onOpenLinkedDevices={() =>
+              setRoute({ name: 'linkedDevices', from: route.from })
+            }
+            onOpenAccountEmail={() =>
+              setRoute({ name: 'accountEmail', from: route.from })
+            }
+            onOpenAccountUsername={() =>
+              setRoute({ name: 'accountUsername', from: route.from })
+            }
+            // LOCK NOW. The row is `relock()` and nothing else:
+            // the same teardown a background auto-lock takes — the call
+            // ended through its own terminal funnel, messaging stopped, the
+            // db closed, the workspace pointer put back — so this door adds
+            // no second state machine and no new native call, and a coerced
+            // tap locks the decoy exactly as a real one locks the real
+            // workspace. Voided rather than awaited because the row is a
+            // verb, not a form: `relock` swallows what it can and ends at
+            // `setRoute({ name: 'locked' })` regardless, and there is no
+            // failure a person on the way out could act on.
+            onLockNow={() => void relock()}
           />
         )}
 
@@ -2294,16 +2446,16 @@ function AppContent() {
         {route.name === 'linkedDevices' && profile && (
           <LinkedDevicesScreen
             profile={profile}
-            onBack={() => setRoute({ name: 'settings' })}
-            onLinkNew={() => setRoute({ name: 'linkDevice' })}
+            onBack={() => popRoute(route)}
+            onLinkNew={() => setRoute({ name: 'linkDevice', from: route.from })}
           />
         )}
 
         {route.name === 'linkDevice' && profile && (
           <LinkDeviceScreen
             profile={profile}
-            onBack={() => setRoute({ name: 'linkedDevices' })}
-            onDone={() => setRoute({ name: 'linkedDevices' })}
+            onBack={() => popRoute(route)}
+            onDone={() => setRoute({ name: 'linkedDevices', from: route.from })}
           />
         )}
 
@@ -2319,7 +2471,7 @@ function AppContent() {
             already in place; the Settings entry above is the
             promised one line. */}
         {route.name === 'accountEmail' && profile && (
-          <AccountEmailScreen onBack={() => setRoute({ name: 'settings' })} />
+          <AccountEmailScreen onBack={() => popRoute(route)} />
         )}
 
         {/* The phone + discoverability surface
@@ -2327,7 +2479,7 @@ function AppContent() {
             screen itself renders null while the pin is false, so even a
             programmatic route entry shows nothing in a dark build. */}
         {route.name === 'accountPhone' && profile && (
-          <AccountPhoneScreen onBack={() => setRoute({ name: 'settings' })} />
+          <AccountPhoneScreen onBack={() => popRoute(route)} />
         )}
 
         {/* The username surface — the identifier
@@ -2336,8 +2488,10 @@ function AppContent() {
             programmatic route entry shows nothing in a dark build. */}
         {route.name === 'accountUsername' && profile && (
           <AccountUsernameScreen
-            onBack={() => setRoute({ name: 'settings' })}
-            onOpenAccountEmail={() => setRoute({ name: 'accountEmail' })}
+            onBack={() => popRoute(route)}
+            onOpenAccountEmail={() =>
+              setRoute({ name: 'accountEmail', from: route.from })
+            }
           />
         )}
 
@@ -2897,8 +3051,14 @@ function routeDepth(route: Route): number {
  * onClose does) but is excluded from the SWIPE at the canGoBack call site:
  * its transition is a pure crossfade — a horizontal drag between paper and
  * black reads as a glitch — so it has no movement to drive a swipe with.
+ *
+ * EXPORTED for `App.routes.test.tsx`, which asserts this switch is TOTAL:
+ * a missing case otherwise falls to `default: return null`, so the
+ * chevron, the edge swipe and Android's hardware back all do nothing and the
+ * system backgrounds the app from a pushed surface. Nothing else calls it
+ * from outside this file.
  */
-function backDestination(route: Route): Route | null {
+export function backDestination(route: Route): Route | null {
   switch (route.name) {
     case 'register':
       return { name: 'landing' };
@@ -2911,21 +3071,32 @@ function backDestination(route: Route): Route | null {
       // reads route.from and goes back to calls — back agrees.
       return route.from === 'calls' ? { name: 'calls' } : { name: 'chats' };
     case 'profile':
-      return { name: 'chats' };
+      // The Calls tab has its own profile door: opened there,
+      // Back returns there. Unmarked doors are the chat list's, as they
+      // always were.
+      return route.from === 'calls' ? { name: 'calls' } : { name: 'chats' };
     case 'settings':
-      return { name: 'profile' };
+      // Reached through Profile, Back is Profile. Reached through the chat
+      // list's App Lock nudge, Back is the chat list — a first-run nudge
+      // must not leave a person somewhere they never asked to go.
+      return route.from === 'chats' ? { name: 'chats' } : { name: 'profile' };
     case 'linkedDevices':
-      return { name: 'settings' };
+      // Settings' own origin rides back out with it: a roster opened from
+      // the App Lock nudge's Settings pops to a Settings that still knows
+      // it came from the chat list.
+      return { name: 'settings', from: route.from };
     case 'linkDevice':
-      return { name: 'linkedDevices' };
+      return { name: 'linkedDevices', from: route.from };
     case 'linkConfirm':
-      return { name: 'chats' };
+      // The confirm surface arrives OVER a home surface, and either home
+      // surface can be the one it arrived over.
+      return route.from === 'calls' ? { name: 'calls' } : { name: 'chats' };
     case 'accountEmail':
-      return { name: 'settings' };
+      return { name: 'settings', from: route.from };
     case 'accountPhone':
-      return { name: 'settings' };
+      return { name: 'settings', from: route.from };
     case 'accountUsername':
-      return { name: 'settings' };
+      return { name: 'settings', from: route.from };
     case 'discover':
       return { name: 'newChat' };
     case 'recover':

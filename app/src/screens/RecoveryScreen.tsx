@@ -381,6 +381,8 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
                   : ACCOUNTS_COPY.emailPlaceholder
               }
               placeholderTextColor={t.color.inkMuted}
+              keyboardAppearance={t.scheme}
+              selectionColor={t.color.pine}
               accessibilityLabel={
                 byNumber
                   ? ACCOUNTS_PHONE_COPY.recoverNumberLabel
@@ -434,6 +436,8 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
                   onChangeText={setCodeDraft}
                   placeholder={ACCOUNTS_COPY.codePlaceholder}
                   placeholderTextColor={t.color.inkMuted}
+                  keyboardAppearance={t.scheme}
+                  selectionColor={t.color.pine}
                   accessibilityLabel={ACCOUNTS_COPY.codePlaceholder}
                   keyboardType="number-pad"
                   maxLength={6}

@@ -1,5 +1,6 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  BackHandler,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -34,43 +35,23 @@ interface Props {
 }
 
 /**
- * The username claim / rename / unlink + findability surface — AccountPhoneScreen's SIBLING, deliberately not
- * surgery on it: this screen carries the username class through its own
- * deck (accountsUsernameCopy.ts) and its own state machine
- * (accountsUsername.ts).
+ * Username claims, renames, unlinking, and discovery consent use their own copy
+ * and state machine. USERNAME_UI_ENABLED gates this screen and its entry.
  *
- * DARK BEHIND `USERNAME_UI_ENABLED` (usernameUi.ts — the phoneUi
- * pattern verbatim): while the build pin is false this screen renders
- * NOTHING, even entered programmatically. Its Settings row is gated on the
- * same pin, so a dark binary has neither the door nor the room.
+ * Validate syntax and reserved names locally before spending a claim attempt.
+ * The 72-hour age requirement comes from this device's server-issued ID and
+ * gates the button;
+ * verified email or phone requirements remain server-enforced because another
+ * device may hold a verification this device has not mirrored. The server's
+ * 409 means taken; its 403 deliberately collapses all other refusal reasons.
+ * A transport failure gets separate connection copy.
  *
- * Honesty rules on this glass:
- *  - the shape and the PUBLIC denylist are checked LOCALLY, live, before
- *    the wire (refused, never repaired; a reserved name never spends a
- *    claim attempt) — and each local refusal has its OWN sentence,
- *    honestly distinguishable from the server's answers;
- *  - the claim gate's precondition (a verified email or phone number, 72 h
- *    of account age) is SURFACED up front from this device's own rows,
- *    never enforced here — the server is the gate, and a sibling device
- *    may hold a verification this one has not yet mirrored;
- *  - the server answers this class with exactly TWO shapes: the frozen 409
- *    `taken` (rendered as taken) and the frozen 403 for everything else —
- *    fleet ceiling, caller budget, gate, cool-down alike — rendered as a
- *    generic "try again later" that never says why (distinguishable
- *    by status alone). A transport failure gets the connection sentence;
- *  - the consent-at-claim checkbox is DEFAULT CHECKED on a claim (a
- *    handle exists to be found), the bit rides the wire explicitly, and an
- *    unchecked claim is legal — shown honestly as held-but-unfindable. A
- *    RENAME's box starts at the current findability: changing a name must
- *    not silently flip a person from unfindable to findable;
- *  - the handle is a FINDING label, never a name layer: no `@` sigil, and
- *    the held name is rendered from this device's own row (the server
- *    stores a keyed hash and never echoes it);
- *  - the honesty copy sits behind the ⓘ in full, and nothing here
- *    claims the server is blind to the name;
- *  - a `usernameRevoked` notice renders its FIXED, reasonless copy here —
- *    the parser (linking.ts) already cleared the row in every binary; this
- *    screen is where the person is told, and the dismiss clears the notice.
+ * A claim explicitly sends consent, defaulting on but permitting off. Renaming
+ * preserves existing consent. The username is a discovery label, never a
+ * display name; render the local value because the server stores only a keyed
+ * hash. The disclosure explains this limitation without claiming the server
+ * cannot infer the name. Revocation clears the local row and leaves a fixed,
+ * reasonless notice for the owner to dismiss.
  */
 export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
   const t = useTheme();
@@ -78,14 +59,14 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
   const [identifier, setIdentifier] = useState<db.UsernameIdentifierRow | null>(null);
   const [revoked, setRevoked] = useState<db.UsernameNoticeRow | null>(null);
   const [hasPossessionIdentifier, setHasPossessionIdentifier] = useState(true);
-  // The age gate, counted from the server-minted ID (build 24): the ID is
+  // The age gate, counted from the server-minted ID: the ID is
   // kept and the hours are DERIVED at render, so the clock tick below can
   // move them — null = unknown, quiet; 0 = open; n = hours still to wait,
   // said under the button it disables.
   const [profileId, setProfileId] = useState<string | null>(null);
-  // THIS device's memory of the unlink it performed (build 24): seeded
+  // THIS device's memory of the unlink it performed: seeded
   // once from its row at mount, then moved by this screen's own verbs — the
-  // unlink sets it, a landed claim clears it. Never re-read on refresh: it is
+  // unlink sets it, a successful claim clears it. Never re-read on refresh: it is
   // not account state a sibling can move, it is what this device did.
   const [unlinked, setUnlinked] = useState<db.UsernameUnlinkRow | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -102,6 +83,30 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
   // the default back: a claim form opened after a rename of an unfindable
   // name would otherwise inherit `false` and send it as if chosen.
   const [consent, setConsent] = useState(true);
+
+  /** Read by the system-back handler, which is registered once and must see
+   * what is open at the moment of the press, not at subscription. */
+  const unlinkRef = useRef(false);
+  unlinkRef.current = confirmingUnlink;
+
+  useEffect(() => {
+    // Android Back dismisses the unlink confirmation before the router leaves
+    // this screen. A rename holds typed input and consent, so it remains a
+    // draft handled by normal route navigation, not a dismissible question.
+    // React Native asks the newest listener first; this screen mounts after
+    // the router. Return false when there is no confirmation to close. The
+    // ref keeps the once-registered handler current. BackHandler is inert on
+    // iOS, so registration is unconditional.
+    const subscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      () => {
+        if (!unlinkRef.current) return false;
+        setConfirmingUnlink(false);
+        return true;
+      },
+    );
+    return () => subscription.remove();
+  }, []);
 
   const refresh = useCallback(() => {
     void Promise.all([
@@ -155,7 +160,7 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
     [refresh],
   );
 
-  /** The live LOCAL pre-check (the design shape, the design public denylist): this
+  /** The local syntax and reserved-name checks use this
    * device's own knowledge, rendered as the person types — never a wire
    * call, and never a repair. Empty is quiet, not wrong. */
   const localCheck =
@@ -175,7 +180,7 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
         case 'renamed':
           setNameDraft('');
           setRenaming(false);
-          // A landed claim ends the unlink memory (the module cleared the row).
+          // A successful claim ends the unlink memory (the module cleared the row).
           setUnlinked(null);
           return;
         case 'taken':
@@ -191,7 +196,7 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
           setError(ACCOUNTS_USERNAME_COPY.failed);
           return;
         case 'refused':
-          // The frozen 403 — fleet ceiling, budget, gate, cool-down alike:
+          // The frozen 403 — global limit, budget, gate, cool-down alike:
           // one generic sentence that never says why.
           setError(ACCOUNTS_USERNAME_COPY.tryLater);
           return;
@@ -259,8 +264,8 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
     return () => clearTimeout(timer);
   });
 
-  // THE BUILD-PIN GATE, on the surface itself as well as its door: a dark build
-  // renders NOTHING here even when the route is entered programmatically.
+  // Gate the screen itself so programmatic navigation cannot expose disabled
+  // username features.
   if (!USERNAME_UI_ENABLED) return null;
 
   const held = identifier !== null;
@@ -279,6 +284,8 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
         }}
         placeholder={ACCOUNTS_USERNAME_COPY.fieldPlaceholder}
         placeholderTextColor={t.color.inkMuted}
+        keyboardAppearance={t.scheme}
+        selectionColor={t.color.pine}
         accessibilityLabel={ACCOUNTS_USERNAME_COPY.title}
         autoCapitalize="none"
         autoCorrect={false}
@@ -462,7 +469,7 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
             >
               {ACCOUNTS_USERNAME_COPY.held(identifier!.username)}
             </Text>
-            {/* HOW others reach this name (build 24): the finder's door,
+            {/* HOW others reach this name: the finder's door,
                 named — only while the name is findable; the unfindable
                 sentence below says the opposite and must not sit beside it. */}
             {identifier!.discoverable ? (
@@ -474,9 +481,9 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
               </Text>
             ) : null}
 
-            {/* The USERNAME class's the design consent toggle — its own row, never
-                moved by the email or phone toggles. */}
-            <RuledLabel label={ACCOUNTS_USERNAME_COPY.discoverableLabel} />
+            {/* Username discovery consent has its own row and is never changed
+                by the email or phone toggles. */}
+            <RuledLabel label={ACCOUNTS_USERNAME_COPY.discoverableLabel} heading />
             <View style={styles.toggleRow}>
               <Text
                 style={[t.type.compactBody, styles.toggleLabel, { color: t.color.inkBody }]}
@@ -488,6 +495,15 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
                 onValueChange={toggleDiscoverable}
                 disabled={busy}
                 accessibilityLabel={ACCOUNTS_USERNAME_COPY.discoverableLabel}
+                // Explicit theme colors keep the switch consistent on iOS.
+                // Pine against inset paper gives on/off contrast of 4.8:1 in
+                // light mode and 8.9:1 in dark mode, so state remains visible
+                // without relying only on knob position. The ink knob is
+                // legible on both tracks; pineWash would give only 1.05:1
+                // contrast and make the on track lighter than the off track.
+                trackColor={{ false: t.color.paperInset, true: t.color.pine }}
+                thumbColor={t.color.inkStrong}
+                ios_backgroundColor={t.color.paperInset}
                 testID="username-discoverable-toggle"
               />
             </View>

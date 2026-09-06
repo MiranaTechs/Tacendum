@@ -4,6 +4,8 @@ import {
   personRef,
   sanitizeDisplayName,
   shortId,
+  spellId,
+  spokenPersonName,
 } from '../src/person';
 
 /**
@@ -137,6 +139,58 @@ describe('the render chokepoints', () => {
     expect(personName(PEER, 'Helen R.', 'Mum')).toBe('Mum');
     expect(personRef(PEER, 'Helen R.', null)).toBe('Helen R.');
     expect(monogram(PEER, 'Maya Ruiz', null)).toBe('MR');
+  });
+});
+
+/**
+ * What VoiceOver says about a person who has never shared a
+ * name. `personName` falls back to `shortId`, and that fallback reaches the
+ * chat-list row's accessible name, so the FIRST thing a screen-reader user
+ * heard about a stranger was eight ULID characters said as invented words.
+ * `spellId` has existed for exactly this since the id screens shipped; it
+ * had simply never been pointed at a peer.
+ *
+ * The rule the tests below hold to: this is a LABEL helper, so the visible
+ * text is never touched, and the two must never disagree about WHO this is —
+ * it is the same eight characters, said differently.
+ */
+describe('spokenPersonName — the label a screen reader gets', () => {
+  it('is the name, unchanged, whenever there is one', () => {
+    expect(spokenPersonName(PEER, 'Helen R.', null)).toBe('Helen R.');
+    expect(spokenPersonName(PEER, 'Helen R.', 'Mum')).toBe('Mum');
+  });
+
+  it('spells the id tail when nobody has shared a name', () => {
+    const tail = PEER.slice(-8);
+    expect(spokenPersonName(PEER, null, null)).toBe(`ID ending ${spellId(tail)}`);
+    // The falsifier: the SPOKEN form must not be the visible one. A helper
+    // that just re-exported personName passes every line above.
+    expect(spokenPersonName(PEER, null, null)).not.toBe(shortId(PEER));
+    expect(spokenPersonName(PEER, null, null)).not.toContain('…');
+  });
+
+  it('says the same eight characters the row shows, in the same order', () => {
+    // Two channels, one fact. Strip the spacing back out of the spoken form
+    // and what is left must be exactly the tail under the visible ellipsis.
+    const spoken = spokenPersonName(PEER, null, null).replace(/^ID ending /, '');
+    expect(spoken.replace(/\s+/g, '')).toBe(shortId(PEER).replace('…', ''));
+  });
+
+  it('falls through layer by layer, exactly as personName does', () => {
+    // A name that is nothing but marks is not a name, at either layer — and
+    // the fallback it reaches is the spelled id, not a blank label.
+    expect(spokenPersonName(PEER, 'Helen R.', `${RLO}${ZWSP}`)).toBe('Helen R.');
+    expect(spokenPersonName(PEER, `${RLM}${RLM}`, RLO)).toBe(
+      `ID ending ${spellId(PEER.slice(-8))}`,
+    );
+    expect(spokenPersonName(PEER, `Helen${RLO} R.`, null)).toBe('Helen R.');
+  });
+
+  it('leaves personRef alone: prose keeps the pronoun', () => {
+    // The two rules are deliberately different. "Ask ID ending 6 9 G 5 F A V
+    // to send it again" is worse than "Ask them to send it again".
+    expect(personRef(PEER, null, null)).toBe('them');
+    expect(personName(PEER, null, null)).toBe(shortId(PEER));
   });
 });
 

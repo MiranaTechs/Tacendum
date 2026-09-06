@@ -109,9 +109,13 @@ describe('Settings → ABOUT', () => {
       tree.root.findAllByProps({ testID: 'settings-licenses-body' }).length,
     ).toBeGreaterThan(0);
 
-    // Shared with the PIN flows — CancelLink carries one testID for every
-    // screen it backs out of.
-    await press(tree, 'settings-pin-cancel');
+    // A page you only READ leaves by Done, not by Cancel: nothing was
+    // started here, so there is nothing to abandon. The PIN steps keep
+    // CancelLink; these two read-only steps share DoneLink.
+    expect(
+      tree.root.findAllByProps({ testID: 'settings-pin-cancel' }),
+    ).toHaveLength(0);
+    await press(tree, 'settings-step-done');
 
     expect(
       tree.root.findAllByProps({ testID: 'settings-licenses-body' }),

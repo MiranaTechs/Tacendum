@@ -68,6 +68,18 @@ export const FIELD_MODE_SCREENSHOT_LINES = {
 export const FIELD_MODE_COPY = {
   sectionLabel: 'FIELD MODE',
   label: 'Field Mode',
+  /**
+   * The home surface's line. Field Mode was visible only to
+   * somebody already standing in Settings, which is the one place a person
+   * who has walked somewhere is not going to look.
+   *
+   * THE FEATURE'S OWN NAME AND NOTHING ELSE. No protective adjective here
+   * either — the rule this deck is written under holds on a line a reviewer
+   * can see from the first screen. `homeAction` is the label a screen
+   * reader gets: what is true, and where to go about it.
+   */
+  homeLabel: 'Field Mode on',
+  homeAction: 'Field Mode is on. Open Settings.',
   options: [
     { label: 'On', value: true },
     { label: 'Off', value: false },

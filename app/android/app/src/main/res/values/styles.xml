@@ -4,6 +4,16 @@
     <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
         <!-- Customize your theme here. -->
         <item name="android:editTextBackground">@drawable/rn_edit_text_material</item>
+        <!--
+          The frame before JS exists. AppCompat's default window background is
+          white, so a launch went white, then light, then dark: two visible
+          jumps on a dark-mode device. This is theme.ts's light `paperGround`,
+          the same ground iOS cold-launches into from LaunchScreen.storyboard's
+          LaunchGround colorset. The DayNight parent resolves values-night/ for
+          the dark twin. Kept in sync with theme.ts by
+          app/__tests__/appearance.android.test.ts.
+        -->
+        <item name="android:windowBackground">#EFF2EB</item>
     </style>
 
 </resources>

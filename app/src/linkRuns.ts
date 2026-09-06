@@ -17,7 +17,10 @@ export type LinkRun =
       /** The address as typed, for display. */
       text: string;
       /** What to open: the typed address, with `https://` in front of a bare
-       * `www.` host and the scheme lowercased. */
+       * `www.` host, the scheme lowercased, and the tracking tail removed
+       * (`stripTracking`). It may differ from `text`, and when it does the
+       * difference is deliberate: the address you SEE is what they sent, the
+       * address that OPENS is what this app hands onward. */
       url: string;
     };
 
@@ -82,6 +85,73 @@ function trimTrailing(raw: string): string {
   return end === raw.length ? raw : raw.slice(0, end);
 }
 
+/**
+ * The tracking parameters that come off an address before it opens.
+ *
+ * FIXED AND SHORT, never a heuristic. Every name here exists only to tell a
+ * destination which message the reader arrived from — which is the same
+ * thing this module already refuses to do on the person's behalf (see the
+ * file header). A rule that guessed would eventually drop a parameter the
+ * page needs, and a broken link is worse than a tracked one.
+ *
+ * `ref` and `ref_src` are deliberately ABSENT: both are functional on real
+ * sites often enough that dropping them would break pages.
+ */
+const TRACKING = new Set([
+  'fbclid',
+  'gclid',
+  'mc_eid',
+  'igshid',
+  'si',
+]);
+
+/** The one prefix family: `utm_source`, `utm_medium`, `utm_campaign`, … */
+const TRACKING_PREFIX = 'utm_';
+
+/**
+ * The address, with its tracking tail removed — applied to what OPENS and
+ * never to what is SHOWN.
+ *
+ * That asymmetry is the whole design: `LinkRun.text` stays byte-identical to
+ * what the sender typed, because rewriting the visible address would be
+ * lying about what they sent, while `LinkRun.url` is the thing this app
+ * hands to the system browser and is therefore the app's own act.
+ *
+ * HAND-SPLIT, not `URL`/`URLSearchParams`. The RN runtime's URL polyfill is
+ * not proven for the mutation methods here, and a parse-and-reserialise
+ * would also normalise parts of the address nobody asked it to touch. This
+ * splits on `#` then `?`, filters the `&`-separated pairs by NAME, and
+ * rejoins — so the path, the fragment, the order of the survivors and their
+ * encoding all come through untouched.
+ *
+ * Returns the input unchanged on any throw: a link that opens with its tail
+ * on is better than a link that does not open.
+ */
+export function stripTracking(url: string): string {
+  try {
+    const hash = url.indexOf('#');
+    const fragment = hash === -1 ? '' : url.slice(hash);
+    const head = hash === -1 ? url : url.slice(0, hash);
+    const mark = head.indexOf('?');
+    if (mark === -1) return url;
+    const base = head.slice(0, mark);
+    const kept = head
+      .slice(mark + 1)
+      .split('&')
+      .filter(pair => {
+        if (pair.length === 0) return false;
+        const eq = pair.indexOf('=');
+        const name = (eq === -1 ? pair : pair.slice(0, eq)).toLowerCase();
+        return !TRACKING.has(name) && !name.startsWith(TRACKING_PREFIX);
+      });
+    return kept.length === 0
+      ? base + fragment
+      : `${base}?${kept.join('&')}${fragment}`;
+  } catch {
+    return url;
+  }
+}
+
 function urlFor(text: string): string | null {
   const lower = text.toLowerCase();
   if (lower.startsWith('http://') || lower.startsWith('https://')) {
@@ -125,7 +195,9 @@ export function linkRuns(text: string): LinkRun[] {
     if (start > cursor) {
       runs.push({ kind: 'text', text: text.slice(cursor, start) });
     }
-    runs.push({ kind: 'link', text: trimmed, url });
+    // `text` is what the sender typed; `url` is what this app opens — and
+    // only the second one loses its tracking tail.
+    runs.push({ kind: 'link', text: trimmed, url: stripTracking(url) });
     cursor = start + trimmed.length;
     // Resume right after the trimmed address: the punctuation given back is
     // ordinary text, and the regex must not skip past it.

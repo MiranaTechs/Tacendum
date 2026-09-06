@@ -548,7 +548,13 @@ describe('the person, when there is no video of them', () => {
       peerAvatarB64: null,
       videoEnabled: true,
     });
-    const rendered = texts(byLabel("P1's video, full screen"));
+    // RE-CUT: this used to look the surface up by
+    // `"P1's video, full screen"` — and that assertion PINNED the violation,
+    // because the label itself was spelling the id out to VoiceOver while the
+    // fill below it refused to. The label now goes through `tileName` too, so
+    // the surface answers to the placeholder and no rendered or spoken string
+    // on this screen carries the id.
+    const rendered = texts(byLabel("Someone's video, full screen"));
     expect(rendered).toContain('?');
     expect(rendered).not.toContain('P1');
   });
@@ -637,8 +643,10 @@ describe('the person, when there is no video of them', () => {
       peerAvatarB64: null,
       videoEnabled: true,
     });
-    ReactTestRenderer.act(() => byLabel("P1's video, full screen").props.onPress());
-    const rendered = texts(byLabel("P1's video, small"));
+    // Re-cut for the same reason as the full-screen case above: the corner's
+    // label went through the raw name and said the id out loud.
+    ReactTestRenderer.act(() => byLabel("Someone's video, full screen").props.onPress());
+    const rendered = texts(byLabel("Someone's video, small"));
     expect(rendered).toContain('?');
     expect(rendered).not.toContain('P1');
   });

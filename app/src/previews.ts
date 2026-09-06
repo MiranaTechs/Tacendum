@@ -1,4 +1,5 @@
 import { deleteSharedState, readSharedState, writeSharedState } from 'tacendum-crypto';
+import { session } from './session';
 
 /**
  * How much of a message a notification is allowed to show.
@@ -115,8 +116,18 @@ export async function loadPreviewLevel(): Promise<void> {
   }
 }
 
+/**
+ * A COERCED TAP MOVES THE ROW AND WRITES NOTHING — the `setReadReceipts`
+ * rule, and the file makes it sharper than its Keychain siblings: the
+ * notification extension reads this value directly, so a coerced write would
+ * change what a banner shows on the owner's own phone long after the session
+ * ended, in the direction of disclosing more. The in-memory value still
+ * follows the tap (rule 16) and `loadPreviewLevel` re-reads the file on every
+ * REAL unlock.
+ */
 export async function setPreviewLevel(next: PreviewLevel): Promise<void> {
   level = next;
+  if (session.mode === 'duress') return;
   await writeSharedState(PREVIEW_LEVEL_FILE, next);
 }
 

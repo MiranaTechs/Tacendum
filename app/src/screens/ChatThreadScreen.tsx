@@ -19,7 +19,6 @@ import {
   Platform,
   Pressable,
   ScrollView,
-  StyleSheet,
   Text,
   TextInput,
   useWindowDimensions,
@@ -57,16 +56,16 @@ import {
   stopRecording,
   type RecordingResult,
 } from 'tacendum-audio';
-import { useCallState } from '../call';
+import { clearMissedCallNotices, useCallState } from '../call';
 import * as db from '../db';
 import { DEVICE_NOUN } from '../deviceNoun';
 import {
   clearFocusedConversation,
   setFocusedConversation,
 } from '../messageSound';
-import { MENTION_MARK,
+import {
   VOICE_MAX_SECONDS,
-  // THE detail reader (§3.1), envelope.ts's own: the round pass
+  // THE detail reader , envelope.ts's own: the round pass
   // and the disclosure both ask IT what a body's full answer is, and this
   // screen never re-parses rendered text for one.
   detailText,
@@ -86,8 +85,6 @@ import { MENTION_MARK,
 import {
   MESSAGE_PHOTO,
   PickCancelled,
-  PickDenied,
-  PickUnavailable,
   pickImage,
   type PickedImage,
   type PickSource,
@@ -124,12 +121,13 @@ import { InfoDisclosure } from '../ui/InfoDisclosure';
 // accessibility label, and the glyph itself is hidden from VoiceOver so the
 // state is not read out twice. Two mappings for one fact is one too many.
 import { ReplyGlyph } from '../ui/ReplyGlyph';
-import { TickGlyph, type TickStatus } from '../ui/TickGlyph';
+import { TickGlyph } from '../ui/TickGlyph';
 import {
   InlineError,
   InlineNotice,
   RuledLabel,
   ScreenHeader,
+  TextAction,
 } from '../ui/primitives';
 import { QuietRoom } from '../ui/QuietRoom';
 import { RoomMark } from '../ui/RoomMark';
@@ -152,16 +150,98 @@ import { ApprovalCard, approvalDeadline } from '../ui/ApprovalCard';
 import { AgentBadge } from '../ui/AgentBadge';
 import { DetailDisclosure } from '../ui/DetailDisclosure';
 import { AGENT_COPY } from '../machine';
-// ROUNDS (§3.2): the join is a PURE function over the built list
+// ROUNDS : the join is a PURE function over the built list
 // plus a resolver, so the whole priority order is testable without a screen.
 import {
   ROUND_COPY,
   roomAnchorKey,
   roundHeaderTestID,
-  roundRanges,
   rowKey,
-  type RoundRange,
 } from '../rounds';
+// The thread's own modules : the stylesheet
+// and the pure algebra this screen reads but no longer holds. The direction
+// is one-way — styles ← constants ← format ← items — and nothing under
+// `../thread/` imports back from this screen.
+import {
+  ATTACH_ABOUT,
+  BOTTOM_SLACK,
+  COPIED_MS,
+  COUNTER_DANGER,
+  COUNTER_WARN,
+  DRAFT_SAVE_MS,
+  MENTION_PICKER_MAX_HEIGHT,
+  PLACEHOLDER_NAME_MAX,
+  QUICK_EMOJI,
+  QUOTE_FLASH_MS,
+  RAIL_DISMISS_SCROLL,
+  REACTION_WORD,
+  REACTIONS,
+  REFRESH_DEBOUNCE_MS,
+  STATUS_WORD,
+} from '../thread/constants';
+import {
+  type Drawer,
+  type Pending,
+  type RailIntent,
+} from '../thread/types';
+import {
+  aiSenderOf,
+  approvalPlaceholderRow,
+  buildItems,
+  callPlaceholderRow,
+  threadKey,
+  type ThreadItem,
+  type UnreadWindow,
+} from '../thread/items';
+import {
+  clockDuration,
+  formatBytes,
+  isEmojiOnly,
+  laterArrival,
+  newestInboundOf,
+  quiet,
+  safeFileName,
+  tickStatusOf,
+  type InboundMark,
+} from '../thread/format';
+import { sendErrorFor, type SendError } from '../thread/errors';
+import {
+  caretAfterEdit,
+  liveMentionChips,
+  mentionQueryAt,
+  mentionWire,
+  namesInSentence,
+  shiftMentionChips,
+  type MentionChip,
+} from '../thread/mentions';
+import { roomEventSentence } from '../thread/roomEvents';
+import { stylesFor } from '../thread/styles';
+import { FindBar, FindGlyph } from '../thread/FindBar';
+import {
+  FIND_DEBOUNCE_MS,
+  FIND_LIMIT,
+  findQueryReady,
+  refineFindRows,
+  stepFindCursor,
+} from '../thread/find';
+import {
+  discardReview,
+  discardUnlessSending,
+  NO_PHOTO_REVIEW,
+  offersRetake,
+  PHOTO_REVIEW_MAX_HEIGHT,
+  photoAspect,
+  photoKilobytes,
+  reviewPicked,
+  reviewSending,
+  type PhotoReview,
+} from '../thread/photoReview';
+
+// The room-event sentence now lives in `../thread/roomEvents`. It is
+// re-exported under its own name here because ChatThread.agentbadge.test.tsx
+// imports it from this screen, and the whole split is held to zero test
+// edits .
+export { roomEventSentence };
 
 interface Props {
   peerId: string;
@@ -189,88 +269,6 @@ interface Props {
    */
   onStartRoomCall?: (others: readonly string[], kind: 'audio' | 'video') => void;
 }
-
-/** Tapback choices, with the words VoiceOver should say for each. */
-const REACTIONS: { emoji: string; label: string }[] = [
-  { emoji: '❤️', label: 'React with heart' },
-  { emoji: '👍', label: 'React with thumbs up' },
-  { emoji: '😂', label: 'React with laughing face' },
-  { emoji: '😮', label: 'React with surprised face' },
-  { emoji: '😢', label: 'React with sad face' },
-  { emoji: '🔥', label: 'React with fire' },
-];
-
-/**
- * The same six as words, for a reaction ALREADY on a message. A peer can send
- * any string up to 16 characters, so anything outside the six falls back to
- * reading the character itself.
- */
-const REACTION_WORD: Record<string, string> = {
-  '❤️': 'heart',
-  '👍': 'thumbs up',
-  '😂': 'laughing face',
-  '😮': 'surprised face',
-  '😢': 'sad face',
-  '🔥': 'fire',
-};
-
-/** Composer emoji drawer: eight, scannable, not a wrapped buffet. */
-const QUICK_EMOJI = ['😀', '😂', '❤️', '👍', '🙏', '🎉', '😢', '✨'];
-
-/** Consecutive same-direction messages inside this window render as a group. */
-const GROUP_WINDOW_MS = 5 * 60 * 1000;
-
-/** Scrolling this far dismisses an open reaction rail. */
-const RAIL_DISMISS_SCROLL = 24;
-
-/**
- * How close to the end still counts as "reading the newest message". Auto
- * scrolling is conditioned on this: an unconditional scroll-to-end makes
- * history unreadable and closes the reaction rail the instant it opens.
- */
-const BOTTOM_SLACK = 24;
-
-/** How long the row a tapped quote led to stays washed pine. */
-const QUOTE_FLASH_MS = 600;
-
-/** Trailing debounce on draft writes — one row per pause, not per keystroke. */
-const DRAFT_SAVE_MS = 400;
-
-/** A burst of downloads or receipts must coalesce into one requery. */
-const REFRESH_DEBOUNCE_MS = 80;
-
-/** How long the message strip confirms a copy before returning to detail. */
-const COPIED_MS = 2000;
-
-/** Character counts at which the composer starts, then escalates, a warning. */
-const COUNTER_WARN = 3500;
-const COUNTER_DANGER = 4500;
-
-/** Longer than this, a name in the placeholder wraps the composer to two lines. */
-const PLACEHOLDER_NAME_MAX = 18;
-
-/**
- * Longest @-query the picker chases before deciding the '@' was prose.
- * Names may contain spaces, so the query is not stopped at the first one —
- * the picker simply closes when nothing matches any more.
- */
-const MENTION_QUERY_MAX = 32;
-
-/**
- * The mention picker scrolls inside this height rather than growing past it:
- * it sits over a keyboard, and at accessibility text sizes the rows GROW —
- * fewer are visible and the list scrolls, which is the no-clipping posture
- * the emoji drawer and the safety panel already take.
- */
-const MENTION_PICKER_MAX_HEIGHT = 216;
-
-/** Behind the attach drawer's ⓘ: the two
- * promises the tiles could be read as making, stated where they are asked
- * for rather than printed under the grid on every open. */
-const ATTACH_ABOUT = [
-  'Photos you take here aren’t saved to your Photos.',
-  'Your location is read once, only when you tap Location.',
-] as const;
 
 /** People-facing copy. A raw exception must never reach the screen. */
 const COPY = {
@@ -430,313 +428,39 @@ const COPY = {
    */
   mentionReply:
     'A reply can’t carry an @-mention yet. Remove the mention, or send it as its own message.',
+  /**
+   * Picking a photo opens a review panel; sending requires a separate
+   * confirmation. Show the encoded size because the picker re-encodes the
+   * source and this is the size that will actually be sent.
+   */
+  photoReview: 'Send this photo?',
+  photoSend: 'Send',
+  photoDiscard: 'Discard',
+  photoRetake: 'Take another',
+  photoSize: (kb: number) => `About ${kb} KB`,
+  /** What VoiceOver reads for the panel's largest element. */
+  photoReviewImage: 'The photo you picked',
+  /**
+   * FIND, NEVER SEARCH . The chat list's field says *Filter*
+   * because it makes no lookup; this makes none either — it reads rows
+   * already on this device — and the ⓘ says exactly that, because the
+   * no-directory story is worth more than the familiar verb. "No message
+   * *here*" is the honest scope. No device noun in any of these.
+   */
+  find: 'Find in this conversation',
+  findPlaceholder: 'Find a message',
+  findClose: 'Close find',
+  findNext: 'Next match',
+  findPrevious: 'Previous match',
+  findCount: (i: number, n: number) => `${i} of ${n}`,
+  findNone: 'No message here matches that.',
+  findTooShort: 'Type two or more letters.',
+  findAboutLabel: 'What this looks at',
+  findAbout: [
+    'Only the messages already here.',
+    'Nothing is sent anywhere to find them.',
+  ],
 };
-
-/**
- * The sentence for one room event row.
- *
- * EVERY subject here derives from the AUTHENTICATED author — `row.authorId`
- * for an inbound row, this phone for an outbound one — never from a payload
- * field and never from bubble position. Counted versus declined is decided
- * the same way the receive path decided it: against the anchor's owner, a
- * constant, so the classification is deterministic forever. The one payload
- * field a sentence may name is the OBJECT (`m`, the member acted on), which
- * is the write's content, not its authorship.
- */
-export function roomEventSentence(args: {
-  envelope: Envelope;
-  out: boolean;
-  authorId: string | null | undefined;
-  ownerId: string | null;
-  selfId: string | null;
-  nameFor: (id: string) => string;
-  /** Whether an id is a recorded machine — grp.roster sentences name
-   * an agent WITH its attribution ("Claude — your AI agent"), because the
-   * agent's join is the group-visible Art. 50 roster event. Derived from the
-   * machine record like every badge; the sentence's SUBJECT still comes from
-   * the authenticated author and its OBJECT from `m`, unchanged. */
-  isAgentId?: (id: string) => boolean;
-}): string | null {
-  const { envelope, out, ownerId, selfId, nameFor } = args;
-  const isAgent = args.isAgentId ?? (() => false);
-  const writer = out ? selfId : (args.authorId ?? null);
-  const subject = out ? 'You' : writer ? nameFor(writer) : 'Someone';
-  const ownerName = ownerId
-    ? ownerId === selfId
-      ? 'you'
-      : nameFor(ownerId)
-    : 'the person who runs this room';
-  if (envelope.tcm === 'grp.new') {
-    return `${subject} started this room.`;
-  }
-  if (envelope.tcm === 'grp.roster') {
-    const object =
-      envelope.m === selfId
-        ? 'you'
-        : isAgent(envelope.m)
-          ? AGENT_COPY.attributed(nameFor(envelope.m))
-          : nameFor(envelope.m);
-    if (writer !== null && writer === envelope.m) {
-      // The sovereign self lane: nobody can write it but them.
-      // An agent's own join/leave carries the attribution mid-sentence:
-      // "Claude — your AI agent — joined."
-      const self =
-        !out && isAgent(writer) ? `${AGENT_COPY.attributed(subject)} —` : subject;
-      return envelope.s === 'out'
-        ? `${self} left.`
-        : `${self} joined.`;
-    }
-    if (writer !== null && ownerId !== null && writer === ownerId) {
-      return envelope.s === 'in'
-        ? `${subject} added ${object}.`
-        : `${subject} removed ${object}.`;
-    }
-    // Declined, attributed, never silent: dead the moment it arrived.
-    return envelope.s === 'in'
-      ? `${subject} tried to add ${object}. Only ${ownerName} can change who’s in this room.`
-      : `${subject} tried to remove ${object}. Only ${ownerName} can change who’s in this room.`;
-  }
-  if (envelope.tcm === 'grp.consent') {
-    // The member-consent announcement. The SUBJECT is
-    // the authenticated writer (a member narrating their OWN stance — there
-    // is no subject on the wire to forge); the OBJECT is the one agent the
-    // payload names, a room co-member. The agent wears its attribution only
-    // where the machine record names it (the agent's own owner); a second
-    // human, whose record does not, sees the plain name — honest, because it
-    // is not their agent. The refusal is the load-bearing line ("Bob isn't
-    // sharing with Claude"): a member the agent cannot hear is a fact every
-    // author deserves before typing.
-    const agent = isAgent(envelope.a)
-      ? AGENT_COPY.attributed(nameFor(envelope.a))
-      : nameFor(envelope.a);
-    return envelope.s === 'share'
-      ? out
-        ? `You’re sharing with ${agent}.`
-        : `${subject} is sharing with ${agent}.`
-      : out
-        ? `You’re not sharing with ${agent}.`
-        : `${subject} isn’t sharing with ${agent}.`;
-  }
-  if (envelope.tcm === 'grp.hist') {
-    // Rule 3 of the history-share decision, rendered. The authors could not
-    // consent — their words were already sent — so the one thing they get is
-    // being told, by name and by extent. Counted versus declined is derived
-    // here exactly as the roster's is, from the writer against the anchor's
-    // owner, which is a constant.
-    const object = envelope.to === selfId ? 'you' : nameFor(envelope.to);
-    const count =
-      envelope.c === 1 ? '1 earlier message' : `${envelope.c} earlier messages`;
-    if (writer !== null && ownerId !== null && writer === ownerId) {
-      return `${subject} shared ${count} with ${object}.`;
-    }
-    return `${subject} tried to share ${count} with ${object}. Only ${ownerName} can share this room’s history.`;
-  }
-  if (envelope.tcm === 'grp.set') {
-    const label = disappearLabel(envelope.s);
-    // `0` asserts no constraint — it never drags the room to "off",
-    // so the sentence claims only the writer's own slot.
-    return label === null
-      ? `${subject} turned their disappearing-message timer off.`
-      : `${subject} set disappearing messages to ${label}.`;
-  }
-  if (envelope.tcm === 'grp.del') {
-    // Only a DECLINED grp.del ever persists as a row — a counted one purges
-    // the room it would have announced into.
-    return `${subject} tried to delete this room for everyone. Only ${ownerName} can do that.`;
-  }
-  return null;
-}
-
-// --- @-mentions: the compose-side model (the mentions contract) ---------
-//
-// THE INVARIANT THIS BLOCK EXISTS TO HOLD: the wire's `text` marks and its
-// `who` ids are NEVER produced separately. `mentionWire` derives both in one
-// left-to-right walk over one array of chips, so the Nth mark and the Nth id
-// come from the same chip by construction — the UI cannot produce the
-// mismatch that compose refuses, because there is no second bookkeeping to
-// fall out of step.
-//
-// A chip records the exact characters it stands behind (`@` + the name this
-// phone showed at pick time). It is only ever BELIEVED after re-validation
-// against the draft (`liveMentionChips`), so every programmatic draft write —
-// the post-send clear, the saved-draft load, an edit borrowing the composer —
-// degrades stale chips to plain visible text instead of silently mentioning
-// whoever used to be at that offset. Person-made edits go through
-// `shiftMentionChips`, which keeps chips the edit did not touch and drops any
-// chip the edit cut into: what survives is exactly what the person can see.
-
-/** One live mention in the composer: WHO, and the exact span of draft text
- * (`@` + the name this phone showed) standing in for them. */
-export interface MentionChip {
-  id: string;
-  /** The name as shown at pick time — matching text, never wire content. */
-  name: string;
-  /** Index of the '@' in the draft. */
-  start: number;
-  /** Exclusive end of the token (start + 1 + name.length). */
-  end: number;
-}
-
-/** The one contiguous span an edit changed: common prefix `p`, common suffix
- * `s`, computed so they never overlap. One text event is one contiguous
- * replacement — typing, deletion, paste and autocorrect all fit it. */
-function editSpan(prev: string, next: string): { p: number; s: number } {
-  const max = Math.min(prev.length, next.length);
-  let p = 0;
-  while (p < max && prev[p] === next[p]) p += 1;
-  let s = 0;
-  while (
-    s < max - p &&
-    prev[prev.length - 1 - s] === next[next.length - 1 - s]
-  ) {
-    s += 1;
-  }
-  return { p, s };
-}
-
-/** Where the caret lands after an edit: the end of what was just inserted.
- * Lets the picker follow typing on the keystroke itself, before the input's
- * own selection event confirms it. */
-export function caretAfterEdit(prev: string, next: string): number {
-  return next.length - editSpan(prev, next).s;
-}
-
-/**
- * Carry chips across one text edit. A chip wholly before the change keeps its
- * place; wholly after, it shifts by the edit's delta; a chip the edit CUT
- * INTO stops being a mention — its surviving characters stay in the draft as
- * the plain text the person just made of them, visibly no longer a chip.
- */
-export function shiftMentionChips(
-  prev: string,
-  next: string,
-  chips: MentionChip[],
-): MentionChip[] {
-  if (prev === next) return chips;
-  const { p, s } = editSpan(prev, next);
-  const changedEnd = prev.length - s;
-  const delta = next.length - prev.length;
-  const out: MentionChip[] = [];
-  for (const chip of chips) {
-    if (chip.end <= p) {
-      out.push(chip);
-    } else if (chip.start >= changedEnd) {
-      out.push({ ...chip, start: chip.start + delta, end: chip.end + delta });
-    }
-    // else: the edit reached into the token — no longer a mention.
-  }
-  return out;
-}
-
-/**
- * The chips the draft still actually carries: each span must read exactly
- * `@name`, in order. THE GATE every consumer goes through — the strip, the
- * picker's arithmetic and the send path all see only what survives this, so
- * a draft rewritten around the chips can degrade a mention to plain text but
- * can never mention someone the visible text does not name.
- */
-export function liveMentionChips(
-  draft: string,
-  chips: MentionChip[],
-): MentionChip[] {
-  return chips
-    .filter(
-      chip =>
-        chip.start >= 0 &&
-        chip.end <= draft.length &&
-        draft.slice(chip.start, chip.end) === `@${chip.name}`,
-    )
-    .sort((a, b) => a.start - b.start);
-}
-
-/**
- * The active @-query at the caret, or null when the caret is not completing
- * one. An '@' triggers only on a word boundary — `a@b` is an address, not a
- * summons — and never from inside an already-settled chip, so the picker
- * does not reopen over a mention that is finished.
- */
-export function mentionQueryAt(
-  draft: string,
-  caret: number | null,
-  chips: MentionChip[],
-): { at: number; query: string } | null {
-  if (caret === null) return null;
-  const end = Math.max(0, Math.min(caret, draft.length));
-  for (let i = end - 1; i >= 0 && end - i <= MENTION_QUERY_MAX + 1; i -= 1) {
-    const ch = draft[i]!;
-    if (ch === '\n') return null;
-    if (ch !== '@') continue;
-    if (i > 0 && !/\s/.test(draft[i - 1]!)) return null;
-    if (chips.some(chip => i >= chip.start && i < chip.end)) return null;
-    return { at: i, query: draft.slice(i + 1, end) };
-  }
-  return null;
-}
-
-/**
- * The wire form: one MENTION_MARK where each chip stood, `who` in the SAME
- * order, both from ONE walk (the invariant above). Literal U+FFFC characters
- * a person pasted into the plain text are stripped — a mark the walk did not
- * put there is the one way marks could outnumber ids, and compose refusing
- * that mismatch is only safe because this function makes it unreachable.
- */
-export function mentionWire(
-  draft: string,
-  chips: MentionChip[],
-): { text: string; who: string[] } {
-  const who: string[] = [];
-  let text = '';
-  let pos = 0;
-  for (const chip of liveMentionChips(draft, chips)) {
-    text += draft.slice(pos, chip.start).split(MENTION_MARK).join('');
-    text += MENTION_MARK;
-    who.push(chip.id);
-    pos = chip.end;
-  }
-  text += draft.slice(pos).split(MENTION_MARK).join('');
-  return { text: text.trim(), who };
-}
-
-/** 'you' / 'you and Ana' / 'Ana, Ben and you' — the label clause's list. */
-function namesInSentence(names: string[]): string {
-  if (names.length <= 1) return names[0] ?? '';
-  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
-}
-
-interface SendError {
-  message: string;
-  /** True when the sentence names Settings, so an action can be offered. */
-  settings: boolean;
-  /** Bumped per failure so an identical repeat is announced again. */
-  seq: number;
-}
-
-/** Map a thrown error onto fixed copy; never surface the original text. */
-/**
- * A peer-controlled filename, made safe to DRAW.
- *
- * Two attacks, both classic and both cheap to close: bidirectional control
- * characters reverse the visible extension (U+202E turns "photo\u202Egnp.exe"
- * into something that reads as "photo.png"), and control characters or
- * newlines break out of the row's shape. Stripped, not escaped — there is no
- * legitimate filename that needs them, and the sanitised name is what the
- * QuickLook title shows too.
- */
-function safeFileName(name: string): string {
-  const stripped = name
-    // Bidi overrides/embeddings/isolates, zero-width, and C0/C1 controls.
-    // eslint-disable-next-line no-control-regex
-    .replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2066-\u2069]/g, '')
-    .trim();
-  return stripped.length > 0 ? stripped : 'Document';
-}
-
-/** '3.2 MB' / '412 KB' — one decimal above a megabyte, none below. */
-function formatBytes(n: number): string {
-  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
-  return `${n} B`;
-}
 
 /**
  * A document bubble: name, size, state. The bytes never render — tapping a
@@ -809,12 +533,6 @@ function FileContent({
       </View>
     </Pressable>
   );
-}
-
-/** m:ss for a duration in seconds. */
-function clockDuration(sec: number): string {
-  const s = Math.max(0, Math.round(sec));
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
 /**
@@ -967,76 +685,6 @@ function LocationContent({
   );
 }
 
-function sendErrorFor(
-  err: unknown,
-  kind:
-    | 'text'
-    | 'photo'
-    | 'file'
-    | 'voice'
-    | 'location'
-    | 'reaction'
-    | 'edit'
-    | 'delete',
-): Omit<SendError, 'seq'> {
-  // Classes before strings: a first-ever permission denial used to be reported
-  // as a connection problem, which sends the person nowhere they can fix it.
-  if (err instanceof PickDenied) {
-    return {
-      message: err.source === 'camera' ? COPY.cameraDenied : COPY.libraryDenied,
-      settings: true,
-    };
-  }
-  if (err instanceof PickUnavailable) {
-    return { message: COPY.cameraUnavailable, settings: false };
-  }
-  const raw = err instanceof Error ? err.message : '';
-  // Native rejections carry the reason in `code` — a TurboModule reject()
-  // puts the human sentence in `message`, so matching only on message read
-  // "file is 8388608 bytes" as an unclassified failure and showed the
-  // generic connection error for a size problem the person can act on.
-  const code =
-    typeof (err as { code?: unknown })?.code === 'string'
-      ? (err as { code: string }).code
-      : '';
-  const plain = (message: string) => ({ message, settings: false });
-  if (raw.includes('safety number changed')) return plain(COPY.safetyBlocked);
-  if (raw.includes('no account for this id')) return plain(COPY.noAccount);
-  if (code === 'too_large' || raw.includes('too large to send')) {
-    if (kind === 'file') return plain(COPY.fileTooLarge);
-    return plain(kind === 'photo' ? COPY.photoTooLarge : COPY.tooLong);
-  }
-  if (code === 'denied' && kind === 'voice') {
-    return { message: COPY.micDenied, settings: true };
-  }
-  if (code === 'call_active') return plain(COPY.micBusyCall);
-  if (code === 'denied' && kind === 'location') {
-    return { message: COPY.locationDenied, settings: true };
-  }
-  if (raw.includes('photo unreadable')) return plain(COPY.photoUnreadable);
-  if (kind === 'photo') return plain(COPY.photoFailed);
-  if (kind === 'file') return plain(COPY.fileFailed);
-  if (kind === 'voice') return plain(COPY.voiceFailed);
-  if (kind === 'location') return plain(COPY.locationFailed);
-  if (kind === 'reaction') return plain(COPY.reactionFailed);
-  if (kind === 'edit') return plain(COPY.editFailed);
-  if (kind === 'delete') return plain(COPY.deleteFailed);
-  return plain(COPY.sendFailed);
-}
-
-/**
- * Fire-and-forget database work.
- *
- * A relock closes the connection BEFORE the route changes,
- * so a debounced requery, a draft flush or an opened-at stamp can legitimately
- * arrive after the latch is on. The latch has already guaranteed the work went
- * nowhere — swallowing the rejection only stops a screen that is being torn
- * down from red-boxing on its way out.
- */
-function quiet<T>(work: Promise<T>, then?: (value: T) => void): void {
-  work.then(value => then?.(value)).catch(() => {});
-}
-
 /**
  * A message's words with every declared web address made tappable.
  * Plain words come back as the string itself, so a bubble without an
@@ -1073,90 +721,6 @@ function linkedText(
   );
 }
 
-/**
- * The delivery state a tick can draw. `received` is an inbound state and
- * `error` renders the failed bubble, so neither reaches a tick; they map to
- * the state that draws nothing rather than being cast past the type — a new
- * MessageStatus fails here at compile time instead of on glass. */
-function tickStatusOf(status: db.MessageStatus): TickStatus {
-  return status === 'received' || status === 'error' ? 'pending' : status;
-}
-
-/** The identity of the newest inbound row: the "New messages" register
- * compares this, never a row count. */
-interface InboundMark {
-  ts: number;
-  msgId: string;
-}
-
-/** `a` is a later arrival than `b` — by the sender's clock, then by id, the
- * same order the list itself is sorted in. */
-function laterArrival(a: InboundMark, b: InboundMark): boolean {
-  return a.ts > b.ts || (a.ts === b.ts && a.msgId > b.msgId);
-}
-
-/** The newest inbound row on glass, or null when there is none. */
-function newestInboundOf(rows: db.MessageRow[]): InboundMark | null {
-  let newest: InboundMark | null = null;
-  for (const row of rows) {
-    if (row.direction !== 'in') continue;
-    if (newest === null || laterArrival(row, newest)) {
-      newest = { ts: row.ts, msgId: row.msgId };
-    }
-  }
-  return newest;
-}
-
-/**
- * One emoji as the eye counts it: a pictographic base with any skin tone,
- * presentation selector or keycap, joined to further bases by ZWJ — or a
- * flag, which is two regional indicators. Built once and guarded: a JS
- * engine without Unicode property escapes simply never draws jumbo emoji,
- * it does not fail to draw the thread.
- */
-const EMOJI_UNIT = (() => {
-  try {
-    const base =
-      '\\p{Extended_Pictographic}(?:\\p{Emoji_Modifier}|\\uFE0F|\\u20E3)*';
-    return new RegExp(
-      `(?:${base}(?:\\u200D${base})*|\\p{Regional_Indicator}{2})`,
-      'gu',
-    );
-  } catch {
-    return null;
-  }
-})();
-
-/** At most this many emoji, and nothing else, draw at display size. */
-const JUMBO_EMOJI_MAX = 3;
-
-/**
- * Whether a message is one to three emoji and nothing else. Spaces between
- * them are allowed; any letter, digit or mark that is not part of an emoji
- * is a sentence, and a sentence keeps its bubble. */
-function isEmojiOnly(text: string): boolean {
-  if (EMOJI_UNIT === null) return false;
-  const packed = text.replace(/\s+/g, '');
-  if (packed === '') return false;
-  const units = packed.match(EMOJI_UNIT);
-  return (
-    units !== null &&
-    units.length <= JUMBO_EMOJI_MAX &&
-    units.join('') === packed
-  );
-}
-
-/** What VoiceOver says for a delivery state — never punctuation names. */
-const STATUS_WORD: Record<string, string> = {
-  pending: 'Sending',
-  sent: 'Sent',
-  delivered: 'Delivered',
-  // The only status that came from the other PERSON rather than from the
-  // server, and the only one they can switch off.
-  read: 'Read',
-  received: 'Received',
-};
-
 /** Attachment row without its bytes — all the thread needs to lay a photo out. */
 type AttachmentMeta = Omit<db.AttachmentRow, 'dataB64'> & {
   /** Length of the stored base64, computed in SQL — see listAttachmentMeta. */
@@ -1187,427 +751,6 @@ function CallLogChip({
     />
   );
 }
-
-interface ThreadItem {
-  row: db.MessageRow;
-  /** Present when this item is a CALL, rendered as a full-width chip. The
-   * `row` is then a synthetic placeholder (msgId = cid) that exists only so
-   * key extraction and neighbour arithmetic need no second shape — it is
-   * never rendered and never written to the database (the design stands: call
-   * signalling never becomes a message row; these are derived at render
-   * time from call_log). */
-  call?: db.CallLogRow;
-  /** Present when this item is an APPROVAL, rendered as the card — the same
-   * synthetic-row scheme as calls, derived at render time from the
-   * `approvals` table (an approval never becomes a
-   * message row — the body would hold a command line at rest). */
-  approval?: db.ApprovalRow;
-  /**
-   * The unread divider: how many messages arrived since the thread was last
-   * open. Set on exactly one item, placed above the first of them; `row` is
-   * then a placeholder carrying that row's ts. */
-  divider?: number;
-  /** Present when this item is a ROUND HEADER (§3.2): the
-   * synthetic full-width line over the first answer of a round, produced by
-   * the round pass exactly as `divider` is. `row` is then a placeholder
-   * carrying the first member's ts, and it is NEVER written to the
-   * database — a round is a client-side reading of messages that stand on
-   * their own, joined on a reply reference this phone resolved itself. */
-  round?: RoundRange;
-  /** The row's body, parsed ONCE per data change and carried here so the
-   * grouping pass, the quote resolver and the mounted row all read the
-   * same answer (each used to parse it again). Null for plain text and
-   * for the placeholder rows. */
-  envelope: Envelope | null;
-  firstInGroup: boolean;
-  lastInGroup: boolean;
-  newDay: boolean;
-  /** Last in group AND the next message shows a different clock label. */
-  showClock: boolean;
-}
-
-/** The list key. Distinct namespaces for chips and the divider: a peer
- * controls their own msgIds and could reuse a cid (or a q) as one,
- * colliding two list keys. Module-level, so the list's key function never
- * re-identifies. */
-function threadKey(item: ThreadItem): string {
-  return item.divider != null
-    ? 'unread-divider'
-    : // A round header's own namespace (§3.2): its anchor key is
-      // built from a peer-chosen msgId, so without one it could collide with
-      // the very row it stands over. The placeholder's msgId carries the
-      // namespace AND the first member, because the anchor key alone is NOT
-      // unique per item: `close()` drops the open round on any outbound,
-      // system or non-agent row and the next qualifying row re-opens under
-      // the SAME anchor, so one turn answered, interrupted and answered
-      // again yields two headers — and two identical keyExtractor values is
-      // a VirtualizedList reusing one cell for two different items.
-      item.round
-      ? item.row.msgId
-      : item.approval
-        ? `approval:${item.approval.q}`
-        : item.call
-          ? `call:${item.call.cid}`
-          : `${item.row.msgId}:${item.row.direction}`;
-}
-
-/** The placeholder behind a call item. Empty body: every envelope parse on it
- * yields null, so message-only code paths fall through harmlessly. */
-function callPlaceholderRow(c: db.CallLogRow): db.MessageRow {
-  return {
-    msgId: c.cid,
-    peerId: c.peerId,
-    direction: c.direction,
-    body: '',
-    ts: c.startedAt,
-    status: 'sent' as db.MessageStatus,
-    deletedAt: null,
-  };
-}
-
-/** The placeholder behind an approval card — callPlaceholderRow's scheme:
- * empty body, so message-only code paths fall through harmlessly. */
-function approvalPlaceholderRow(a: db.ApprovalRow): db.MessageRow {
-  return {
-    msgId: `approval:${a.q}`,
-    peerId: a.peerId,
-    direction: 'in',
-    body: '',
-    ts: a.ts,
-    status: 'received' as db.MessageStatus,
-    deletedAt: null,
-  };
-}
-
-/** The placeholder behind a round header — `callPlaceholderRow`'s scheme
- * again: empty body, so every envelope parse on it yields null and every
- * message-only path falls through harmlessly. Its ts is the first member's,
- * so a day label above it stays truthful. Never written to the database. */
-function roundPlaceholderRow(
-  first: db.MessageRow,
-  anchorKey: string,
-): db.MessageRow {
-  return {
-    // Namespaced by the anchor AND identified by the FIRST MEMBER, which is
-    // stable data rather than an index (a requery shifts indices, and this
-    // string is the list key). Two rounds can share one anchor; no two can
-    // share a first member.
-    msgId: `round:${anchorKey}:${rowKey(first.msgId, first.direction)}`,
-    peerId: first.peerId,
-    direction: 'in',
-    body: '',
-    ts: first.ts,
-    status: 'received' as db.MessageStatus,
-    deletedAt: null,
-  };
-}
-
-/**
- * Whether a row's AUTHENTICATED sender is an agent — the AI badge's one
- * question, stated ONCE here because two
- * surfaces now ask it: the bubble's badge and spoken attribution, and the
- * round pass's membership test (§3.2, "the round is not a third
- * source of that signal").
- *
- * Two sources and ONLY these two:
- *
- *  - the machine record: the AUTHENTICATED sender — in a room the
- *    row's authorId, in a 1:1 the thread's peer — looked up in
- *    machine_peers, the app's memory of the server's own adopt/revoke
- *    answers. It KEEPS the badge against a lying client that omits the
- *    marker: a class is never shed by silence.
- *  - the row's `ai` column: the sender-claimed in-envelope marker,
- *    recorded AT ARRIVAL like `outsider`. It GAINS the
- *    badge on a phone with no record — the paired-never-adopted 1:1, and a
- *    stranger's phone in a room — honest as sender-claimed, which D5
- *    records is the most this wire can say.
- *
- * Never the words, never a shared name, never a render-time body parse — a
- * body that merely LOOKS marked cannot badge a row that arrived unmarked, and
- * cannot join a round either. Inbound only: my own sends are a person typing
- * on this phone.
- */
-function aiSenderOf(
-  row: db.MessageRow,
-  ctx: {
-    inRoom: boolean;
-    isAgentId: (id: string) => boolean;
-    peerIsAgent: boolean;
-  },
-): boolean {
-  if (row.direction === 'out') return false;
-  if (row.ai === 1) return true;
-  return ctx.inRoom
-    ? row.authorId != null && ctx.isAgentId(row.authorId)
-    : ctx.peerIsAgent;
-}
-
-/** The placeholder behind the unread divider — the same scheme: empty body,
- * the first unread row's ts so the day label above it stays truthful. */
-function dividerPlaceholderRow(first: db.MessageRow): db.MessageRow {
-  return {
-    msgId: 'unread-divider',
-    peerId: first.peerId,
-    direction: 'in',
-    body: '',
-    ts: first.ts,
-    status: 'received' as db.MessageStatus,
-    deletedAt: null,
-  };
-}
-
-/**
- * Whether a row arrived after the thread was last open — the chat list's
- * unread rule (db.ts, `arrivedAt`), applied per row: THIS phone's arrival
- * clock, never the sender's `ts`; my own sends, relayed history and
- * retracted rows are never new. A row that predates the arrivedAt column
- * falls back to its ts in a 1:1 and to "never" in a room, exactly as the
- * count query does. */
-function isUnreadRow(row: db.MessageRow, window: UnreadWindow): boolean {
-  if (row.direction !== 'in' || row.sharedBy || row.deletedAt) return false;
-  const arrived = row.arrivedAt ?? (row.authorId != null ? 0 : row.ts);
-  return arrived > window.since && arrived <= window.until;
-}
-
-/**
- * What the unread divider stands against: the window between the previous
- * open and THIS one, both on this phone's clock.
- *
- * The upper bound is the whole point. Without it the divider was recomputed
- * from the current rows on every requery, so a message arriving WHILE the
- * thread was open — the person sitting at the bottom, reading — counted as
- * unread, grew the line, and made the landing block hand the anchor over and
- * scroll away from the message being read. The divider marks what
- * was unread at open, and nothing that has landed since. */
-interface UnreadWindow {
-  /** The chat's `lastOpenedAt` as it stood BEFORE this open; 0 for never. */
-  since: number;
-  /** The moment this open stamped the chat — the same `Date.now()` that went
-   * to `markChatOpened`. */
-  until: number;
-}
-
-function buildItems(
-  rows: db.MessageRow[],
-  callAt: (db.CallLogRow | undefined)[],
-  approvalAt: (db.ApprovalRow | undefined)[],
-  /** `rows[i]`'s parsed body — the caller's once-per-row parse. */
-  envelopes: (Envelope | null)[],
-  /** The open's unread window, or null while unknown — no divider is drawn
-   * against a guess. */
-  unreadWindow: UnreadWindow | null,
-  /** What the round pass (§3.2) needs and cannot derive here:
-   * who is an agent, and which stored row a reply reference resolves to. */
-  round: {
-    aiSender: (row: db.MessageRow) => boolean;
-    /** The anchor's list key, or null when the row carries no reply ref or
-     * the ref does not resolve against rows this phone holds. */
-    anchorKey: (row: db.MessageRow, envelope: Envelope | null) => string | null;
-  },
-): ThreadItem[] {
-    // Screenshot notices render as full-width system rows that ignore every
-    // grouping flag — so they must be transparent to direction runs, like the
-    // date divider: a bubble next to one keeps its own clock and margins.
-    // Rows that render as full-width system lines print no clock and ignore
-    // every grouping flag, so they must be transparent to direction runs —
-    // otherwise a neighbour loses the timestamp this one never shows.
-    const system = rows.map((r, i) => {
-      if (callAt[i]) return true;
-      // An approval card is full-width and prints no clock, so it must be
-      // grouping-transparent — the same defect class the vault line above
-      // records: missing from this list, the symptom shows on the NEIGHBOUR.
-      if (approvalAt[i]) return true;
-      if (r.deletedAt) return true;
-      // An outsider row renders full-width and tagged,
-      // so it is grouping-transparent for the same reason the notices are.
-      if (r.outsider) return true;
-      // A relayed history row is deliberately NOT here: this list is about
-      // rows that render through the full-width ruled line below, and a
-      // relayed row renders as an ordinary bubble with a provenance line
-      // above it.
-      //
-      // Adding it would not suppress its clock — I asserted that in an
-      // earlier version of this comment and a mutation proved it false. The
-      // flag governs GROUPING, so listing it would only make it transparent
-      // to direction runs. Left out because the claim it makes would be
-      // untrue, not because the alternative breaks anything.
-      const tcm = envelopes[i]?.tcm;
-      // All of these render through the full-width ruled line below, so all
-      // of them must be listed here. A timer notice missing from this list
-      // would have swallowed a neighbouring bubble's clock label — the same
-      // defect shot rows were fixed for, and the reason that fix left a test
-      // behind. A vault notice is the third of the same shape, and it is the
-      // easiest step in the whole feature to forget because the symptom shows
-      // up on the NEIGHBOUR, not on the row you added. The four room kinds
-      // (grp.new, grp.roster, grp.set, plus the declined
-      // grp.del row) are four more chances at exactly that defect.
-      return (
-        tcm === 'shot' ||
-        tcm === 'timer' ||
-        tcm === 'vault' ||
-        tcm === 'grp.new' ||
-        tcm === 'grp.roster' ||
-        tcm === 'grp.set' ||
-        tcm === 'grp.del' ||
-        tcm === 'grp.hist' ||
-        // The consent announcement renders through the same full-width
-        // ruled line, so it must be grouping-transparent too, or a neighbour
-        // bubble loses the clock this row never prints.
-        tcm === 'grp.consent'
-      );
-    });
-    // The unread divider: above the first inbound MESSAGE that arrived
-    // after the previous open AND BEFORE THIS ONE, counting every such row
-    // — a message that lands while the thread is up is being read, not
-    // waiting to be read. Events (the system rows above), calls and
-    // approval cards are not messages a person has yet to read, so they
-    // neither count nor carry the line.
-    const unread = rows.map(
-      (r, i) =>
-        unreadWindow !== null &&
-        !system[i] &&
-        !callAt[i] &&
-        !approvalAt[i] &&
-        isUnreadRow(r, unreadWindow),
-    );
-    const firstUnread = unread.indexOf(true);
-    const unreadCount = unread.filter(Boolean).length;
-    // THE ROUND PASS (§3.2). Computed over ROWS, before any item
-    // is pushed, so the ranges index the same list the grouping flags were
-    // computed from. Calls and approval cards join `system` here for the
-    // reason they join it above: they are events, they break a run, and they
-    // are never the human turn a round answers.
-    const rounds = roundRanges(
-      rows.map((r, i) => ({
-        msgId: r.msgId,
-        direction: r.direction,
-        system: system[i] || !!callAt[i] || !!approvalAt[i],
-        aiSender: round.aiSender(r),
-        // The AUTHENTICATED author, beside `aiSender` and from the same kind
-        // of source — the row's column, never the body. The header counts
-        // DISTINCT values of it, so one agent answering twice is one agent
-        // and a 1:1 (every authorId null, one peer) grows no header at all.
-        authorId: r.authorId ?? null,
-        arrivedAt: r.arrivedAt ?? null,
-      })),
-      (_item, i) => round.anchorKey(rows[i]!, envelopes[i] ?? null),
-    );
-    /** Row index → the round that STARTS there, so the header can be emitted
-     * in one pass beside the divider. */
-    const roundAt = new Map<number, RoundRange>();
-    for (const r of rounds) roundAt.set(r.first, r);
-    const items: ThreadItem[] = [];
-    rows.forEach((row, i) => {
-      const prev = rows[i - 1];
-      const next = rows[i + 1];
-      // A non-negative delta is required as well as a small one: two devices
-      // with skewed clocks can produce a negative gap, which passes any
-      // upper bound and groups messages that are minutes apart.
-      const before = prev ? row.ts - prev.ts : -1;
-      const after = next ? next.ts - row.ts : -1;
-      const groupedBefore =
-        !!prev &&
-        !system[i] &&
-        !system[i - 1] &&
-        // A round header stands between them (§3.2): the run
-        // ends here, so the first answer of a round keeps its own author
-        // label and its own corner instead of being tucked under a bubble
-        // the header has already separated it from.
-        !roundAt.has(i) &&
-        prev.direction === row.direction &&
-        // In a room, direction alone lies: two inbound neighbours can be two
-        // different PEOPLE, and grouping them would hide the second author's
-        // label. authorId is null on every 1:1 row, so this clause is inert
-        // outside rooms.
-        (prev.authorId ?? null) === (row.authorId ?? null) &&
-        before >= 0 &&
-        before < GROUP_WINDOW_MS &&
-        sameDay(prev.ts, row.ts);
-      const groupedAfter =
-        !!next &&
-        !system[i] &&
-        !system[i + 1] &&
-        // The same break, seen from the row above it — so THIS row is last in
-        // its group and keeps the clock label the header never prints.
-        !roundAt.has(i + 1) &&
-        next.direction === row.direction &&
-        (next.authorId ?? null) === (row.authorId ?? null) &&
-        after >= 0 &&
-        after < GROUP_WINDOW_MS &&
-        sameDay(next.ts, row.ts);
-      const lastInGroup = !groupedAfter;
-      const newDay = !prev || !sameDay(prev.ts, row.ts);
-      // Whichever full-width line lands here FIRST takes the day label with
-      // it, so the eye reads the date, then the line, then the message.
-      let dayTaken = false;
-      if (i === firstUnread) {
-        // The divider takes the day label with it, so the eye reads the
-        // date, then "N new messages", then the message — never the line
-        // wedged between a date and its first row. Grouping is untouched:
-        // the flags below were computed from the rows, not from the items.
-        items.push({
-          row: dividerPlaceholderRow(row),
-          envelope: null,
-          divider: unreadCount,
-          firstInGroup: true,
-          lastInGroup: true,
-          newDay,
-          showClock: false,
-        });
-        dayTaken = true;
-      }
-      const roundHere = roundAt.get(i);
-      if (roundHere) {
-        // THE DIVIDER WINS THE SLOT (§3.2): when both land on the
-        // same row the divider is emitted first, then the header, then the
-        // row. A round must never hide the row the divider points at — which
-        // is also why the BRIEFS are visible by default and only the details
-        // are collapsed.
-        items.push({
-          row: roundPlaceholderRow(row, roundHere.anchorKey),
-          envelope: null,
-          round: roundHere,
-          firstInGroup: true,
-          lastInGroup: true,
-          newDay: dayTaken ? false : newDay,
-          showClock: false,
-        });
-        dayTaken = true;
-      }
-      items.push({
-        row,
-        call: callAt[i],
-        approval: approvalAt[i],
-        envelope: envelopes[i] ?? null,
-        firstInGroup: !groupedBefore,
-        lastInGroup,
-        newDay: dayTaken ? false : newDay,
-        // Groups end at every direction change, so a quick exchange inside
-        // one minute otherwise prints the same clock label four times. A
-        // system row prints no clock, so it never suppresses a neighbor's.
-        showClock:
-          lastInGroup &&
-          (!next ||
-            system[i + 1] ||
-            clockLabel(next.ts) !== clockLabel(row.ts)),
-      });
-    });
-    return items;
-  }
-
-type Drawer = 'none' | 'attach' | 'emoji';
-
-/**
- * What the composer is doing besides writing something new. Both states hold
- * the row they act on, so the composer can name it and the send path knows
- * which verb to use.
- */
-type Pending =
-  | { kind: 'reply'; row: db.MessageRow }
-  | { kind: 'edit'; row: db.MessageRow };
-
-/** What a rail was opened to do, so VoiceOver's Delete reaches the confirm. */
-type RailIntent = 'react' | 'delete';
 
 /**
  * One conversation. Everything that could have been a floating overlay is
@@ -1749,6 +892,22 @@ export function ChatThreadScreen({
   const [sendingPhoto, setSendingPhoto] = useState(false);
   /** Retained bytes of a photo that failed to send, so retry is one tap. */
   const [failedPhoto, setFailedPhoto] = useState<PickedImage | null>(null);
+  /** A photo picked and not yet sent. The bytes ride inside the state,
+   * so discarding is one assignment and leaves no copy behind; the machine
+   * itself is `../thread/photoReview`. */
+  const [photoReview, setPhotoReview] =
+    useState<PhotoReview>(NO_PHOTO_REVIEW);
+  /** FIND. Open swaps the whole header for the bar; the query is
+   * debounced into `db.findMessages` and refined in JS. `findCursor` indexes
+   * `findMatches`, which arrive newest first. */
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState('');
+  const [findMatches, setFindMatches] = useState<db.MessageRow[]>([]);
+  const [findCursor, setFindCursor] = useState(0);
+  /** WHICH QUERY THE MATCHES ANSWER FOR — '' while nothing has answered.
+   * Without it the bar says "No message here matches that." for the first
+   * 400 ms of every query, and answers a refined one with the old count. */
+  const [findAnswered, setFindAnswered] = useState('');
   /**
    * An UNACCEPTED IDENTITY CHANGE. Nothing to do with `peerBlocked` below, and
    * the only one of the two that may reach `safetyStateFor`.
@@ -1876,6 +1035,11 @@ export function ChatThreadScreen({
   const callPickerRef = useRef<'audio' | 'video' | null>(null);
   const safetyOpenRef = useRef(false);
   const drawerRef = useRef<Drawer>('none');
+  const findOpenRef = useRef(false);
+  /** Read by the find read's own callback, which resolves long after the
+   * keystroke that issued it. */
+  const findQueryRef = useRef('');
+  const photoReviewRef = useRef<PhotoReview>(NO_PHOTO_REVIEW);
 
   draftRef.current = draft;
   pendingRef.current = pending;
@@ -1884,6 +1048,9 @@ export function ChatThreadScreen({
   callPickerRef.current = callPicker;
   safetyOpenRef.current = safetyOpen;
   drawerRef.current = drawer;
+  findOpenRef.current = findOpen;
+  findQueryRef.current = findQuery;
+  photoReviewRef.current = photoReview;
 
   useEffect(() => {
     railForRef.current = railFor;
@@ -2170,16 +1337,29 @@ export function ChatThreadScreen({
     void messaging.sweepDisappearing(peerId);
   }, [peerId]);
 
-  // Foreground as state: the read-receipt effect above keys on `appActive`,
-  // so a message that arrived while the phone was pocketed — correctly not
-  // receipted then — is receipted when the thread comes back on glass.
-  // Coming forward is also the other moment a person is actually looking, so
-  // it sweeps the disappearing rows again: the timer below may never fire
-  // while the app is suspended.
+  // Opening a conversation clears that peer's missed-call notices.
+  // Repeat when the app becomes active: a call can be missed while this
+  // thread remains open in the background. This handles 1:1 calls only;
+  // the coordinator does not post missed-call notices for room sessions.
+  useEffect(() => {
+    if (!appActive) return;
+    void clearMissedCallNotices(peerId);
+  }, [peerId, appActive]);
+
+  // Foreground as state: the read-receipt effect above keys
+  // on `appActive`, so a message that arrived while the phone was pocketed —
+  // correctly not receipted then — is receipted when the thread comes back
+  // on glass. Coming forward is also the other moment a person is actually
+  // looking, so it sweeps the disappearing rows again: the
+  // timer below may never fire while the app is suspended.
   useEffect(() => {
     const sub = AppState.addEventListener('change', next => {
       const active = next === 'active';
       setAppActive(active);
+      // A photo waiting for a decision does not wait behind another app
+      //, and the bytes go with it: an unsent photo is the one thing on
+      // this screen that is not already in the database.
+      if (!active) setPhotoReview(discardReview());
       if (!active) return;
       quiet(
         messaging.sweepDisappearing(peerId).then(() => {
@@ -2378,6 +1558,20 @@ export function ChatThreadScreen({
     // rows would restock from the NEXT room's fold while the panel still
     // believed it was choosing people for the last one.
     setCallPicker(null);
+    // A photo chosen for one person is not a photo for the next, and its
+    // bytes must not outlive the conversation it was picked in. Same
+    // for a failed one: Try again aims at whoever is on screen now.
+    setPhotoReview(discardReview());
+    setFailedPhoto(null);
+    // Find belongs to the conversation it was opened in, for the same
+    // reason: one thread's query, its count and its rows must never stand
+    // over another's messages. (`closeFind` cannot be called here — it is
+    // declared below, and this effect's dependency array is read first.)
+    setFindOpen(false);
+    setFindQuery('');
+    setFindMatches([]);
+    setFindAnswered('');
+    setFindCursor(0);
   }, [peerId]);
 
   // What is new in the chat list is measured against this stamp; the thread is
@@ -2769,7 +1963,7 @@ export function ChatThreadScreen({
   const quotedFor = useCallback(
     // Narrower than ThreadItem on purpose: the round pass asks the SAME
     // resolver about a row it has not built an item for yet, and a second
-    // copy of this arithmetic is exactly what §6 rule 5 forbids.
+    // copy of this arithmetic could drift from the shared calculation.
     ({ row, envelope }: Pick<ThreadItem, 'row' | 'envelope'>):
       | db.MessageRow
       | undefined => {
@@ -2783,7 +1977,7 @@ export function ChatThreadScreen({
   );
 
   /**
-   * THE ROUND'S REF ARM (§3.2): which stored row an answer
+   * THE ROUND'S REF ARM : which stored row an answer
    * answers, as a list key — or null when it answers nothing this phone
    * holds.
    *
@@ -2813,7 +2007,7 @@ export function ChatThreadScreen({
     [group, me?.userId, byKey, quotedFor],
   );
 
-  /** Membership in a round, asked of the same rule the badge asks (§3.2). */
+  /** Membership in a round, asked of the same rule the badge asks . */
   const roundAiSender = useCallback(
     (row: db.MessageRow): boolean =>
       aiSenderOf(row, { inRoom: group !== null, isAgentId, peerIsAgent }),
@@ -2822,7 +2016,7 @@ export function ChatThreadScreen({
 
   /**
    * Which rows have their FULL ANSWER open, by `${msgId}:${direction}`
-   * (§3.2). Held on the SCREEN, not inside the disclosure:
+   * . Held on the SCREEN, not inside the disclosure:
    * a thread requeries on every receipt, reaction and download tick, and
    * state inside the row would close every open detail each time one landed.
    * A Set, so the memo comparator is one `has` per row.
@@ -2989,6 +2183,78 @@ export function ChatThreadScreen({
     [reduceMotion, scrollToRow],
   );
 
+  /** FIND opens. Everything anchored to something else closes with it:
+   * the rail is fixed to one row and find is about to move the list out from
+   * under it, and the picker and the safety panel hang UNDER the header —
+   * which find is replacing, leaving them attached to nothing. */
+  const openFind = useCallback(() => {
+    setFindOpen(true);
+    setRailFor(null);
+    setDrawer('none');
+    setCallPicker(null);
+    setSafetyOpen(false);
+  }, []);
+
+  /** And closes, WITHOUT moving the list: jumping back to the end would
+   * throw away the thing just found. `revealQuoted` already released the
+   * bottom anchor, so the view stays where the last match left it. */
+  const closeFind = useCallback(() => {
+    setFindOpen(false);
+    setFindQuery('');
+    setFindMatches([]);
+    setFindAnswered('');
+    setFindCursor(0);
+  }, []);
+
+  /**
+   * The query, debounced, prefiltered in SQL and REFINED here.
+   *
+   * The refinement is not optional: a stored body is sometimes an envelope,
+   * so `body LIKE '%door%'` matches inside a photo's base64 key material.
+   * `refineFindRows` re-reads every row through `displayText`, with this
+   * thread's own author resolver so a mention matches the NAME this phone
+   * shows. Deleted rows are excluded in SQL; expired rows never reach it.
+   * Reading your own history is not a send, so this runs under a block,
+   * under an identity change, and in a duress session — on the decoy's rows.
+   */
+  useEffect(() => {
+    if (!findOpen) return;
+    const query = findQuery.trim();
+    if (!findQueryReady(query)) {
+      setFindMatches([]);
+      setFindAnswered('');
+      setFindCursor(0);
+      return;
+    }
+    const timer = setTimeout(() => {
+      quiet(db.findMessages(peerId, query, FIND_LIMIT), found => {
+        // A STALE ANSWER IS DROPPED, never rendered. The cleanup above can
+        // cancel a timer but not a read already issued, so two are in
+        // flight whenever one outlives the 400 ms to the next — and the
+        // older one resolving last would answer for a query the field no
+        // longer holds, or repopulate a bar that has since closed.
+        if (peerIdRef.current !== peerId) return;
+        if (!findOpenRef.current) return;
+        if (findQueryRef.current.trim() !== query) return;
+        setFindMatches(refineFindRows(found, query, nameFor));
+        setFindAnswered(query);
+        setFindCursor(0);
+      });
+    }, FIND_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [findOpen, findQuery, peerId, nameFor]);
+
+  /** Every step, and the first result, go through the SAME function a
+   * tapped quote does: it already releases the bottom anchor, scrolls to
+   * mid-view and washes the row pine. Nothing else in the scroll machine
+   * is touched. */
+  useEffect(() => {
+    if (!findOpen) return;
+    const target = findMatches[findCursor];
+    if (!target) return;
+    revealQuoted(target);
+  }, [findOpen, findMatches, findCursor, revealQuoted]);
+
   /**
    * Without getItemLayout the list cannot reach a row it has not measured in
    * one step — a quoted message far up, the unread divider in a long
@@ -3029,7 +2295,7 @@ export function ChatThreadScreen({
   }, [anyPendingApproval]);
 
   /**
-   * AUTO-SCROLL ATTRIBUTION (device demo, build 9): what caused the render
+   * AUTO-SCROLL ATTRIBUTION: what caused the render
    * that is about to resize the list?
    *
    * Reported from the phone: long-press a bubble to copy or reply and the
@@ -3083,7 +2349,7 @@ export function ChatThreadScreen({
       prev.approvalNow !== approvalNow ||
       prev.streamTick !== streamTick ||
       // OPENING A FULL ANSWER is the same class as a tick, and the sharpest
-      // case of it (§3.2): the disclosure grows the bubble by
+      // case of it : the disclosure grows the bubble by
       // hundreds of points, fires this resize, and — pinned — would scroll
       // the list to the end away from the very words the person just asked
       // to read. Nothing arrived; a row already on glass got taller.
@@ -3130,7 +2396,7 @@ export function ChatThreadScreen({
         });
         return;
       }
-      setSendError({ ...sendErrorFor(err, kind), seq: errorSeq.current });
+      setSendError({ ...sendErrorFor(err, kind, COPY), seq: errorSeq.current });
     },
     [isRoom],
   );
@@ -3396,6 +2662,9 @@ export function ChatThreadScreen({
     }
   };
 
+  /** PICK IS NO LONGER SEND: the picker's result goes into the review
+   * panel and nothing leaves this device until the person says so. A
+   * cancelled pick leaves whatever was under review where it was. */
   const attachPhoto = async (source: PickSource) => {
     setDrawer('none');
     setSendError(null);
@@ -3410,6 +2679,17 @@ export function ChatThreadScreen({
       showError(err, 'photo');
       return;
     }
+    setPhotoReview(reviewPicked(picked, source));
+  };
+
+  /** The decision to send. The failure path is the one that already
+   * shipped: the bytes move to `failedPhoto`, where Try again finds them,
+   * and the panel goes — two Sends for one photo is not a choice. */
+  const sendReviewedPhoto = async () => {
+    if (photoReview.kind !== 'review') return;
+    const { picked } = photoReview;
+    setPhotoReview(reviewSending(photoReview));
+    setSendError(null);
     setSendingPhoto(true);
     try {
       await messaging.sendImage(
@@ -3418,7 +2698,9 @@ export function ChatThreadScreen({
         picked.width,
         picked.height,
       );
+      setPhotoReview(discardReview());
     } catch (err) {
+      setPhotoReview(discardReview());
       setFailedPhoto(picked);
       showError(err, 'photo');
     } finally {
@@ -3771,8 +3053,7 @@ export function ChatThreadScreen({
   // auto-sends, and it never keeps the microphone hot behind another app.
   // Armed on `recordingIntent`, not on `recording`: the listener used to be
   // installed only after startRecording RESOLVED, so backgrounding during
-  // the permission dialog — the slowest part — was unobserved (found by
-  // review).
+  // the permission dialog — the slowest part — was unobserved.
   useEffect(() => {
     if (!recordingIntent) return;
     const sub = AppState.addEventListener('change', next => {
@@ -3882,8 +3163,8 @@ export function ChatThreadScreen({
       } catch (err) {
         // THE TAKE COMES BACK ONLY IF NOTHING WAS ENQUEUED. Past the outbox
         // commit the message is already on its way, and handing the take
-        // back would let Retry send a SECOND copy of the same note (the
-        // review's point-of-no-return finding). `enqueued` is set by
+        // back would let Retry send a SECOND copy of the same note.
+        // `enqueued` is set by
         // sendVoice's own onEnqueued callback, so it is the honest signal
         // for which side of the commit the failure landed on.
         if (!(err as { enqueued?: boolean })?.enqueued) {
@@ -3905,7 +3186,7 @@ export function ChatThreadScreen({
   /**
    * `${msgId}:${direction}` → the DECODED length, once this device has
    * played the note and learned it. The envelope's `dur` is a sender claim
-   * and a peer can lie about it (found by review); the moment the decoder
+   * and a peer can lie about it ; the moment the decoder
    * disagrees, the bubble shows the decoder.
    */
   const [trueDurations, setTrueDurations] = useState<Map<string, number>>(
@@ -4083,6 +3364,13 @@ export function ChatThreadScreen({
     // is registered once, and a press can land before a state has flushed.
     // On iOS `BackHandler` is inert (RegisterScreen's precedent).
     const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      // FIND IS THE OUTERMOST THING: it is not a panel under the header,
+      // it IS the header while it is open. One case here rather than a
+      // second handler, which would be asked first and win every press.
+      if (findOpenRef.current) {
+        closeFind();
+        return true;
+      }
       if (callPickerRef.current !== null) {
         setCallPicker(null);
         return true;
@@ -4093,6 +3381,15 @@ export function ChatThreadScreen({
       }
       if (railForRef.current !== null) {
         setRailFor(null);
+        return true;
+      }
+      // The photo waiting for a decision is the composer's own panel, so it
+      // sits with the composer-seamed cases. Only while it is WAITING: once
+      // the bytes are going, Back can no more call them back than the ✕
+      // can, and hiding the panel would say otherwise — so that press falls
+      // through to the router, exactly as it did before this panel existed.
+      if (photoReviewRef.current.kind === 'review') {
+        setPhotoReview(discardReview());
         return true;
       }
       if (drawerRef.current !== 'none') {
@@ -4106,7 +3403,10 @@ export function ChatThreadScreen({
       return false;
     });
     return () => subscription.remove();
-  }, [cancelPending]);
+    // closeFind has no dependencies, so this stays a ONE-TIME registration:
+    // the ordering guarantee above is that the thread subscribes after the
+    // router and is asked first, and a re-subscription would lose it.
+  }, [cancelPending, closeFind]);
 
   /**
    * Through messaging, so the enforcement Set, the chat list and this thread
@@ -4253,7 +3553,7 @@ export function ChatThreadScreen({
             />
           </View>
         ) : item.round ? (
-          // THE ROUND HEADER (§3.2), on the unread divider's
+          // THE ROUND HEADER , on the unread divider's
           // ruled geometry and ahead of every bubble path for the approval
           // card's reason: a synthetic item must never reach MessageRow.
           // It says only how many agents answered — never that the relay
@@ -4417,6 +3717,28 @@ export function ChatThreadScreen({
         { backgroundColor: t.color.paperGround, paddingBottom: keyboardInset },
       ]}
     >
+      {/* FIND REPLACES THE HEADER, it does not stack under it: a second row
+          of chrome over a back chevron, a name and three trailing targets is
+          how a narrow window at an accessibility text size runs out of
+          room. One thing at a time, so one row of chrome. */}
+      {findOpen ? (
+        <FindBar
+          copy={COPY}
+          value={findQuery}
+          onChange={setFindQuery}
+          onClose={closeFind}
+          onNext={() =>
+            setFindCursor(c => stepFindCursor(c, findMatches.length, 1))
+          }
+          onPrevious={() =>
+            setFindCursor(c => stepFindCursor(c, findMatches.length, -1))
+          }
+          cursor={findCursor}
+          total={findMatches.length}
+          ready={findQueryReady(findQuery)}
+          settled={findAnswered === findQuery.trim()}
+        />
+      ) : (
       <ScreenHeader
         onBack={onBack}
         backLabel="Back to chats"
@@ -4504,6 +3826,25 @@ export function ChatThreadScreen({
         }
         right={
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+            {/* FIND COMES FIRST, before the call glyphs: the call buttons
+                keep the outermost corner they have always had, so nothing a
+                person already knows moves. The glyph does not scale (the
+                back chevron's reason: scaling an icon only breaks its 44pt
+                target), which is what keeps three trailing targets from
+                clipping — the title compresses, the controls do not. */}
+            <Pressable
+              onPress={openFind}
+              accessibilityRole="button"
+              accessibilityLabel={COPY.find}
+              testID="thread-find"
+              style={({ pressed }) => [
+                styles.safetyControl,
+                { borderRadius: t.radius.circle },
+                pressed && { backgroundColor: t.color.pineWash },
+              ]}
+            >
+              <FindGlyph color={t.color.pine} />
+            </Pressable>
             {/* Two buttons, not one with a hidden long-press. A long-press
                 that is the ONLY way to reach audio is a feature most people
                 never find, and "Call" did not say which kind it would place.
@@ -4534,9 +3875,7 @@ export function ChatThreadScreen({
                   { kind: 'audio' as const, Glyph: PhoneGlyph, verb: 'Call' },
                   { kind: 'video' as const, Glyph: VideoGlyph, verb: 'Video call' },
                 ]
-                  // A ROOM OFFERS AUDIO ONLY. Group calls ship audio-only at
-                  // v1 ("v1 scope, cut to the launch
-                  // date"): the mesh video surface is cut to 1.1, so a
+                  // A ROOM OFFERS AUDIO ONLY. Group calls support audio, so a
                   // video button here would connect an AUDIO call behind a
                   // camera glyph — a capability claim made in a button rather
                   // than a sentence. The audio-only clause
@@ -4607,6 +3946,7 @@ export function ChatThreadScreen({
           </View>
         }
       />
+      )}
 
       {/* The picker, attached under the header exactly as the safety panel
           is. Its candidates are the folded roster, labelled with the SAME
@@ -5033,6 +4373,96 @@ export function ChatThreadScreen({
           onReview={toggleSafety}
           onAccept={() => void acceptIdentityChange()}
         />
+      ) : photoReview.kind !== 'none' ? (
+        /* Review a picked photo in the composer's place, alongside the existing
+           voice-draft interaction. Keep the decision in the conversation
+           rather than opening a modal. */
+        <View
+          testID="photo-review"
+          style={[
+            styles.voiceBar,
+            { flexDirection: 'column', alignItems: 'stretch', gap: t.space.s4 },
+          ]}
+        >
+          <Image
+            source={{
+              uri: `data:image/jpeg;base64,${photoReview.picked.base64}`,
+            }}
+            // A CEILING, not a height: the photo's own shape decides how
+            // tall it draws under it, so a wide, short picture gives the
+            // space back to the size line and the two controls — which is
+            // why 200 was chosen over the bubble's 320 in the first place.
+            style={{
+              width: '100%',
+              maxHeight: PHOTO_REVIEW_MAX_HEIGHT,
+              aspectRatio: photoAspect(photoReview.picked),
+              borderRadius: t.radius.bubble,
+              backgroundColor: t.color.paperSheet,
+            }}
+            // `contain`, not `cover`: this is the picture being checked, so
+            // it must not be cropped to fit the frame doing the checking.
+            resizeMode="contain"
+            accessible
+            accessibilityRole="image"
+            accessibilityLabel={COPY.photoReviewImage}
+            testID="photo-review-image"
+          />
+          <View
+            style={{
+              flexDirection: 'row',
+              alignItems: 'center',
+              gap: t.space.s5,
+            }}
+          >
+            <View style={{ flex: 1, minWidth: 0 }}>
+              <Text style={[t.type.compactStrong, { color: t.color.inkStrong }]}>
+                {COPY.photoReview}
+              </Text>
+              {/* The size it will ARRIVE at: the picker re-encoded the
+                  original, so the base64 on hand is the honest number. */}
+              <Text style={[t.type.timeStatus, { color: t.color.inkMuted }]}>
+                {COPY.photoSize(photoKilobytes(photoReview.picked.base64))}
+              </Text>
+            </View>
+            {/* Guarded like Send, and for a stronger reason: a send already
+                in flight cannot be called back, so a ✕ that dropped the
+                panel would stop nothing and the photo would arrive anyway.
+                The refusal is in the state machine as well as the control. */}
+            <Pressable
+              onPress={() => setPhotoReview(discardUnlessSending)}
+              disabled={photoReview.kind === 'sending'}
+              accessibilityRole="button"
+              accessibilityLabel={COPY.photoDiscard}
+              accessibilityState={{ disabled: photoReview.kind === 'sending' }}
+              testID="photo-review-discard"
+              style={styles.composerIcon}
+            >
+              <CloseGlyph
+                size={20}
+                color={
+                  photoReview.kind === 'sending'
+                    ? t.color.inkMuted
+                    : t.color.danger
+                }
+              />
+            </Pressable>
+            {offersRetake(photoReview) ? (
+              <TextAction
+                label={COPY.photoRetake}
+                onPress={() => void attachPhoto('camera')}
+                testID="photo-review-retake"
+              />
+            ) : null}
+            {/* A send already under way is not started twice; the state
+                machine refuses it too, and the control says so. */}
+            <TextAction
+              label={COPY.photoSend}
+              onPress={() => void sendReviewedPhoto()}
+              disabled={photoReview.kind === 'sending'}
+              testID="photo-review-send"
+            />
+          </View>
+        </View>
       ) : (
         <Composer
           theme={t}
@@ -6348,7 +5778,7 @@ interface MessageRowProps {
   /** Who wrote `quoted`, resolved by the parent the way every author label
    * is — "You", or my name for them. Undefined with no `quoted`. */
   quotedAuthor: string | undefined;
-  /** This row's FULL ANSWER is open (§3.2). Screen-held, so a
+  /** This row's FULL ANSWER is open . Screen-held, so a
    * requery cannot close it. Always false for a row with no detail. */
   expanded: boolean;
   /** Open or close this row's full answer. */
@@ -6427,7 +5857,7 @@ function sameRowProps(a: MessageRowProps, b: MessageRowProps): boolean {
     a.onReveal !== b.onReveal ||
     a.flashed !== b.flashed ||
     // Without these two the memo goes stale and the disclosure does not open
-    // (§3.9) — the defect this comparator's own header warns
+    //  — the defect this comparator's own header warns
     // about. The detail's CONTENT is free: `x.row.body` is already compared
     // below, and the detail rides in the body.
     a.expanded !== b.expanded ||
@@ -6599,7 +6029,7 @@ function MessageRowInner({
    *
    * The RULE itself lives in `aiSenderOf` above, because the round pass asks
    * the same question of the same row and a round must not become a third
-   * source of this signal (§3.2).
+   * source of this signal .
    */
   const aiSender = aiSenderOf(row, { inRoom, isAgentId, peerIsAgent });
 
@@ -7277,7 +6707,7 @@ function MessageRowInner({
     : linkRuns(spokenWords).flatMap(run => (run.kind === 'link' ? [run] : []));
 
   /**
-   * THE FULL ANSWER carried by this row, or null (§3.1). Read
+   * THE FULL ANSWER carried by this row, or null . Read
    * through envelope.ts's `detailText` — the one reader — so the brief on
    * glass and the detail behind the tap can never disagree about what a body
    * is. Structured rows are excluded outright: a photo, voice note, file or
@@ -7699,7 +7129,7 @@ function MessageRowInner({
             ) : null}
             {detail !== null ? (
               // THE FULL ANSWER, inside the bubble and UNDER the words
-              // (§3.2): the brief and the detail are one message
+              // : the brief and the detail are one message
               // written by one model under one sender, so the disclosure
               // belongs to the bubble rather than beside it. Visible by
               // default is the BRIEF; only the detail is collapsed.
@@ -8343,468 +7773,4 @@ function PhotoContent({
       )}
     </View>
   );
-}
-
-/**
- * The thread's styles, per theme: spacing from `t.space`, floors from
- * `t.layout`, built once per token set and shared by every component in
- * this file. A WeakMap rather than a per-component useMemo because
- * MessageRowInner mounts by the dozen — one StyleSheet per theme, never
- * one per row. The token sets are module constants in theme.ts, so the map
- * holds at most two entries.
- *
- * Values that are SIZES — a 44pt floor, a 32pt arrow box, a 3pt rule — are
- * sizes, not spacing, and stay as they were (the floor is `t.layout`'s).
- * The 1pt optical nudges under a tick and a chip line stay literal too:
- * the scale has no 1, and 2 is not what the eye wanted there. */
-const stylesByTheme = new WeakMap<Theme, ReturnType<typeof makeStyles>>();
-function stylesFor(t: Theme): ReturnType<typeof makeStyles> {
-  let s = stylesByTheme.get(t);
-  if (!s) {
-    s = makeStyles(t);
-    stylesByTheme.set(t, s);
-  }
-  return s;
-}
-
-function makeStyles(t: Theme) {
-  const { space, layout } = t;
-  return StyleSheet.create({
-    root: { flex: 1 },
-    peerControl: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: space.s5,
-      minHeight: layout.touchTarget,
-      flex: 1,
-    },
-    peerText: { flex: 1 },
-    safetyControl: {
-      width: 60,
-      // 48 rather than the 44pt floor: the glyphs grew to 24, and a control
-      // sized exactly at the minimum leaves a larger mark crowding its own
-      // edges. Still a floor, not a fixed height, so Dynamic Type can push it
-      // taller without clipping.
-      minHeight: 48,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-    safetyPanel: { paddingVertical: space.s6, borderBottomWidth: 1 },
-    safetyTop: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      justifyContent: 'space-between',
-    },
-    safetyClose: {
-      minWidth: layout.touchTarget,
-      minHeight: layout.touchTarget,
-      alignItems: 'flex-end',
-      justifyContent: 'center',
-    },
-    safetyStatusRow: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      marginTop: space.s5,
-    },
-    safetyStatusRule: {
-      width: 3,
-      alignSelf: 'stretch',
-      minHeight: 15,
-      marginRight: space.s5,
-    },
-    safetyGrid: { flexDirection: 'row', flexWrap: 'wrap', marginTop: space.s4 },
-    // A third of the row at default size; the group text is free to wrap
-    // within it rather than being shrunk to fit.
-    safetyCell: { width: '33.333%' },
-    safetyHint: { marginTop: space.s4 },
-    /** The panel's ⓘ, under the action row. */
-    safetyAbout: { marginTop: space.s2 },
-    safetyActions: {
-      flexDirection: 'row',
-      flexWrap: 'wrap',
-      alignItems: 'center',
-      gap: space.s6,
-    },
-    textAction: {
-      minHeight: layout.touchTarget,
-      justifyContent: 'center',
-      paddingHorizontal: space.s4,
-      marginHorizontal: -space.s4,
-    },
-    listContent: { paddingHorizontal: layout.gutter, paddingBottom: space.s7 },
-    emptyThread: {
-      alignItems: 'center',
-      marginTop: space.s7,
-      marginBottom: space.s8,
-    },
-    emptyTitle: { marginTop: space.s7, textAlign: 'center' },
-    emptyBody: { marginTop: space.s4, textAlign: 'center', maxWidth: 280 },
-    bubble: {
-      borderWidth: 1,
-      flexDirection: 'row',
-      alignItems: 'flex-end',
-      justifyContent: 'center',
-      gap: space.s3,
-    },
-    messageText: { flexShrink: 1 },
-    /** A web address inside a bubble: underlined as well as inked, so the
-     * affordance never rests on colour alone. */
-    linkSpan: { textDecorationLine: 'underline' },
-    /** An inbound content row: the bubble and its reply arrow on one line.
-     * `alignItems: 'flex-end'` seats the arrow by the bubble's tail corner,
-     * where the eye already reads "this message ends here". */
-    replyRow: { flexDirection: 'row', alignItems: 'flex-end' },
-    /** The bubble yields, the arrow never does: Yoga's flexShrink defaults to
-     * 0, so without this a maximal bubble would push the fixed arrow box
-     * toward the edge instead of letting its own text reflow. */
-    bubbleShrink: { flexShrink: 1 },
-    replyArrow: {
-      width: 32,
-      height: 32,
-      marginLeft: space.s3,
-      marginBottom: 1,
-      alignItems: 'center',
-      justifyContent: 'center',
-      flexShrink: 0,
-    },
-    /** The bubble is a row so the delivery tick sits beside the last line; a
-     * quote, its answer and the edited mark stack inside this column. */
-    bubbleBody: { flexShrink: 1 },
-    quote: {
-      borderLeftWidth: 2,
-      paddingHorizontal: space.s4,
-      paddingVertical: space.s3,
-      marginBottom: space.s3,
-    },
-    /** Secondary text at FULL alpha: the palette owns the colour (inkMuted on
-     * paper, onBubbleOut on pine) and the type role owns the emphasis. The 0.75
-     * opacity these carried put the inbound quote at ≈3.1:1 and the edited mark at
-     * ≈3.7:1, under the 4.5:1 AA floor. */
-    quoteText: {},
-    /** The quoted author's name over their words. */
-    quoteAuthor: { marginBottom: space.s1 },
-    editedMark: { marginTop: space.s1 },
-    chip: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      borderWidth: StyleSheet.hairlineWidth,
-      borderBottomWidth: 0,
-      paddingLeft: 0,
-      paddingRight: space.s2,
-      paddingVertical: space.s4,
-      overflow: 'hidden',
-    },
-    chipBar: { width: 3, alignSelf: 'stretch', marginRight: space.s5 },
-    chipBody: { flex: 1, flexShrink: 1 },
-    chipText: { marginTop: 1 },
-    chipCancel: {
-      width: 36,
-      height: 36,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-    tombstone: {
-      borderWidth: StyleSheet.hairlineWidth,
-      paddingHorizontal: space.s5,
-      // 9, not a step: the bubble's own vertical padding, set inline where
-      // the bubble is drawn — a tombstone stands in a bubble's place and
-      // must be its height.
-      paddingVertical: 9,
-    },
-    tombstoneText: { flexShrink: 1, fontStyle: 'italic' },
-    /** The group gap — the same step a bubble opens a run with. */
-    failedOut: { marginTop: space.s5 },
-    failedBubble: { alignSelf: 'flex-end' },
-    failedActions: {
-      flexDirection: 'row',
-      justifyContent: 'flex-end',
-      alignItems: 'center',
-      gap: space.s6,
-    },
-    statusGlyph: { marginBottom: 1 },
-    photoStatus: {
-      alignSelf: 'flex-end',
-      marginTop: space.s2,
-      marginRight: space.s2,
-    },
-    metaLeft: {
-      alignSelf: 'flex-start',
-      marginTop: space.s2,
-      marginLeft: space.s2,
-    },
-    metaRight: {
-      alignSelf: 'flex-end',
-      marginTop: space.s2,
-      marginRight: space.s2,
-    },
-    photoFallback: { alignItems: 'center', justifyContent: 'center' },
-    photoFallbackText: { marginTop: space.s4 },
-    photoRetry: {
-      minHeight: layout.touchTarget,
-      justifyContent: 'center',
-      paddingHorizontal: space.s5,
-    },
-    reactionRow: { flexDirection: 'row', gap: space.s2, marginTop: space.s3 },
-    reactionChip: {
-      minHeight: 26,
-      minWidth: 30,
-      borderWidth: 1,
-      paddingHorizontal: space.s3,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-    rail: {
-      marginTop: space.s3,
-      flexDirection: 'row',
-      alignItems: 'center',
-      paddingHorizontal: space.s5,
-      borderTopWidth: StyleSheet.hairlineWidth,
-    },
-    railChoice: {
-      width: layout.touchTarget,
-      minHeight: layout.touchTarget,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-    actionStrip: {
-      minHeight: 40,
-      flexDirection: 'row',
-      flexWrap: 'wrap',
-      alignItems: 'center',
-      justifyContent: 'space-between',
-      paddingHorizontal: space.s5,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-    },
-    actionDetail: { flexShrink: 1, marginRight: space.s4 },
-    actionButtons: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      flexWrap: 'wrap',
-      gap: space.s6,
-    },
-    /** One strip action: the 44pt floor the system wants, with the word
-     * centred in it. The line stayed an 18pt line with 8pt of slop — a ~34pt
-     * target — until this floor was applied. */
-    actionButton: { minHeight: layout.touchTarget, justifyContent: 'center' },
-    corruptRow: {
-      marginVertical: space.s3,
-      paddingHorizontal: space.s5,
-      paddingVertical: space.s4,
-      borderTopWidth: StyleSheet.hairlineWidth,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-      alignItems: 'center',
-    },
-    corruptAction: { alignSelf: 'flex-end' },
-    /** The event-row delivery notice: a breath under the event
-     * sentence, centered with it by the corruptRow container. */
-    eventNotice: { marginTop: space.s2 },
-    /** The provenance line above a relayed row. Indented to the bubble it
-     * annotates, so it reads as belonging to that message and not as a
-     * standalone system notice. */
-    sharedTag: {
-      marginTop: space.s4,
-      marginBottom: space.s1,
-      marginHorizontal: space.s6,
-    },
-    /** An outsider's message: full width with a slate
-     * accent bar — deliberately NOT the bubble shape, so it cannot be read as
-     * a member speaking even with the tag line cropped. */
-    outsiderRow: {
-      marginVertical: space.s3,
-      paddingHorizontal: space.s5,
-      paddingVertical: space.s4,
-      borderLeftWidth: 3,
-      alignSelf: 'stretch',
-    },
-    outsiderText: { marginTop: space.s2 },
-    /** The authenticated author over an inbound run's first bubble. */
-    /** The line above a bubble: author label and/or the AI marker. A row so
-     * the badge sits beside the name when both render; flex-start so an
-     * unlabelled agent bubble's lone badge hugs the bubble's edge. */
-    authorLine: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: space.s3,
-      alignSelf: 'flex-start',
-      marginBottom: space.s1,
-    },
-    authorLabel: { marginLeft: space.s2, flexShrink: 1 },
-    mismatchRow: {
-      paddingVertical: space.s4,
-      borderTopWidth: StyleSheet.hairlineWidth,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-      alignItems: 'flex-start',
-    },
-    jumpRow: {
-      minHeight: 40,
-      flexDirection: 'row',
-      alignItems: 'center',
-      justifyContent: 'center',
-      gap: space.s4,
-    },
-    errorActions: {
-      borderLeftWidth: 2,
-      flexDirection: 'row',
-      justifyContent: 'flex-end',
-      alignItems: 'center',
-      gap: space.s6,
-    },
-    progressRow: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: space.s4,
-      paddingVertical: space.s4,
-    },
-    offlineRow: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: space.s3,
-      paddingVertical: space.s4,
-      borderTopWidth: StyleSheet.hairlineWidth,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-    },
-    offlineMark: { width: 6, height: 6 },
-    offlineText: { flex: 1 },
-    banner: {
-      borderTopWidth: 2,
-      borderLeftWidth: 3,
-      paddingVertical: space.s5,
-    },
-    bannerTitleRow: { flexDirection: 'row', alignItems: 'center', gap: space.s5 },
-    bannerTitle: { flex: 1 },
-    bannerBody: { marginTop: space.s3 },
-    bannerActions: { flexDirection: 'row', gap: space.s5, marginTop: space.s5 },
-    bannerButton: {
-      minHeight: layout.touchTarget,
-      borderWidth: 1,
-      paddingHorizontal: space.s6,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-    alertSquare: {
-      width: 24,
-      height: 24,
-      borderWidth: 1,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-    composerWrap: {
-      paddingTop: space.s4,
-      paddingHorizontal: space.s5,
-      paddingBottom: space.s4,
-      borderTopWidth: StyleSheet.hairlineWidth,
-    },
-    counter: { textAlign: 'right', marginBottom: space.s2, marginRight: space.s2 },
-    drawer: {
-      borderWidth: 1,
-      borderBottomWidth: 0,
-      overflow: 'hidden',
-      paddingTop: space.s6,
-      paddingBottom: space.s5,
-    },
-    drawerSeam: { width: StyleSheet.hairlineWidth, height: '100%' },
-    drawerGrid: { flexDirection: 'row', paddingHorizontal: space.s4 },
-    drawerAction: {
-      flex: 1,
-      alignItems: 'center',
-      paddingVertical: space.s1,
-      gap: space.s3,
-    },
-    drawerDisc: {
-      width: 46,
-      height: 46,
-      borderRadius: 23,
-      borderWidth: StyleSheet.hairlineWidth,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-    drawerLabel: { textAlign: 'center' },
-    /** The drawer's ⓘ, aligned with the grid's own gutter. */
-    drawerAbout: { paddingHorizontal: space.s6, marginTop: space.s2 },
-    voiceBar: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: space.s5,
-      paddingHorizontal: space.s5,
-      paddingBottom: space.s3,
-    },
-    voiceLevelTrack: { flex: 1, height: 4, borderRadius: 2, overflow: 'hidden' },
-    voiceTrack: { height: 3, borderRadius: 2, overflow: 'hidden' },
-    voiceTrackFill: { height: 3, borderRadius: 2 },
-    voiceMetaRow: {
-      flexDirection: 'row',
-      alignItems: 'baseline',
-      justifyContent: 'space-between',
-      gap: space.s4,
-    },
-    voiceLevelFill: { height: 4, borderRadius: 2 },
-    emojiRow: { paddingHorizontal: space.s4, alignItems: 'center' },
-    emojiChoice: {
-      width: layout.touchTarget,
-      minHeight: layout.touchTarget,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-    /** The member picker: list padding replaces the drawer's grid padding. */
-    mentionDrawer: { paddingTop: space.s3, paddingBottom: space.s2 },
-    /** One person: a circle and a name. minHeight (never height) so scaled
-     * text grows the row — the no-clipping rule the room header tests pin. */
-    mentionRow: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: space.s5,
-      paddingHorizontal: space.s6,
-      paddingVertical: space.s2,
-    },
-    mentionName: { flexShrink: 1 },
-    mentionChipRow: {
-      flexDirection: 'row',
-      flexWrap: 'wrap',
-      gap: space.s3,
-      paddingHorizontal: space.s2,
-      paddingBottom: space.s3,
-    },
-    mentionChip: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      borderWidth: 1,
-      paddingLeft: space.s5,
-      minHeight: 32,
-    },
-    mentionChipCancel: {
-      minWidth: 32,
-      minHeight: 32,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-    /** A mention in a bubble: weight beside the '@' glyph — the ink is the
-     * theme's, applied inline, and never the only signal. */
-    mentionSpan: { fontWeight: '600' },
-    composer: {
-      flexDirection: 'row',
-      alignItems: 'flex-end',
-      borderWidth: 1,
-      minHeight: layout.buttonHeight,
-      paddingHorizontal: space.s2,
-    },
-    composerIcon: {
-      width: layout.touchTarget,
-      height: layout.touchTarget,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-    composerInput: {
-      flex: 1,
-      minHeight: layout.touchTarget,
-      maxHeight: 110,
-      // 11: tuned with the input's 21pt line to meet the 44pt floor exactly
-      // — sizing, not spacing.
-      paddingVertical: 11,
-    },
-    sendDisc: {
-      borderWidth: 1,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-  });
 }

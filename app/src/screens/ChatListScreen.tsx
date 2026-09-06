@@ -7,11 +7,14 @@ import React, {
 } from 'react';
 import {
   AccessibilityInfo,
+  BackHandler,
   // Deprecated in core but still shipped (the StartChatScreen trade): a
   // paste target is the whole point of an id.
   Clipboard,
   FlatList,
   Linking,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
   Pressable,
   StyleSheet,
   Text,
@@ -25,6 +28,7 @@ import * as lock from '../lock';
 import { DEVICE_NOUN } from '../deviceNoun';
 import { parseEnvelope, previewFor } from '../envelope';
 import { messaging } from '../messaging';
+import { session } from '../session';
 import { isNamingSettled, namingNudgeDue, skipNaming } from '../naming';
 import { NAMING_COPY } from '../namingCopy';
 import { shareIdMessage } from '../peerId';
@@ -35,7 +39,13 @@ import {
   updateGate,
 } from '../updateGate';
 import { UPDATE_COPY } from '../updateGateCopy';
-import { personName, sanitizeDisplayName } from '../person';
+import {
+  personName,
+  sanitizeDisplayName,
+  spokenPersonName,
+} from '../person';
+import { FIELD_MODE_COPY } from '../fieldModeCopy';
+import { useFieldModeActive } from '../useFieldModeActive';
 import { useTheme } from '../theme';
 import { timeLabel } from '../time';
 import { Avatar } from '../ui/Avatar';
@@ -70,6 +80,13 @@ interface Props {
   /** A room is made FROM people already here, so its entry lives with the
    * list rather than behind the + (which reaches someone new). */
   onStartRoom: () => void;
+  /** Settings, for the Field Mode line under the title. Optional
+   * for the same reason `onOpenAppLock` is: without it the line still says
+   * the true thing, it just offers no control that would claim a route this
+   * screen was not given. The host passes
+   * `onOpenSettings={() => setRoute({ name: 'settings', from: 'chats' })}`,
+   * and `from` is what brings the person back here afterwards. */
+  onOpenSettings?: () => void;
 }
 
 const COPY = {
@@ -94,10 +111,32 @@ const COPY = {
     `${label}, new messages, you were mentioned, ${preview}`,
 
   rowActions: 'Conversation actions',
+
+  // The two reversible row actions (tablestakes-8). Both are local, neither
+  // is ever sent, and neither names a device.
+  pin: 'Pin to the top',
+  unpin: 'Unpin',
+  /** The pinned mark is a glyph in a 12pt gutter, so the WORD travels in the
+   * row's label — two channels, never the glyph alone. */
+  pinnedSpoken: (label: string) => `${label}, pinned`,
+  markUnread: 'Mark unread',
+  markedUnread: 'Marked unread.',
+  /** The preview slot's prefix when there is something unsent here. Pine
+   * carries it visually; `draftSpoken` carries it for everyone else. */
+  draftPrefix: 'Draft',
+  draftSpoken: (label: string, text: string) => `${label}, draft, ${text}`,
+
   deleteChat: 'Delete conversation',
   // The device is named in the
   // platform's own words via the token, here and in the room copy below.
   deleteConfirm: `Delete this conversation? The messages are only on this ${DEVICE_NOUN} — Tacendum has no copy to restore.`,
+  /**
+   * Deleting a conversation also deletes its 1:1 call log. State that
+   * consequence explicitly so a user does not expect calls to remain in
+   * Calls after their messages are erased. Keep it separate from the
+   * existing message-loss sentence and avoid an additional device noun.
+   */
+  deleteAlsoCalls: 'Your calls with them go too.',
   keep: 'Keep',
   delete: 'Delete',
   deleted: 'Conversation deleted.',
@@ -105,7 +144,7 @@ const COPY = {
 
   // Rooms. Deleting a room is LOCAL — the
   // room lives on for its other members — and the recreate rule is said
-  // rather than hidden: rule 22 forbids copy that implies more was removed
+  // rather than hidden: the copy must not imply more was removed
   // than was.
   newRoom: 'New room',
   roomFallbackName: 'Room',
@@ -114,6 +153,10 @@ const COPY = {
     `Delete this room from this ${DEVICE_NOUN}? Its messages here are only on this ` +
     `${DEVICE_NOUN} — Tacendum has no copy to restore. The other members keep ` +
     'theirs, and while the room stays active with you in it, it can return.',
+  /** The room's own second line. "here" rather than a device noun, and
+   * "The room's calls" rather than "your calls": a room-call leg belongs to
+   * the room, and deleteGroup takes the room's legs alone. */
+  roomDeleteAlsoCalls: 'The room’s calls here go too.',
   roomDeleted: `Room deleted from this ${DEVICE_NOUN}.`,
 
   /** What VoiceOver hears for a room row. The walled-square mark is visual
@@ -127,11 +170,12 @@ const COPY = {
   emptyRoom: 'A private space waiting for the people you invite',
   emptyTitle: 'Nobody else is here yet',
   stepOne: 'Send someone your ID.',
-  stepTwo: 'Tap +, then enter theirs.',
-  /** Where a conversation's actions live: Block and Delete sit behind a
-   * long press and the … each row carries, and nothing on the screen
-   * used to say so. */
-  actionsHint: 'Later, the … beside a chat holds Block and Delete.',
+  /** The new-chat screen offers scanning before typing, so the first-run
+   * instructions introduce those actions in the same order. */
+  stepTwo: 'Tap + to scan their code, or type their ID.',
+  /** Conversation actions live behind a long press or the row's ellipsis.
+   * Name the location without listing a subset of a drawer that can vary. */
+  actionsHint: 'The … beside a chat holds what you can do with it.',
   copyId: 'Copy ID',
   shareId: 'Share ID',
   // Byte-identical to StartChatScreen.tsx — the same copy action must never
@@ -158,6 +202,59 @@ const COPY_NOTICE_MS = 3000;
  * bottom inset is derived from these, so the two cannot drift apart. */
 const FAB_BOTTOM = 24;
 const FAB_SIZE = 56;
+
+/**
+ * WHERE THE LIST WAS, LAST TIME SOMEBODY LOOKED AT IT.
+ *
+ * Module scope, not state and not a ref, precisely because the router keeps
+ * no stack (`App.tsx`): this
+ * screen UNMOUNTS on every navigation into a conversation and mounts afresh
+ * on the way back, so anything held inside the component is gone by the time
+ * it would be needed. Opening the thirtieth conversation and backing out
+ * returned you to the top of the list, every time.
+ *
+ * NOT A DURESS TELL, and the guard is what makes that true. An offset is a
+ * number with no content; it names nobody and says nothing about what is in
+ * the list. But it is still process-scope state, and the one boundary it
+ * must not cross is the workspace switch — so `offsetOwner` names the
+ * SESSION as well as the account.
+ *
+ * The account alone does not separate them: a decoy workspace stores the
+ * real account's own `userId` (decoy.ts writes it into the decoy profile so
+ * the two never drift), so an id-only owner check does not fire on a duress
+ * unlock, and the place the owner had scrolled their real list to would be
+ * put back under the decoy. `${session.mode}:${userId}` fires on both a
+ * change of account and a change of session, which is every crossing there
+ * is.
+ */
+let lastOffset = 0;
+let offsetOwner: string | null = null;
+
+/**
+ * The conversations this run has PROVEN have something inbound.
+ *
+ * `canMarkUnread` is the one question the drawer cannot answer from what is
+ * already on screen, and the only statement that answers it today is
+ * `db.listMessages`, whose own comment calls it deliberately unbounded: it
+ * selects every column of every message in the conversation, bodies
+ * included, to compute one boolean. Cache known-positive results so
+ * reopening the same drawer does not repeatedly read its whole history.
+ *
+ * ONLY THE `true` ANSWER IS KEPT, and the asymmetry is the design. A
+ * conversation that has received something cannot un-receive it, so a true
+ * holds for the life of the process. A false can turn true at any moment —
+ * that is what an arrival IS — so it is never remembered and the next
+ * drawer asks again, which is cheap precisely because a conversation with
+ * nothing inbound is the small one.
+ *
+ * Forgotten with `lastOffset`, on the same owner change and for the same
+ * reason: it is a fact about one workspace's conversations, and the decoy
+ * shares this account's id.
+ *
+ * A bulk inbound-peer query could replace this cache and the history read;
+ * until such a query exists, cache only facts that remain true.
+ */
+const inboundSeen = new Set<string>();
 
 /**
  * Which step of a row's attached actions is showing. Blocking gets its own
@@ -199,11 +296,15 @@ const ConversationRow = React.memo(function ConversationRowBody({
   blocked,
   selected,
   menu,
+  draft,
+  canMarkUnread,
   onOpen,
   onMenu,
   onDelete,
   onBlock,
   onUnblock,
+  onPin,
+  onMarkUnread,
 }: {
   chat: db.ChatRow;
   /** The room anchor when this row IS a room: its name
@@ -226,11 +327,24 @@ const ConversationRow = React.memo(function ConversationRowBody({
   selected: boolean;
   /** Which step of this row's actions is showing, if any. */
   menu: RowMenu;
+  /** What is sitting unsent in this conversation's composer, if anything
+   *. Undefined is the ordinary case; the preview line is
+   * unchanged then. */
+  draft: string | undefined;
+  /** Whether this conversation has anything inbound to mark, or
+   * `undefined` while the answer is still on its way. The row is WITHHELD
+   * rather than greyed when there is nothing: `markChatUnread` is a silent
+   * no-op with nothing to roll back to. Unknown reserves the space instead
+   * — see `heldUnreadSlot`. */
+  canMarkUnread: boolean | undefined;
   onOpen: (peerId: string) => void;
   onMenu: (peerId: string, next: RowMenu) => void;
   onDelete: (peerId: string) => Promise<boolean>;
   onBlock: (peerId: string) => Promise<boolean>;
   onUnblock: (peerId: string) => Promise<boolean>;
+  /** A moment, or null to unpin. */
+  onPin: (peerId: string, at: number | null) => Promise<boolean>;
+  onMarkUnread: (peerId: string) => Promise<boolean>;
 }) {
   const t = useTheme();
   const [busy, setBusy] = useState(false);
@@ -266,6 +380,17 @@ const ConversationRow = React.memo(function ConversationRowBody({
       sanitizeDisplayName(room.name) ||
       COPY.roomFallbackName
     : personName(chat.peerId, chat.displayName, chat.localName);
+  /**
+   * The same row, said out loud. `label` above falls back to
+   * `shortId` for somebody who has never shared a name — eight ULID
+   * characters, which a screen reader pronounces as invented words, on the
+   * row that introduces a stranger. The SPOKEN name spells that tail
+   * instead. Rooms are unaffected by construction: a nameless room falls
+   * back to a word, never to an id, so the two are the same string there.
+   */
+  const spokenLabel = room
+    ? label
+    : spokenPersonName(chat.peerId, chat.displayName, chat.localName);
   // A name I gave outranks the card they shared, so the disc and the line
   // under it can never disagree about who this is — and a card that
   // sanitizes away is not a name, exactly as personName drops it.
@@ -274,6 +399,43 @@ const ConversationRow = React.memo(function ConversationRowBody({
     (sanitizeDisplayName(chat.localName) ||
       sanitizeDisplayName(chat.displayName)) !== '';
   const preview = previewLine(chat);
+  /** Pinned is a moment on the row, not a flag: `listChats` orders by it, so
+   * the row only has to SAY so. */
+  const pinned = chat.pinnedAt != null;
+  /**
+   * The draft, collapsed to the one line this row has — and withheld on a
+   * blocked row, which has exactly one thing to say and it is not this
+   *. A row that is discarding what this person sends keeps its
+   * status.
+   */
+  const draftLine = blocked ? '' : (draft ?? '').replace(/\s+/g, ' ').trim();
+  const showDraft = draftLine !== '';
+  /**
+   * WHETHER THIS OPENING OF THE DRAWER HAS TO HOLD THE MARK-UNREAD SPACE.
+   *
+   * `canMarkUnread` is undefined until the read behind it lands, and the
+   * drawer paints before that. Inserting the row afterwards pushed Block
+   * and Delete down 44pt under a finger already moving; collapsing a
+   * placeholder afterwards would pull Delete UP into where Block had been,
+   * which is worse. So the decision is frozen at the moment this drawer
+   * OPENS: opened without an answer, the space is held for as long as this
+   * opening lasts, whichever way the answer goes. Closing the drawer
+   * forgets it, and the next opening — with the answer now remembered —
+   * paints its final shape immediately.
+   */
+  const heldUnreadSlot = useRef(false);
+  if (menu !== 'actions') {
+    heldUnreadSlot.current = false;
+  } else if (canMarkUnread === undefined) {
+    heldUnreadSlot.current = true;
+  }
+
+  /** The name a screen reader hears, plus the two facts that are otherwise
+   * only a glyph: room-ness, and pinned-ness. */
+  const spokenTitle = (() => {
+    const withKind = room ? COPY.roomSpoken(spokenLabel) : spokenLabel;
+    return pinned ? COPY.pinnedSpoken(withKind) : withKind;
+  })();
 
   const remove = () => {
     setBusy(true);
@@ -330,24 +492,40 @@ const ConversationRow = React.memo(function ConversationRowBody({
         // already read correctly) — because the room mark is only visual.
         {...(blocked
           ? {
-              accessibilityLabel: BLOCK.rowLabel(
-                room ? COPY.roomSpoken(label) : label,
-                preview,
-              ),
+              accessibilityLabel: BLOCK.rowLabel(spokenTitle, preview),
             }
           : unread || (room && mentioned)
             ? {
                 // "you were mentioned" outranks the plain unread sentence:
                 // being addressed is the one fact worth adding words for.
+                //
+                // The TAIL is whatever the preview slot is actually
+                // showing, which is the draft when there is one. News
+                // outranks a draft in the sentence, but it does not put the
+                // incoming message back: the visible slot has already given
+                // that line up to the draft, so speaking it would describe a
+                // row nobody can see. Same rule as the branch below, one
+                // sentence further on.
                 accessibilityLabel: (room && mentioned
                   ? COPY.unreadMention
-                  : COPY.unread)(room ? COPY.roomSpoken(label) : label, preview),
+                  : COPY.unread)(
+                  spokenTitle,
+                  showDraft ? `${COPY.draftPrefix}, ${draftLine}` : preview,
+                ),
               }
-            : room
+            : showDraft
               ? {
-                  accessibilityLabel: `${COPY.roomSpoken(label)}, ${preview}`,
+                  // News outranks a draft — an arrival is about them, a
+                  // draft is about me — but a draft outranks the preview it
+                  // has replaced on screen, or the two channels would
+                  // disagree about what this row is showing.
+                  accessibilityLabel: COPY.draftSpoken(spokenTitle, draftLine),
                 }
-              : {})}
+              : room || pinned
+                ? {
+                    accessibilityLabel: `${spokenTitle}, ${preview}`,
+                  }
+                : {})}
         testID={`chat-${chat.peerId}`}
         style={({ pressed }) => [
           styles.row,
@@ -396,6 +574,22 @@ const ConversationRow = React.memo(function ConversationRowBody({
                 },
               ]}
             />
+          ) : pinned ? (
+            /* The pinned mark, in the column the unread dot already owns —
+               so the name never shifts, and the two can never collide. News
+               outranks placement: an arrival is about somebody else, a pin
+               is my own filing. Frozen against Dynamic Type and hidden from
+               assistive tech, the "…" precedent below: the row is ONE
+               element and the WORD rides its label. */
+            <Text
+              allowFontScaling={false}
+              accessibilityElementsHidden
+              importantForAccessibility="no-hide-descendants"
+              testID={`pin-mark-${chat.peerId}`}
+              style={[styles.pinMark, { color: t.color.pine }]}
+            >
+              ▲
+            </Text>
           ) : null}
         </View>
         <View style={styles.rowBody}>
@@ -452,7 +646,20 @@ const ConversationRow = React.memo(function ConversationRowBody({
                 { color: unread ? t.color.inkBody : t.color.inkMuted },
               ]}
             >
-              {preview}
+              {/* The conventional shape, and the reason the drafts table was
+                  built: the word in pine, then what you left. Two children
+                  rather than a fragment, so the line is one text run the row
+                  can ellipsize. The row's own weight carries the rest, so a
+                  draft on an unread row still reads as unread. */}
+              {showDraft ? (
+                <Text
+                  testID={`draft-prefix-${chat.peerId}`}
+                  style={{ color: t.color.pine }}
+                >
+                  {COPY.draftPrefix}
+                </Text>
+              ) : null}
+              {showDraft ? ` ${draftLine}` : preview}
             </Text>
             {/* WhatsApp's @ badge: an unread message in this room mentions
                 YOU. Rooms only, and re-verified by the screen against the
@@ -517,6 +724,7 @@ const ConversationRow = React.memo(function ConversationRowBody({
 
       {menu === 'actions' ? (
         <View
+          testID={`chat-drawer-${chat.peerId}`}
           style={[
             styles.rowDrawer,
             {
@@ -529,6 +737,37 @@ const ConversationRow = React.memo(function ConversationRowBody({
         >
           {blocked ? (
             <>
+              {/* PIN LIVES IN BOTH DRAWERS, and it has to. `listChats`
+                  orders pinned rows first whatever else is true of them, so
+                  a conversation you pinned and then blocked sits at the top
+                  of your home screen permanently — and every other route
+                  back is unblock, unpin, block again. Same control, same
+                  testID, same label as the unblocked branch; it leads here
+                  because "reversible above irreversible" has only one
+                  irreversible thing left to be above, and unblocking is the
+                  subject of this drawer, not its filing. */}
+              <Pressable
+                onPress={() =>
+                  void onPin(chat.peerId, pinned ? null : Date.now())
+                }
+                accessibilityRole="button"
+                accessibilityLabel={pinned ? COPY.unpin : COPY.pin}
+                testID={`chat-${pinned ? 'unpin' : 'pin'}-${chat.peerId}`}
+                style={({ pressed }) => [
+                  styles.rowDrawerAction,
+                  {
+                    minHeight: t.layout.touchTarget,
+                    paddingHorizontal: t.layout.gutter,
+                    backgroundColor: pressed ? t.color.pineWash : 'transparent',
+                  },
+                ]}
+              >
+                <Text
+                  style={[t.type.compactStrong, { color: t.color.inkStrong }]}
+                >
+                  {pinned ? COPY.unpin : COPY.pin}
+                </Text>
+              </Pressable>
               <Pressable
                 onPress={() => runBlockWrite(onUnblock)}
                 disabled={blockBusy}
@@ -584,12 +823,76 @@ const ConversationRow = React.memo(function ConversationRowBody({
             </>
           ) : (
             <>
-              {/* Reversible above irreversible. Blocking is protective, not
-                  destructive, so it takes the pine wash: two stacked red rows
-                  read as one undifferentiated hazard. A ROOM offers no Block
-                  at all — blocking a room is not a thing; a member is
-                  blocked from their own conversation, and leaving is the
-                  room-shaped act. */}
+              {/* Reversible above irreversible, so the two filing actions
+                  lead: pinning and marking unread change where a row sits
+                  and what it says, and both are undone by doing them again
+                  (tablestakes-8). Neither is ever sent — the person pinned
+                  is never told. */}
+              <Pressable
+                onPress={() =>
+                  void onPin(chat.peerId, pinned ? null : Date.now())
+                }
+                accessibilityRole="button"
+                accessibilityLabel={pinned ? COPY.unpin : COPY.pin}
+                testID={`chat-${pinned ? 'unpin' : 'pin'}-${chat.peerId}`}
+                style={({ pressed }) => [
+                  styles.rowDrawerAction,
+                  {
+                    minHeight: t.layout.touchTarget,
+                    paddingHorizontal: t.layout.gutter,
+                    backgroundColor: pressed ? t.color.pineWash : 'transparent',
+                  },
+                ]}
+              >
+                <Text
+                  style={[t.type.compactStrong, { color: t.color.inkStrong }]}
+                >
+                  {pinned ? COPY.unpin : COPY.pin}
+                </Text>
+              </Pressable>
+              {/* WITHHELD, never greyed: with nothing inbound there is
+                  nothing to roll the clock back to, and a control that does
+                  nothing is the same defect as one that claims something.
+                  While the answer is still on its way the SPACE is held
+                  instead (see `heldUnreadSlot`), so Block and Delete never
+                  move under a finger already travelling to them. */}
+              {canMarkUnread === true ? (
+                <Pressable
+                  onPress={() => void onMarkUnread(chat.peerId)}
+                  accessibilityRole="button"
+                  accessibilityLabel={COPY.markUnread}
+                  testID={`chat-markunread-${chat.peerId}`}
+                  style={({ pressed }) => [
+                    styles.rowDrawerAction,
+                    {
+                      minHeight: t.layout.touchTarget,
+                      paddingHorizontal: t.layout.gutter,
+                      backgroundColor: pressed
+                        ? t.color.pineWash
+                        : 'transparent',
+                    },
+                  ]}
+                >
+                  <Text
+                    style={[t.type.compactStrong, { color: t.color.inkStrong }]}
+                  >
+                    {COPY.markUnread}
+                  </Text>
+                </Pressable>
+              ) : heldUnreadSlot.current ? (
+                <View
+                  testID={`chat-markunread-hold-${chat.peerId}`}
+                  accessibilityElementsHidden
+                  importantForAccessibility="no-hide-descendants"
+                  style={{ minHeight: t.layout.touchTarget }}
+                />
+              ) : null}
+              {/* Blocking is protective, not destructive, so it takes the
+                  pine wash: two stacked red rows read as one
+                  undifferentiated hazard. A ROOM offers no Block at all —
+                  blocking a room is not a thing ; a member is blocked
+                  from their own conversation, and leaving is the room-shaped
+                  act. */}
               {room === undefined ? (
                 <Pressable
                   onPress={() => onMenu(chat.peerId, 'blockConfirm')}
@@ -717,6 +1020,19 @@ const ConversationRow = React.memo(function ConversationRowBody({
           <Text style={[t.type.compactBody, { color: t.color.inkBody }]}>
             {room ? COPY.roomDeleteConfirm : COPY.deleteConfirm}
           </Text>
+          {/* What the delete also takes, said rather than
+              discovered later in Calls. A second line, because the sentence
+              above is anchored in the copy inventory. */}
+          <Text
+            testID={`chat-delete-calls-${chat.peerId}`}
+            style={[
+              t.type.compactBody,
+              styles.rowConfirmAlso,
+              { color: t.color.inkBody },
+            ]}
+          >
+            {room ? COPY.roomDeleteAlsoCalls : COPY.deleteAlsoCalls}
+          </Text>
           <View style={styles.confirmActions}>
             <TextAction
               label={COPY.keep}
@@ -767,6 +1083,8 @@ function FilterField({
         onBlur={() => setFocused(false)}
         placeholder={COPY.filterLabel}
         placeholderTextColor={t.color.inkMuted}
+        keyboardAppearance={t.scheme}
+        selectionColor={t.color.pine}
         accessibilityLabel={COPY.filterLabel}
         autoCapitalize="none"
         autoCorrect={false}
@@ -1201,9 +1519,18 @@ export function ChatListScreen({
   onStartChat,
   onStartRoom,
   onOpenAppLock,
+  onOpenSettings,
 }: Props) {
   const t = useTheme();
   const [chats, setChats] = useState<db.ChatRow[]>([]);
+  /**
+   * Wait for the first listChats read before showing the empty state.
+   * The router remounts this screen when returning from a conversation;
+   * an initially empty state array says nothing about stored chats and
+   * must not flash first-run instructions while SQLite is still reading.
+   * Leave the list area blank until the read finishes, as the thread does.
+   */
+  const [loaded, setLoaded] = useState(false);
   /**
    * Which rows are rooms, keyed by the room's ULID, carrying the anchor
    * (owner + name). Read from the `groups` anchor per row because
@@ -1212,6 +1539,25 @@ export function ChatListScreen({
    */
   const [rooms, setRooms] = useState<Map<string, db.GroupRow>>(new Map());
   const [unread, setUnread] = useState<Record<string, number>>({});
+  /** What is sitting unsent in each conversation, in the
+   * `unreadCounts` shape and read the same way: one whole-table statement
+   * per refresh, never one per row. */
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  /**
+   * Which conversations have anything inbound to mark unread, learned
+   * one at a time when a drawer opens.
+   *
+   * THE HONEST COST, STATED. There is no bulk "has this chat ever received
+   * anything" read, and every cheap approximation is wrong in a case people
+   * actually hit: the newest row being outbound just means you replied last.
+   * So the answer is read exactly, for one conversation, at the moment
+   * somebody opens its drawer — the same posture the delete routing takes
+   * with its press-time anchor re-check — and it is skipped entirely when
+   * the row is already unread, which is inbound by definition. A bulk read
+   * could replace these per-conversation reads; until then, read the
+   * actual inbound state rather than estimating it.
+   */
+  const [inbound, setInbound] = useState<Record<string, boolean>>({});
   /** Rooms whose unread messages mention ME — the @ badge (the mentions
    * contract). Decided HERE, against the parsed envelope's `who` and my
    * own account id: the db read hands over bodies, never judgements, so a
@@ -1240,12 +1586,47 @@ export function ChatListScreen({
     step: 'actions' | 'confirm' | 'blockConfirm';
   } | null>(null);
 
-  /** Sequenced (CallsScreen's own guard): this refresh is N async reads
-   * long — listChats, then a getGroup per row — and it is called both
-   * directly after a delete/block and from the 80 ms notify window, so two
-   * can overlap. Every set below lands only if no newer refresh has
-   * started since, or a just-deleted row's OLDER snapshot could resolve
-   * last and paint the row back. */
+  /** Read by the system-back handler, which is registered once and must see
+   * what is open at the moment of the press, not at subscription. */
+  const menuRef = useRef(menu);
+  menuRef.current = menu;
+
+  useEffect(() => {
+    // ANDROID SYSTEM BACK closes the drawer that is open before it leaves
+    // the home screen. The router's
+    // handler (App.tsx) answers every press, and on the home route that
+    // press exits the app — so a person who opened a row's drawer, or the
+    // delete or block question inside it, and pressed Back to dismiss it
+    // was closing Tacendum instead. That is the worst version of this bug
+    // in the app, because it is the screen a person is on most.
+    //
+    // ONE PRESS CLOSES THE WHOLE DRAWER, not one step of it. Both questions
+    // inside it — "Delete" and "Block" — cancel to `none` rather than back
+    // to the actions row (`chat-keep-*`, `chat-block-cancel-*`), so a
+    // back-to-actions step here would be a motion the screen's own controls
+    // do not have. The state is one object with one open row in it, which
+    // is why this is one case and not three.
+    //
+    // With nothing open it yields (`false`) and the router does what it
+    // always did. Refs, not state: registered once, and a press can land
+    // before a state has flushed. On iOS `BackHandler` is inert
+    // (RegisterScreen's precedent), so this registers
+    // unconditionally.
+    const subscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      () => {
+        if (menuRef.current === null) return false;
+        setMenu(null);
+        return true;
+      },
+    );
+    return () => subscription.remove();
+  }, []);
+
+  /** Refresh reads chats and groups asynchronously and can overlap with
+   * refreshes from writes or the coalesced notification callback. Apply a
+   * result only if no newer refresh has started, or an older snapshot can
+   * resurrect a deleted row. */
   const refreshSeq = useRef(0);
   const refresh = useCallback(() => {
     const seq = ++refreshSeq.current;
@@ -1253,21 +1634,44 @@ export function ChatListScreen({
     void db.listChats().then(async rows => {
       if (!current()) return;
       setChats(rows);
+      // Set beside the rows it describes, and under the same sequence
+      // guard: the gate lifts when a read that is still the newest has
+      // actually answered, never on a snapshot that has been superseded.
+      setLoaded(true);
       // The anchors identify the rooms among the rows. A row whose anchor
       // read fails renders as a person — the quiet posture every other
       // enhancement here takes — and its delete still re-checks the anchor.
-      const anchors = await Promise.all(
-        rows.map(
-          async row =>
-            [row.peerId, await db.getGroup(row.peerId).catch(() => null)] as const,
-        ),
-      );
+      //
+      // ONE READ, NOT ONE PER ROW. This was a getGroup per row
+      // beside the four reads below — N+4 on the screen a person looks at
+      // most, re-run inside every 80 ms notify window while a backlog
+      // drains. `useCoalescedSubscribe` caps the RATE; it never capped the
+      // cost. `listGroups` returns the same three columns `getGroup` reads,
+      // so nothing downstream can tell where the anchor came from.
+      const anchors = await db.listGroups().catch(() => []);
       if (!current()) return;
+      // Filtered to the rows actually being drawn: the anchors table
+      // outlives a locally deleted room, so it can hold
+      // ids this list has no row for.
+      const drawn = new Set(rows.map(row => row.peerId));
       setRooms(
         new Map(
-          anchors.filter((pair): pair is [string, db.GroupRow] => pair[1] !== null),
+          anchors
+            .filter(anchor => drawn.has(anchor.groupId))
+            .map(anchor => [anchor.groupId, anchor] as const),
         ),
       );
+    },
+    () => {
+      // A FAILED READ OPENS THE GATE TOO. `loaded` exists to stop the empty
+      // state flashing before the answer, not to withhold the screen
+      // forever — and this read can reject: a connection closed under a
+      // workspace switch or a relock is the ordinary case. Without this arm
+      // the gate never lifted, and what was left was the header, the + and
+      // nothing at all, with no way back but a remount. The empty state is
+      // the wrong answer here, but it is a screen that offers a way out of
+      // itself.
+      if (current()) setLoaded(true);
     });
     void db.unreadCounts().then(
       counts => {
@@ -1275,6 +1679,15 @@ export function ChatListScreen({
       },
       () => {
         // Marks are an enhancement: a list without them still works.
+      },
+    );
+    void db.listDrafts().then(
+      byPeer => {
+        if (current()) setDrafts(byPeer);
+      },
+      () => {
+        // The unread mark's own quiet posture: a list without draft
+        // prefixes still shows every conversation.
       },
     );
     void db.unreadRoomBodies().then(
@@ -1324,16 +1737,16 @@ export function ChatListScreen({
   // Under the wide shell this list is LIVE beside an open thread, and
   // messaging.notify() fires on every receipt, inbound frame, socket
   // transition and attachment tick — subscribed raw, a draining backlog
-  // cost one full list requery (listChats + a getGroup per row + three
-  // more reads) PER notify, doubled against the thread's own requeries.
-  // The window itself lives in useCoalescedSubscribe now, so the profile
-  // and composer screens hold the same one; the screen's own mutations
-  // (delete/block/unblock) keep calling refresh() directly and are not
-  // delayed.
+  // cost one full list requery (listChats + listGroups + three more reads)
+  // PER notify, doubled against the thread's own requeries.
+  // useCoalescedSubscribe gives the profile and composer screens the same
+  // coalescing behavior; the
+  // screen's own mutations (delete/block/unblock) keep calling refresh()
+  // directly and are not delayed.
   useCoalescedSubscribe(refresh, REFRESH_DEBOUNCE_MS);
 
   // Colour alone cannot carry connection state, so the marker always travels
-  // with the word (the bare dot is cut).
+  // with the word.
   const connection = {
     open: { label: 'Connected', mark: t.color.pine, ink: t.color.inkMuted },
     connecting: {
@@ -1348,6 +1761,21 @@ export function ChatListScreen({
       ink: t.color.inkMuted,
     },
   }[wsState];
+
+  /**
+   * FIELD MODE, ON THE FIRST SCREEN. Derived from the same
+   * getters Settings reads, so it cannot go stale and cannot disagree with
+   * the chip; the router is not keep-alive, so this list remounts on every
+   * return from Settings and the read is taken again.
+   *
+   * The precedence under the title is a strict order: a connection problem
+   * outranks everything, then Field Mode, then nothing. In a coerced session
+   * the derivation lands on Off — the same answer the Settings chip gives at
+   * the same moment — so this line is the same fact at a second address, not
+   * a new one, and adds no discriminator.
+   */
+  const fieldModeOn = useFieldModeActive();
+  const showFieldMode = wsState === 'open' && fieldModeOn;
 
   const openChat = useCallback(
     (peerId: string) => {
@@ -1380,9 +1808,95 @@ export function ChatListScreen({
     [profile.userId],
   );
 
+  /**
+   * The unread counts and the conversations already asked about, held as
+   * refs so `changeMenu` can stay IDENTITY-STABLE. The
+   * memoised row compares its props: a callback rebuilt whenever unread or
+   * inbound changed would re-render every row in the list each time a
+   * drawer opened, which is the exact defect the memo exists to prevent —
+   * and `ChatListScreen.test.tsx` catches it.
+   */
+  const unreadRef = useRef(unread);
+  useEffect(() => {
+    unreadRef.current = unread;
+  }, [unread]);
+  const askedInbound = useRef(new Set<string>());
   const changeMenu = useCallback((peerId: string, next: RowMenu) => {
     setMenu(next === 'none' ? null : { peerId, step: next });
+    // The one question the drawer cannot answer from what is already on
+    // screen. Asked once per conversation per mount, and never for a
+    // row that is already unread — unread IS inbound.
+    if (next !== 'actions') return;
+    if ((unreadRef.current[peerId] ?? 0) > 0) return;
+    // Already proven, this run (see `inboundSeen`). Set in the same handler
+    // as the menu itself, so the two land in one render and the drawer's
+    // first paint is already the final one.
+    if (inboundSeen.has(peerId)) {
+      setInbound(prev =>
+        prev[peerId] === true ? prev : { ...prev, [peerId]: true },
+      );
+      return;
+    }
+    if (askedInbound.current.has(peerId)) return;
+    askedInbound.current.add(peerId);
+    void db
+      .listMessages(peerId)
+      .then(rows => {
+        const answered = rows.some(row => row.direction === 'in');
+        if (answered) inboundSeen.add(peerId);
+        setInbound(prev => ({ ...prev, [peerId]: answered }));
+      })
+      .catch(() => {
+        // Unreadable means unknown, and unknown withholds: the row is never
+        // offered on a guess. Asking again is allowed — the failure was the
+        // read's, not the conversation's.
+        askedInbound.current.delete(peerId);
+      });
   }, []);
+
+  /**
+   * Pin, or unpin with null. Local to this workspace like everything else on
+   * a chats row — never sent, so the person pinned is never told, and a pin
+   * made under duress pins a decoy row while nothing real moves.
+   */
+  const pinChat = useCallback(
+    async (peerId: string, at: number | null) => {
+      try {
+        await db.setPinned(peerId, at);
+      } catch {
+        return false;
+      }
+      setMenu(null);
+      refresh();
+      return true;
+    },
+    [refresh],
+  );
+
+  /**
+   * Put the mark back on a conversation I have already read. This device
+   * only: `syncThreadRead` propagates READ to my siblings and there is no
+   * inverse envelope — a fact, not a defect, and nothing here claims
+   * otherwise.
+   */
+  const markUnread = useCallback(
+    async (peerId: string) => {
+      try {
+        await db.markChatUnread(peerId);
+      } catch {
+        return false;
+      }
+      setMenu(null);
+      refresh();
+      // Queued so it survives the drawer leaving the tree, the same way the
+      // delete and block announcements are.
+      AccessibilityInfo.announceForAccessibilityWithOptions(COPY.markedUnread, {
+        queue: true,
+      });
+      return true;
+    },
+    [refresh],
+  );
 
   const deleteChat = useCallback(
     async (peerId: string) => {
@@ -1648,17 +2162,100 @@ export function ChatListScreen({
   // column and drawer both depend on it; rooms for the same reason — an
   // anchor arriving after the first paint renames the row.
   const listExtra = useMemo(
-    () => ({ menu, unread, blockedIds, rooms, mentioned, selectedPeerId }),
-    [menu, unread, blockedIds, rooms, mentioned, selectedPeerId],
+    () => ({
+      menu,
+      unread,
+      blockedIds,
+      rooms,
+      mentioned,
+      selectedPeerId,
+      drafts,
+      inbound,
+    }),
+    [
+      menu,
+      unread,
+      blockedIds,
+      rooms,
+      mentioned,
+      selectedPeerId,
+      drafts,
+      inbound,
+    ],
   );
   const listInset = useMemo(() => {
     const clearance = FAB_BOTTOM + FAB_SIZE + t.space.s6;
     return { paddingBottom: clearance, indicator: { bottom: clearance } };
   }, [t]);
 
-  // Stable across renders: the memoised row skips when its props are
-  // unchanged, and that needs the callbacks — these five are already
-  // useCallbacks — and this function to keep their identity.
+  /**
+   * SCROLL MEMORY, in three parts.
+   *
+   * The offset is remembered in module scope (see `lastOffset`), forgotten
+   * when the account changes, and put back EXACTLY ONCE — after the first
+   * render that actually has rows. Once, not on every requery: a restore
+   * per refresh would fight the person's own scrolling for as long as a
+   * backlog takes to drain, which is precisely when someone is scrolling.
+   *
+   * `scrollToOffset` on the ref rather than the `contentOffset` prop: the
+   * prop's Android support is not something to bet a release on, and the
+   * list clamps an offset past its own end, so a shorter list simply lands
+   * at its end instead of somewhere impossible.
+   *
+   * That same clamp is why the restore is armed by the effect and FIRED
+   * from `onContentSizeChange`: before the list has measured, its content
+   * size is zero and every offset clamps to the top.
+   */
+  const listRef = useRef<FlatList<db.ChatRow>>(null);
+  const restored = useRef(false);
+  /** Armed by the effect below, drained by `onContentSizeChange`. */
+  const pendingRestore = useRef(false);
+  // Read at the first render of this mount, before any effect can restore
+  // from it: a different account — or the same account's other session —
+  // inherits nothing. Guarded by its own ref so a re-render cannot re-zero
+  // an offset this session has since written.
+  const ownerChecked = useRef(false);
+  if (!ownerChecked.current) {
+    ownerChecked.current = true;
+    const owner = `${session.mode}:${profile.userId}`;
+    if (offsetOwner !== owner) {
+      offsetOwner = owner;
+      lastOffset = 0;
+      inboundSeen.clear();
+    }
+  }
+  const onScroll = useCallback(
+    (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+      lastOffset = event.nativeEvent.contentOffset.y;
+    },
+    [],
+  );
+  const rowCount = visible.length;
+  useEffect(() => {
+    if (restored.current || !loaded || rowCount === 0) return;
+    restored.current = true;
+    if (lastOffset > 0) pendingRestore.current = true;
+  }, [loaded, rowCount]);
+  /**
+   * WHERE THE RESTORE ACTUALLY FIRES. The effect above only ARMS it.
+   *
+   * A scroll offset set against a list that has not measured yet is a no-op:
+   * the underlying scroll view clamps every offset to its own content size,
+   * and at the commit that first has rows that size is still zero. Firing
+   * there is how "comes back where you left it" silently stops holding on a
+   * device while every jest assertion stays green — jest can see the call
+   * and can never see where it landed. So the number waits here, for the
+   * first report of a real content height, and is put back exactly once.
+   */
+  const onContentSizeChange = useCallback((_width: number, height: number) => {
+    if (!pendingRestore.current || height <= 0) return;
+    pendingRestore.current = false;
+    listRef.current?.scrollToOffset({ offset: lastOffset, animated: false });
+  }, []);
+
+  // Stable across renders: the memoised row skips when its
+  // props are unchanged, and that needs the callbacks — these five are
+  // already useCallbacks — and this function to keep their identity.
   const renderRow = useCallback(
     ({ item }: { item: db.ChatRow }) => (
       <ConversationRow
@@ -1669,11 +2266,20 @@ export function ChatListScreen({
         blocked={blockedIds.has(item.peerId)}
         selected={item.peerId === selectedPeerId}
         menu={menu?.peerId === item.peerId ? menu.step : 'none'}
+        draft={drafts[item.peerId]}
+        // Unread IS inbound, so the question only reaches the read rows —
+        // and undefined means "not answered yet", which the row reserves the
+        // space for rather than guessing at.
+        canMarkUnread={
+          (unread[item.peerId] ?? 0) > 0 ? true : inbound[item.peerId]
+        }
         onOpen={openChat}
         onMenu={changeMenu}
         onDelete={deleteChat}
         onBlock={blockPeer}
         onUnblock={unblockPeer}
+        onPin={pinChat}
+        onMarkUnread={markUnread}
       />
     ),
     [
@@ -1681,9 +2287,13 @@ export function ChatListScreen({
       blockedIds,
       changeMenu,
       deleteChat,
+      drafts,
+      inbound,
+      markUnread,
       menu,
       mentioned,
       openChat,
+      pinChat,
       rooms,
       selectedPeerId,
       unblockPeer,
@@ -1699,22 +2309,71 @@ export function ChatListScreen({
       <HomeHeader
         title={COPY.title}
         statusLine={
-          <View style={styles.connection} testID={`ws-${wsState}`}>
-            <View
-              style={[
-                styles.connectionMark,
-                {
-                  borderRadius: t.radius.tail,
-                  backgroundColor: connection.mark,
-                },
-              ]}
-            />
-            <Text
-              numberOfLines={1}
-              style={[t.type.timeStatus, { color: connection.ink }]}
-            >
-              {connection.label}
-            </Text>
+          /* Connection status needs attention only when it is not open. Keep the
+             wrapper and its ws-<state> testID mounted for observation, but
+             hide an empty wrapper from assistive technology so it does not
+             add a meaningless navigation stop. */
+          <View
+            style={styles.connection}
+            testID={`ws-${wsState}`}
+            {...(wsState === 'open' && !showFieldMode
+              ? {
+                  accessibilityElementsHidden: true,
+                  importantForAccessibility: 'no-hide-descendants' as const,
+                }
+              : {})}
+          >
+            {wsState === 'open' ? null : (
+              <>
+                <View
+                  testID="ws-mark"
+                  style={[
+                    styles.connectionMark,
+                    {
+                      borderRadius: t.radius.tail,
+                      backgroundColor: connection.mark,
+                    },
+                  ]}
+                />
+                <Text
+                  numberOfLines={1}
+                  style={[t.type.timeStatus, { color: connection.ink }]}
+                >
+                  {connection.label}
+                </Text>
+              </>
+            )}
+            {showFieldMode ? (
+              /* Pressable when the host wired a route, plain words when it
+                 did not — the LockNudge's rule: no control may promise a
+                 door this screen was not given. */
+              <Pressable
+                {...(onOpenSettings
+                  ? {
+                      onPress: onOpenSettings,
+                      accessibilityRole: 'button' as const,
+                      accessibilityLabel: FIELD_MODE_COPY.homeAction,
+                    }
+                  : {})}
+                testID="home-fieldmode"
+                style={({ pressed }) => [
+                  styles.fieldMode,
+                  {
+                    borderRadius: t.radius.tail,
+                    backgroundColor: pressed
+                      ? t.color.pineWash
+                      : 'transparent',
+                  },
+                ]}
+              >
+                <Text
+                  numberOfLines={1}
+                  style={[t.type.timeStatus, { color: t.color.pine }]}
+                >
+                  {FIELD_MODE_COPY.homeLabel}
+                </Text>
+              </Pressable>
+            ) : null}
           </View>
         }
         profile={profile}
@@ -1736,6 +2395,15 @@ export function ChatListScreen({
       <FlatList
         data={visible}
         extraData={listExtra}
+        // THE READING COLUMN. Width only, and the
+        // same clamp CallsScreen uses, so switching tabs changes the word
+        // and not the measure. It never engages below 520pt, so no phone
+        // moves; on a medium window — iPad portrait, Split View, most
+        // Android tablets in portrait, the class that gets no pane
+        // projection at all — 72pt rows stop being painted across the whole
+        // glass. The FAB is deliberately OUTSIDE this: it hangs off the
+        // window, or it drifts into the middle of a tablet's screen.
+        style={[styles.clamp, { maxWidth: t.layout.contentMax }]}
         keyExtractor={chat => chat.peerId}
         keyboardShouldPersistTaps="handled"
         // The + button floats over the list's bottom edge: the content ends
@@ -1746,8 +2414,21 @@ export function ChatListScreen({
         scrollIndicatorInsets={listInset.indicator}
         ListHeaderComponent={header}
         ItemSeparatorComponent={separator}
+        ref={listRef}
+        // The place the list was left, written cheaply and restored once
+        //. 100 ms is the same window the refresh coalescing holds:
+        // often enough that a fast flick is remembered accurately, rare
+        // enough that scrolling costs nothing.
+        onScroll={onScroll}
+        scrollEventThrottle={100}
+        // The restore's real trigger: an offset set before the list has a
+        // content size is clamped to nothing (see `onContentSizeChange`).
+        onContentSizeChange={onContentSizeChange}
         ListEmptyComponent={
-          filtering && trimmedQuery !== '' ? (
+          // NOTHING until the first read answers. A
+          // filter that matched nothing is a different question and only
+          // reachable once there are rows, so it sits inside the gate.
+          !loaded ? null : filtering && trimmedQuery !== '' ? (
             // The Quiet Room is reserved for genuinely having nobody; a filter
             // that matched nothing is not that.
             <Text
@@ -1806,7 +2487,13 @@ export function ChatListScreen({
           },
         ]}
       >
-        <Text style={[t.type.iconGlyph, styles.fabGlyph, { color: t.color.onPine }]}>
+        {/* Frozen, like every other glyph in this file: at
+            fontSize 30 with no cap the + scales to about 93pt inside a
+            56pt disc. The label above carries the meaning at any size. */}
+        <Text
+          allowFontScaling={false}
+          style={[t.type.iconGlyph, styles.fabGlyph, { color: t.color.onPine }]}
+        >
           +
         </Text>
       </Pressable>
@@ -1819,6 +2506,9 @@ const styles = StyleSheet.create({
 
   connection: { flexDirection: 'row', alignItems: 'center', marginTop: 2 },
   connectionMark: { width: 6, height: 6, marginRight: 6 },
+  /** The Field Mode line's own press box, inside the status row. Negative
+   * inset so the words stay on the header's grid while the target grows. */
+  fieldMode: { marginLeft: -6, paddingHorizontal: 6, paddingVertical: 2 },
 
   filterWrap: { paddingTop: 12, paddingBottom: 12 },
   filterInput: { paddingHorizontal: 14 },
@@ -1835,6 +2525,9 @@ const styles = StyleSheet.create({
   row: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10 },
   rowGap: { width: 12, alignItems: 'center' },
   unreadMark: { width: 6, height: 6 },
+  /** The pinned mark, sized to sit in the same 12pt gutter as the 6pt unread
+   * dot without widening it. Fixed, because it never scales. */
+  pinMark: { fontSize: 9, lineHeight: 11 },
   rowBody: { flex: 1 },
   rowTopLine: {
     flexDirection: 'row',
@@ -1865,6 +2558,8 @@ const styles = StyleSheet.create({
   rowDrawerAction: { justifyContent: 'center' },
   rowDrawerNote: { paddingBottom: 12 },
   rowConfirm: { borderLeftWidth: 3, padding: 12 },
+  /** The second confirm line sits under the first, in the same measure. */
+  rowConfirmAlso: { marginTop: 6 },
   rowConfirmBody: { marginTop: 8 },
   confirmActions: { flexDirection: 'row', alignItems: 'center', marginTop: 10 },
   /** The kit's compact OutlineButton beside the TextAction: only the gap
@@ -1872,6 +2567,9 @@ const styles = StyleSheet.create({
   confirmDelete: { marginLeft: 8 },
 
   noMatch: { marginTop: 24, textAlign: 'center' },
+
+  /** Full width until contentMax caps it — CallsScreen's own expression. */
+  clamp: { width: '100%', alignSelf: 'center' },
 
   fab: {
     position: 'absolute',

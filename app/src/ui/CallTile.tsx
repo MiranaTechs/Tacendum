@@ -218,7 +218,7 @@ export function CallTile({
       {/* No fixed heights below this point. The labels grow with Dynamic
           Type and the tile grows with them; a boxed status line clips at XXL
           and the state a person needs is the thing that disappears. */}
-      <Text numberOfLines={1} style={styles.name}>
+      <Text numberOfLines={1} style={[styles.name, settled && styles.nameSettled]}>
         {shown}
       </Text>
       <Text style={styles.status}>{status}</Text>
@@ -241,9 +241,23 @@ function makeStyles(t: Theme) {
       borderColor: t.color.mediaLine,
       backgroundColor: t.color.mediaBlack,
     },
-    /** A leg that will not change again reads quieter than a live one. The
-     * distinction is never colour alone — the status line says the word. */
-    settled: { opacity: 0.66 },
+    /**
+     * A leg that will not change again reads quieter than a live one — in
+     * the INK, never in opacity.
+     *
+     * This was `opacity: 0.66`, the exact line `ApprovalCard.tsx:312-318`
+     * removed from itself: it measured the settled status line at ≈2.8:1,
+     * under the 4.5:1 AA floor, named the defect "the CallTile rule" and
+     * left the rule unapplied here. `primitives.tsx:173` states it outright
+     * — "Disabled is a recessed surface, never opacity" — and dimming the
+     * whole tile also dimmed the person's photo, which is not a state.
+     *
+     * The tile keeps its `mediaLine` edge; the NAME takes muted ink, and the
+     * distinction is still never colour alone: the status line below says
+     * the word ("Declined", "Left", "Ended").
+     */
+    settled: {},
+    nameSettled: { color: t.color.mediaInkMuted },
     disc: {
       width: 64,
       height: 64,

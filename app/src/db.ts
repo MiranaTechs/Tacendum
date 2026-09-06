@@ -110,6 +110,10 @@ export interface ChatRow {
    * rows that predate the column and on chats an inbound message opened —
    * neither is a server introduction. Local only. */
   introducedBy?: IntroducedBy | null;
+  /** When this conversation was pinned to the top, or null when it is not.
+   * A moment, not a flag: pinned rows sort newest-pin-first among themselves.
+   * Local only, and absent on rows that predate the column. */
+  pinnedAt?: number | null;
 }
 
 export type MessageStatus =
@@ -1020,6 +1024,12 @@ export async function initSchema(d: Handle): Promise<void> {
     // reads as NOT server-introduced, so an existing install's chats all
     // wake up unbannered. Never on the wire.
     ['introducedBy', 'introducedBy TEXT'],
+    // When this conversation was pinned to the top of the list, or NULL for
+    // the ordinary rows. A moment rather than a flag, so pinned rows keep an
+    // order among themselves (newest pin first) without a second column and
+    // without a cap. Local only: a pin is my list, not a claim about the
+    // person, so nothing about it goes on the wire.
+    ['pinnedAt', 'pinnedAt INTEGER'],
   ] as const) {
     if (!chatColumns.includes(column)) {
       await d.execute(`ALTER TABLE chats ADD COLUMN ${ddl}`);
@@ -2354,15 +2364,22 @@ export async function clearDecoyState(): Promise<void> {
 const CHAT_COLUMNS = `peerId, displayName, lastMessageAt, lastMessageText,
      about, avatarB64, profileVersion, safetyCheckedAt, localName, createdAt,
      lastOpenedAt, identityChangedAt, safetyMismatchAt,
-     disappearSec, disappearVersion, introducedBy`;
+     disappearSec, disappearVersion, introducedBy, pinnedAt`;
 
 export async function listChats(): Promise<ChatRow[]> {
   // A chat you just started has no lastMessageAt, and sorting those last put
   // it underneath every old thread — below the fold on the one screen where
   // you went looking for it. Its creation moment stands in until it speaks.
+  //
+  // Pinned rows lead. (pinnedAt IS NULL) sorts 0 before 1, so the pinned set
+  // comes first without a CASE; pinnedAt DESC then puts the newest pin at the
+  // top of that set. Everything after the second comma is exactly the order
+  // this list has always had, so an unpinned list is unmoved. No cap: the
+  // list is invite-only and short by construction.
   const res = await conn().execute(
     `SELECT ${CHAT_COLUMNS}
-     FROM chats ORDER BY COALESCE(lastMessageAt, createdAt, 0) DESC, peerId`,
+     FROM chats ORDER BY (pinnedAt IS NULL), pinnedAt DESC,
+       COALESCE(lastMessageAt, createdAt, 0) DESC, peerId`,
   );
   return res.rows as unknown as ChatRow[];
 }
@@ -2516,6 +2533,89 @@ export async function markChatOpened(
     at,
     peerId,
   ]);
+}
+
+/**
+ * Pin a conversation to the top of the list, or unpin it with null.
+ *
+ * A MOMENT RATHER THAN A FLAG, so pinned rows keep an order among themselves
+ * (see listChats) without a second column. Local to this workspace, like
+ * every other thing on a chats row: a pin made under duress pins a decoy row
+ * and nothing real moves, and a pin is never sent, so the person pinned is
+ * never told.
+ */
+export async function setPinned(
+  peerId: string,
+  at: number | null,
+): Promise<void> {
+  await conn().execute(`UPDATE chats SET pinnedAt = ? WHERE peerId = ?`, [
+    at,
+    peerId,
+  ]);
+}
+
+/**
+ * Put the unread mark back on a conversation I have already read.
+ *
+ * markChatOpened only ever clears; unread is defined as "arrived after I last
+ * opened this", so the reverse is one UPDATE that rolls lastOpenedAt back to
+ * ONE MILLISECOND BEFORE THE NEWEST INBOUND ARRIVAL. Not to zero: rolling all
+ * the way back would light every message this thread has ever received, and
+ * the mark a person asked for is "there is something here", not "start again".
+ *
+ * THE SUBSELECT IS unreadCounts' OWN PREDICATE, deliberately duplicated
+ * rather than approximated. A 1:1 row's window is COALESCE(arrivedAt, seen.ts)
+ * and a room row's is arrivedAt with sharedBy IS NULL, and a mark computed
+ * from any other rule is a mark that screen would not have counted - it would
+ * set a flag nothing displays, which is the same defect as a control that
+ * claims something it did not do.
+ *
+ * BACKWARDS ONLY, WHICH IS WHY THE MIN IS THERE. The roll-back is scalar
+ * MIN over the value already on the row, so this statement can lower
+ * lastOpenedAt and never raise it. Without that guard the assignment is a
+ * move FORWARD on a conversation that is ALREADY unread — three unread
+ * messages become one, and the two the person had not read are marked read by
+ * the control they tapped to keep them. Nothing in the caller can prevent it:
+ * The menu withholds the row only when there is nothing inbound, not when the chat
+ * is already unread, so the precondition would have to be "call this only on
+ * a read chat" and no type says that. Monotonic here, unconditionally, means
+ * a second tap is harmless from any caller.
+ *
+ * The floor inside the MIN is COALESCE(lastOpenedAt, 0) — the same reading
+ * unreadCounts gives a never-opened row, so a NULL resolves to 0 in both
+ * statements rather than being pulled up to an arrival.
+ *
+ * A NO-OP WHEN THERE IS NOTHING INBOUND. MAX over no rows is NULL, MIN of
+ * anything with NULL is NULL, and the outer COALESCE then writes lastOpenedAt
+ * back over itself. You cannot mark unread what never arrived, and the caller
+ * withholds the control rather than offering one that quietly does nothing.
+ *
+ * THIS DEVICE ONLY. syncThreadRead propagates READ to my sibling devices;
+ * there is no inverse envelope, so the mark stays here. Nothing claims
+ * otherwise, so nothing needs to say so.
+ */
+export async function markChatUnread(peerId: string): Promise<void> {
+  // NO BACKTICKS IN THIS COMMENT: scripts/prove-db.mjs pulls a function's SQL
+  // by finding the first backtick after its name, and one in the prose here
+  // would silently become the "SQL" it proves. No interpolation in the
+  // template either, for the same reader - an unprovable SQL function is how
+  // two logic inversions once passed the whole jest suite.
+  await conn().execute(
+    `UPDATE chats SET lastOpenedAt = COALESCE(
+       MIN(COALESCE(lastOpenedAt, 0),
+           (SELECT MAX(CASE WHEN g.groupId IS NULL
+                            THEN COALESCE(m.arrivedAt, s.ts)
+                            ELSE m.arrivedAt END) - 1
+              FROM messages m
+              LEFT JOIN groups g ON g.groupId = m.peerId
+              LEFT JOIN seen s ON s.msgId = m.msgId
+             WHERE m.peerId = chats.peerId
+               AND m.direction = 'in'
+               AND (g.groupId IS NULL OR m.sharedBy IS NULL))),
+       lastOpenedAt)
+     WHERE peerId = ?`,
+    [peerId],
+  );
 }
 
 /** Record (or clear, with null) an identity change for this peer. */
@@ -3006,6 +3106,105 @@ export async function listMessages(peerId: string): Promise<MessageRow[]> {
             expiresAt, authorId, sq, outsider, sharedBy, ai, arrivedAt
      FROM messages WHERE peerId = ? ORDER BY ts, msgId`,
     [peerId],
+  );
+  return res.rows as unknown as MessageRow[];
+}
+
+/**
+ * The character that neutralises a wildcard inside a find pattern.
+ *
+ * NOT A BACKSLASH, and the reason is the gate rather than SQL. A backslash has
+ * to be written doubled in a TypeScript template, and scripts/prove-db.mjs
+ * pulls a function's SQL out of THIS FILE'S RAW TEXT — so the engine would be
+ * handed a two-character escape and refuse the statement, and the one proof
+ * that can say what this query matches would never run. A tilde is one
+ * character in the source and one character at runtime, which is the whole
+ * requirement; any single character does the job identically.
+ */
+const FIND_ESCAPE = '~';
+
+/**
+ * The most rows one find may return, and the floor of one.
+ *
+ * SQLite reads a NEGATIVE limit as NO LIMIT and coerces a non-integer, and
+ * the rows here are RAW BODIES — an image or file body is JSON carrying
+ * base64. So a caller's NaN parse, a -1 sentinel or an off-by-one would not
+ * return slightly too much; it would read every envelope on the phone across
+ * the bridge, on every keystroke. The clamp lives here because the caller is
+ * the thing that can be wrong, and 200 is far past what a person scrolls in
+ * one conversation. A caller needing more should widen this constant on
+ * purpose rather than pass a bigger number.
+ */
+const FIND_LIMIT_MAX = 200;
+
+/** Wrap a person's words as a LIKE pattern, with every wildcard AND the
+ * escape character itself neutralised. One pass, so an escape this function
+ * introduces is never escaped again. */
+function findPattern(query: string): string {
+  return `%${query.replace(/[~%_]/g, c => FIND_ESCAPE + c)}%`;
+}
+
+/**
+ * Messages whose body contains `query` — newest first, capped at `limit`.
+ *
+ * A PREFILTER, NEVER AN ANSWER. The caller decides what counts as a match,
+ * and it must, because a body is sometimes an envelope: an image message is
+ * stored as JSON carrying base64, so a three-letter query LIKE-matches inside
+ * key material and would show a person a "result" that is a fragment of a
+ * photo. Every caller refines these rows through displayText(body,
+ * resolveName) — the same reader the clipboard and the VoiceOver label use —
+ * and keeps a row only when the query survives in the WORDS. A room's rows
+ * come free: displayText already unwraps the grp.msg carrier.
+ *
+ * TWO PATTERNS, ONE MEANING. SQLite's LIKE folds case for ASCII only, so the
+ * query is bound as typed AND locale-lowercased, OR'd. The refinement in JS
+ * compares locale-lowercased and is the authority. The residual, stated
+ * plainly: a row differing from the query only by case in a non-ASCII script
+ * can fail the prefilter and never reach the refinement, so it may miss. That
+ * is a missed row, never a wrong one.
+ *
+ * `peerId` null drops the peer clause, for a reader across conversations.
+ * Retracted rows are excluded here rather than in the caller: a tombstone
+ * keeps its place in the thread with an empty body, and it is not something
+ * to find. Expired rows never reach this query at all — sweepExpired has
+ * taken them.
+ *
+ * THE LIMIT IS CLAMPED, not bound as given: a positive integer, at most
+ * FIND_LIMIT_MAX. A caller asking for more gets that ceiling.
+ *
+ * Reading your own history is not a send: this runs under a block, under an
+ * identity change, and in a duress session, where it reaches the decoy's own
+ * rows and nothing else.
+ */
+export async function findMessages(
+  peerId: string | null,
+  query: string,
+  limit: number,
+): Promise<MessageRow[]> {
+  // NO BACKTICKS AND NO INTERPOLATION BELOW: scripts/prove-db.mjs takes the
+  // text between the first two backticks after this function's name, and an
+  // unprovable SQL function is how two logic inversions once passed the whole
+  // jest suite.
+  // Clamped, never bound as given: see FIND_LIMIT_MAX. Math.trunc first so a
+  // fractional limit cannot reach the binder, then the floor of 1 catches
+  // 0, every negative, and NaN.
+  const cap = Math.max(1, Math.min(FIND_LIMIT_MAX, Math.trunc(limit) || 1));
+  const res = await conn().execute(
+    `SELECT msgId, peerId, direction, body, ts, status, editedAt, deletedAt,
+            expiresAt, authorId, sq, outsider, sharedBy, ai, arrivedAt
+     FROM messages
+     WHERE (peerId = ? OR ? IS NULL)
+       AND deletedAt IS NULL
+       AND (body LIKE ? ESCAPE '~' OR body LIKE ? ESCAPE '~')
+     ORDER BY ts DESC, msgId DESC
+     LIMIT ?`,
+    [
+      peerId,
+      peerId,
+      findPattern(query),
+      findPattern(query.toLocaleLowerCase()),
+      cap,
+    ],
   );
   return res.rows as unknown as MessageRow[];
 }
@@ -3574,10 +3773,22 @@ async function previewInTx(d: Handle, body: string): Promise<string> {
 
 /**
  * Remove a whole conversation from this device: its messages, their photos and
- * reactions, its vault items, anything still queued to send, and the draft.
+ * reactions, its vault items, its 1:1 call history and the always-relay choice
+ * made about that person, anything still queued to send, and the draft. The
+ * room legs are scoped out and die with the room (`deleteGroup`).
  * Irreversible for the same reason as `deleteMessage`, and `seen` survives for
  * the same reason. Children go before parents so a failure mid-way cannot
  * orphan rows.
+ *
+ * `call_relay_prefs` goes with the calls, and that is a judgement rather than
+ * a cascade: it is one row per peer recording a choice made ABOUT that
+ * person, which is the same residue as the call log — a delete that claims
+ * to take the calls but leaves a row naming who was called. It is safe to
+ * take because it is a PREFERENCE, not a protection, and it cannot become one
+ * by being kept: the `call_log` rows go in the same transaction, so
+ * `hasConnectedCallWith` is false for a re-added peer and `relayForPeer`
+ * falls back to its first-call default, which relays. Dropping the row can
+ * only make the next call more careful, never less.
  *
  * A block is NOT removed here, deliberately. `blocked_peers` is a separate
  * table so that deleting a conversation cannot silently unblock the person
@@ -3635,6 +3846,30 @@ export async function deleteChat(peerId: string): Promise<void> {
       // with the two subquery-driven deletes above — it needs no messages row
       // to find its rows, and it must go before `chats` like every other child.
       await d.execute(`DELETE FROM vault_items WHERE peerId = ?`, [peerId]);
+      // The calls go with the conversation, or "delete" is not what happened.
+      // Without this the person kept every call row on the Calls tab, renamed
+      // to a bare id fragment (CallsScreen resolves names from listChats) and
+      // still one tap from redial — under a confirmation that says Tacendum
+      // has no copy to restore.
+      //
+      // `roomId IS NULL` is the SAME scoping the outbox delete above makes,
+      // for the same reason: a room call writes ONE ROW PER LEG keyed by the
+      // member's id, so an unscoped purge would take the room's call history
+      // out with a 1:1 delete. A room's calls belong to the room and die with
+      // it (deleteGroup).
+      await d.execute(
+        `DELETE FROM call_log WHERE peerId = ? AND roomId IS NULL`,
+        [peerId],
+      );
+      // And the remembered always-relay choice about this person, keyed on
+      // peerId directly like outbox and drafts. The reasoning is written
+      // above: a preference, not a protection, and safe to drop precisely
+      // because the call rows it would have outlived go in the same
+      // transaction. NOT deleted by deleteGroup — a room id never appears
+      // in this table, and a member's own choice is not the room's to take.
+      await d.execute(`DELETE FROM call_relay_prefs WHERE peerId = ?`, [
+        peerId,
+      ]);
       await d.execute(`DELETE FROM messages WHERE peerId = ?`, [peerId]);
       await d.execute(`DELETE FROM chats WHERE peerId = ?`, [peerId]);
       await d.execute('COMMIT');
@@ -3721,6 +3956,18 @@ export async function deleteGroup(
         groupId,
       ]);
       await d.execute(`DELETE FROM vault_items WHERE peerId = ?`, [groupId]);
+      // deleteChat's purge, room-keyed: a room call's legs each carry this
+      // roomId, so one statement reaches the whole session's history and no
+      // member's 1:1 rows.
+      await d.execute(`DELETE FROM call_log WHERE roomId = ?`, [groupId]);
+      // And the live-session roster. Not history — `call_sessions` is written
+      // before CallKit rings and deleted at release — but a row stranded by a
+      // crash outlives the room, and this table's own comment says what that
+      // costs: it hands a coerced unlock the membership the decoy exists to
+      // hide. In BOTH forms, because a locally deleted room is exactly the
+      // room whose roster must not be readable from the drawer that deleted
+      // it.
+      await d.execute(`DELETE FROM call_sessions WHERE roomId = ?`, [groupId]);
       await d.execute(`DELETE FROM messages WHERE peerId = ?`, [groupId]);
       await d.execute(`DELETE FROM chats WHERE peerId = ?`, [groupId]);
       if (opts.purgeState) {
@@ -3777,6 +4024,24 @@ export async function getGroup(groupId: string): Promise<GroupRow | null> {
     [groupId],
   );
   return (res.rows[0] as unknown as GroupRow) ?? null;
+}
+
+/**
+ * Every room anchor this device holds, in one read.
+ *
+ * The chat list resolved rooms with a getGroup per row — N single-row selects
+ * beside the four reads a refresh already makes, on the screen a person looks
+ * at most, re-run on every receipt, frame, socket transition and attachment
+ * tick. The rate is coalesced; the COST per refresh was not. The caller keeps
+ * its own map and filters to the ids it is drawing, and it keeps the
+ * press-time getGroup re-check as well: that one is a correctness gate
+ * against stranding a room's queued fan-out legs, not render cost.
+ *
+ * The same three columns getGroup reads, deliberately — one anchor shape.
+ */
+export async function listGroups(): Promise<GroupRow[]> {
+  const res = await conn().execute(`SELECT groupId, ownerId, name FROM groups`);
+  return res.rows as unknown as GroupRow[];
 }
 
 /**
@@ -4651,6 +4916,32 @@ export async function setDraft(peerId: string, text: string): Promise<void> {
     `INSERT OR REPLACE INTO drafts (peerId, text, updatedAt) VALUES (?, ?, ?)`,
     [peerId, text, Date.now()],
   );
+}
+
+/**
+ * Every unsent draft, keyed by conversation — the chat list's whole read.
+ *
+ * ONE WHOLE-TABLE STATEMENT, NEVER ONE PER ROW, in the `unreadCounts` shape
+ * the caller already knows how to hold. A refresh runs four reads inside an
+ * 80 ms coalescing window; this makes it five, not five per row.
+ *
+ * `text <> ''` is belt and braces: setDraft drops the row when nothing is
+ * left rather than storing an empty fragment of what someone typed, so the
+ * table should never hold one. A guard costs nothing and an empty prefix on a
+ * list row would be a claim about a message that does not exist.
+ *
+ * Local by construction, like everything else on this file: a duress session
+ * reads the decoy workspace's drafts and nothing else.
+ */
+export async function listDrafts(): Promise<Record<string, string>> {
+  const res = await conn().execute(
+    `SELECT peerId, text FROM drafts WHERE text <> ''`,
+  );
+  const drafts: Record<string, string> = {};
+  for (const row of res.rows as unknown as { peerId: string; text: string }[]) {
+    drafts[row.peerId] = row.text;
+  }
+  return drafts;
 }
 
 // --- blocking (this device, this workspace; never sent, never server-side) ---

@@ -1,4 +1,5 @@
 import { getSecret, setSecret } from 'tacendum-crypto';
+import { session } from './session';
 
 /**
  * Whether this device tells people you are typing to them.
@@ -40,8 +41,16 @@ export async function loadTypingIndicators(): Promise<void> {
   }
 }
 
+/**
+ * A COERCED TAP MOVES THE ROW AND WRITES NOTHING — the `setReadReceipts`
+ * behavior. The
+ * in-memory value still follows the tap so the chip is indistinguishable
+ * from a real session's (rule 16); App.tsx re-reads on every REAL unlock, so
+ * the move lives exactly as long as the coerced session.
+ */
 export async function setTypingIndicators(on: boolean): Promise<void> {
   enabled = on;
+  if (session.mode === 'duress') return;
   await setSecret(KEY, on ? '1' : '0');
 }
 

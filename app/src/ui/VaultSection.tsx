@@ -907,6 +907,8 @@ export function VaultSection({ peerId, meUserId, who, blockedAt }: Props) {
             {...KEYBOARD_OFF}
             placeholder={VAULT.namePlaceholder}
             placeholderTextColor={t.color.inkMuted}
+            keyboardAppearance={t.scheme}
+            selectionColor={t.color.pine}
             accessibilityLabel={VAULT.nameLabel}
             testID="peer-vault-name-input"
             style={[
@@ -953,6 +955,8 @@ export function VaultSection({ peerId, meUserId, who, blockedAt }: Props) {
             {...KEYBOARD_OFF}
             placeholder={VAULT.valuePlaceholder}
             placeholderTextColor={t.color.inkMuted}
+            keyboardAppearance={t.scheme}
+            selectionColor={t.color.pine}
             accessibilityLabel={VAULT.valueLabel}
             testID="peer-vault-value-input"
             style={[

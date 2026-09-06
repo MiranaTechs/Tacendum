@@ -392,14 +392,14 @@ describe('peer profile — the timer while blocked', () => {
     const { themeTokens } = jest.requireActual<typeof import('../src/theme')>(
       '../src/theme',
     );
-    const { DISAPPEAR_OPTIONS } = jest.requireActual<
+    const { DISAPPEAR_OPTIONS_PEER } = jest.requireActual<
       typeof import('../src/blocking')
     >('../src/blocking');
     const theme = themeTokens();
     const tree = await renderProfile();
     expect(has(tree, 'peer-unblock')).toBe(true); // the fixture reached "blocked"
 
-    for (const option of DISAPPEAR_OPTIONS) {
+    for (const option of DISAPPEAR_OPTIONS_PEER) {
       const c = chip(tree, `peer-disappear-${option.seconds}`);
       expect(c.props.disabled).toBe(true);
       expect(c.props.accessibilityState.disabled).toBe(true);
@@ -424,6 +424,40 @@ describe('peer profile — the timer while blocked', () => {
     expect(c.props.disabled).toBe(false);
     expect(c.props.accessibilityState).toEqual({ selected: true, disabled: false });
     expect(has(tree, 'peer-disappear-locked')).toBe(false);
+    await ReactTestRenderer.act(() => tree.unmount());
+  });
+
+  // -------------------------------------------------------------------------
+  // Build 27: the 1:1 list grew to six. The layout claim is a CONTRACT, not a
+  // hope — a wrapping row cannot clip at any type size, which is the whole
+  // reason a sixth chip is affordable without a device in hand.
+  // -------------------------------------------------------------------------
+
+  test('six chips on the 1:1 surface, in a row that wraps', async () => {
+    const { StyleSheet } = jest.requireActual<typeof import('react-native')>(
+      'react-native',
+    );
+    const { DISAPPEAR_OPTIONS_PEER } = jest.requireActual<
+      typeof import('../src/blocking')
+    >('../src/blocking');
+    const tree = await renderProfile();
+
+    expect(DISAPPEAR_OPTIONS_PEER).toHaveLength(6);
+    for (const option of DISAPPEAR_OPTIONS_PEER) {
+      expect(chip(tree, `peer-disappear-${option.seconds}`)).toBeDefined();
+    }
+    // Four weeks is the 1:1's own far end; the room never renders it.
+    expect(chip(tree, 'peer-disappear-2419200')).toBeDefined();
+
+    const row = tree.root.find(
+      n => n.props?.testID === 'peer-disappear-row' && typeof n.type === 'string',
+    );
+    const style = StyleSheet.flatten(row.props.style);
+    expect(style.flexDirection).toBe('row');
+    // THE CONTRACT: without this a sixth chip clips off the right edge at
+    // Dynamic Type XXL, on the screen where the timer is set.
+    expect(style.flexWrap).toBe('wrap');
+
     await ReactTestRenderer.act(() => tree.unmount());
   });
 });

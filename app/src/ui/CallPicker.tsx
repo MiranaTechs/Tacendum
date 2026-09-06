@@ -132,9 +132,15 @@ export function CallPicker({
               accessibilityState={{ checked: on, disabled }}
               accessibilityLabel={shown}
               {...(disabled ? { accessibilityHint: CALL_PICKER_COPY.cap } : {})}
+              // A full row RECEDES, it does not dim (following the
+              // ApprovalCard treatment): `opacity: 0.45` dropped the name
+              // under the contrast floor, and `primitives.tsx:173`'s rule is
+              // "a recessed surface, never opacity". The edge softens and
+              // the ink mutes — OutlineButton's own disabled arm — and the
+              // hint still says why.
               style={({ pressed }) => [
                 styles.row,
-                { minHeight: t.layout.rowHeight, opacity: disabled ? 0.45 : 1 },
+                { minHeight: t.layout.rowHeight },
                 pressed && { backgroundColor: t.color.pineWash },
               ]}
             >
@@ -142,7 +148,11 @@ export function CallPicker({
                 style={[
                   styles.box,
                   {
-                    borderColor: on ? t.color.pine : t.color.lineStrong,
+                    borderColor: on
+                      ? t.color.pine
+                      : disabled
+                        ? t.color.lineSoft
+                        : t.color.lineStrong,
                     backgroundColor: on ? t.color.pine : 'transparent',
                   },
                 ]}
@@ -156,7 +166,13 @@ export function CallPicker({
                   {on ? '✓' : ''}
                 </Text>
               </View>
-              <Text numberOfLines={1} style={[t.type.body, { color: t.color.inkBody, flexShrink: 1 }]}>
+              <Text
+                numberOfLines={1}
+                style={[
+                  t.type.body,
+                  { color: disabled ? t.color.inkMuted : t.color.inkBody, flexShrink: 1 },
+                ]}
+              >
                 {shown}
               </Text>
             </Pressable>

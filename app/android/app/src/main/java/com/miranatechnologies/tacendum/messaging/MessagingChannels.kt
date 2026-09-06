@@ -25,6 +25,12 @@ import android.content.Context
  * follow one rule: no "iPhone", no "Apple", nothing that names a message or a
  * person. A channel name appears in system settings forever; it says what the
  * channel is for and nothing about who uses it.
+ *
+ * They also avoid device nouns so the description fits Android tablets as
+ * well as phones. Android updates an existing channel's name and
+ * description when ensure() submits the same IDs again, so existing installs
+ * receive this correction on the next messaging start or notification path.
+ * This copy change preserves notification behavior settings and user choices.
  */
 internal object MessagingChannels {
 
@@ -48,7 +54,7 @@ internal object MessagingChannels {
 
     val service =
         NotificationChannel(SERVICE, "Connection", NotificationManager.IMPORTANCE_LOW)
-    service.description = "Shows while this phone is connected and able to receive messages."
+    service.description = "Shows while Tacendum is connected and able to receive messages."
     service.setShowBadge(false)
     service.setSound(null, null)
     service.enableVibration(false)

@@ -1,0 +1,19 @@
+<resources>
+
+    <!--
+      The night half of the launch window. Only the ground differs: everything
+      else about AppTheme is inherited from values/styles.xml through the same
+      DayNight parent, so the two files cannot disagree about anything but the
+      colour they are here to disagree about.
+
+      This is theme.ts's dark `paperGround`. It follows the SYSTEM's dark
+      setting, which is all a launch theme can see — the app's own stored
+      choice reaches the screen one frame later, synchronously, through
+      AppearancePrefsModule's `initialAppearance` constant.
+    -->
+    <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:editTextBackground">@drawable/rn_edit_text_material</item>
+        <item name="android:windowBackground">#0C0F0D</item>
+    </style>
+
+</resources>

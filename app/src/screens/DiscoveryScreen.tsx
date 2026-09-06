@@ -298,6 +298,8 @@ export function DiscoveryScreen({ onBack, onOpenChat }: Props) {
                 : ACCOUNTS_COPY.emailPlaceholder
           }
           placeholderTextColor={t.color.inkMuted}
+          keyboardAppearance={t.scheme}
+          selectionColor={t.color.pine}
           accessibilityLabel={
             searchingUsername
               ? ACCOUNTS_USERNAME_COPY.findTitle

@@ -1,4 +1,5 @@
 import { getSecret, setSecret } from 'tacendum-crypto';
+import { session } from './session';
 
 /**
  * Whether this device tells people their messages have been read.
@@ -41,8 +42,19 @@ export async function loadReadReceipts(): Promise<void> {
   }
 }
 
+/**
+ * A COERCED TAP MOVES THE ROW AND WRITES NOTHING. The reading half of rule 16
+ * was already here — `resetReadReceiptsForDuress` shows the default when the
+ * decoy opens — and the writing half was not: a tap in a coerced session
+ * durably changed the owner's real preference, and the owner had no way to
+ * learn it had moved. The in-memory value still follows the tap, because a
+ * chip that refused to move would be its own tell, and it is safe to let it:
+ * App.tsx re-reads this on every REAL unlock, so the move lives exactly as
+ * long as the session that made it.
+ */
 export async function setReadReceipts(on: boolean): Promise<void> {
   enabled = on;
+  if (session.mode === 'duress') return;
   await setSecret(KEY, on ? '1' : '0');
 }
 

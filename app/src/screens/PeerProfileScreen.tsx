@@ -1,8 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AccessibilityInfo,
-  // Deprecated in core but still shipped (the StartChatScreen trade): a
-  // paste target is the whole point of an id.
+  BackHandler,
+  // Core Clipboard remains available for copying public account addresses.
   Clipboard,
   Pressable,
   ScrollView,
@@ -17,7 +17,7 @@ import {
   BLOCK_COPY as BLOCK,
   BLOCK_EXPLAINER,
   DISAPPEAR,
-  DISAPPEAR_OPTIONS,
+  DISAPPEAR_OPTIONS_PEER,
   blockStatusTone,
   disappearLabel,
 } from '../blocking';
@@ -97,6 +97,24 @@ const COPY = {
    * own-id sentence: this is THEIR address, not one to read out in fours. */
   idCopied: (who: string) => `Copied ${who}’s ID.`,
 
+  /**
+   * How this chat started — one flat line, because it is CONTEXT and not a
+   * warning. The warning shape for a server introduction is already taken by
+   * the thread's provenance notice, and a second alarm for one fact teaches
+   * people to ignore both.
+   *
+   * There is no sentence for "they wrote to you first": an inbound-created
+   * row and a row that predates the column are both null here, and the
+   * profile cannot tell them apart.
+   */
+  originQr: 'You started this chat by scanning their code.',
+  originManual: 'You started this chat by typing their ID.',
+  /** All discovery classes, including the bare `discovery` mark, use generic
+   * server-introduction copy. The mark may represent email, phone, or another
+   * lookup class, so naming a specific identifier would claim information
+   * that the stored provenance does not contain. */
+  originLookup: 'You found them by looking them up.',
+
   safetyTitle: 'Safety number',
   safetyHint:
     'Read these aloud and check every group matches on the other device',
@@ -113,28 +131,27 @@ const COPY = {
 } as const;
 
 /**
- * The per-person relay memory — `call_relay_prefs`,
- * `db.setPeerRelayPref`, `relayForPeer`. The storage, the read path and the
- * policy all shipped and were tested; nothing wrote it, so `remembered` was
- * permanently null in production while four published pages said the choice is
- * "remembered per person".
+ * Name QR and manual introductions directly. For any discovery class,
+ * including the bare family marker, use the same `db.serverIntroduced`
+ * predicate as the thread so the copy does not invent an identifier class.
+ * Null, legacy rows without provenance, and unknown non-discovery values
+ * produce no sentence because they cannot establish who introduced the peer.
+ */
+function originLineFor(kind: string | null | undefined): string | null {
+  if (kind === 'qr') return COPY.originQr;
+  if (kind === 'manual') return COPY.originManual;
+  if (db.serverIntroduced(kind)) return COPY.originLookup;
+  return null;
+}
+
+/**
+ * Per-person relay preference is true, false, or null. Null preserves the
+ * first-call default: relay until a call with this person connects, then allow
+ * direct calls. `setPeerRelayPref` represents null by deleting the row, so a
+ * two-state switch would lose a meaningful choice.
  *
- * WHY THREE CHOICES AND NOT A SWITCH. The stored value is `true | false |
- * null`, and null is not off: it is the first-call default (relayed until a
- * call with this person has actually connected, direct afterwards), and
- * `setPeerRelayPref` preserves it by DELETING the row rather than writing a
- * value. A two-state switch cannot express that. Worse, it would destroy it
- * silently — every peer a person merely glanced at would be frozen to whatever
- * the switch happened to render for "no memory", and the default would become
- * unreachable for the rest of that person's life with them. So the control is
- * the timer's idiom (chips in a row, one selected, a sentence above saying
- * what the current setting DOES), which this screen already uses for another
- * setting with more than two answers.
- *
- * ORDER IS A DIAL, most protection to least, and the default sits in the
- * middle because that is where it belongs on that dial rather than because it
- * is the default — relaying always discloses nothing to them, the default
- * discloses once a call has connected, and direct discloses now.
+ * The three chips order choices from most to least IP-address protection:
+ * always relay, relay until a call connects, and allow direct calls now.
  */
 const RELAY_OPTIONS: ReadonlyArray<{
   id: string;
@@ -155,13 +172,9 @@ const RELAY = {
    * still promising "your first call is relayed" would be describing the past.
    */
   status: {
-    /**
-     * The app-wide switch wins unconditionally — `relayForPeer` returns true
-     * on `global` before it ever looks at the memory. A control that stayed
-     * silent about that would be showing someone a choice with no effect and
-     * letting them believe otherwise, which is the exact defect this whole
-     * change exists to end.
-     */
+    /** The app-wide relay switch overrides the per-person preference in
+     * `relayForPeer`. Explain that override so the stored choice is not shown
+     * as if it currently controlled the call. */
     global: `Every call from this ${DEVICE_NOUN} is relayed right now — “Relay every call” is on in Settings, and it decides this one. What you choose here waits until you turn that off.`,
     always: (who: string) =>
       `Calls with ${who} go through Tacendum’s relay, first one and every one after.`,
@@ -192,14 +205,14 @@ const RELAY = {
 /**
  * The per-device drill-down deck. Remote devices
  * speak the never-wrong generic — the remote platform is unknowable — and slot words reach glass only through
- * `LINKING_COPY.slotLabel`, the one policed chokepoint.
+ * `LINKING_COPY.slotLabel`, the shared source of display labels.
  */
 const PEER_DEVICES = {
   title: 'Their devices',
   intro: (who: string) =>
     `${who}’s account spans more than one device. Each one has its own key — and its own safety number with this one.`,
-  // Membership via the SHARED class list — the slot words themselves are
-  // never spelled in this file (the sweep polices it).
+  // Use the shared device-class list so membership and display labels cannot
+  // drift across screens.
   deviceLabel: (deviceClass: string): string =>
     (DEVICE_CLASSES as readonly string[]).includes(deviceClass)
       ? LINKING_COPY.slotLabel(deviceClass as DeviceClass)
@@ -228,6 +241,20 @@ const PEER_DEVICES = {
 } as const;
 
 /**
+ * A section's answer to the Android back button.
+ * The two questions on this page that belong to sibling components publish
+ * one of these into a ref the screen holds, so the screen's SINGLE back
+ * handler can retire them in a stated order. `true` means this section had
+ * something open and dealt with the press; `false` means it had nothing and
+ * the press belongs to whatever is asked next.
+ */
+type SectionCloser = { current: () => boolean };
+
+/** What a ref holds before a section has published anything, and after it
+ * has gone: nothing is open here, so the press is not ours. */
+const NOTHING_OPEN = (): boolean => false;
+
+/**
  * Someone else's profile — strictly the card they chose to send inside this
  * chat, plus the name I filed them under here. There is no directory to
  * consult, so there is nothing to fetch: no phone number, no presence, no last
@@ -252,11 +279,9 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
   /** Blocking is a two-step commitment, never a single tap. */
   const [confirmingBlock, setConfirmingBlock] = useState(false);
   const [blockFailed, setBlockFailed] = useState(false);
-  /** The block committed, but the lock-screen mirror could not be
-   * written — enforced here, not yet at the extension. Read from messaging's
-   * durable-seeded flag rather than remembered from this mount's own action: a person who blocked, saw the warning, and
-   * relaunched used to land on a screen that said nothing at all while the
-   * lock screen still disagreed with them. */
+  /** A block is enforced in-app even when its lock-screen mirror write fails.
+   * Read the durable stale-mirror flag so the warning survives a relaunch and
+   * stays visible until reconciliation updates the extension's copy. */
   const [blockPartial, setBlockPartial] = useState(
     messaging.isBlockNotificationMirrorStale(),
   );
@@ -279,10 +304,70 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
    * must not overwrite a newer one — nor land after the screen is gone.
    * Bumped on unmount for exactly that. */
   const refreshSeq = useRef(0);
-  // THE keyboard mechanism (keyboardInset.ts), on
-  // the one input-bearing screen that lacked it: the nickname field sits a
-  // QuietRoom and a hero down the page, and on a short phone it and Save
-  // ended under the keyboard with no scroll extent to lift them.
+
+  /** Read by the system-back handler, which is registered once and must see
+   * what is open at the moment of the press, not at subscription. */
+  const confirmingBlockRef = useRef(false);
+  const confirmingSafetyRef = useRef(false);
+  /** A write in flight — the block above all, which is a real network write
+   * and not one of `write()`'s silent local records. */
+  const busyRef = useRef(false);
+  confirmingBlockRef.current = confirmingBlock;
+  confirmingSafetyRef.current = confirming;
+  busyRef.current = busy;
+  /**
+   * The two questions this file's SIBLING sections own — the report chooser
+   * (`step`) and the machine adopt/revoke (`confirming`) — are state this
+   * component cannot read. Each section publishes a closer here instead: a
+   * function that shuts whatever it has open and says whether it did. That
+   * keeps ONE listener on the screen, which is what lets the order below be
+   * a decision rather than an accident of which component mounted last.
+   */
+  const closeReportRef = useRef<() => boolean>(NOTHING_OPEN);
+  const closeMachineRef = useRef<() => boolean>(NOTHING_OPEN);
+
+  useEffect(() => {
+    // Android Back dismisses one confirmation before leaving this profile.
+    // React Native asks the newest listener first; this screen mounts after
+    // the router. One listener calls section-owned closers through refs so
+    // priority does not depend on component effect or mount order.
+    //
+    // Several sections may be open. Close the report chooser first because
+    // it holds only reselectable chips and has sent nothing; then the machine
+    // pairing question, the safety comparison, and the relationship block.
+    // This orders section-specific commitments before the broader ones.
+    //
+    // Each closer consumes Back while its own write is busy, matching its
+    // disabled Cancel control. Safety and block confirmations use the same
+    // rule. With no question open, return false even during a nickname save
+    // so the router retains normal navigation. Dismissing a safety question
+    // records neither a match nor a mismatch.
+    //
+    // Refs keep the once-registered handler current without resubscribing.
+    // BackHandler is inert on iOS, so registration is unconditional.
+    const subscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      () => {
+        if (closeReportRef.current()) return true;
+        if (closeMachineRef.current()) return true;
+        if (confirmingSafetyRef.current) {
+          if (busyRef.current) return true;
+          setConfirming(false);
+          return true;
+        }
+        if (confirmingBlockRef.current) {
+          if (busyRef.current) return true;
+          setConfirmingBlock(false);
+          return true;
+        }
+        return false;
+      },
+    );
+    return () => subscription.remove();
+  }, []);
+
+  // The keyboard inset adds enough scroll space to keep the nickname field
+  // and Save reachable below the identity section on short screens.
   const keyboardInset = useKeyboardInset();
   /** The stored nickname is loaded once per peer: a refresh triggered by an
    * arriving message must never overwrite what is being typed. */
@@ -291,10 +376,8 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
    * — 'linked' and 'pending' only: a removed or
    * revoked device has left the set, and its absence IS the record. */
   const [peerDeviceRows, setPeerDeviceRows] = useState<db.PeerDeviceDbRow[]>([]);
-  /** Per-pair safety numbers for the drill-down (each pair has its
-   * OWN number and the UI says so) — null until that pair has a session.
-   * Wired deliberately: the deck promised per-pair
-   * numbers this screen never rendered. */
+  /** Each device pair has its own safety number, or null until a session
+   * exists. Render this per-pair value rather than repeating the anchor. */
   const [deviceSafety, setDeviceSafety] = useState<Map<string, string | null>>(
     new Map(),
   );
@@ -316,8 +399,7 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
           setNickname(row.localName ?? '');
         }
         // The agreed timer is a property of the conversation, so it is read
-        // from the chat row — THIS read of it: the row used to be fetched a
-        // second time for the one column.
+        // from the same chat-row snapshot as the rest of the conversation.
         setDisappearSec(row?.disappearSec ?? 0);
       })
       .catch(() => {});
@@ -342,8 +424,7 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
         );
         if (seq !== refreshSeq.current) return;
         setPeerDeviceRows(shown);
-        // The per-pair numbers, one native read per listed device (≤2 in
-        // v1): null renders as the honest "no number yet" line.
+        // Read each listed pair's number once; null renders as "no number yet".
         void (async () => {
           const numbers = new Map<string, string | null>();
           const records = new Map<string, db.PeerPairSafetyRow>();
@@ -426,6 +507,9 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
    */
   const who = label || 'this person';
   const whoCap = label || 'This person';
+
+  /** How this chat started, or nothing at all — see `originLineFor`. */
+  const originLine = originLineFor(chat?.introducedBy);
 
   // `blockedAt` is deliberately absent from this object and must stay absent.
   // `blocked` here means one thing only — an unaccepted identity change — and
@@ -516,7 +600,7 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
       setConfirming(false);
     });
 
-  /** The outcome the app never had a place for until now. */
+  /** Record a reported mismatch separately from an unchecked number. */
   const markMismatch = () =>
     write(async () => {
       await db.setSafetyMismatch(peerId, Date.now());
@@ -552,8 +636,8 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
       await db.setPeerPairChecked(deviceId, null);
     });
 
-  /** Clearing the stale local findings is `acceptIdentityChange`'s job, in that
-   * order, so this screen and the thread cannot drift apart about it again. */
+  /** `acceptIdentityChange` clears stale comparison records before accepting
+   * the new identity, keeping this screen and the thread consistent. */
   const acceptChange = () =>
     write(async () => {
       await messaging.acceptIdentityChange(peerId);
@@ -635,8 +719,7 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
 
   /** The bare id, and no pasteboard expiry (contrast pasteboard.ts): an id
    * is an address, not a secret — the whole point is that it gets pasted.
-   * The one row on this screen with nothing to look up had no way to hand
-   * the id on; StartChat's own-id row always had. */
+   * Copying it lets the owner share the address with someone else. */
   const copyPeerId = () => {
     Clipboard.setString(peerId);
     setIdCopied(true);
@@ -775,6 +858,8 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
               maxLength={NICKNAME_MAX}
               placeholder={COPY.nicknamePlaceholder}
               placeholderTextColor={t.color.inkMuted}
+              keyboardAppearance={t.scheme}
+              selectionColor={t.color.pine}
               accessibilityLabel={COPY.nicknameLabel}
               testID="peer-nickname-input"
               style={[
@@ -857,6 +942,18 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
             />
           ) : null}
 
+          {/* How this chat started: under the identity sheet, above safety —
+              the place a person is already deciding how much to trust this
+              row. One line, never a section; this screen is long enough. */}
+          {originLine !== null ? (
+            <Text
+              style={[t.type.compactBody, styles.originLine, { color: t.color.inkMuted }]}
+              testID="peer-origin"
+            >
+              {originLine}
+            </Text>
+          ) : null}
+
           <View style={styles.safety}>
             <Text
               accessibilityRole="header"
@@ -931,7 +1028,7 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
                   {copy.body(who, checkedOn)}
                 </Text>
                 {/* What the number is, why both phones show the same one, and
-                    what a difference would mean — never stated until now. */}
+                    what a difference would mean before asking for a comparison. */}
                 {SAFETY_EXPLAINER.map(line => (
                   <Text
                     key={line}
@@ -1184,8 +1281,11 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
                 ? DISAPPEAR.notSet
                 : DISAPPEAR.status(disappearLabel(disappearSec)!)}
             </Text>
-            <View style={styles.disappearRow}>
-              {DISAPPEAR_OPTIONS.map(option => {
+            {/* The six chips wrap: the row has to hold '5 minutes'
+                through '4 weeks' at every type size, so it is a wrapping row
+                and not a scroller. */}
+            <View style={styles.disappearRow} testID="peer-disappear-row">
+              {DISAPPEAR_OPTIONS_PEER.map(option => {
                 const active = option.seconds === disappearSec;
                 // Off while they are blocked: the chips say so to
                 // VoiceOver AND to the eye — a recessed surface with muted
@@ -1294,14 +1394,14 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
               cannot know which, because the server refuses to enumerate a
               crew even to its owner, so the section says who it is for and
               lets the server's own refusals answer for everyone else. */}
-          <MachineSection peerId={peerId} />
+          <MachineSection peerId={peerId} closerRef={closeMachineRef} />
 
           {/* Reporting, placed ABOVE blocking and never inside it. The two are
               different remedies and the order says which is which: blocking
               is immediate, local, and needs nobody's agreement; reporting asks
               a human and changes nothing by itself. Putting report second
               would read as the escalation, which is backwards. */}
-          <ReportSection peerId={peerId} />
+          <ReportSection peerId={peerId} closerRef={closeReportRef} />
 
           <View style={styles.blocking}>
             <Text
@@ -1519,10 +1619,9 @@ function SafetyGrid({
 /**
  * Reporting.
  *
- * App Store guideline 1.2 wants a way to report; the product's premise is
- * that nobody here can read a conversation. Both hold, because the report is
- * account-plus-category by default and carries message text only when a
- * person deliberately chooses some.
+ * Reports contain an account and category by default. Message text requires
+ * explicit selection by the sender because encrypted conversations are not
+ * otherwise available to the service.
  *
  * THE SHAPE, AND WHY. Two steps, not one: picking a reason is a decision, and
  * a single tap that fires a report the instant it is touched gives no room to
@@ -1530,21 +1629,43 @@ function SafetyGrid({
  * submit control, the way `BLOCK.confirmBody` names discard-on-arrival above
  * its button — a consequence read after the fact is not consent.
  *
- * This first version ships the no-excerpt path only: the reason list, the
- * consent copy, and the send. Message selection needs a picker in the thread
- * (`ChatThreadScreen`) and is the next slice; the wire, the client and the
- * server already carry excerpts, so that slice adds a screen rather than a
- * protocol. Shipping the smaller thing first is deliberate — a report that
- * reaches a human satisfies 1.2 today, and the attachment flow is the part
- * that can get consent wrong.
+ * This chooser sends only an account identifier and a category. It has no
+ * message-selection control, so its consent copy must say that no message
+ * text is included even though the reporting protocol supports excerpts.
  */
-function ReportSection({ peerId }: { peerId: string }) {
+function ReportSection({
+  peerId,
+  closerRef,
+}: {
+  peerId: string;
+  closerRef: SectionCloser;
+}) {
   const t = useTheme();
   const [step, setStep] = useState<'idle' | 'choosing'>('idle');
   const [reason, setReason] = useState<ReportReason | null>(null);
   const [busy, setBusy] = useState(false);
   const [sentId, setSentId] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
+
+  // Android Back is answered through the screen's one listener. Since
+  // `step` belongs to this component, publish a
+  // closer instead. Assigned during render, exactly as the screen mirrors
+  // its own state into refs, so the press sees the last committed render.
+  // It does what the chooser's own Cancel does — and refuses while a report
+  // is being sent, where that Cancel is `disabled={busy}`.
+  closerRef.current = () => {
+    if (step !== 'choosing') return false;
+    if (busy) return true;
+    setStep('idle');
+    setReason(null);
+    return true;
+  };
+  useEffect(() => {
+    const ref = closerRef;
+    return () => {
+      ref.current = NOTHING_OPEN;
+    };
+  }, [closerRef]);
 
   const send = useCallback(async () => {
     if (reason === null) return;
@@ -1887,11 +2008,34 @@ function RelaySection({
   );
 }
 
-function MachineSection({ peerId }: { peerId: string }) {
+function MachineSection({
+  peerId,
+  closerRef,
+}: {
+  peerId: string;
+  closerRef: SectionCloser;
+}) {
   const t = useTheme();
   const [confirming, setConfirming] = useState<'adopt' | 'revoke' | null>(null);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
+
+  // Same as ReportSection above: the adopt/revoke question is this
+  // component's state, and the screen's single back handler reaches it
+  // through this closer. Its own Cancel is `disabled={busy}` while the
+  // server call is in flight, so the press is refused there too.
+  closerRef.current = () => {
+    if (confirming === null) return false;
+    if (busy) return true;
+    setConfirming(null);
+    return true;
+  };
+  useEffect(() => {
+    const ref = closerRef;
+    return () => {
+      ref.current = NOTHING_OPEN;
+    };
+  }, [closerRef]);
 
   const act = useCallback(
     async (which: 'adopt' | 'revoke') => {
@@ -1930,12 +2074,10 @@ function MachineSection({ peerId }: { peerId: string }) {
       >
         {MACHINE.title}
       </Text>
-      {/* THE 5.1.2(i) DISCLOSURE, ABOVE THE ACTIONS.
-          Placement is the requirement, not wording: both lines sit outside the
-          confirm branch below, so they are on screen in the idle state AND
-          still on screen at the confirm step — the whole window in which the
-          adopt can be completed. Moving either inside the branch, or below the
-          buttons, is the defect this placement exists to prevent. */}
+      {/* Keep both data-sharing disclosures above the actions in the idle
+          and confirmation states so they remain visible throughout adoption.
+          Placing them inside the confirmation branch or below the buttons
+          would let someone begin the action before reading what it shares. */}
       <Text
         style={[t.type.compactBody, styles.explainerLine, { color: t.color.inkBody }]}
         testID="peer-machine-ai"
@@ -2023,10 +2165,8 @@ function MachineSection({ peerId }: { peerId: string }) {
   );
 }
 
-// The private TextAction/DangerAction/WarningAction this file used to draw
-// are the kit's TextAction and OutlineButton now: the same outlined 52pt
-// button existed in three screens with three paddings and three disabled
-// rules.
+// Shared action components keep button padding and disabled states consistent
+// across screens.
 
 const styles = StyleSheet.create({
   root: { flex: 1 },
@@ -2083,6 +2223,9 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   explainerLine: { marginTop: 8 },
+  /** Its own breathing room under the identity sheet — one line, no rule,
+   * no heading; it is context, not a section. */
+  originLine: { marginTop: 12 },
   panel: { marginTop: 12, borderLeftWidth: 3, padding: 12 },
   panelLine: { marginTop: 8 },
   action: { marginTop: 12 },
