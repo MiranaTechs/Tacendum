@@ -308,6 +308,43 @@ test('a reinstall with orphaned Keychain lock keys boots unlocked and clears the
   expect(crypto.__keychain.has('lock.passcode')).toBe(false);
 });
 
+test('a reinstall clears provider keys even when app lock was disabled', async () => {
+  const install = jest.requireMock('../src/install') as {
+    __install: { firstRun: boolean }; markInstalled: jest.Mock;
+  };
+  install.__install.firstRun = true;
+  crypto.__keychain.set('aiWriting.openai', 'orphaned-writing-fixture');
+  crypto.__keychain.set('aiWriting.anthropic', 'orphaned-writing-fixture');
+  const tree = await renderApp();
+  expect(crypto.__keychain.has('aiWriting.openai')).toBe(false);
+  expect(crypto.__keychain.has('aiWriting.anthropic')).toBe(false);
+  expect(install.__install.firstRun).toBe(false);
+  expect(tree.root.findAllByProps({ testID: 'lock-screen' })).toHaveLength(0);
+});
+
+test('a refused provider-key delete does not invent a lock on a fresh install', async () => {
+  const install = jest.requireMock('../src/install') as { __install: { firstRun: boolean } };
+  const native = jest.requireMock('tacendum-crypto') as { deleteSecret: jest.Mock };
+  const healthy = native.deleteSecret.getMockImplementation()!;
+  install.__install.firstRun = true;
+  crypto.__keychain.set('aiWriting.openai', 'orphaned-writing-fixture');
+  crypto.__keychain.set('aiWriting.anthropic', 'orphaned-writing-fixture');
+  native.deleteSecret.mockImplementation(async (key: string) => {
+    if (key === 'aiWriting.openai') throw new Error('controlled native refusal');
+    return healthy(key);
+  });
+  try {
+    const tree = await renderApp();
+    expect(crypto.__keychain.has('aiWriting.openai')).toBe(true);
+    expect(crypto.__keychain.has('aiWriting.anthropic')).toBe(false);
+    expect(install.__install.firstRun).toBe(false);
+    expect(tree.root.findAllByProps({ testID: 'lock-screen' })).toHaveLength(0);
+  } finally {
+    native.deleteSecret.mockImplementation(healthy);
+    install.__install.firstRun = false;
+  }
+});
+
 test('the real code opens the real workspace', async () => {
   crypto.__keychain.set('lock.enabled', '1');
   crypto.__keychain.set('lock.passcode', '123456');

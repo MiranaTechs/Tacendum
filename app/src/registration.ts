@@ -25,6 +25,7 @@ import * as lock from './lock';
 import { AUTH_TOKEN_KEY, messaging, resumeReauth, suspendReauth } from './messaging';
 import { session } from './session';
 import { API_BASE } from './config';
+import { clearWritingConnections, invalidateWritingSession } from './aiWritingService';
 
 /**
  * Account lifecycle: keygen (native, PQXDH set) →
@@ -82,6 +83,7 @@ import { API_BASE } from './config';
  */
 export async function deleteAccount(): Promise<void> {
   if (session.mode === 'duress') {
+    invalidateWritingSession();
     // A coerced "delete it all": the decoy dies
     // convincingly, nothing real is touched, and no packet leaves the phone.
     // No 1:1 call can be live here — the transport refuses every duress
@@ -106,6 +108,11 @@ export async function deleteAccount(): Promise<void> {
   suspendReauth();
   const token = await getSecret(AUTH_TOKEN_KEY);
   if (token) await apiDeleteAccount(token);
+  invalidateWritingSession();
+  // Provider keys are account data, not installation preferences. Cleanup
+  // attempts both records, and never misreports an already deleted account
+  // as an offline failure. Owner binding makes any refused residue inert.
+  const writingCleanup = clearWritingConnections();
   // AFTER the server delete — a deletion that throws offline must leave the
   // call untouched — and BEFORE the socket stops, so the peer's `call.end`
   // is composed while the transport still accepts it and the CXCall does not
@@ -118,6 +125,7 @@ export async function deleteAccount(): Promise<void> {
   // stop existing.
   disposeGroupCall();
   quiesceCallMetrics();
+  await writingCleanup;
   await db.clearLocalState();
   await resetProtocolState();
   await deleteSecret(AUTH_TOKEN_KEY);

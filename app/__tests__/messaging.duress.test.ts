@@ -386,6 +386,8 @@ describe('deleteAccount (the most dangerous seam)', () => {
   });
 
   test('duress delete clears decoy tables only — no network, real identity intact', async () => {
+    crypto.__keychain.set('aiWriting.openai', 'real-writing-fixture');
+    crypto.__keychain.set('aiWriting.anthropic', 'real-writing-fixture');
     crypto.__keychain.set('authToken', 'token-1');
     crypto.__keychain.set('lock.passcode', '123456');
     crypto.__keychain.set('lock.enabled', '1');
@@ -403,9 +405,13 @@ describe('deleteAccount (the most dangerous seam)', () => {
     expect(crypto.__keychain.get('authToken')).toBe('token-1');
     expect(crypto.__keychain.get('lock.passcode')).toBe('123456');
     expect(crypto.__keychain.get('lock.enabled')).toBe('1');
+    expect(crypto.__keychain.get('aiWriting.openai')).toBe('real-writing-fixture');
+    expect(crypto.__keychain.get('aiWriting.anthropic')).toBe('real-writing-fixture');
   });
 
   test('real delete retires the account server-side, then wipes identity, token, lock state, and the decoy', async () => {
+    crypto.__keychain.set('aiWriting.openai', 'real-writing-fixture');
+    crypto.__keychain.set('aiWriting.anthropic', 'real-writing-fixture');
     api.apiDeleteAccount.mockResolvedValueOnce(undefined);
     crypto.__keychain.set('authToken', 'token-1');
     crypto.__keychain.set('lock.passcode', '123456');
@@ -419,11 +425,15 @@ describe('deleteAccount (the most dangerous seam)', () => {
     expect(crypto.__keychain.has('authToken')).toBe(false);
     expect(crypto.__keychain.has('lock.passcode')).toBe(false);
     expect(crypto.__keychain.has('lock.enabled')).toBe(false);
+    expect(crypto.__keychain.has('aiWriting.openai')).toBe(false);
+    expect(crypto.__keychain.has('aiWriting.anthropic')).toBe(false);
     const decoy = sqlite.instances.get('tacendum-decoy.sqlite');
     expect(statementsOf(decoy).some(s => s.includes('DELETE FROM'))).toBe(true);
   });
 
   test('an offline delete throws and wipes NOTHING — the promise must never be false', async () => {
+    crypto.__keychain.set('aiWriting.openai', 'real-writing-fixture');
+    crypto.__keychain.set('aiWriting.anthropic', 'real-writing-fixture');
     // The default api mock rejects: the server was never reached, so the ID
     // still works, so nothing local may be destroyed.
     crypto.__keychain.set('authToken', 'token-1');
@@ -437,6 +447,8 @@ describe('deleteAccount (the most dangerous seam)', () => {
     expect(crypto.resetProtocolState).not.toHaveBeenCalled();
     expect(crypto.__keychain.get('authToken')).toBe('token-1');
     expect(crypto.__keychain.get('lock.passcode')).toBe('123456');
+    expect(crypto.__keychain.get('aiWriting.openai')).toBe('real-writing-fixture');
+    expect(crypto.__keychain.get('aiWriting.anthropic')).toBe('real-writing-fixture');
     const wipes = real.execute.mock.calls
       .slice(before)
       .map(c => String(c[0]))

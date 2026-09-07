@@ -740,8 +740,13 @@ describe('GroupCreateScreen — the picks, the disabled button, the review group
     await db.upsertChat(BEN, 'Ben');
     await db.upsertChat(CARA, 'Cara');
     await db.upsertChat(DAN, 'Dan');
-    // Ben's safety number changed; he would otherwise sort wherever his last
-    // message put him — here, first.
+    // Give the chat list an explicit order: relying on the three upserts'
+    // Date.now() values made Cara and Dan swap whenever their inserts crossed
+    // a millisecond boundary under full-suite load. Ben's latest message puts
+    // him first before the stable review-group sort moves him to the end.
+    await db.touchChat(BEN, 'Latest', 3000);
+    await db.touchChat(CARA, 'Middle', 2000);
+    await db.touchChat(DAN, 'Oldest', 1000);
     await db.setIdentityChanged(BEN, Date.now());
     const tree = await mount();
 

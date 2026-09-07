@@ -1,17 +1,17 @@
 /**
- * The eight Settings sections become rotor stops.
+ * The Settings sections become rotor stops.
  *
  * `RuledLabel` renders a plain row, so every section label on the longest
  * scroll in the app was invisible to the VoiceOver rotor's Headings
  * navigator: reaching APPEARANCE meant swiping past every row above it.
- * Cluster 1 gave the component an opt-in `heading` prop; this screen is the
- * first owner to pass it, on its own eight labels and nowhere else.
+ * The component has an opt-in `heading` prop; this screen is the
+ * first owner to pass it. The writing assistant adds a ninth section.
  *
  * OPT-IN IS THE POINT. The same component draws the thread's date dividers
  * and Register's consent labels, where a heading per day would flood the
  * rotor the prop exists to make useful — so this suite asserts the exact
- * SET of headings, not merely that some exist. A ninth would be a
- * regression, and so would a missing one.
+ * SET of headings, not merely that some exist. An unrelated row claiming
+ * this role would be a regression, and so would a missing section.
  */
 import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
@@ -74,6 +74,7 @@ const SECTIONS = [
   'CALLS',
   'NOTIFICATIONS',
   'APPEARANCE',
+  'WRITING ASSISTANT',
   'ABOUT',
 ];
 
@@ -88,7 +89,7 @@ afterEach(async () => {
   });
 });
 
-test('all eight sections are rotor headings, in the order they are read', async () => {
+test('all nine sections are rotor headings, in the order they are read', async () => {
   await lock.setup('123456');
   await render();
   expect(headings()).toEqual(SECTIONS);
@@ -97,9 +98,9 @@ test('all eight sections are rotor headings, in the order they are read', async 
 test('nothing else on the screen claims to be one', async () => {
   await lock.setup('123456');
   await render();
-  // Exactly eight — a ninth heading would be a row or a note that took the
+  // Exactly nine — a tenth heading would be a row or a note that took the
   // role it should not have, and the rotor's value is that it is short.
-  expect(headings()).toHaveLength(8);
+  expect(headings()).toHaveLength(9);
 });
 
 test('a sub-step offers no section stops at all', async () => {
@@ -109,7 +110,7 @@ test('a sub-step offers no section stops at all', async () => {
   // the walker above would have said so if it were counting something else.
   await lock.setup('123456');
   await render();
-  expect(headings()).toHaveLength(8);
+  expect(headings()).toHaveLength(9);
 
   await ReactTestRenderer.act(async () => {
     (tree.root

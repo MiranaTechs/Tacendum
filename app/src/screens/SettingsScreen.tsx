@@ -56,6 +56,7 @@ import {
   VERSION_LABEL,
 } from '../version';
 import { ChoiceRow } from '../ui/ChoiceRow';
+import { WritingConnection } from '../ui/WritingConnection';
 import { InfoDisclosure } from '../ui/InfoDisclosure';
 import { PinPad } from '../ui/PinPad';
 import {
@@ -546,6 +547,7 @@ export function SettingsScreen({
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [autolockSec, setAutolockSec] = useState(0);
   const [flow, setFlow] = useState<Flow>({ step: 'menu' });
+  const [writingOpen, setWritingOpen] = useState(false);
   const [value, setValue] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -1592,6 +1594,22 @@ export function SettingsScreen({
                   testIDPrefix="settings-appearance"
                 />
               </View>
+
+              <RuledLabel heading label="WRITING ASSISTANT" marginTop={32} marginBottom={12} />
+              <View style={[styles.sheet, {
+                marginHorizontal: -t.layout.gutter,
+                backgroundColor: t.color.paperSheet,
+                borderColor: t.color.lineSoft,
+                borderTopWidth: t.hairline,
+                borderBottomWidth: t.hairline,
+              }]}>
+                <MenuRow
+                  label="Your AI connections"
+                  testID="settings-writing"
+                  onPress={() => setWritingOpen(open => !open)}
+                />
+              </View>
+              {writingOpen ? <WritingConnection onDone={() => setWritingOpen(false)} /> : null}
 
               <RuledLabel
                 heading

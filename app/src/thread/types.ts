@@ -8,7 +8,7 @@
 // `../screens/`.
 import { type MessageRow } from '../db';
 
-export type Drawer = 'none' | 'attach' | 'emoji';
+export type Drawer = 'none' | 'attach' | 'emoji' | 'writing';
 
 /**
  * What the composer is doing besides writing something new. Both states hold

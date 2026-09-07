@@ -61,6 +61,9 @@ import * as db from '../src/db';
 import { messaging } from '../src/messaging';
 import { createOrRestoreAccount } from '../src/registration';
 import { session } from '../src/session';
+import * as calling from '../src/call';
+import { getWritingConnections } from '../src/aiWritingService';
+import { SettingsScreen } from '../src/screens/SettingsScreen';
 
 interface FakeDb {
   name: string;
@@ -173,6 +176,7 @@ async function press(
 
 async function transition(state: 'background' | 'active'): Promise<void> {
   await ReactTestRenderer.act(async () => {
+    AppState.currentState = state;
     for (const listener of [...appStateListeners]) listener(state);
     await flush();
   });
@@ -181,6 +185,62 @@ async function transition(state: 'background' | 'active'): Promise<void> {
 function currentRoute(): string {
   return (globalThis as Record<string, unknown>).TacendumDevRoute as string;
 }
+
+async function unlockWritingWorkspace() {
+  const tree = await renderApp();
+  expect((await getWritingConnections()).status).toBe('failed');
+  for (const key of ['1', '2', '3', '4', '5', '6']) await press(tree, `pin-key-${key}`);
+  await press(tree, 'pin-submit');
+  await ReactTestRenderer.act(flush);
+  expect(currentRoute()).toBe('chats');
+  expect((await getWritingConnections()).status).toBe('completed');
+  return tree;
+}
+
+test('writing stays denied until the latest foreground lock verdict completes', async () => {
+  await unlockWritingWorkspace();
+  await transition('background');
+  expect((await getWritingConnections()).status).toBe('failed');
+  const gate = deferred<string | null>();
+  crypto.getSecret.mockImplementation(key => key === 'lock.enabled' ? gate.promise : healthyGetSecret(key));
+  await transition('active');
+  expect((await getWritingConnections()).status).toBe('failed');
+  await transition('background');
+  await ReactTestRenderer.act(async () => {
+    gate.resolve('1');
+    await flush();
+  });
+  expect((await getWritingConnections()).status).toBe('failed');
+  crypto.getSecret.mockImplementation(healthyGetSecret);
+  await transition('active');
+  expect((await getWritingConnections()).status).toBe('completed');
+});
+
+test('Lock now revokes writing before waiting for call teardown', async () => {
+  const tree = await unlockWritingWorkspace();
+  await ReactTestRenderer.act(async () => {
+    const nav = (globalThis as unknown as { TacendumDevNav: (route: { name: string }) => void }).TacendumDevNav;
+    nav({ name: 'settings' });
+  });
+  const gate = deferred<void>();
+  const quiesce = jest.spyOn(calling, 'endCallOnQuiesce').mockImplementation(() => gate.promise);
+  let pending!: Promise<void>;
+  await ReactTestRenderer.act(async () => {
+    pending = tree.root.findByType(SettingsScreen).props.onLockNow();
+    await flush();
+  });
+  expect(quiesce).toHaveBeenCalled();
+  // AppState is still active, and Settings is still mounted behind the await.
+  expect(AppState.currentState).toBe('active');
+  expect(currentRoute()).toBe('settings');
+  expect((await getWritingConnections()).status).toBe('failed');
+  await ReactTestRenderer.act(async () => {
+    gate.resolve();
+    await pending;
+    await flush();
+  });
+  expect(currentRoute()).toBe('locked');
+});
 
 /** The jest.setup factory's own read, restorable after the failure leg. */
 const healthyGetSecret = async (key: string): Promise<string | null> =>
@@ -195,6 +255,7 @@ const fetchMock = jest.fn(async () => ({
 }));
 
 beforeEach(async () => {
+  AppState.currentState = 'active';
   messaging.stop();
   resetCallingForTests();
   await db.close();

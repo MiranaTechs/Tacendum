@@ -13,7 +13,7 @@ marking of generative output. Guideline 5.1.2(i) requires clear disclosure and
 permission before personal data is shared with a third party, including
 third-party AI.
 
-## 1. The canonical sentence
+## 1. The canonical sentence for machine-hosted agent chat
 
 > **"Replies you send are delivered to the AI provider through a client running
 > on your machine; Tacendum's servers relay message ciphertext, not plaintext."**
@@ -41,8 +41,10 @@ the routing metadata listed in §2.
 - **The operator's machine runs the agent through the vendor's client.**
   `attend` resolves the `claude` or `codex` binary from the operator's `PATH`
   and launches it under the operator's sign-in. Its default profiles are
-  Codex `-s read-only` and Claude `--permission-mode plan`. Tacendum operates
-  no model, stores no vendor credential, and proxies no inference request.
+  Codex `-s read-only` and Claude `--permission-mode plan`. In this machine-hosted
+  agent path, Tacendum operates no model, stores no vendor credential, and
+  proxies no inference request. The optional on-device writing assistant has
+  a separate data flow, described in §2.2.
 - **The service relays ciphertext and routing metadata.** Queued ciphertext is
   retained for up to 30 days (`MESSAGE_TTL_SECONDS`). The service can observe
   sender, recipient, time, and ciphertext size. End-to-end encryption protects
@@ -83,6 +85,41 @@ account or API-key authentication, and for Claude with API-key authentication.
 Copy may describe those modes but must not characterize provider retention,
 training, or terms beyond the operator's applicable agreement. Vendor terms
 can change; the statements above are dated rather than permanent assurances.
+
+### 2.2 Optional writing assistant (2026-09-07)
+
+The writing assistant has a separate, direct data flow. A person may save an
+OpenAI or Anthropic API key in the phone's protected native store. ChatGPT and
+Claude subscriptions do not cover API billing. Setup states this before saving.
+
+Opening Improve reads connection metadata but does not generate. Choosing
+Improve, Shorter, Warmer or Translate sends the unsent draft directly over
+HTTPS to the selected provider, named in the panel. Only transformation
+instructions and the draft are included. Picked mentions are replaced by
+opaque tokens; IDs and picked display names stay local. Other personal
+information typed into the draft still reaches the provider. No chat history,
+reply quote, recipient/account/room ID or attachment metadata is included.
+
+OpenAI receives a Responses request with `store:false`; Anthropic receives a
+Messages request. Neither includes tools or a conversation continuation. This
+is not a zero-retention claim. Processing, retention and billing follow the
+person's provider agreement; Tacendum cannot delete a request already received
+by the provider. Consumer sign-in is not used to authorize these API requests.
+
+The result stays in memory until Use text adopts it into the ordinary local
+draft. It is not a chat message, agent reply or recipient notification. Send
+remains separate, after human review. Undo restores the original only while
+the adopted draft is unchanged. The integration-account origin marker below
+continues to identify agent messages; it is not attached to reviewed human
+drafts merely because their author used a writing aid.
+
+Provider keys never enter the Tacendum relay, database, sync, notifications or
+diagnostics. Native records are account-bound and cleared on disconnect,
+successful real account deletion and initial installation cleanup. Lock,
+duress and background transitions revoke access and retire results. Saved
+means saved: the UI does not claim a key is verified before a successful
+request. Implementation: `app/src/aiWritingService.ts`,
+`app/src/aiWritingDraft.ts`, and the composer integration.
 
 ## 3. Article 50 position and AI-origin marker
 

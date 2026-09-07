@@ -150,6 +150,7 @@ import {
 import { resetFieldModeForDuress } from './src/fieldMode';
 import { loadPushConsent, resetPushConsentForDuress } from './src/pushConsent';
 import { accountGone, onAccountGone } from './src/reauth';
+import { clearWritingConnections, invalidateWritingSession, setWritingAccess, setWritingForeground } from './src/aiWritingService';
 import { screenSecurity } from './src/screenSecurity';
 import { session } from './src/session';
 import { type CheckReason, storeUrl, updateGate } from './src/updateGate';
@@ -877,6 +878,14 @@ function AppContent() {
    * advances the generation synchronously, then waits for the invalidated
    * task before performing the final full relock. */
   const openingGeneration = useRef(0);
+  // Explicit opening/teardown authority. A stale registration callback must
+  // not rearm access while a relock is still awaiting call shutdown.
+  const writingWorkspaceReady = useRef(false);
+  const writingForegroundEpoch = useRef(0);
+  useEffect(() => {
+    setWritingForeground(AppState.currentState === 'active');
+    return () => invalidateWritingSession();
+  }, []);
   const activeOpening = useRef<{
     generation: number;
     task: Promise<void>;
@@ -933,6 +942,8 @@ function AppContent() {
    * database itself.
    */
   const quiesceForUpdateWall = useCallback(async () => {
+    writingWorkspaceReady.current = false;
+    invalidateWritingSession();
     // First, and synchronously: everything below awaits, and an APNs
     // rotation landing in that window must not re-register a build that is
     // about to be walled off. Nothing is withdrawn, only withheld.
@@ -946,6 +957,8 @@ function AppContent() {
 
   /** Open the real workspace: the normal boot, and the 'real' verdict. */
   const enterRealWorkspace = useCallback(async (generation: number) => {
+    writingWorkspaceReady.current = false;
+    invalidateWritingSession();
     try {
       // Fence any continuation from the session/workspace that just ended
       // before this path closes or reopens SQLite. Ahead of `beginUnlock`
@@ -1152,6 +1165,8 @@ function AppContent() {
         // binary; the ordinary chats landing wins meanwhile.
         const pendingRecovery = await db.loadLocalRecovery().catch(() => null);
         if (!openingIsCurrent(generation)) return;
+        setWritingAccess(existing.userId);
+        writingWorkspaceReady.current = true;
         if (recoveryRowVisible(pendingRecovery)) {
           setRoute({ name: 'recover', from: 'chats' });
         } else {
@@ -1170,6 +1185,7 @@ function AppContent() {
         if (tapped) setRoute({ name: 'thread', peerId: tapped });
       } else {
         if (!openingIsCurrent(generation)) return;
+        writingWorkspaceReady.current = true;
         setProfile(null);
         setRoute({ name: 'landing' });
       }
@@ -1228,6 +1244,8 @@ function AppContent() {
           // — a heal must not strand a pending wait.
           const healedPendingRecovery = await db.loadLocalRecovery().catch(() => null);
           if (!openingIsCurrent(generation)) return;
+          setWritingAccess(healed.userId);
+          writingWorkspaceReady.current = true;
           if (recoveryRowVisible(healedPendingRecovery)) {
             setRoute({ name: 'recover', from: 'chats' });
           } else {
@@ -1254,6 +1272,7 @@ function AppContent() {
         return 'lock-status-rejected' as const;
       }
       if (!openingIsCurrent(generation)) return;
+      writingWorkspaceReady.current = !lockEnabled;
       setRoute(lockEnabled ? { name: 'locked' } : { name: 'landing' });
     }
   }, [checkForUpdate, openingIsCurrent, quiesceForUpdateWall]);
@@ -1261,6 +1280,8 @@ function AppContent() {
   /** Open the decoy workspace: the 'duress' verdict.
    * Messaging is never started — the session is network-silent. */
   const enterDecoyWorkspace = useCallback(async (generation: number) => {
+    writingWorkspaceReady.current = false;
+    invalidateWritingSession();
     try {
       // Fence the outgoing session's metric authority FIRST, and on this arm
       // that is the fix rather than the symmetry too. The lifecycle heartbeat
@@ -1436,6 +1457,8 @@ function AppContent() {
   /** Relock: quiesce in order — end any live call, stop messaging, close the
    * db — so the next verdict can switch workspaces safely. */
   const relock = useCallback(async () => {
+    writingWorkspaceReady.current = false;
+    invalidateWritingSession();
     // Revoke every boot/unlock continuation before the first await. Route is
     // not authority: both loading and locked remain visible while an opening
     // is in flight, so only this generation can make its later work stale.
@@ -1551,9 +1574,14 @@ function AppContent() {
             return;
           }
           if (!openingIsCurrent(generation)) return;
-          if (status.enabled && isFirstRunAfterInstall()) {
-            // Keychain outlived an uninstall; the guarded data is gone.
-            await lock.clearAll();
+          if (isFirstRunAfterInstall()) {
+            // Provider keys, like lock keys, can outlive an iOS uninstall.
+            // Run regardless of lock status and before the install marker.
+            // A refused deletion must not invent a lock with no passcode.
+            // Owner-bound residue cannot configure for a different account;
+            // mark this install so a later boot never wipes a newly saved key.
+            await clearWritingConnections();
+            if (status.enabled) await lock.clearAll();
             if (!openingIsCurrent(generation)) return;
             status.enabled = false;
           }
@@ -1609,7 +1637,11 @@ function AppContent() {
    * retrying. The latch is terminal, so this state only ever arrives once.
    */
   const [gone, setGone] = useState(accountGone);
-  useEffect(() => onAccountGone(() => setGone(true)), []);
+  useEffect(() => onAccountGone(() => {
+    writingWorkspaceReady.current = false;
+    invalidateWritingSession();
+    setGone(true);
+  }), []);
 
   // Screen security: blank every surface while the screen is captured, and
   // disclose a screenshot to the conversation it was taken in (the route is
@@ -1720,6 +1752,8 @@ function AppContent() {
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', next => {
+      const writingEpoch = ++writingForegroundEpoch.current;
+      setWritingForeground(false);
       setAppActive(next === 'active');
       if (next === 'background') {
         backgroundedAt.current = Date.now();
@@ -1820,6 +1854,10 @@ function AppContent() {
             await relock();
             return;
           }
+          // An inactive/active cycle during the secure read retires this
+          // verdict. Only the latest foreground edge may reopen AI access.
+          if (writingForegroundEpoch.current === writingEpoch &&
+            AppState.currentState === 'active') setWritingForeground(true);
           // Not relocking: reopen the socket the background pause closed.
           // After the relock decision on purpose — resuming first would dial
           // a connection the relock tears down a beat later — and never for a
@@ -2279,6 +2317,10 @@ function AppContent() {
           <RegisterScreen
             onBack={() => setRoute({ name: 'landing' })}
             onRegistered={p => {
+              // Registration is an explicit account-opening event. Background
+              // access remains independently denied until its lock verdict.
+              if (writingWorkspaceReady.current && session.mode === 'real' &&
+                routeRef.current.name === 'register') setWritingAccess(p.userId);
               setProfile(p);
               // Arm the naming moment: the chat list asks "What should
               // people call you?" before it shows anything else.
@@ -2456,6 +2498,7 @@ function AppContent() {
             onProfileChanged={p => setProfile(p)}
             onOpenSettings={() => setRoute({ name: 'settings', from: 'profile' })}
             onSignedOut={() => {
+              invalidateWritingSession();
               setProfile(null);
               setRoute({ name: 'landing' });
             }}

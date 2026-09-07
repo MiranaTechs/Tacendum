@@ -15,6 +15,7 @@ import {
   findNodeHandle,
   FlatList,
   Image,
+  Keyboard,
   Linking,
   Platform,
   Pressable,
@@ -28,6 +29,10 @@ import {
   type ViewToken,
 } from 'react-native';
 import { BLOCK_COPY as BLOCK, disappearLabel } from '../blocking';
+import { AI_WRITING_INPUT_MAX, type AiWritingAction, type AiWritingResult } from '../aiWriting';
+import { generateWriting, getWritingRevision } from '../aiWritingService';
+import { maskWritingMentions, sameWritingDraft, type WritingDraftSnapshot } from '../aiWritingDraft';
+import { WritingAssistant } from '../ui/WritingAssistant';
 import { CallLogRow } from '../components/CallLogRow';
 import {
   CameraGlyph,
@@ -1011,7 +1016,28 @@ export function ChatThreadScreen({
   const [fanoutFailures, setFanoutFailures] = useState<
     Map<string, { failed: number; total: number }>
   >(new Map());
-  const [draft, setDraft] = useState('');
+  const writingRevision = useRef(0);
+  const writingAbort = useRef<AbortController | null>(null);
+  const writingCandidate = useRef<{
+    source: WritingDraftSnapshot;
+    result: { text: string; chips: MentionChip[] };
+  } | null>(null);
+  const [writingUndo, setWritingUndo] = useState<{
+    before: WritingDraftSnapshot;
+    after: WritingDraftSnapshot;
+  } | null>(null);
+  const retireWriting = useCallback(() => {
+    writingRevision.current += 1;
+    writingAbort.current?.abort();
+    writingAbort.current = null;
+    writingCandidate.current = null;
+    setWritingUndo(null);
+  }, []);
+  const [draft, setDraftValue] = useState('');
+  const setDraft = useCallback((next: React.SetStateAction<string>) => {
+    retireWriting();
+    setDraftValue(next);
+  }, [retireWriting]);
   const [sendError, setSendError] = useState<SendError | null>(null);
   const [sendingPhoto, setSendingPhoto] = useState(false);
   /** Retained bytes of a photo that failed to send, so retry is one tap. */
@@ -1052,12 +1078,24 @@ export function ChatThreadScreen({
    * dials straight through and never sees a picker. */
   const [callPicker, setCallPicker] = useState<'audio' | 'video' | null>(null);
   const [safety, setSafety] = useState<string | null>(null);
-  const [drawer, setDrawer] = useState<Drawer>('none');
+  const [drawer, setDrawerValue] = useState<Drawer>('none');
+  const setDrawer = useCallback((next: React.SetStateAction<Drawer>) => {
+    const value = typeof next === 'function' ? next(drawerRef.current) : next;
+    if (value !== drawerRef.current) retireWriting();
+    drawerRef.current = value;
+    setDrawerValue(value);
+  }, [retireWriting]);
   const [railFor, setRailFor] = useState<db.MessageRow | null>(null);
   const [railIntent, setRailIntent] = useState<RailIntent>('react');
   /** Replying to, or rewriting, an existing message. Null while composing
    * something new. */
-  const [pending, setPending] = useState<Pending | null>(null);
+  const [pending, setPendingValue] = useState<Pending | null>(null);
+  const setPending = useCallback((next: React.SetStateAction<Pending | null>) => {
+    retireWriting();
+    const value = typeof next === 'function' ? next(pendingRef.current) : next;
+    pendingRef.current = value;
+    setPendingValue(value);
+  }, [retireWriting]);
   /** Shown after accepting an identity change: accepting is not verifying. */
   const [acceptedNotice, setAcceptedNotice] = useState(false);
   /** Mirrors `atBottom` for rendering — a ref cannot drive the jump control. */
@@ -1821,7 +1859,7 @@ export function ChatThreadScreen({
       draftLoaded.current = true;
     });
     return () => { cancelled = true; };
-  }, [peerId]);
+  }, [setDraft, peerId]);
 
   useEffect(() => {
     // While an edit holds the composer its contents are somebody's already
@@ -1948,6 +1986,8 @@ export function ChatThreadScreen({
       ),
     [isRoom, roomMembers, me?.userId, nameFor],
   );
+  const writingMentionNames = useRef(eligibleMentionNames);
+  writingMentionNames.current = eligibleMentionNames;
 
   useEffect(() => {
     const saved = savedMentionBinding;
@@ -2068,13 +2108,14 @@ export function ChatThreadScreen({
   const changeDraft = useCallback(
     (next: string) => {
       const prev = draftRef.current;
+      if (drawerRef.current === 'writing') setDrawer('none');
       setSavedMentionBinding(null);
       setMentionChips(chips => shiftMentionChips(prev, next, chips));
       setMentionCaret(caretAfterEdit(prev, next));
       setDraft(next);
       typingSignaler.onDraftChange(next.trim().length > 0);
     },
-    [typingSignaler],
+    [typingSignaler, setDraft, setDrawer],
   );
 
   /** The input's own selection events refine the inferred caret — a tap into
@@ -2178,7 +2219,7 @@ export function ChatThreadScreen({
       setDraft(prev.slice(0, at.at) + token + prev.slice(caret));
       setMentionCaret(at.at + token.length);
     },
-    [nameFor],
+    [setDraft, nameFor],
   );
 
   /** The chip's ✕: the token leaves the draft WITH its id — text and id
@@ -2201,7 +2242,7 @@ export function ChatThreadScreen({
     );
     setDraft(prev.slice(0, chip.start) + prev.slice(end));
     setMentionCaret(chip.start);
-  }, []);
+  }, [setDraft]);
 
   /** Current targets for one agent answer. The source is removed in the
    * model, so an agent can never be asked to trigger itself. */
@@ -2255,7 +2296,7 @@ export function ChatThreadScreen({
       setDrawer('none');
       setSendError(null);
     },
-    [
+    [setDraft, setDrawer,
       isRoom,
       roomMembers,
       machinePeers,
@@ -2284,7 +2325,7 @@ export function ChatThreadScreen({
     setMentionCaret(null);
     setSendError(null);
     quiet(db.setDraft(peerId, ''));
-  }, [peerId, typingSignaler]);
+  }, [setDraft, peerId, typingSignaler]);
 
   /**
    * The fingerprint is thousands of iterations of native work, so it must not
@@ -2449,7 +2490,7 @@ export function ChatThreadScreen({
     } else if (live.body !== pending.row.body) {
       setPending(current => (current ? { ...current, row: live } : current));
     }
-  }, [pending, byKey]);
+  }, [setDraft, setPending, pending, byKey]);
 
   // A details surface never outlives its exact message, emoji, or ability to
   // act. Requeries from deletion, expiry, block and retraction all converge
@@ -2667,7 +2708,7 @@ export function ChatThreadScreen({
     setDrawer('none');
     setCallPicker(null);
     setSafetyOpen(false);
-  }, []);
+  }, [setDrawer]);
 
   /** And closes, WITHOUT moving the list: jumping back to the end would
    * throw away the thing just found. `revealQuoted` already released the
@@ -3449,13 +3490,13 @@ export function ChatThreadScreen({
         refresh();
       })();
     },
-    [peerId, refresh, showError],
+    [setPending, peerId, refresh, showError],
   );
 
   const startReply = useCallback((row: db.MessageRow) => {
     setRailFor(null);
     setPending({ kind: 'reply', row });
-  }, []);
+  }, [setPending]);
 
   /** Rewriting starts from the words that are already there — an edit that
    * makes you retype the message is a delete with extra steps. */
@@ -3479,7 +3520,7 @@ export function ChatThreadScreen({
     // the mention-in-reply refusal on a message that mentions nobody. They
     // return with the shelf in cancelPending.
     setMentionChips([]);
-  }, []);
+  }, [setDraft, setPending]);
 
   const cancelPending = useCallback(() => {
     // Read the ref rather than a state updater: an updater may be invoked
@@ -3496,7 +3537,7 @@ export function ChatThreadScreen({
       shelvedChips.current = [];
     }
     setPending(null);
-  }, []);
+  }, [setDraft, setPending]);
 
   /** Rows whose retry is currently in flight. The control stays mounted for
    * the whole multi-await send window (prekey fetch, encrypt, enqueue — a
@@ -3932,9 +3973,105 @@ export function ChatThreadScreen({
     refresh();
   };
 
+  const writingEligible = appActive && draft.trim().length > 0 && draft.length <= AI_WRITING_INPUT_MAX &&
+    pending?.kind !== 'edit' && !secondOpinionReview && photoReview.kind === 'none' &&
+    !recording && !recordingIntent && voiceDraft === null;
+  const writingEligibleRef = useRef(writingEligible);
+  writingEligibleRef.current = writingEligible;
+  const writingSnapshot = useCallback((): WritingDraftSnapshot => ({
+    peerId: peerIdRef.current,
+    text: draftRef.current,
+    chips: liveMentionChips(draftRef.current, mentionChipsRef.current).map(chip => ({ ...chip })),
+    pending: pendingRef.current
+      ? `${pendingRef.current.kind}:${pendingRef.current.row.msgId}:${pendingRef.current.row.direction}`
+      : null,
+    revision: writingRevision.current,
+    providerRevision: getWritingRevision(),
+  }), []);
+  const writingSourceCurrent = useCallback((source: WritingDraftSnapshot) =>
+    screenLive.current && AppState.currentState === 'active' &&
+    sameWritingDraft(source, writingSnapshot()) &&
+    source.chips.every(chip => writingMentionNames.current.get(chip.id) === chip.name),
+  [writingSnapshot]);
+  const requestWriting = useCallback(async (
+    action: AiWritingAction, signal: AbortSignal,
+  ): Promise<AiWritingResult> => {
+    if (!writingEligibleRef.current || drawerRef.current !== 'writing') {
+      return { status: 'failed', reason: 'stale' };
+    }
+    writingAbort.current?.abort();
+    writingCandidate.current = null;
+    const controller = new AbortController();
+    writingAbort.current = controller;
+    const abort = () => controller.abort();
+    signal.addEventListener('abort', abort);
+    if (signal.aborted) controller.abort();
+    const source = writingSnapshot();
+    const masked = maskWritingMentions(source.text, source.chips);
+    try {
+      if (!masked || !writingSourceCurrent(source)) return { status: 'failed', reason: 'stale' };
+      const result = await generateWriting({ draft: masked.draft, action }, controller.signal);
+      if (controller.signal.aborted || !writingSourceCurrent(source) || drawerRef.current !== 'writing') {
+        return { status: 'failed', reason: 'stale' };
+      }
+      if (result.status === 'failed') return result;
+      const restored = masked.restore(result.text);
+      if (!restored) return { status: 'failed', reason: 'invalid_response' };
+      writingCandidate.current = { source, result: restored };
+      return { status: 'completed', text: restored.text };
+    } finally {
+      signal.removeEventListener('abort', abort);
+      if (writingAbort.current === controller) writingAbort.current = null;
+    }
+  }, [writingSnapshot, writingSourceCurrent]);
+  const replaceWritingDraft = useCallback((text: string, chips: MentionChip[]) => {
+    setDraft(text);
+    draftRef.current = text;
+    setMentionChips(chips);
+    mentionChipsRef.current = chips;
+    setSavedMentionBinding(null);
+    setMentionCaret(null);
+  }, [setDraft]);
+  const useWriting = useCallback((text: string): boolean => {
+    const candidate = writingCandidate.current;
+    if (!candidate || !writingEligibleRef.current || candidate.result.text !== text || drawerRef.current !== 'writing' ||
+      !writingSourceCurrent(candidate.source)) return false;
+    replaceWritingDraft(text, candidate.result.chips);
+    setDrawer('none');
+    setWritingUndo({ before: candidate.source, after: writingSnapshot() });
+    return true;
+  }, [replaceWritingDraft, setDrawer, writingSnapshot, writingSourceCurrent]);
+  const undoWriting = useCallback(() => {
+    if (!writingUndo || !writingSourceCurrent(writingUndo.after)) {
+      setWritingUndo(null);
+      return;
+    }
+    replaceWritingDraft(writingUndo.before.text, writingUndo.before.chips);
+  }, [writingUndo, writingSourceCurrent, replaceWritingDraft]);
+  // Previews and Undo belong to this foreground visit, never to a later chat.
+  useEffect(() => {
+    retireWriting();
+    const sub = AppState.addEventListener('change', next => {
+      if (next !== 'active') {
+        retireWriting();
+        if (drawerRef.current === 'writing') setDrawer('none');
+      }
+    });
+    return () => {
+      sub.remove();
+      writingAbort.current?.abort();
+      writingCandidate.current = null;
+    };
+  }, [peerId, retireWriting, setDrawer]);
+
   const openDrawer = useCallback((next: Drawer) => {
+    if (next === 'writing') {
+      if (!writingEligibleRef.current) return;
+      Keyboard.dismiss();
+      setMentionCaret(null);
+    }
     setDrawer(current => (current === next ? 'none' : next));
-  }, []);
+  }, [setDrawer]);
 
   /** The composer taking focus: the drawers close (the keyboard takes their
    * place) and so does an open reaction rail. The rail is revealed at the
@@ -3945,7 +4082,7 @@ export function ChatThreadScreen({
   const focusComposer = useCallback(() => {
     setDrawer('none');
     setRailFor(null);
-  }, []);
+  }, [setDrawer]);
 
   useEffect(() => {
     // ANDROID SYSTEM BACK closes what is open before it leaves the thread.
@@ -4016,7 +4153,7 @@ export function ChatThreadScreen({
     // closeFind has no dependencies, so this stays a ONE-TIME registration:
     // the ordering guarantee above is that the thread subscribes after the
     // router and is asked first, and a re-subscription would lose it.
-  }, [cancelPending, closeFind]);
+  }, [setDrawer, cancelPending, closeFind]);
 
   /**
    * Through messaging, so the enforcement Set, the chat list and this thread
@@ -5219,6 +5356,18 @@ export function ChatThreadScreen({
           }
           draft={draft}
           drawer={drawer}
+          writing={{
+            offered: writingEligible,
+            undo: writingUndo && sameWritingDraft(writingUndo.after, writingSnapshot()) ? undoWriting : null,
+            panel: drawer === 'writing' && writingEligible ? (
+              <WritingAssistant
+                sourceKey={JSON.stringify([peerId, writingRevision.current, draft, liveChips, pending?.kind, pending?.row.msgId])}
+                onRequest={requestWriting}
+                onUse={useWriting}
+                onClose={() => setDrawer('none')}
+              />
+            ) : null,
+          }}
           onChangeDraft={changeDraft}
           onSelectionChange={changeSelection}
           mention={{
@@ -5767,6 +5916,7 @@ function Composer({
   name,
   draft,
   drawer,
+  writing,
   onChangeDraft,
   onSelectionChange,
   mention,
@@ -5788,6 +5938,7 @@ function Composer({
   name: string | null;
   draft: string;
   drawer: Drawer;
+  writing: { offered: boolean; panel: React.ReactNode; undo: (() => void) | null };
   onChangeDraft: (v: string) => void;
   /** The caret, for the @-query — the picker must follow a tap into the
    * middle of the draft, not only typing. */
@@ -5889,6 +6040,34 @@ function Composer({
         },
       ]}
     >
+      {writing.panel}
+      {(writing.offered && drawer !== 'writing') || writing.undo ? (
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'flex-end', alignItems: 'center', gap: 8 }}>
+          {writing.undo ? (
+            <Pressable
+              testID="composer-writing-undo"
+              accessibilityRole="button"
+              accessibilityLabel="Undo writing suggestion"
+              onPress={writing.undo}
+              style={{ minHeight: t.layout.touchTarget, justifyContent: 'center', paddingHorizontal: 12 }}
+            >
+              <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>Undo</Text>
+            </Pressable>
+          ) : null}
+          {writing.offered && drawer !== 'writing' ? (
+            <Pressable
+              testID="composer-writing"
+              accessibilityRole="button"
+              accessibilityLabel="Improve draft"
+              accessibilityHint="Opens writing and translation options"
+              onPress={() => onOpenDrawer('writing')}
+              style={{ minHeight: t.layout.touchTarget, justifyContent: 'center', paddingHorizontal: 12 }}
+            >
+              <Text style={[t.type.compactStrong, { color: t.color.pine }]}>Improve</Text>
+            </Pressable>
+          ) : null}
+        </View>
+      ) : null}
       {secondOpinion ? (
         <View
           testID="second-opinion-review"
