@@ -50,7 +50,14 @@ import { DEVICE_NOUN } from './src/deviceNoun';
 import { isFirstRunAfterInstall, markInstalled } from './src/install';
 import * as lock from './src/lock';
 import { AUTH_TOKEN_KEY, messaging } from './src/messaging';
-import { createOrRestoreAccount } from './src/registration';
+import {
+  clearGoneAccount,
+  clearStaleInstallationCredentials,
+  createOrRestoreAccount,
+  deleteAccount,
+  hasPendingAccountDeletion,
+} from './src/registration';
+import { PrimaryButton, TextAction } from './src/ui/primitives';
 import { BrandMark } from './src/ui/BrandMark';
 import { CallPicker } from './src/ui/CallPicker';
 import { EmptyDetail } from './src/ui/EmptyDetail';
@@ -175,20 +182,18 @@ const COPY_COVER = {
 };
 
 /**
- * Account-gone copy. Says what is true and stops: the server
- * has no account for this device's identity, and nothing here can change that.
- * It does NOT offer a fix, because there is not one — "sign in again" is what
- * the app has already been doing silently, and pointing at account deletion
- * would point at a call that answers 403 as well.
+ * Account-gone copy. The old identity cannot be restored.
+ * An explicit, confirmed local erase now allows setup with a fresh identity;
+ * it never promises to restore the deleted account or its conversations.
  */
 const COPY_GONE = {
-  title: 'This account no longer exists',
+  title: 'This device can no longer sign in',
   // The device is named in the
   // platform's own words via the token.
   line:
-    `The identity this ${DEVICE_NOUN} signs in with has been deleted or revoked, so\n` +
-    'the server no longer has an account for it. Nothing new can be sent or\n' +
-    'received. What is already on this device stays on it.',
+    `The identity on this ${DEVICE_NOUN} cannot sign in to its saved account. ` +
+    'It may have been deleted, revoked, or belong to different credentials. ' +
+    'What is already on this device stays on it until you choose to erase it.',
 };
 
 /**
@@ -754,6 +759,11 @@ function AppContent() {
       : [];
 
   const [profile, setProfile] = useState<db.ProfileRow | null>(null);
+  const [deletionPending, setDeletionPending] = useState(false);
+  const [identityMissing, setIdentityMissing] = useState(false);
+  const [freshStartConfirm, setFreshStartConfirm] = useState(false);
+  const [deletionBusy, setDeletionBusy] = useState(false);
+  const deletionActionRunning = useRef(false);
   // The naming moment: armed by a registration that just
   // succeeded, spent by the step's own Continue or Not now. In memory on
   // purpose — a process that dies in between leaves the account nameless
@@ -1003,6 +1013,30 @@ function AppContent() {
       // reach.
       db.beginUnlock('real');
       session.setMode('real');
+      // A durable deletion intent wins over token healing, push registration,
+      // and identity restoration. It is read only AFTER the real unlock.
+      // A refused marker read also holds this gate closed until a retry.
+      const pendingDeletion = await hasPendingAccountDeletion().catch(() => true);
+      if (!openingIsCurrent(generation)) return;
+      if (pendingDeletion) {
+        adoptPushRegistration({ real: false });
+        await db.close();
+        if (!openingIsCurrent(generation)) return;
+        db.setWorkspace('real');
+        await db.initDb();
+        if (!openingIsCurrent(generation)) return;
+        let unfinished = false;
+        try { await deleteAccount(); } catch { unfinished = true; }
+        const missingIdentity = unfinished && !(await hasIdentity().catch(() => true));
+        if (!openingIsCurrent(generation)) return;
+        setDeletionPending(unfinished);
+        setIdentityMissing(missingIdentity);
+        writingWorkspaceReady.current = !unfinished;
+        setRecoveryIntent(false);
+        setProfile(null);
+        setRoute({ name: 'landing' });
+        return;
+      }
       // A duress session may have flipped the blank setting in memory; the
       // real session re-reads the persisted truth.
       await screenSecurity.reloadSetting();
@@ -1089,6 +1123,7 @@ function AppContent() {
         const identityPresent = await hasIdentity().catch(() => true);
         if (!openingIsCurrent(generation)) return;
         if (!identityPresent) {
+          setIdentityMissing(true);
           setProfile(null);
           setRoute({ name: 'landing' });
           return;
@@ -1581,9 +1616,17 @@ function AppContent() {
             // Owner-bound residue cannot configure for a different account;
             // mark this install so a later boot never wipes a newly saved key.
             await clearWritingConnections();
-            if (status.enabled) await lock.clearAll();
+            // Uninstall normally removes the protocol files, while Keychain
+            // preferences/bearer may survive. That bearer cannot recover the
+            // lost private key and must never register push for the old ID.
+            let identityPresent: boolean;
+            try { identityPresent = await clearStaleInstallationCredentials(); }
+            catch { await relock(); return; }
+            // A retained App Group can still hold identity and plaintext
+            // inbox data. A fresh defaults marker alone must not unlock it.
+            if (status.enabled && !identityPresent) await lock.clearAll();
             if (!openingIsCurrent(generation)) return;
-            status.enabled = false;
+            if (!identityPresent) status.enabled = false;
           }
           markInstalled();
           if (status.enabled) {
@@ -1638,10 +1681,39 @@ function AppContent() {
    */
   const [gone, setGone] = useState(accountGone);
   useEffect(() => onAccountGone(() => {
-    writingWorkspaceReady.current = false;
-    invalidateWritingSession();
-    setGone(true);
+    const isGone = accountGone();
+    if (isGone) {
+      writingWorkspaceReady.current = false;
+      invalidateWritingSession();
+    }
+    setGone(isGone);
   }), []);
+
+  const finishDeletionFromCover = async (fresh: boolean) => {
+    if (deletionActionRunning.current || session.mode !== 'real' ||
+        routeRef.current.name === 'locked' || routeRef.current.name === 'loading') return;
+    deletionActionRunning.current = true;
+    setDeletionBusy(true);
+    const generation = openingGeneration.current;
+    try {
+      adoptPushRegistration({ real: false });
+      if (fresh) await clearGoneAccount();
+      else await deleteAccount();
+      if (!openingIsCurrent(generation)) return;
+      setRecoveryIntent(false);
+      setProfile(null);
+      setDeletionPending(false);
+      setIdentityMissing(false);
+      writingWorkspaceReady.current = true;
+      setFreshStartConfirm(false);
+      setRoute({ name: 'landing' });
+    } catch {
+      if (openingIsCurrent(generation)) setDeletionPending(true);
+    } finally {
+      deletionActionRunning.current = false;
+      setDeletionBusy(false);
+    }
+  };
 
   // Screen security: blank every surface while the screen is captured, and
   // disclose a screenshot to the conversation it was taken in (the route is
@@ -2127,6 +2199,11 @@ function AppContent() {
     return () => subscription.remove();
   }, [goBack]);
 
+  // Async screen callbacks belong to the opening that rendered them. A
+  // deletion finishing after relock must not route around the new cover.
+  const surfaceOpeningGeneration = openingGeneration.current;
+  const surfaceSessionMode = session.mode;
+
   // The two home LIST surfaces, built once and rendered by whichever
   // projection owns them this render: compact mounts them as the chats/calls
   // routes; wide mounts them in the list pane beside an open detail. One
@@ -2406,6 +2483,7 @@ function AppContent() {
             ordinary thread — TOFU unchanged. */}
         {route.name === 'discover' && profile && (
           <DiscoveryScreen
+            onOpenAccountEmail={() => setRoute({ name: 'accountEmail', from: 'chats' })}
             onBack={() => setRoute({ name: 'newChat' })}
             onOpenChat={chatId => setRoute({ name: 'thread', peerId: chatId })}
           />
@@ -2498,9 +2576,18 @@ function AppContent() {
             onProfileChanged={p => setProfile(p)}
             onOpenSettings={() => setRoute({ name: 'settings', from: 'profile' })}
             onSignedOut={() => {
+              if (!openingIsCurrent(surfaceOpeningGeneration) ||
+                  session.mode !== surfaceSessionMode || routeRef.current.name !== 'profile') return;
               invalidateWritingSession();
+              setRecoveryIntent(false);
+              setDeletionPending(false);
               setProfile(null);
               setRoute({ name: 'landing' });
+            }}
+            onDeletionPending={() => {
+              if (!openingIsCurrent(surfaceOpeningGeneration) ||
+                  session.mode !== surfaceSessionMode || routeRef.current.name !== 'profile') return;
+              setDeletionPending(true);
             }}
           />
         )}
@@ -2989,12 +3076,13 @@ function AppContent() {
           something about a workspace they are not supposed to know exists
 . Mounted below both covers, so a capture or an
           app-switcher snapshot still hides it. */}
-      {gone && session.mode === 'real' && (
+      {(gone || deletionPending || identityMissing) && session.mode === 'real' &&
+        route.name !== 'locked' && route.name !== 'loading' && (
         <View
-          testID="account-gone"
-          accessible
+          testID={deletionPending ? 'account-deletion-pending' : 'account-gone'}
           accessibilityViewIsModal
-          accessibilityLabel={`Tacendum. ${COPY_GONE.title}. ${COPY_GONE.line}`}
+          accessibilityLabel={deletionPending ? 'Account deletion needs to finish' :
+            `Tacendum. ${COPY_GONE.title}. ${COPY_GONE.line}`}
           style={[
             StyleSheet.absoluteFill,
             styles.cover,
@@ -3010,7 +3098,8 @@ function AppContent() {
               { color: t.color.inkStrong },
             ]}
           >
-            {COPY_GONE.title}
+            {deletionPending ? 'Account deletion needs to finish' : identityMissing
+              ? 'This device has lost its identity' : COPY_GONE.title}
           </Text>
           <Text
             style={[
@@ -3019,8 +3108,34 @@ function AppContent() {
               { color: t.color.inkMuted },
             ]}
           >
-            {COPY_GONE.line}
+            {freshStartConfirm
+              ? 'Starting fresh does not confirm server deletion. The old account may still exist. It permanently erases the chats and credentials on this device. Your next setup gets a new Tacendum ID. Other linked devices keep their accounts.'
+              : deletionPending
+                ? 'Tacendum could not finish confirming deletion and clearing this device. Try again when you’re online. Setup can continue once this is complete.'
+                : identityMissing
+                  ? 'The private identity key is no longer on this device, so these credentials cannot restore it. You can start fresh, then recover a linked account grouping if one is available.'
+                  : COPY_GONE.line}
           </Text>
+          <PrimaryButton
+            testID={freshStartConfirm ? 'account-start-fresh-confirm' :
+              deletionPending ? 'account-deletion-retry' : 'account-start-fresh'}
+            label={freshStartConfirm ? 'Erase this device and start fresh' :
+              deletionPending ? 'Try again' : 'Start fresh'}
+            busy={deletionBusy}
+            onPress={() => {
+              if (freshStartConfirm) void finishDeletionFromCover(true);
+              else if (deletionPending) void finishDeletionFromCover(false);
+              else setFreshStartConfirm(true);
+            }}
+            style={{ marginTop: 24 }}
+          />
+          {(gone || identityMissing) && deletionPending && !freshStartConfirm && (
+            <TextAction label="Start fresh on this device" testID="account-deletion-abandon"
+              onPress={() => setFreshStartConfirm(true)} />
+          )}
+          {freshStartConfirm && (
+            <TextAction label="Cancel" onPress={() => setFreshStartConfirm(false)} />
+          )}
         </View>
       )}
       {/* Capture cover: while the screen is recorded, mirrored, or cast,

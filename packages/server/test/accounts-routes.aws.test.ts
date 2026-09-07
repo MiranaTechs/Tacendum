@@ -138,7 +138,7 @@ const PHONE_TOKEN_ROUTES = [
   'POST /v1/identifiers/phone/unlink',
   'POST /v1/identifiers/phone/discoverable',
 ];
-//the four username legs — all token-path, all
+// The username token routes — all
 // on HttpFn, each gated on the MASTER flag AND feature#accounts-username
 // (accountsUsernameRoute); driven through the REAL dispatch below like the
 // phone legs, oversized bodies included.
@@ -147,6 +147,7 @@ const USERNAME_TOKEN_ROUTES = [
   'POST /v1/identifiers/username/rename',
   'POST /v1/identifiers/username/unlink',
   'POST /v1/identifiers/username/discoverable',
+  'GET /v1/identifiers/username/eligibility',
 ];
 /** Which deployed host serves a route key — the chooser every loop below
  * uses, so a route added to the wrong table here fails its parity case. */
@@ -716,7 +717,17 @@ describe('cross-host refusal parity : the local host answers the SAME bytes per 
         // agent: false — one fresh connection per probe: the oversize path
         // deliberately tears its connection down after responding, and a
         // pooled keep-alive socket would hand the NEXT probe a dead pipe.
-        { host: '127.0.0.1', port, method, path, headers: over.headers ?? {}, agent: false },
+        {
+          host: '127.0.0.1', port, method, path,
+          // GET does not add chunked framing automatically. Explicitly
+          // frame this deliberate malformed-body probe so Node reaches
+          // the route instead of rejecting the HTTP request itself.
+          headers: {
+            ...(over.body === undefined ? {} : { 'content-length': Buffer.byteLength(over.body) }),
+            ...over.headers,
+          },
+          agent: false,
+        },
         (res) => {
           let data = '';
           res.on('data', (c: Buffer) => (data += c.toString('utf8')));

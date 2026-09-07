@@ -1248,6 +1248,14 @@ public final class TacendumCryptoImpl: NSObject {
    * contract is "make it gone".
    */
   @objc public func resetProtocolState() throws {
+    // The NSE holds this SAME lock through decryption and plaintext spooling.
+    // Waiting for it before deleting both store and inbox prevents an old
+    // notification from writing plaintext back after the new account starts.
+    guard let lockFile = SharedContainer.storeLockFile() else {
+      throw StoreError.io("account reset container unavailable")
+    }
+    try StoreLock.shared.lock(at: lockFile)
+    defer { StoreLock.shared.unlock() }
     var firstError: Error?
     var targets: [URL] = []
     do {
@@ -1265,6 +1273,8 @@ public final class TacendumCryptoImpl: NSObject {
     } catch {
       firstError = firstError ?? error
     }
+    if let inbox = SharedContainer.inboxRoot() { targets.append(inbox) }
+    if let shared = SharedContainer.sharedStateRoot() { targets.append(shared) }
 
     for target in targets {
       do {

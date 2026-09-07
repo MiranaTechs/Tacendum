@@ -122,6 +122,46 @@ test('a 401 renews and retries the same request once, with the new bearer', asyn
   expect(crypto.__keychain.get(reauth.AUTH_TOKEN_KEY)).toBe('fresh-1');
 });
 
+test.each([200, 401])('an old response (%i) cannot complete or retry into a new account', async status => {
+  let finish!: (response: Response) => void;
+  (globalThis.fetch as jest.Mock).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  const oldRequest = api.apiRegisterPushToken(STALE, BUNDLE_ID, 'aabb');
+  const verdict = oldRequest.catch(error => error);
+  await reauth.suspendReauth();
+  reauth.resetAccountReauth();
+  crypto.__keychain.set(reauth.AUTH_TOKEN_KEY, 'new-account-token');
+  reauth.resumeReauth();
+  finish(json(status, status === 401 ? unauthorized().body : {}));
+  expect(await verdict).toBeInstanceOf(TypeError);
+  expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+});
+
+test('deletion suppresses ordinary authenticated calls while retaining its own route', async () => {
+  await reauth.suspendReauth();
+  await expect(api.apiRegisterPushToken(STALE, BUNDLE_ID, 'aabb')).rejects.toBeInstanceOf(TypeError);
+  expect(globalThis.fetch).not.toHaveBeenCalled();
+  reply = () => ({ status: 200 });
+  await api.apiDeleteAccount(STALE);
+  expect(wire).toEqual([{ method: 'DELETE', path: '/v1/account', bearer: STALE }]);
+});
+
+test('an old JSON body arriving after response headers cannot enter a new account', async () => {
+  let finish!: (body: unknown) => void;
+  let reading!: () => void;
+  const started = new Promise<void>(resolve => { reading = resolve; });
+  (globalThis.fetch as jest.Mock).mockResolvedValueOnce({
+    ...json(200, {}),
+    json: () => { reading(); return new Promise(resolve => { finish = resolve; }); },
+  });
+  const result = api.apiGetPrekeyBundle(STALE, USER_ID).catch(error => error);
+  await started;
+  await reauth.suspendReauth();
+  reauth.resetAccountReauth();
+  reauth.resumeReauth();
+  finish({});
+  expect(await result).toBeInstanceOf(TypeError);
+});
+
 test('four calls that 401 together produce exactly one POST /v1/auth', async () => {
   // Day 31 of an install is not one request failing. It is the prekey fetch,
   // the attachment download, the push registration and the profile card all

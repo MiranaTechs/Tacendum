@@ -51,6 +51,7 @@ interface Props {
   onProfileChanged: (profile: ProfileRow) => void;
   onOpenSettings: () => void;
   onSignedOut: () => void;
+  onDeletionPending?: () => void;
 }
 
 const NAME_MAX = 40;
@@ -71,7 +72,7 @@ const COPY = {
   // "About line" is the field's implementation name; nobody says it.
   noAbout: 'Say something about yourself',
   sharing:
-    'Only the people you chat with can see this. There is no profile page and no way to look you up.',
+    'Only the people you chat with can see this. There is no public profile page.',
   // There is no Phone row any more: an account is a keypair, not a number, so the ID is the only identifier this screen
   // has to show — and the only one there is to hand anybody.
   idLabel: 'Tacendum ID',
@@ -116,7 +117,9 @@ const COPY = {
   // Server-first contract: if the server was never reached, nothing local was
   // destroyed either — the account is exactly as it was.
   signOutFailed:
-    'Tacendum couldn’t reach the server, so nothing was deleted. Try again when you’re back on.',
+    'Tacendum couldn’t confirm deletion. Your local data is still here. Try again when you’re back on.',
+  cleanupPending:
+    'Your account was deleted, but this device still needs to finish clearing its data. Try again.',
   /** The App Lock code before the one irreversible verb on this screen: an
    * unlocked phone handed over for a moment must not be enough to delete
    * the account. The verdict sentences are the Settings flow's, byte for
@@ -147,6 +150,7 @@ export function ProfileScreen({
   onProfileChanged,
   onOpenSettings,
   onSignedOut,
+  onDeletionPending,
 }: Props) {
   const t = useTheme();
   // THE keyboard mechanism: the
@@ -426,10 +430,12 @@ export function ProfileScreen({
     try {
       await deleteAccount();
       onSignedOut();
-    } catch {
-      // Server-first: reaching here means the server was never told, so the
-      // account — and everything local — is still intact. Say so plainly.
-      setSignOutError(COPY.signOutFailed);
+    } catch (error) {
+      // A lost response does not prove that DELETE never reached the server.
+      // Essential local cleanup has its own retry state after confirmation.
+      const cleanupPending = error instanceof Error && error.name === 'AccountCleanupPendingError';
+      setSignOutError(cleanupPending ? COPY.cleanupPending : COPY.signOutFailed);
+      if (cleanupPending) onDeletionPending?.();
       signingOutRef.current = false;
       setSigningOut(false);
     }

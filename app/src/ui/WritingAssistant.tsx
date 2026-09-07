@@ -8,19 +8,28 @@ import React, {
 import {
   AccessibilityInfo,
   ActivityIndicator,
+  Clipboard,
+  Linking,
   Platform,
   Pressable,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
   useWindowDimensions,
 } from 'react-native';
 import {
   AI_WRITING_LANGUAGES,
+  AI_WRITING_HANDOFF_MAX,
+  AI_WRITING_OUTPUT_MAX,
+  AI_WRITING_EXTERNAL_PROVIDER_LABELS,
+  AI_WRITING_EXTERNAL_URLS,
   AI_WRITING_PROVIDER_LABELS,
   type AiWritingAction,
   type AiWritingFailure,
+  type AiWritingExternalProvider,
+  type AiWritingMode,
   type AiWritingProvider,
   type AiWritingResult,
 } from '../aiWriting';
@@ -40,6 +49,7 @@ export interface WritingAssistantProps {
     action: AiWritingAction,
     signal: AbortSignal,
   ) => Promise<AiWritingResult>;
+  onReview: (text: string) => AiWritingResult;
   onUse: (text: string) => boolean;
   onClose: () => void;
 }
@@ -47,7 +57,18 @@ export interface WritingAssistantProps {
 type ViewState =
   | { phase: 'choose' }
   | { phase: 'working'; action: AiWritingAction }
-  | { phase: 'review'; action: AiWritingAction; text: string; revision: number }
+  | {
+      phase: 'handoff';
+      action: AiWritingAction;
+      provider: AiWritingExternalProvider;
+      opened: boolean;
+    }
+  | {
+      phase: 'review';
+      action: AiWritingAction | null;
+      text: string;
+      revision: number;
+    }
   | { phase: 'error'; action: AiWritingAction | null; message: string };
 
 const ACTIONS: ReadonlyArray<{
@@ -116,9 +137,22 @@ function workingCopy(action: AiWritingAction): string {
   return 'Improving…';
 }
 
+function progressCopy(
+  action: AiWritingAction,
+  mode: AiWritingMode | null,
+  externalProvider: AiWritingExternalProvider,
+): string {
+  return mode === 'external'
+    ? `Preparing ${
+        AI_WRITING_EXTERNAL_PROVIDER_LABELS[externalProvider]
+      } request…`
+    : workingCopy(action);
+}
+
 export function WritingAssistant({
   sourceKey,
   onRequest,
+  onReview,
   onUse,
   onClose,
 }: WritingAssistantProps) {
@@ -138,8 +172,13 @@ export function WritingAssistant({
   const [showLanguages, setShowLanguages] = useState(false);
   const [manageConnection, setManageConnection] = useState(false);
   const [connectionLoading, setConnectionLoading] = useState(true);
+  const [connectionMode, setConnectionMode] =
+    useState<AiWritingMode | null>(null);
+  const [externalProvider, setExternalProvider] =
+    useState<AiWritingExternalProvider>('chatgpt');
   const [provider, setProvider] = useState<AiWritingProvider | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [pastedReply, setPastedReply] = useState('');
 
   const retireRequest = useCallback(() => {
     requestIdRef.current += 1;
@@ -152,6 +191,7 @@ export function WritingAssistant({
     setView({ phase: 'choose' });
     setShowLanguages(false);
     setSelectedLanguage(null);
+    setPastedReply('');
   }, [retireRequest]);
 
   const loadConnection = useCallback(async () => {
@@ -163,6 +203,7 @@ export function WritingAssistant({
       if (!mountedRef.current || connectionLoadRef.current !== owner) return;
       setConnectionLoading(false);
       if (result.status === 'failed') {
+        setConnectionMode(null);
         setProvider(null);
         setConnectionError(
           'Couldn’t access the writing connection. Try again.',
@@ -170,6 +211,8 @@ export function WritingAssistant({
         return;
       }
       const selected = result.state.selected;
+      setConnectionMode(result.state.mode);
+      setExternalProvider(result.state.externalProvider);
       setProvider(
         selected && result.state.providers[selected].configured
           ? selected
@@ -178,6 +221,7 @@ export function WritingAssistant({
     } catch {
       if (!mountedRef.current || connectionLoadRef.current !== owner) return;
       setConnectionLoading(false);
+      setConnectionMode(null);
       setProvider(null);
       setConnectionError('Couldn’t access the writing connection. Try again.');
     }
@@ -205,7 +249,11 @@ export function WritingAssistant({
     if (Platform.OS !== 'ios') return;
     const message =
       view.phase === 'working'
-        ? workingCopy(view.action)
+        ? progressCopy(view.action, connectionMode, externalProvider)
+        : view.phase === 'handoff'
+        ? view.opened
+          ? `Request copied. ${AI_WRITING_EXTERNAL_PROVIDER_LABELS[view.provider]} opened.`
+          : `Request copied. Open ${AI_WRITING_EXTERNAL_PROVIDER_LABELS[view.provider]} to paste it.`
         : view.phase === 'review'
         ? 'Writing suggestion ready. Review before using.'
         : null;
@@ -213,7 +261,7 @@ export function WritingAssistant({
     AccessibilityInfo.announceForAccessibilityWithOptions(message, {
       queue: true,
     });
-  }, [view]);
+  }, [connectionMode, externalProvider, view]);
 
   const request = useCallback(
     async (action: AiWritingAction) => {
@@ -237,8 +285,8 @@ export function WritingAssistant({
         ) {
           return;
         }
-        requestRef.current = null;
         if (getWritingRevision() !== revision) {
+          requestRef.current = null;
           setView({
             phase: 'error',
             action,
@@ -247,6 +295,7 @@ export function WritingAssistant({
           return;
         }
         if (result.status === 'failed') {
+          requestRef.current = null;
           if (result.reason === 'cancelled') {
             setView({ phase: 'choose' });
             return;
@@ -258,6 +307,57 @@ export function WritingAssistant({
           });
           return;
         }
+        if (result.status === 'handoff') {
+          const url = AI_WRITING_EXTERNAL_URLS[result.provider];
+          if (
+            !url || result.url !== url ||
+            result.prompt.trim().length === 0 ||
+            result.prompt.length > AI_WRITING_HANDOFF_MAX
+          ) {
+            requestRef.current = null;
+            setView({
+              phase: 'error',
+              action,
+              message: 'Couldn’t prepare the writing request. Try again.',
+            });
+            return;
+          }
+          try {
+            Clipboard.setString(result.prompt);
+          } catch {
+            requestRef.current = null;
+            setView({
+              phase: 'error',
+              action,
+              message: 'Couldn’t copy the writing request. Try again.',
+            });
+            return;
+          }
+          let opened = true;
+          try {
+            await Linking.openURL(url);
+          } catch {
+            opened = false;
+          }
+          if (
+            !mountedRef.current ||
+            controller.signal.aborted ||
+            requestRef.current?.id !== id ||
+            sourceRef.current !== requestSource ||
+            getWritingRevision() !== revision
+          ) {
+            return;
+          }
+          requestRef.current = null;
+          setView({
+            phase: 'handoff',
+            action,
+            provider: result.provider,
+            opened,
+          });
+          return;
+        }
+        requestRef.current = null;
         setView({ phase: 'review', action, text: result.text, revision });
       } catch {
         if (
@@ -277,6 +377,43 @@ export function WritingAssistant({
     },
     [onRequest, retireRequest],
   );
+
+  const reviewPasted = useCallback(() => {
+    if (pastedReply.trim().length === 0) return;
+    const requestSource = sourceRef.current;
+    const revision = getWritingRevision();
+    let result: AiWritingResult;
+    try {
+      result = onReview(pastedReply);
+    } catch {
+      result = { status: 'failed', reason: 'invalid_response' };
+    }
+    if (
+      sourceRef.current !== requestSource ||
+      getWritingRevision() !== revision
+    ) {
+      setPastedReply('');
+      setView({
+        phase: 'error',
+        action: null,
+        message: 'The draft changed. Try again.',
+      });
+      return;
+    }
+    if (result.status !== 'completed') {
+      setView({
+        phase: 'error',
+        action: null,
+        message:
+          result.status === 'failed'
+            ? failureCopy(result.reason)
+            : 'That pasted reply couldn’t be used. Try again.',
+      });
+      return;
+    }
+    setPastedReply('');
+    setView({ phase: 'review', action: null, text: result.text, revision });
+  }, [onReview, pastedReply]);
 
   const close = useCallback(() => {
     resetWriting();
@@ -311,7 +448,13 @@ export function WritingAssistant({
   }, [onClose, onUse, view]);
 
   const maxHeight = Math.min(440, Math.max(180, windowHeight * 0.52));
-  const providerLabel = provider ? AI_WRITING_PROVIDER_LABELS[provider] : null;
+  const providerLabel =
+    connectionMode === 'external'
+      ? AI_WRITING_EXTERNAL_PROVIDER_LABELS[externalProvider]
+      : provider
+      ? AI_WRITING_PROVIDER_LABELS[provider]
+      : null;
+  const connectionReady = connectionMode === 'external' || provider !== null;
 
   return (
     <View
@@ -336,7 +479,7 @@ export function WritingAssistant({
           </Text>
           {providerLabel && !manageConnection ? (
             <Text style={[t.type.timeStatus, { color: t.color.inkMuted }]}>
-              {providerLabel} · Saved
+              {providerLabel} · {connectionMode === 'external' ? 'App handoff' : 'API key'}
             </Text>
           ) : null}
         </View>
@@ -350,11 +493,12 @@ export function WritingAssistant({
         keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator
       >
-        {manageConnection || (!connectionLoading && !provider) ? (
+        {manageConnection || (!connectionLoading && !connectionReady) ? (
           <WritingConnection
             showDone={false}
             onChanged={() => {
               resetWriting();
+              setManageConnection(false);
               void loadConnection();
             }}
             onDone={() => {
@@ -384,7 +528,9 @@ export function WritingAssistant({
                   { color: t.color.inkMuted },
                 ]}
               >
-                Only this draft goes to {providerLabel}. Review before using.
+                {connectionMode === 'external'
+                  ? `Choose an action to copy this draft and open ${providerLabel}. Paste it there, then bring the reply back here.`
+                  : `Only this draft goes to ${providerLabel}. Review before using.`}
               </Text>
               <TextAction
                 label="Manage"
@@ -412,7 +558,11 @@ export function WritingAssistant({
                       testID={`writing-action-${action.kind}`}
                       accessibilityRole="button"
                       accessibilityLabel={action.label}
-                      accessibilityHint={action.description}
+                      accessibilityHint={
+                        connectionMode === 'external'
+                          ? `${action.description}. Copies a request and opens ${providerLabel}.`
+                          : action.description
+                      }
                       onPress={() => {
                         if (action.kind === 'translate') {
                           setShowLanguages(true);
@@ -523,19 +673,107 @@ export function WritingAssistant({
               <View
                 testID="writing-working"
                 accessibilityLiveRegion="polite"
-                accessibilityLabel={workingCopy(view.action)}
+                accessibilityLabel={progressCopy(
+                  view.action,
+                  connectionMode,
+                  externalProvider,
+                )}
                 style={styles.workingBlock}
               >
                 <View style={styles.working}>
                   <ActivityIndicator color={t.color.pine} />
                   <Text style={[t.type.bodyStrong, { color: t.color.inkBody }]}>
-                    {workingCopy(view.action)}
+                    {progressCopy(
+                      view.action,
+                      connectionMode,
+                      externalProvider,
+                    )}
                   </Text>
                 </View>
                 <TextAction
                   label="Cancel"
                   testID="writing-cancel"
                   onPress={resetWriting}
+                />
+              </View>
+            ) : null}
+
+            {view.phase === 'handoff' ? (
+              <View
+                testID="writing-handoff"
+                accessibilityLiveRegion="polite"
+                style={styles.handoff}
+              >
+                <Text style={[t.type.bodyStrong, { color: t.color.inkStrong }]}>
+                  Request copied
+                </Text>
+                <Text style={[t.type.compactBody, { color: t.color.inkBody }]}>
+                  {view.opened
+                    ? `${AI_WRITING_EXTERNAL_PROVIDER_LABELS[view.provider]} opened. Paste the request there, then return and paste its reply below.`
+                    : `${AI_WRITING_EXTERNAL_PROVIDER_LABELS[view.provider]} didn’t open. Open it yourself and paste the copied request.`}
+                </Text>
+                {!view.opened ? (
+                  <OutlineButton
+                    size="compact"
+                    label={`Open ${AI_WRITING_EXTERNAL_PROVIDER_LABELS[view.provider]}`}
+                    testID="writing-handoff-open"
+                    onPress={() => {
+                      void Linking.openURL(
+                        AI_WRITING_EXTERNAL_URLS[view.provider],
+                      ).catch(() => undefined);
+                    }}
+                  />
+                ) : null}
+              </View>
+            ) : null}
+
+            {connectionMode === 'external' &&
+            view.phase !== 'working' &&
+            view.phase !== 'review' ? (
+              <View testID="writing-paste-area" style={styles.pasteArea}>
+                <Text
+                  accessibilityRole="header"
+                  style={[t.type.bodyStrong, { color: t.color.inkStrong }]}
+                >
+                  Paste AI reply
+                </Text>
+                <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
+                  Tacendum never reads your clipboard. Paste the reply here,
+                  review it, then choose whether to use it.
+                </Text>
+                <TextInput
+                  testID="writing-paste-input"
+                  value={pastedReply}
+                  onChangeText={next => {
+                    setPastedReply(next);
+                    if (view.phase === 'error') setView({ phase: 'choose' });
+                  }}
+                  placeholder="Paste the reply"
+                  placeholderTextColor={t.color.inkMuted}
+                  keyboardAppearance={t.scheme}
+                  selectionColor={t.color.pine}
+                  accessibilityLabel="AI reply"
+                  multiline
+                  maxLength={AI_WRITING_OUTPUT_MAX}
+                  autoCapitalize="sentences"
+                  autoCorrect
+                  style={[
+                    styles.pasteInput,
+                    t.type.message,
+                    {
+                      minHeight: 92,
+                      borderRadius: t.radius.button,
+                      borderColor: t.color.lineStrong,
+                      backgroundColor: t.color.paperSheet,
+                      color: t.color.inkStrong,
+                    },
+                  ]}
+                />
+                <PrimaryButton
+                  label="Review pasted reply"
+                  testID="writing-paste-review"
+                  disabled={pastedReply.trim().length === 0}
+                  onPress={reviewPasted}
                 />
               </View>
             ) : null}
@@ -571,12 +809,14 @@ export function WritingAssistant({
                   onPress={useText}
                 />
                 <View style={styles.reviewActions}>
-                  <OutlineButton
-                    size="compact"
-                    label="Try again"
-                    testID="writing-review-retry"
-                    onPress={() => void request(view.action)}
-                  />
+                  {view.action ? (
+                    <OutlineButton
+                      size="compact"
+                      label="Try again"
+                      testID="writing-review-retry"
+                      onPress={() => void request(view.action!)}
+                    />
+                  ) : null}
                   <TextAction label="Keep original" onPress={close} />
                 </View>
               </View>
@@ -687,6 +927,20 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 8,
+  },
+  handoff: {
+    gap: 6,
+    marginBottom: 12,
+  },
+  pasteArea: {
+    gap: 8,
+    marginTop: 14,
+  },
+  pasteInput: {
+    borderWidth: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    textAlignVertical: 'top',
   },
   review: {
     gap: 10,

@@ -45,7 +45,7 @@
  *
  * 10. THE PIN, BOTH WAYS, API SPY: with the pin OFF (the module mock,
  *     driven exactly as the username-ux suite drives it) the landed
- *     discovery surface makes no username call — none of the five — and
+ *     discovery surface makes no username call — none of the six — and
  *     with the pin ON (build 23's shipped value) the find-by-name chip
  *     drives the ONE lookup call over the shared route; and statically, no
  *     production file outside the module imports the username wire.
@@ -61,6 +61,7 @@ import {
   USERNAME_TAKEN_BODY,
   USERNAME_TAKEN_STATUS,
   UsernameClaimRequest,
+  UsernameEligibilityResponse,
   UsernameUnlinkRequest,
   type AccountsNoticeFrame,
 } from '@tacendum/shared';
@@ -432,6 +433,22 @@ describe('the username payloads survive the REAL serializer against the shared w
     expect(SetDiscoverableRequest.safeParse(calls[1]!.body).success).toBe(true);
   });
 
+  it('eligibility: GET carries no body and accepts only the caller-owned proof boolean', async () => {
+    nextText = JSON.stringify({ hasVerifiedIdentifier: true });
+    await expect(api.apiUsernameEligibility('tok')).resolves.toEqual({
+      hasVerifiedIdentifier: true,
+    });
+    expect(calls[0]!.path.endsWith('/v1/identifiers/username/eligibility')).toBe(true);
+    expect(calls[0]!.body).toBeUndefined();
+    expect(UsernameEligibilityResponse.safeParse({ hasVerifiedIdentifier: true }).success).toBe(
+      true,
+    );
+    expect(
+      UsernameEligibilityResponse.safeParse({ hasVerifiedIdentifier: true, reason: 'missing' })
+        .success,
+    ).toBe(false);
+  });
+
   it('discovery: the ONE lookup route, the THIRD parallel field, exactly-one-of, .strict()', async () => {
     nextText = JSON.stringify({ members: [{ userId: ANCHOR, class: 'phone' }], rosterVersion: 1 });
     await api.apiDiscoveryLookupUsername('tok', 'alice_7');
@@ -751,6 +768,7 @@ describe('duress (the duress rule at the api chokepoint; the row in the workspac
       () => api.apiUnlinkUsername('tok'),
       () => api.apiSetUsernameDiscoverable('tok', true),
       () => api.apiDiscoveryLookupUsername('tok', 'alice_7'),
+      () => api.apiUsernameEligibility('tok'),
     ]) {
       await expect(call()).rejects.toThrow(TypeError);
       await expect(call()).rejects.not.toBeInstanceOf(ApiRequestError);
@@ -991,7 +1009,7 @@ describe('startDiscoveredChat provenance (designed open — the username class w
 
 /* ── 10. the pin, both ways: the api spy ────────────────────────────── */
 
-/** The five username wire functions under spy, and a fetch that records every
+/** The six username wire functions under spy, and a fetch that records every
  * path and body and refuses everything with the collapsed 403. */
 function armWireSpies(): {
   spies: jest.SpyInstance[];
@@ -1005,13 +1023,18 @@ function armWireSpies(): {
     jest.spyOn(api, 'apiUnlinkUsername'),
     jest.spyOn(api, 'apiSetUsernameDiscoverable'),
     jest.spyOn(api, 'apiDiscoveryLookupUsername'),
+    jest.spyOn(api, 'apiUsernameEligibility'),
   ];
   const paths: string[] = [];
   const bodies: string[] = [];
   const realFetch = globalThis.fetch;
   globalThis.fetch = jest.fn(async (url: unknown, init?: { body?: unknown }) => {
-    paths.push(String(url));
+    const path = String(url);
+    paths.push(path);
     bodies.push(typeof init?.body === 'string' ? init.body : '');
+    if (path.endsWith('/v1/identifiers/username/eligibility')) {
+      return { ok: true, status: 200, json: async () => ({ hasVerifiedIdentifier: true }) };
+    }
     return { ok: false, status: 403, json: async () => ({ error: { code: 'accounts_refused', detail: 'x' } }) };
   }) as unknown as typeof fetch;
   return {
@@ -1067,15 +1090,16 @@ describe('with USERNAME_UI_ENABLED on (build 23, the shipped value), the find-by
     } finally {
       wire.restore();
     }
-    // The ONE call: the lookup, with the normalized handle, through the real
-    // wire function to the shared route — never a lifecycle verb, never the
-    // email path.
+    // One caller-owned eligibility read precedes the target lookup. No
+    // lifecycle verb or email lookup runs.
     expect(wire.spies[4]).toHaveBeenCalledTimes(1);
     expect(wire.spies[4]).toHaveBeenCalledWith('bearer', 'alice_7');
+    expect(wire.spies[5]).toHaveBeenCalledTimes(1);
+    expect(wire.spies[5]).toHaveBeenCalledWith('bearer');
     for (const spy of wire.spies.slice(0, 4)) expect(spy).not.toHaveBeenCalled();
     expect(emailSearch).not.toHaveBeenCalled();
     expect(wire.paths.filter(p => p.endsWith('/v1/discovery/lookup'))).toHaveLength(1);
-    expect(wire.bodies).toEqual([JSON.stringify({ username: 'alice_7' })]);
-    expect(wire.paths.filter(p => p.includes('/username'))).toEqual([]);
+    expect(wire.paths.filter(p => p.endsWith('/v1/identifiers/username/eligibility'))).toHaveLength(1);
+    expect(wire.bodies).toEqual(['', JSON.stringify({ username: 'alice_7' })]);
   });
 });

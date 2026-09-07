@@ -583,6 +583,8 @@ export const AuthRequest = z.object({
   challenge: ChallengeB64,
   /** Signature over AUTH_CHALLENGE_DOMAIN || <raw challenge bytes>. */
   signature: SignatureB64,
+  /** Renewal must never create an account after this device's ID was deleted. */
+  expectedUserId: Ulid.optional(),
   /**
    * Declared ONCE, at account creation, by clients that are integrations —
    * CLI notifiers, CI bots. Honored only when this auth
@@ -1543,6 +1545,16 @@ export const UsernameClaimRequest = z
 export type UsernameClaimRequest = z.infer<typeof UsernameClaimRequest>;
 
 /**
+ * GET /v1/identifiers/username/eligibility — the authenticated caller's
+ * own possession-proof state. No identifier, name, age, target, or refusal
+ * reason travels on this caller-owned read.
+ */
+export const UsernameEligibilityResponse = z
+  .object({ hasVerifiedIdentifier: z.boolean() })
+  .strict();
+export type UsernameEligibilityResponse = z.infer<typeof UsernameEligibilityResponse>;
+
+/**
  * POST /v1/identifiers/username/unlink (token path):
  * the per-class twin of the email/phone unlink, whose routes carry no body —
  * this schema PINS that emptiness (`.strict()` on the empty object: any key
@@ -1556,7 +1568,7 @@ export type UsernameUnlinkRequest = z.infer<typeof UsernameUnlinkRequest>;
  * distinguishably, because in this class uniqueness is the product. What it
  * discloses is namespace occupancy of a self-chosen public label — never
  * linkage — and ONLY as the priced side effect of an authenticated,
- * identifier-verified, aged, budget-charged WRITE attempt. Reserved names,
+ * identifier-verified, budget-charged WRITE attempt. Reserved names,
  * skeleton conflicts, and live tombstones answer these SAME bytes, so the
  * one distinguishable answer stays one bit. Deliberately NOT the
  * accountsRefusal bytes: `taken` must be distinguishable BY DESIGN, and
@@ -1661,9 +1673,10 @@ export const DISCOVERY_LOOKUP_BURST_PER_MINUTE = 5;
 /** The fleet-wide global lookup ceiling (2,000/day — beyond it,
  * uniform refusals + the scrape alarm). */
 export const DISCOVERY_LOOKUP_FLEET_DAILY_CEILING = 2000;
-/** The anti-Sybil caller age gate (§4): a lookup caller must hold a verified
- * identifier AND be at least this old. Numerically the recovery delay, but
- * its OWN pin — the two values answer different threats and may diverge. */
+/** The email/phone discovery anti-Sybil age gate. Username lookup and
+ * claim accept fresh accounts once they hold a verified possession proof;
+ * their separate caller and fleet budgets remain enforced. Numerically the
+ * recovery delay, but its OWN pin — these values answer different threats. */
 export const DISCOVERY_MIN_ACCOUNT_AGE_SECONDS = 72 * 3600;
 /** Per-TARGET aggregate one-time-prekey budget across ALL requesters
  * (30 fetches/day, then signed-prekey-only degrade — the
@@ -1983,6 +1996,7 @@ export const ApiErrorCode = z.enum([
    * partially-failed deletion. The client retries as a new account rather than
    * the server silently minting a second account for one key. */
   'account_conflict',
+  'account_gone',
   // --- Integration accounts ---
   /** The identity key was revoked by its integration's owner. Terminal: the
    * signature verified, the KEY is dead — never retried as fresh auth. */

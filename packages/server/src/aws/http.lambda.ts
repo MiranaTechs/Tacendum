@@ -42,6 +42,7 @@ import {
 } from '../handlers/discovery.js';
 import {
   usernameClaimRoute,
+  usernameEligibilityRoute,
   usernameRenameRoute,
   usernameUnlinkRoute,
 } from '../handlers/username.js';
@@ -153,6 +154,7 @@ export const routes: Record<string, Handler> = {
   'POST /v1/identifiers/username/rename': usernameRenameRoute,
   'POST /v1/identifiers/username/unlink': usernameUnlinkRoute,
   'POST /v1/identifiers/username/discoverable': setUsernameDiscoverableRoute,
+  'GET /v1/identifiers/username/eligibility': usernameEligibilityRoute,
   'POST /v1/recovery/request-code': recoveryRequestCodeRoute,
   'POST /v1/recovery/verify': recoveryVerifyRoute,
   'POST /v1/recovery/cancel': recoveryCancelRoute,

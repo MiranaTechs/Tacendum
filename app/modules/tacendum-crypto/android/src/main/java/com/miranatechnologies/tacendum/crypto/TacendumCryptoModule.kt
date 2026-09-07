@@ -663,7 +663,11 @@ class TacendumCryptoModule(reactContext: ReactApplicationContext) :
         // gone, best-effort, all roots" shape kept: attempt everything,
         // fail only after attempting all. Secrets are cleared by the caller
         // via deleteSecret, not here (the iOS contract).
-        val roots = listOf(File(filesDir, PROTOCOL_DIR))
+        val roots = listOf(
+            File(filesDir, PROTOCOL_DIR),
+            File(filesDir, INBOX_DIR),
+            File(filesDir, SHARED_STATE_DIR),
+        )
         var failed = false
         for (root in roots) {
           if (root.exists() && !root.deleteRecursively()) failed = true

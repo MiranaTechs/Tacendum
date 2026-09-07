@@ -37,6 +37,7 @@ import { emailRequestCodeRoute, emailVerifyRoute } from '../src/handlers/identif
 import { setUsernameDiscoverableRoute } from '../src/handlers/discovery.js';
 import {
   usernameClaimRoute,
+  usernameEligibilityRoute,
   usernameRefusal,
   usernameRenameRoute,
   usernameTaken,
@@ -230,7 +231,7 @@ function routesSuite(
       return store;
     };
 
-    gated('THE CLAIM GATE: an identifier-less solo caller, an identifier-less ceremony GROUP, and a 71 h-aged verified caller are refused with the frozen bytes; at 73 h the verified caller is admitted — and no refused attempt ever touched a claim budget', async () => {
+    gated('a newly verified account claims immediately while identifier-less solo and linked callers remain refused before claim budgets', async () => {
       const { db } = on();
       const deps = freshDeps(db);
       const f = family();
@@ -267,20 +268,10 @@ function routesSuite(
       ).toBe('linked');
       const verified = await verifiedAcct(db, deps);
 
-      // T + 71 h: every one of the three is the frozen refusal.
-      deps.advanceMs(71 * HOUR_MS);
+      // Freshly verified: possession proof is sufficient; there is no age wait.
       expectFrozen(await claim(deps, solo, f('solo')));
       expectFrozen(await claim(deps, g1, f('grouped')));
-      expectFrozen(await claim(deps, verified, f('young')));
-      expect(takesOf(deps, 'unameclaim')).toEqual([]);
-
-      // T + 73 h: the verified caller passes — the refusal above was the
-      // age gate, nothing else — while the identifier-less two stay refused
-      // (the gate demands possession proof, not mere age or grouping).
-      deps.advanceMs(2 * HOUR_MS);
       expect((await claim(deps, verified, f('young'))).statusCode).toBe(200);
-      expectFrozen(await claim(deps, solo, f('solo')));
-      expectFrozen(await claim(deps, g1, f('grouped')));
       expect(takesOf(deps, 'unameclaim:')).toEqual([`unameclaim:${verified.groupId}`]);
       expect(takesOf(deps, 'unameclaim-fleet')).toHaveLength(1);
       expect(eventsOf(deps, 'username_claim_admitted')).toBe(1);
@@ -291,6 +282,73 @@ function routesSuite(
         | undefined;
       expect(row?.groupId).toBe(verified.groupId);
       expect(row?.discoverable).toBe(true);
+    });
+
+    gated('caller-owned eligibility is false without possession proof and true for a verified sibling, with no name or reason in the response', async () => {
+      const { db } = on();
+      const deps = freshDeps(db);
+      const first = await mkAcct(db, deps);
+      const sibling = await mkAcct(db, deps);
+      const groupId = uid();
+      canaries.add(groupId);
+      const offerNonce = `nonce-elig-${RUN}-${++seq}`;
+      const nowS = Math.floor(deps.now() / 1000);
+      expect(await db.putLinkOffer({
+        offerNonce,
+        groupId,
+        offererUserId: first.userId,
+        acceptorUserId: sibling.userId,
+        acceptorClass: 'tablet',
+        offererClass: 'phone',
+        rosterEpoch: 0,
+        expiresAt: nowS + 600,
+        offerSig: Buffer.from(`o-${offerNonce}`).toString('base64'),
+      })).toBe('created');
+      expect(await db.linkDeviceToGroup({
+        offerNonce,
+        acceptSig: Buffer.from(`a-${offerNonce}`).toString('base64'),
+        nowSeconds: nowS,
+        linkedAtMs: deps.now(),
+      })).toBe('linked');
+
+      const before = await usernameEligibilityRoute(post(sibling.token, undefined), deps);
+      expect(before.statusCode).toBe(200);
+      expect(JSON.parse(before.body!)).toEqual({ hasVerifiedIdentifier: false });
+
+      await attachEmail(deps, first, `${first.userId}@example.test`);
+      const after = await usernameEligibilityRoute(post(sibling.token, undefined), deps);
+      expect(after.statusCode).toBe(200);
+      expect(JSON.parse(after.body!)).toEqual({ hasVerifiedIdentifier: true });
+      expect(Object.keys(JSON.parse(after.body!))).toEqual(['hasVerifiedIdentifier']);
+      expect(takesOf(deps, `idroute:${sibling.userId}`)).toHaveLength(2);
+      expect(takesOf(deps, 'unameclaim')).toEqual([]);
+
+      // A user-row pointer is not membership. Simulate an eventual stale
+      // groupId by returning the real group with this caller absent from its
+      // authoritative roster; no former-group proof may cross that boundary.
+      const realGetUser = deps.db.getUserById.bind(deps.db);
+      const realGetGroup = deps.db.getAccountGroup.bind(deps.db);
+      const consistency: Array<boolean | undefined> = [];
+      deps.db.getUserById = async (userId, signal, opts) => {
+        consistency.push(opts?.consistent);
+        return realGetUser(userId, signal, opts);
+      };
+      deps.db.getAccountGroup = async (groupId) => {
+        const group = await realGetGroup(groupId);
+        return group
+          ? { ...group, members: group.members.filter((member) => member.userId !== sibling.userId) }
+          : undefined;
+      };
+      try {
+        const staleNonmember = await usernameEligibilityRoute(post(sibling.token, undefined), deps);
+        expect(staleNonmember.statusCode).toBe(200);
+        expect(JSON.parse(staleNonmember.body!)).toEqual({ hasVerifiedIdentifier: false });
+        expect(consistency).toEqual([true]);
+      } finally {
+        deps.db.getUserById = realGetUser;
+        deps.db.getAccountGroup = realGetGroup;
+      }
+      expect(takesOf(deps, `idroute:${sibling.userId}`)).toHaveLength(3);
     });
 
     gated('THE REFUSAL DISCIPLINE (carve-out): `taken` is the ONE distinguishable answer — one frozen 409 object, byte-pinned — and a live claim, a skeleton conflict, a reserved name (exact and skeleton-vs-skeleton), and a live tombstone all answer it identically; the former owner reclaims through it', async () => {
@@ -593,6 +651,7 @@ function routesSuite(
         ['rename', usernameRenameRoute],
         ['unlink', usernameUnlinkRoute],
         ['discoverable', setUsernameDiscoverableRoute],
+        ['eligibility', usernameEligibilityRoute],
       ];
       const a = await verifiedAcct(store.db, deps);
       deps.advanceMs(DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000);
@@ -792,12 +851,13 @@ describe('the pins, the route tables, the collapse mark', () => {
     expect(Object.isFrozen(usernameRefusal())).toBe(true);
   });
 
-  it('the AWS dispatch table and the local adapter both list the four routes, and every one carries the host-adapter collapse mark', () => {
+  it('the AWS dispatch table and the local adapter both list all five routes, and every one carries the host-adapter collapse mark', () => {
     const keys = [
       'POST /v1/identifiers/username/claim',
       'POST /v1/identifiers/username/rename',
       'POST /v1/identifiers/username/unlink',
       'POST /v1/identifiers/username/discoverable',
+      'GET /v1/identifiers/username/eligibility',
     ];
     for (const key of keys) {
       const route = httpDispatch[key];
@@ -810,10 +870,13 @@ describe('the pins, the route tables, the collapse mark', () => {
     expect(httpDispatch['POST /v1/identifiers/username/discoverable']).toBe(
       setUsernameDiscoverableRoute,
     );
+    expect(httpDispatch['GET /v1/identifiers/username/eligibility']).toBe(
+      usernameEligibilityRoute,
+    );
     // The local adapter's table is module-private; its source is the census.
     const local = readFileSync(new URL('../src/local/http.ts', import.meta.url), 'utf8');
     for (const key of keys) {
-      const pattern = key.slice('POST '.length);
+      const pattern = key.slice(key.indexOf(' ') + 1);
       expect(local, key).toContain(`pattern: '${pattern}'`);
     }
   });

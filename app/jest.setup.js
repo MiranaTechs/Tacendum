@@ -172,7 +172,8 @@ jest.mock('tacendum-crypto', () => {
       };
     }),
     resetProtocolState: jest.fn(async () => {
-      secrets.clear();
+      // Native reset removes files, never Keychain/Keystore values. Keeping
+      // those here exercises durable deletion recovery instead of hiding it.
       sharedState.clear();
       inbox.clear();
     }),

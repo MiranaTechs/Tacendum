@@ -83,6 +83,43 @@ test('opening does not generate; explicit Use changes only the draft and Undo re
   expect(text()).toBe('please come at eight');
 });
 
+test('external handoff stays outside the draft until a pasted reply is explicitly reviewed and used', async () => {
+  const handoff: AiWritingResult = {
+    status: 'handoff',
+    provider: 'chatgpt',
+    prompt: 'fixed instructions\n\n"please come at eight"',
+    url: 'https://chatgpt.com/',
+  };
+  generate.mockResolvedValueOnce(handoff);
+  await open();
+  const props = writer();
+
+  await ReactTestRenderer.act(async () => {
+    await expect(
+      props.onRequest(
+        { kind: 'improve' },
+        new AbortController().signal,
+      ),
+    ).resolves.toEqual(handoff);
+  });
+  expect(text()).toBe('please come at eight');
+  expect(props.onUse(handoff.prompt)).toBe(false);
+
+  let review!: AiWritingResult;
+  await ReactTestRenderer.act(async () => {
+    review = props.onReview('Please come at eight.');
+  });
+  expect(review).toEqual({
+    status: 'completed',
+    text: 'Please come at eight.',
+  });
+  await ReactTestRenderer.act(async () => {
+    expect(props.onUse('Please come at eight.')).toBe(true);
+  });
+  expect(text()).toBe('Please come at eight.');
+  expect(messaging.sendText).not.toHaveBeenCalled();
+});
+
 test('typing retires an in-flight request even when its transport returns late', async () => {
   let finish!: (value: AiWritingResult) => void;
   generate.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));

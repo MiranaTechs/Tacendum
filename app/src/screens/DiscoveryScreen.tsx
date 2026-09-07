@@ -1,4 +1,4 @@
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Pressable,
   ScrollView,
@@ -24,11 +24,13 @@ import {
   InlineNotice,
   PrimaryButton,
   ScreenHeader,
+  TextAction,
 } from '../ui/primitives';
 
 interface Props {
   onBack: () => void;
   onOpenChat: (chatId: string) => void;
+  onOpenAccountEmail?: () => void;
 }
 
 /**
@@ -72,7 +74,7 @@ interface Props {
  * malformed handle is refused here with its own sentence (this device's
  * knowledge); every server refusal is the one outcome.
  */
-export function DiscoveryScreen({ onBack, onOpenChat }: Props) {
+export function DiscoveryScreen({ onBack, onOpenChat, onOpenAccountEmail }: Props) {
   const t = useTheme();
   const keyboardInset = useKeyboardInset();
   const [typed, setTyped] = useState('');
@@ -88,6 +90,9 @@ export function DiscoveryScreen({ onBack, onOpenChat }: Props) {
     | { name: 'error' }
   >({ name: 'idle' });
   const [ownEmailHint, setOwnEmailHint] = useState(false);
+  const [usernameEligibility, setUsernameEligibility] = useState<
+    'unchecked' | 'checking' | accountsUsername.UsernameEligibilityOutcome
+  >('unchecked');
   const searchingNumber = PHONE_UI_ENABLED && classSel === db.PHONE_KIND;
   const searchingUsername = USERNAME_UI_ENABLED && classSel === db.USERNAME_KIND;
   // The selector renders when ANY typed class beyond email is live; each
@@ -99,9 +104,46 @@ export function DiscoveryScreen({ onBack, onOpenChat }: Props) {
    * newer query, and no second request starts while one is in flight (the
    * button disables on 'searching', and `search` refuses re-entry too). */
   const searchSeq = useRef(0);
+  const eligibilitySeq = useRef(0);
+  const eligibilityPending = useRef<
+    Promise<accountsUsername.UsernameEligibilityOutcome> | null
+  >(null);
   /** Whether a chip has been TAPPED on this visit. Until one is, the class
    * is the screen's default and the preselect below may move it. */
   const classChosen = useRef(false);
+
+  const refreshUsernameEligibility = useCallback(
+    (force = false): Promise<accountsUsername.UsernameEligibilityOutcome> => {
+      if (!force && eligibilityPending.current) return eligibilityPending.current;
+      const mySeq = ++eligibilitySeq.current;
+      setUsernameEligibility('checking');
+      let request!: Promise<accountsUsername.UsernameEligibilityOutcome>;
+      request = accountsUsername
+        .getUsernameEligibility()
+        .then(outcome => {
+          if (eligibilitySeq.current === mySeq) setUsernameEligibility(outcome);
+          return outcome;
+        })
+        .finally(() => {
+          if (eligibilityPending.current === request) eligibilityPending.current = null;
+        });
+      eligibilityPending.current = request;
+      return request;
+    },
+    [],
+  );
+
+  useEffect(
+    () => () => {
+      eligibilitySeq.current += 1;
+      eligibilityPending.current = null;
+      // A username search may be awaiting this preflight. Retire the whole
+      // search too so an eligible answer cannot start a target lookup after
+      // this screen has gone away.
+      searchSeq.current += 1;
+    },
+    [],
+  );
 
   const search = useCallback(() => {
     const query = typed.trim();
@@ -132,22 +174,35 @@ export function DiscoveryScreen({ onBack, onOpenChat }: Props) {
     // will compare stale below and drop — the NEWER request always wins.
     const mySeq = ++searchSeq.current;
     void (async () => {
+      if (byUsername) {
+        const eligibility = await refreshUsernameEligibility();
+        if (searchSeq.current !== mySeq) return;
+        setOwnEmailHint(false);
+        if (eligibility !== 'eligible') {
+          setPhase({ name: 'idle' });
+          return;
+        }
+      }
       // The honest local hint (the caller gate is server-enforced and its
       // refusal is uniform BY DESIGN; this device still knows its OWN
       // state and may say so): searching needs a verified identifier here
       // too — the gate is CLASS-BLIND, so under the phone
       // pin EITHER class's verified row quiets the hint.
-      const own = await db.loadAccountIdentifier().catch(() => null);
-      const ownNumber = PHONE_UI_ENABLED
-        ? await db.loadPhoneIdentifier().catch(() => null)
-        : null;
+      const own = byUsername ? null : await db.loadAccountIdentifier().catch(() => null);
+      const ownNumber =
+        !byUsername && PHONE_UI_ENABLED
+          ? await db.loadPhoneIdentifier().catch(() => null)
+          : null;
       const result = byUsername
         ? await accountsUsername.discoverySearchByUsername(query)
         : byNumber
           ? await accountsPhone.discoverySearchByPhone(query)
           : await accounts.discoverySearch(query);
       if (searchSeq.current !== mySeq) return; // superseded — drop, silently
-      setOwnEmailHint(own?.email == null && ownNumber?.phone == null);
+      // Username eligibility already came from the authoritative group read
+      // above. A sibling may hold the proof even when both local rows are
+      // empty, so the legacy local hint belongs only to email/phone lookup.
+      setOwnEmailHint(!byUsername && own?.email == null && ownNumber?.phone == null);
       if (result.outcome === 'found') {
         setPhase({
           name: 'found',
@@ -166,7 +221,7 @@ export function DiscoveryScreen({ onBack, onOpenChat }: Props) {
         setPhase({ name: 'error' });
       }
     })();
-  }, [typed, classSel]);
+  }, [typed, classSel, refreshUsernameEligibility]);
 
   const startChat = useCallback(() => {
     if (phase.name !== 'found') return;
@@ -246,10 +301,11 @@ export function DiscoveryScreen({ onBack, onOpenChat }: Props) {
                     // A tap is a decision, even on the chip already lit:
                     // from here the preselect never moves the class.
                     classChosen.current = true;
-                    if (classSel === kind) return;
-                    setClassSel(kind);
-                    searchSeq.current += 1;
-                    setPhase({ name: 'idle' });
+                    if (classSel !== kind) {
+                      setClassSel(kind);
+                      searchSeq.current += 1;
+                      setPhase({ name: 'idle' });
+                    }
                   }}
                   accessibilityRole="button"
                   accessibilityState={{ selected }}
@@ -277,6 +333,44 @@ export function DiscoveryScreen({ onBack, onOpenChat }: Props) {
               );
             })}
           </View>
+        ) : null}
+
+        {searchingUsername && usernameEligibility === 'checking' ? (
+          <InlineNotice
+            tone="quiet"
+            message={ACCOUNTS_USERNAME_COPY.eligibilityChecking}
+            testID="discovery-username-eligibility-checking"
+          />
+        ) : null}
+        {searchingUsername && usernameEligibility === 'needs_verification' ? (
+          <>
+            <InlineNotice
+              tone="quiet"
+              message={ACCOUNTS_USERNAME_COPY.needsIdentifier}
+              testID="discovery-username-needs-identifier"
+            />
+            {onOpenAccountEmail ? (
+              <TextAction
+                label={ACCOUNTS_USERNAME_COPY.needsIdentifierAction}
+                onPress={onOpenAccountEmail}
+                testID="discovery-username-link-email"
+              />
+            ) : null}
+          </>
+        ) : null}
+        {searchingUsername && usernameEligibility === 'unavailable' ? (
+          <>
+            <InlineNotice
+              tone="quiet"
+              message={ACCOUNTS_USERNAME_COPY.eligibilityUnavailable}
+              testID="discovery-username-eligibility-unavailable"
+            />
+            <TextAction
+              label={ACCOUNTS_USERNAME_COPY.eligibilityRetry}
+              onPress={() => void refreshUsernameEligibility(true)}
+              testID="discovery-username-eligibility-retry"
+            />
+          </>
         ) : null}
 
         <TextInput
@@ -331,7 +425,13 @@ export function DiscoveryScreen({ onBack, onOpenChat }: Props) {
         <PrimaryButton
           label={ACCOUNTS_COPY.discoverSearch}
           onPress={search}
-          disabled={typed.trim() === '' || phase.name === 'searching'}
+          disabled={
+            typed.trim() === '' ||
+            phase.name === 'searching' ||
+            (searchingUsername &&
+              usernameEligibility !== 'unchecked' &&
+              usernameEligibility !== 'eligible')
+          }
           busy={phase.name === 'searching'}
           testID="discovery-search"
         />

@@ -291,6 +291,7 @@ test('a transient unlock failure never wipes the real workspace', async () => {
 });
 
 test('a reinstall with orphaned Keychain lock keys boots unlocked and clears them', async () => {
+  jest.requireMock('tacendum-crypto').hasIdentity.mockResolvedValue(false);
   // The Keychain outlives an app uninstall; the SQLite data it guarded does
   // not. First boot after a reinstall must clear the stale lock rather than
   // demand a code that protects nothing.
@@ -320,6 +321,23 @@ test('a reinstall clears provider keys even when app lock was disabled', async (
   expect(crypto.__keychain.has('aiWriting.anthropic')).toBe(false);
   expect(install.__install.firstRun).toBe(false);
   expect(tree.root.findAllByProps({ testID: 'lock-screen' })).toHaveLength(0);
+});
+
+test('a reinstall retaining its native identity must retain the lock protecting it', async () => {
+  const install = jest.requireMock('../src/install') as { __install: { firstRun: boolean } };
+  const native = jest.requireMock('tacendum-crypto') as { hasIdentity: jest.Mock };
+  install.__install.firstRun = true;
+  native.hasIdentity.mockResolvedValue(true);
+  crypto.__keychain.set('lock.enabled', '1');
+  crypto.__keychain.set('lock.passcode', '123456');
+  try {
+    const tree = await renderApp();
+    expect(tree.root.findAllByProps({ testID: 'lock-screen' }).length).toBeGreaterThan(0);
+    expect(crypto.__keychain.get('lock.passcode')).toBe('123456');
+  } finally {
+    native.hasIdentity.mockResolvedValue(false);
+    install.__install.firstRun = false;
+  }
 });
 
 test('a refused provider-key delete does not invent a lock on a fresh install', async () => {

@@ -46,24 +46,42 @@ interface Props {
  * 409 means taken; its 403 deliberately collapses all other refusal reasons.
  * A transport failure gets separate connection copy.
  *
- * A claim explicitly sends consent, defaulting on but permitting off. Renaming
- * preserves existing consent. The username is a discovery label, never a
- * display name; render the local value because the server stores only a keyed
- * hash. The disclosure explains this limitation without claiming the server
- * cannot infer the name. Revocation clears the local row and leaves a fixed,
- * reasonless notice for the owner to dismiss.
+ * Username display and eligibility rules:
+ *  - the shape and the PUBLIC denylist are checked LOCALLY, live, before
+ *    the wire (refused, never repaired; a reserved name never spends a
+ *    claim attempt) — and each local refusal has its OWN sentence,
+ *    honestly distinguishable from the server's answers;
+ *  - the claim gate's possession-proof precondition is read from the
+ *    server's caller-owned eligibility endpoint, so a verified identifier
+ *    on a linked sibling qualifies and the action is disabled honestly;
+ *  - the server answers this class with exactly TWO shapes: the frozen 409
+ *    `taken` (rendered as taken) and the frozen 403 for everything else —
+ *    fleet ceiling, caller budget, gate, cool-down alike — rendered as a
+ *    generic "try again later" that never says why (distinguishable
+ *    by status alone). A transport failure gets the connection sentence;
+ *  - the consent-at-claim checkbox is DEFAULT CHECKED on a claim (a
+ *    handle exists to be found), the bit rides the wire explicitly, and an
+ *    unchecked claim is legal — shown honestly as held-but-unfindable. A
+ *    RENAME's box starts at the current findability: changing a name must
+ *    not silently flip a person from unfindable to findable;
+ *  - the handle is a FINDING label, never a name layer: no `@` sigil, and
+ *    the held name is rendered from this device's own row (the server
+ *    stores a keyed hash and never echoes it);
+ *  - the disclosure sits behind the ⓘ in full, and nothing here
+ *    claims the server is blind to the name;
+ *  - a `usernameRevoked` notice renders its FIXED, reasonless copy here —
+ *    the parser (linking.ts) already cleared the row in every binary; this
+ *    screen is where the person is told, and the dismiss clears the notice.
  */
 export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
   const t = useTheme();
   const keyboardInset = useKeyboardInset();
   const [identifier, setIdentifier] = useState<db.UsernameIdentifierRow | null>(null);
   const [revoked, setRevoked] = useState<db.UsernameNoticeRow | null>(null);
-  const [hasPossessionIdentifier, setHasPossessionIdentifier] = useState(true);
-  // The age gate, counted from the server-minted ID: the ID is
-  // kept and the hours are DERIVED at render, so the clock tick below can
-  // move them — null = unknown, quiet; 0 = open; n = hours still to wait,
-  // said under the button it disables.
-  const [profileId, setProfileId] = useState<string | null>(null);
+  const [eligibility, setEligibility] = useState<
+    'checking' | accountsUsername.UsernameEligibilityOutcome
+  >('checking');
+  const eligibilitySeq = useRef(0);
   // THIS device's memory of the unlink it performed: seeded
   // once from its row at mount, then moved by this screen's own verbs — the
   // unlink sets it, a successful claim clears it. Never re-read on refresh: it is
@@ -109,24 +127,31 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
   }, []);
 
   const refresh = useCallback(() => {
-    void Promise.all([
-      db.loadUsernameIdentifier(),
-      db.loadUsernameNotice(),
-      db.loadAccountIdentifier().catch(() => null),
-      db.loadPhoneIdentifier().catch(() => null),
-      db.loadProfile().catch(() => null),
-    ])
-      .then(([row, notice, email, phone, profile]) => {
+    void Promise.all([db.loadUsernameIdentifier(), db.loadUsernameNotice()])
+      .then(([row, notice]) => {
         setIdentifier(row);
         setRevoked(notice);
-        setHasPossessionIdentifier(email?.email != null || phone?.phone != null);
-        setProfileId(profile?.userId ?? null);
         setLoaded(true);
       })
       .catch(() => setLoaded(true));
   }, []);
 
+  const refreshEligibility = useCallback(() => {
+    if (!USERNAME_UI_ENABLED) return;
+    const mySeq = ++eligibilitySeq.current;
+    setEligibility('checking');
+    void accountsUsername.getUsernameEligibility().then(outcome => {
+      if (eligibilitySeq.current === mySeq) setEligibility(outcome);
+    });
+  }, []);
+
   useEffect(refresh, [refresh]);
+  useEffect(() => {
+    refreshEligibility();
+    return () => {
+      eligibilitySeq.current += 1;
+    };
+  }, [refreshEligibility]);
   useEffect(() => {
     db.loadUsernameUnlink()
       .then(row => setUnlinked(row))
@@ -241,29 +266,6 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
       await db.clearUsernameNotice();
     });
 
-  const claimWaitHours =
-    profileId === null ? null : accountsUsername.usernameClaimWaitHours(profileId, Date.now());
-  // THE AGE GATE IS THIS DEVICE'S OWN TRUTH: the server counts the CALLER's
-  // createdAt, which the ULID carries — so the claim button waits it out
-  // rather than inviting a tap the wire can only refuse with the same
-  // reasonless 403. The identifier precondition is NOT enforced here: it is
-  // group-level, and a sibling may hold the verification this device has
-  // not mirrored. A wait that ends while the screen is open must re-enable
-  // the button on its own: the RecoveryScreen clock tick, capped at 60 s so
-  // a long wait costs a trivial timer.
-  const claimGateClosed = claimWaitHours !== null && claimWaitHours > 0;
-  const [, setClockTick] = useState(0);
-  useEffect(() => {
-    if (profileId === null || !claimGateClosed) return;
-    const opensAt = accountsUsername.usernameClaimOpensAtMs(profileId);
-    if (opensAt === null) return;
-    const timer = setTimeout(
-      () => setClockTick(n => n + 1),
-      Math.max(250, Math.min(opensAt - Date.now() + 250, 60_000)),
-    );
-    return () => clearTimeout(timer);
-  });
-
   // Gate the screen itself so programmatic navigation cannot expose disabled
   // username features.
   if (!USERNAME_UI_ENABLED) return null;
@@ -351,18 +353,9 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
       <PrimaryButton
         label={held ? ACCOUNTS_USERNAME_COPY.renameSubmit : ACCOUNTS_USERNAME_COPY.claim}
         onPress={submit}
-        disabled={busy || localCheck !== 'ok' || (!held && claimGateClosed)}
+        disabled={busy || localCheck !== 'ok' || eligibility !== 'eligible'}
         testID="account-username-submit"
       />
-      {/* The hours sentence sits UNDER the button it disables,
-          and leaves with the wait. */}
-      {!held && claimGateClosed ? (
-        <InlineNotice
-          tone="quiet"
-          message={ACCOUNTS_USERNAME_COPY.needsAge(claimWaitHours!)}
-          testID="account-username-needs-age"
-        />
-      ) : null}
       {held ? (
         <TextAction
           label={ACCOUNTS_USERNAME_COPY.renameKeep}
@@ -424,14 +417,11 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
 
         {error ? <InlineError message={error} testID="account-username-error" /> : null}
 
-        {/* The claim gate's preconditions, SURFACED from this device's
-            own knowledge, never enforced here: the server is the gate. The
-            possession-proof identifier from this device's rows; the age from
-            the server-minted ID; the cool-down from the unlink this device
-            performed — each its own sentence, each BEFORE the tap,
-            because every refusal the wire answers is the same reasonless
-            403. */}
-        {loaded && !held && !hasPossessionIdentifier ? (
+        {/* The claim/rename proof gate comes from an authoritative,
+            caller-owned group read. It never describes a target and it sees
+            a verified identifier held by a linked sibling. Only this form is
+            disabled: consent and unlink remain usable if proof is removed. */}
+        {showForm && eligibility === 'needs_verification' ? (
           <>
             <InlineNotice
               tone="quiet"
@@ -446,6 +436,27 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
                 testID="account-username-link-email"
               />
             ) : null}
+          </>
+        ) : null}
+        {showForm && eligibility === 'checking' ? (
+          <InlineNotice
+            tone="quiet"
+            message={ACCOUNTS_USERNAME_COPY.eligibilityChecking}
+            testID="account-username-eligibility-checking"
+          />
+        ) : null}
+        {showForm && eligibility === 'unavailable' ? (
+          <>
+            <InlineNotice
+              tone="quiet"
+              message={ACCOUNTS_USERNAME_COPY.eligibilityUnavailable}
+              testID="account-username-eligibility-unavailable"
+            />
+            <TextAction
+              label={ACCOUNTS_USERNAME_COPY.eligibilityRetry}
+              onPress={refreshEligibility}
+              testID="account-username-eligibility-retry"
+            />
           </>
         ) : null}
         {loaded &&

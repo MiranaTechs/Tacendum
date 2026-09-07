@@ -1,5 +1,13 @@
 import React from 'react';
-import { AccessibilityInfo, Platform, ScrollView, Text } from 'react-native';
+import {
+  AccessibilityInfo,
+  Clipboard,
+  Linking,
+  Platform,
+  ScrollView,
+  Text,
+  TextInput,
+} from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import type { AiWritingResult } from '../src/aiWriting';
 import {
@@ -13,15 +21,31 @@ jest.mock('../src/aiWritingService', () => ({
   getWritingRevision: jest.fn(),
   saveWritingConnection: jest.fn(),
   removeWritingConnection: jest.fn(),
+  selectExternalWritingProvider: jest.fn(),
   selectWritingProvider: jest.fn(),
 }));
 
 const CONNECTED = {
   status: 'completed' as const,
   state: {
+    mode: 'api' as const,
+    externalProvider: 'chatgpt' as const,
     selected: 'openai' as const,
     providers: {
       openai: { configured: true },
+      anthropic: { configured: false },
+    },
+  },
+};
+
+const EXTERNAL = {
+  status: 'completed' as const,
+  state: {
+    mode: 'external' as const,
+    externalProvider: 'chatgpt' as const,
+    selected: null,
+    providers: {
+      openai: { configured: false },
       anthropic: { configured: false },
     },
   },
@@ -66,6 +90,10 @@ async function render(
         text: 'A clearer note.',
       }),
     ),
+    onReview: jest.fn((text: string): AiWritingResult => ({
+      status: 'completed',
+      text,
+    })),
     onUse: jest.fn(() => true),
     onClose: jest.fn(),
     ...overrides,
@@ -103,10 +131,90 @@ test('opening the assistant stays local until a writing action is pressed', asyn
   );
 });
 
+test('an external action copies only after the press, opens a fixed origin, and never reads the clipboard', async () => {
+  (getWritingConnections as jest.Mock).mockResolvedValue(EXTERNAL);
+  const setString = jest.spyOn(Clipboard, 'setString').mockImplementation(() => {});
+  const getString = jest.spyOn(Clipboard, 'getString').mockResolvedValue('must not read');
+  const openURL = jest.spyOn(Linking, 'openURL').mockResolvedValue(undefined);
+  const prompt = 'Fixed task\n\n"private draft"';
+  const onRequest = jest.fn(async (): Promise<AiWritingResult> => ({
+    status: 'handoff',
+    provider: 'chatgpt',
+    prompt,
+    url: 'https://chatgpt.com/',
+  }));
+  const { tree, props } = await render({ onRequest });
+
+  expect(setString).not.toHaveBeenCalled();
+  expect(openURL).not.toHaveBeenCalled();
+  expect(copy(tree)).toMatch(/copy this draft and open ChatGPT/i);
+  expect(copy(tree)).toMatch(/Paste it there, then bring the reply back here/i);
+
+  await ReactTestRenderer.act(async () => {
+    await control(tree, 'writing-action-improve').props.onPress();
+  });
+
+  expect(setString).toHaveBeenCalledTimes(1);
+  expect(setString).toHaveBeenCalledWith(prompt);
+  expect(openURL).toHaveBeenCalledWith('https://chatgpt.com/');
+  expect(getString).not.toHaveBeenCalled();
+  expect(props.onUse).not.toHaveBeenCalled();
+  expect(copy(tree)).toContain('Request copied');
+});
+
+test('a manually pasted external reply is validated before review and adopted only through Use text', async () => {
+  (getWritingConnections as jest.Mock).mockResolvedValue(EXTERNAL);
+  const onReview = jest.fn((text: string): AiWritingResult => ({
+    status: 'completed',
+    text: text.replace('TOKEN', '@Ana'),
+  }));
+  const { tree, props } = await render({ onReview });
+  const input = tree.root.findByProps({ testID: 'writing-paste-input' });
+
+  expect(input.type).toBe(TextInput);
+  expect(input.props.value).toBe('');
+  await ReactTestRenderer.act(async () => {
+    input.props.onChangeText('Thanks TOKEN');
+  });
+  expect(props.onUse).not.toHaveBeenCalled();
+
+  await ReactTestRenderer.act(async () => {
+    control(tree, 'writing-paste-review').props.onPress();
+  });
+  expect(onReview).toHaveBeenCalledWith('Thanks TOKEN');
+  expect(copy(tree)).toContain('Thanks @Ana');
+  expect(props.onUse).not.toHaveBeenCalled();
+
+  await ReactTestRenderer.act(async () => {
+    control(tree, 'writing-use').props.onPress();
+  });
+  expect(props.onUse).toHaveBeenCalledWith('Thanks @Ana');
+});
+
+test('changing source clears a pasted reply before it can be reviewed', async () => {
+  (getWritingConnections as jest.Mock).mockResolvedValue(EXTERNAL);
+  const { tree, props } = await render();
+  await ReactTestRenderer.act(async () => {
+    tree.root
+      .findByProps({ testID: 'writing-paste-input' })
+      .props.onChangeText('reply for old draft');
+    tree.update(
+      <WritingAssistant {...props} sourceKey="peer-b:new-draft" />,
+    );
+  });
+
+  expect(
+    tree.root.findByProps({ testID: 'writing-paste-input' }).props.value,
+  ).toBe('');
+  expect(props.onReview).not.toHaveBeenCalled();
+});
+
 test('inline connection setup uses the assistant Close action without an inert Done action', async () => {
   (getWritingConnections as jest.Mock).mockResolvedValue({
     status: 'completed',
     state: {
+      mode: 'external',
+      externalProvider: 'chatgpt',
       selected: null,
       providers: {
         openai: { configured: false },

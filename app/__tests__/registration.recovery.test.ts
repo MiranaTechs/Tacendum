@@ -34,6 +34,7 @@ import {
   IdentityLostError,
 } from '../src/registration';
 import { session } from '../src/session';
+import { accountGone, resetAccountReauth } from '../src/reauth';
 
 /**
  * The half-states of registration, mapped by a state-table analysis.
@@ -71,6 +72,7 @@ const PROFILE = {
 };
 
 beforeEach(() => {
+  resetAccountReauth();
   jest.clearAllMocks();
   session.setMode('real');
   crypto.__keychain.clear();
@@ -191,4 +193,28 @@ test('duress still refuses before anything at all', async () => {
   expect(apiM.apiAuthChallenge).not.toHaveBeenCalled();
   expect(crypto.existingKeysForUpload).not.toHaveBeenCalled();
   session.setMode('real');
+});
+
+test('duress beginning during registration stops before the next packet or profile write', async () => {
+  crypto.hasIdentity.mockResolvedValue(true);
+  apiM.apiAuthChallenge!.mockImplementationOnce(async () => {
+    session.setMode('duress');
+    return { challenge: 'Q0g=', expiresAt: 0 };
+  });
+  await expect(createOrRestoreAccount()).rejects.toThrow(/offline/i);
+  expect(apiM.apiAuth).not.toHaveBeenCalled();
+  expect(dbM.saveProfile).not.toHaveBeenCalled();
+  expect(crypto.__keychain.has('authToken')).toBe(false);
+});
+
+test('a deleted account during boot restoration surfaces the fresh-start exit', async () => {
+  crypto.hasIdentity.mockResolvedValue(true);
+  dbM.loadProfile!.mockResolvedValue(PROFILE);
+  apiM.apiAuth!.mockRejectedValueOnce(Object.assign(new Error('account_gone'), {
+    name: 'ApiRequestError', status: 409, code: 'account_gone',
+  }));
+  await expect(createOrRestoreAccount()).rejects.toThrow('account_gone');
+  expect(accountGone()).toBe(true);
+  expect(crypto.__keychain.has('authToken')).toBe(false);
+  expect(dbM.saveProfile).not.toHaveBeenCalled();
 });

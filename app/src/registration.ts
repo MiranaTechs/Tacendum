@@ -4,6 +4,7 @@ import {
   generateAndStoreKeys,
   getSecret,
   hasIdentity,
+  identityPublicKey,
   resetProtocolState,
   setSecret,
   signAuthChallenge,
@@ -26,6 +27,7 @@ import { AUTH_TOKEN_KEY, messaging, resumeReauth, suspendReauth } from './messag
 import { session } from './session';
 import { API_BASE } from './config';
 import { clearWritingConnections, invalidateWritingSession } from './aiWritingService';
+import { accountGone, reportAccountGone, resetAccountReauth } from './reauth';
 
 /**
  * Account lifecycle: keygen (native, PQXDH set) →
@@ -36,117 +38,196 @@ import { clearWritingConnections, invalidateWritingSession } from './aiWritingSe
  * `completeRegistration` are gone with the routes they called.
  */
 
-/**
- * Delete the account: retire it server-side, then leave nothing behind on
- * this device. There is no sign-out — chats exist only here, so "sign out
- * and come back later" was a promise the architecture cannot keep; deletion
- * is the only honest exit.
- *
- * Order matters twice over. Server FIRST: the local wipe runs only once the
- * ID has actually stopped working — offline, this throws and destroys
- * nothing. Then stop the socket so nothing writes during the wipe, clear
- * local state, and only then the identity keys and token.
- *
- * "Leave nothing behind" is total up to the secret store, and BEST-EFFORT
- * past it (AD-1, 2026-09-03). Every local wipe is attempted; a store that
- * refuses a delete it cannot complete (SecretStore.kt throws on a failed
- * unlink; TacendumCryptoImpl.swift throws on any Keychain status but
- * success/notFound) can leave lock keys behind on a device whose account is
- * gone. That residue is inert and already an accepted edge — §11,
- * "the relaunch after a deletion shows the lock screen" — and it is NOT
- * reported to the caller, because past the server delete there is no honest
- * error to report and no retry that helps: the token is gone, so a second
- * attempt skips `DELETE /v1/account` entirely and fails the same way for
- * ever. See the comment at the wipe itself.
- *
- * WHAT THIS DELIBERATELY DOES NOT REACH — the on-device residuals, named
- * here so nobody has to discover them one at a time. Every one is a
- * Keychain generic-password item belonging to the INSTALL rather than to the
- * account, and each survives deletion (and a reinstall) on purpose:
- *
- *  - `screensec.blank` — the "hide messages while the screen is shared"
- *    preference (`screenSecurity.ts`). Written by that module alone and
- *    re-read at every launch; a person who turned it off does not mean
- *    "until my next account".
- *  - `updateGate.policy` — the last update policy the server gave this
- *    build, and `updateGate.softDismissed`, the store build whose nudge was
- *    waved away (`updateGate.ts`, as amended). These
- *    are about this BINARY's build number, not about any account: signing
- *    out does not make an old build new, so a blocked verdict that a
- *    wipe-and-re-register could erase would be a way out of the update wall
- *    for anyone who found it.
- *
- * The rule they share, and the one to apply to the next such key: if the
- * value describes the DEVICE rather than the person, deletion leaves it, and
- * the fact is written down here, beside the deletion itself, instead of
- * being left to a reader of this function to notice.
- */
-export async function deleteAccount(): Promise<void> {
-  if (session.mode === 'duress') {
-    invalidateWritingSession();
-    // A coerced "delete it all": the decoy dies
-    // convincingly, nothing real is touched, and no packet leaves the phone.
-    // No 1:1 call can be live here — the transport refuses every duress
-    // frame, so an attempt tears itself down — but the quiesce rule is
-    // one rule (endCallOnQuiesce beside every messaging.stop), and a no-op
-    // costs nothing.
-    await endCallOnQuiesce();
-    messaging.stop();
-    disposeGroupCall();
-    quiesceCallMetrics();
-    await db.clearLocalState();
-    return;
+/** Durable across crashes and iOS reinstalls; never cleared by install healing. */
+export const ACCOUNT_DELETION_KEY = 'accountDeletion';
+type DeletionRecord = { phase: 'requested' | 'confirmed' | 'local-only'; userId: string | null };
+
+export class AccountCleanupPendingError extends Error {
+  constructor() {
+    super('account_cleanup_pending');
+    this.name = 'AccountCleanupPendingError';
   }
-  // Before the bearer dies, not after. `DELETE /v1/account` revokes it, and any
-  // authenticated request already in flight will 401 a moment later — which the
-  // REST seam would faithfully "heal" by minting a new session, and `POST
-  // /v1/auth` CREATES an account for a known identity key whose user row is
-  // gone. The user would be left on the onboarding screen under a no-exit "this
-  // account no longer exists" sheet, with an orphan account on the server that
-  // nothing on this device can reach. Deletion is the one moment when a 401 is
-  // the intended outcome.
-  suspendReauth();
-  const token = await getSecret(AUTH_TOKEN_KEY);
-  if (token) await apiDeleteAccount(token);
+}
+
+async function deletionRecord(): Promise<DeletionRecord | null> {
+  const value = await getSecret(ACCOUNT_DELETION_KEY);
+  if (value === null) return null;
+  const record: unknown = JSON.parse(value);
+  if (typeof record !== 'object' || record === null ||
+      !('phase' in record) || !['requested', 'confirmed', 'local-only'].includes(String(record.phase)) ||
+      !('userId' in record) || (record.userId !== null && typeof record.userId !== 'string')) {
+    throw new AccountCleanupPendingError();
+  }
+  return record as DeletionRecord;
+}
+
+export async function hasPendingAccountDeletion(): Promise<boolean> {
+  return (await getSecret(ACCOUNT_DELETION_KEY)) !== null;
+}
+
+function authFailure(error: unknown, status: number, code?: string): boolean {
+  const e = error as { name?: string; status?: number; code?: string } | null;
+  return e?.name === 'ApiRequestError' && e.status === status &&
+    (code === undefined || e.code === code);
+}
+
+/** Renewal for an explicit deletion only, with get-or-create disabled server-side. */
+async function deletionToken(userId: string | null): Promise<string> {
+  if (!userId) throw new Error('account_deletion_auth_required');
+  refuseInDuress();
+  const identityKey = await identityPublicKey();
+  if (!identityKey) throw new IdentityLostError();
+  refuseInDuress();
+  const { challenge } = await apiAuthChallenge(identityKey);
+  refuseInDuress();
+  const signature = await signAuthChallenge(challenge, API_BASE);
+  refuseInDuress();
+  let response;
+  try {
+    response = await apiAuth(identityKey, challenge, signature, userId);
+  } catch (error) {
+    refuseInDuress();
+    // These uniform refusals also cover a mismatched LIVE account or a revoked
+    // key. They prove only that this identity cannot renew, never that DELETE
+    // succeeded. Keep the bearer/intent until an explicit local fresh start.
+    if (authFailure(error, 409, 'account_gone') ||
+        authFailure(error, 409, 'account_conflict') ||
+        authFailure(error, 403, 'identity_tombstoned')) reportAccountGone();
+    throw error;
+  }
+  refuseInDuress();
+  if (response.userId !== userId) throw new AccountMismatchError();
+  await setSecret(AUTH_TOKEN_KEY, response.authToken);
+  return response.authToken;
+}
+
+/**
+ * Erase only after remote deletion is confirmed. Each independent operation
+ * runs even if another fails; a failed essential wipe retains the marker and
+ * blocks setup until a later retry finishes it. Installation preferences
+ * (screen sharing and update policy) deliberately survive.
+ */
+async function finishAccountDeletion(): Promise<void> {
   invalidateWritingSession();
-  // Provider keys are account data, not installation preferences. Cleanup
-  // attempts both records, and never misreports an already deleted account
-  // as an offline failure. Owner binding makes any refused residue inert.
-  const writingCleanup = clearWritingConnections();
-  // AFTER the server delete — a deletion that throws offline must leave the
-  // call untouched — and BEFORE the socket stops, so the peer's `call.end`
-  // is composed while the transport still accepts it and the CXCall does not
-  // outlive the account it belonged to (see endCallOnQuiesce).
-  await endCallOnQuiesce();
+  await endCallOnQuiesce().catch(() => undefined);
   messaging.stop();
-  // Beside the socket, not after the wipe: a live small-group session holds
-  // N leg services, a roster and armed timers in MEMORY, none of which
-  // `clearLocalState` can reach — and the account they belong to is about to
-  // stop existing.
   disposeGroupCall();
   quiesceCallMetrics();
-  await writingCleanup;
-  await db.clearLocalState();
-  await resetProtocolState();
-  await deleteSecret(AUTH_TOKEN_KEY);
-  // Both, not one-then-the-other (AD-1, 2026-09-03). These are two
-  // independent wipes and neither is a precondition of the other, so a
-  // Keychain that refuses to drop `lock.enabled` must not also strand the
-  // decoy database on an account that no longer exists.
-  //
-  // And NEITHER failure is reported, because the only caller cannot tell the
-  // truth about one. ProfileScreen's catch renders COPY.signOutFailed
-  // (ProfileScreen.tsx: "Tacendum couldn't reach the server, so nothing was
-  // deleted. Try again when you're back on.") and skips onSignedOut(). By the
-  // time these two lines run the server HAS been reached, the account IS
-  // gone, and the auth token has already been deleted — so that sentence
-  // would be false and the retry it invites is a closed loop that can only
-  // ever repeat it. Rejecting here would buy an untrue sentence and a screen
-  // with no exit; the surviving lock keys are inert and are the accepted
-  // §11 edge instead. Rule 4: nothing is logged and no error
-  // carries a key or a value.
+  let incomplete = false;
+  for (const clear of [
+    () => db.clearLocalState(),
+    () => resetProtocolState(),
+    () => deleteSecret(AUTH_TOKEN_KEY),
+    () => deleteSecret(PREKEY_REPLENISHED_AT_KEY),
+    () => deleteSecret('recovery.request'),
+  ]) {
+    try { refuseInDuress(); await clear(); } catch { incomplete = true; }
+  }
+  // Provider cleanup reports refused writes as a value. Owner binding makes
+  // that residue unusable by a future identity; preserve the existing
+  // best-effort contract independently of the essential identity/data wipes.
+  refuseInDuress();
+  try { await clearWritingConnections(); } catch { /* owner-bound residue */ }
+  // The existing AD-1 contract: refused lock/decoy residues are inert and
+  // must not be reported as a server failure after an account was deleted.
+  refuseInDuress();
   await lock.clearAll().catch(() => undefined);
+  refuseInDuress();
   await db.clearDecoyState().catch(() => undefined);
+  if (incomplete) throw new AccountCleanupPendingError();
+  try { await deleteSecret(ACCOUNT_DELETION_KEY); }
+  catch { throw new AccountCleanupPendingError(); }
+  resetAccountReauth();
+}
+
+/** A surviving Keychain bearer cannot restore a deleted protocol identity. */
+export async function clearStaleInstallationCredentials(): Promise<boolean> {
+  const identityPresent = await hasIdentity();
+  if (identityPresent || await hasPendingAccountDeletion()) return identityPresent;
+  await deleteSecret(AUTH_TOKEN_KEY);
+  await deleteSecret(PREKEY_REPLENISHED_AT_KEY);
+  await deleteSecret('recovery.request');
+  return false;
+}
+
+let deletionFlight: Promise<void> | null = null;
+
+/** Server first, durable intent before the first destructive request. */
+export function deleteAccount(): Promise<void> {
+  if (session.mode === 'duress') return deleteDecoyAccount();
+  if (deletionFlight) return deletionFlight;
+  const task = deleteRealAccount();
+  deletionFlight = task;
+  const settled = () => { if (deletionFlight === task) deletionFlight = null; };
+  void task.then(settled, settled);
+  return task;
+}
+
+async function deleteDecoyAccount(): Promise<void> {
+  invalidateWritingSession();
+  await endCallOnQuiesce();
+  messaging.stop();
+  disposeGroupCall();
+  quiesceCallMetrics();
+  await db.clearLocalState();
+}
+
+async function deleteRealAccount(): Promise<void> {
+  // Await the renewal already in flight BEFORE reading its final bearer.
+  await suspendReauth();
+  let confirmed = false;
+  try {
+    refuseInDuress();
+    let record = await deletionRecord();
+    if (!record) {
+      record = { phase: 'requested', userId: (await db.loadProfile())?.userId ?? null };
+      await setSecret(ACCOUNT_DELETION_KEY, JSON.stringify(record));
+    }
+    confirmed = record.phase !== 'requested';
+    if (!confirmed) {
+      let token = await getSecret(AUTH_TOKEN_KEY);
+      if (!token) token = await deletionToken(record.userId);
+      try {
+        refuseInDuress();
+        await apiDeleteAccount(token);
+      } catch (error) {
+        if (!authFailure(error, 401)) throw error;
+        token = await deletionToken(record.userId);
+        refuseInDuress();
+        await apiDeleteAccount(token);
+      }
+      confirmed = true;
+      // If this write fails, the pre-request intent still records the ID and
+      // a retry may finish deletion. Do not wipe its proof prematurely.
+      refuseInDuress();
+      await setSecret(ACCOUNT_DELETION_KEY, JSON.stringify({ ...record, phase: 'confirmed' }));
+    }
+    refuseInDuress();
+    await finishAccountDeletion();
+  } catch (error) {
+    if (!confirmed) resumeReauth();
+    // A transport failure does not establish whether DELETE reached the
+    // server. The caller says it could not confirm deletion, never "nothing
+    // was deleted". No local wipe runs without the affirmative proof above.
+    if (confirmed) throw new AccountCleanupPendingError();
+    throw error;
+  }
+}
+
+/** An explicit local fresh start for an unusable identity, after unlock. */
+export async function clearGoneAccount(): Promise<void> {
+  refuseInDuress();
+  const gone = accountGone();
+  // Also offers a way out after reinstall removed the identity files but a
+  // deletion intent survived in Keychain. The UI explicitly says the remote
+  // deletion is unconfirmed before consenting to abandon that local proof.
+  if (!gone && await hasIdentity()) throw new Error('account_not_gone');
+  await suspendReauth();
+  refuseInDuress();
+  await setSecret(ACCOUNT_DELETION_KEY, JSON.stringify({
+    phase: 'local-only', userId: null,
+  }));
+  await finishAccountDeletion();
 }
 
 /** A duress session is network-silent. A coerced
@@ -179,8 +260,8 @@ function refuseInDuress(): void {
  *  - **Never touch the network in duress mode.** `refuseInDuress` runs FIRST,
  *    ahead of keygen as well as the request — because
  *    generating a keypair under coercion would also be a visible side effect.
- *  - **Never reset a protocol state that has a profile behind it.** The wipe
- *    below is strictly the keys-without-profile case.
+ *  - **Never silently rebind an existing profile.** An explicit deletion or
+ *    confirmed local fresh start must finish before a new identity is made.
  */
 /**
  * The identity key on this device is gone and the profile it belonged to is
@@ -189,8 +270,7 @@ function refuseInDuress(): void {
  * restoring one would be a way of being handed someone's account by asking
  * convincingly enough. This is a TERMINAL state, and throwing it — instead of
  * quietly minting a fresh keypair and rebinding the profile — is the fix for
- * the worst thing the old code did: a backup restore to a new phone (SQLite
- * is backed up, the protocol store is deliberately not) presented every old
+ * the worst thing the old code did: a stale database restored to a new phone without its protocol store presented every old
  * chat intact under a brand-new account, while every peer still pinned the
  * dead key and the messages went nowhere.
  */
@@ -280,6 +360,8 @@ export async function replenishPrekeys(
 
 export async function createOrRestoreAccount(): Promise<db.ProfileRow> {
   refuseInDuress();
+  if (await hasPendingAccountDeletion()) await deleteAccount();
+  refuseInDuress();
   // An account is about to exist again, so the deletion-time suspension is
   // over. Clearing it HERE rather than at the end of `deleteAccount` is
   // deliberate: the window that must stay closed is the whole gap between the
@@ -289,6 +371,7 @@ export async function createOrRestoreAccount(): Promise<db.ProfileRow> {
 
   const existingProfile = await db.loadProfile();
   const identityExists = await hasIdentity();
+  refuseInDuress();
 
   // A profile with no identity behind it is a dead account, and saying so is
   // the only honest answer. Guarded FIRST, before anything can be minted or
@@ -318,10 +401,23 @@ export async function createOrRestoreAccount(): Promise<db.ProfileRow> {
     ? await existingKeysForUpload()
     : await generateAndStoreKeys();
 
+  refuseInDuress();
   const { challenge } = await apiAuthChallenge(keys.identityKey);
-  // The private key never leaves the Keychain; only the signature comes back.
+  refuseInDuress();
+  // The private key stays in the native protocol store; only the signature comes back.
   const signature = await signAuthChallenge(challenge, API_BASE);
-  const { userId, authToken } = await apiAuth(keys.identityKey, challenge, signature);
+  refuseInDuress();
+  let authenticated;
+  try {
+    authenticated = await apiAuth(keys.identityKey, challenge, signature, existingProfile?.userId);
+  } catch (error) {
+    refuseInDuress();
+    if (authFailure(error, 409, 'account_gone') || authFailure(error, 409, 'account_conflict') ||
+        authFailure(error, 403, 'identity_tombstoned')) reportAccountGone();
+    throw error;
+  }
+  refuseInDuress();
+  const { userId, authToken } = authenticated;
 
   // Before the token write, before the upload, before the profile: nothing
   // may be mutated on the strength of an identity that answers for a
@@ -346,7 +442,9 @@ export async function createOrRestoreAccount(): Promise<db.ProfileRow> {
   // nothing would ever run this again. The reverse crash (upload lands,
   // token write dies) re-uploads idempotently on the retry.
   await apiUploadKeys(authToken, keys);
+  refuseInDuress();
   await setSecret(AUTH_TOKEN_KEY, authToken);
+  refuseInDuress();
 
   const profile: db.ProfileRow =
     existingProfile !== null

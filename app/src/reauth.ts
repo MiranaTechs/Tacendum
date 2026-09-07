@@ -9,6 +9,7 @@ import * as db from './db';
 import { session } from './session';
 import type { WsAuthOutcome } from './ws';
 import { API_BASE } from './config';
+import { resumeAccountRequests, suspendAccountRequests } from './accountLifecycle';
 
 /**
  * Re-authentication: the 30-day cliff, and the only path back
@@ -23,7 +24,7 @@ import { API_BASE } from './config';
  * forever, with no interaction that could fix it. A silent death, in an app.
  *
  * Keypair accounts make the remedy nearly free: the identity private key IS
- * the account, it is already in the Keychain, and
+ * the account, it is in the native protocol store, and
  * three calls that `createOrRestoreAccount` already makes mint a fresh session
  * with no user interaction — minus the key upload, which would drag prekey
  * replenishment into a code path that has nothing to do with it.
@@ -93,7 +94,7 @@ export type ReauthResult =
 
 /** The one in-flight mint every concurrent caller joins. */
 let inflight: Promise<ReauthResult> | null = null;
-/** Terminal latch. Once true, no further packet is ever sent. */
+/** Terminal until explicit local erasure permits a new identity. */
 let gone = false;
 /** The newest token THIS module minted — the cheap half of rule 2. */
 let lastMinted: string | null = null;
@@ -145,12 +146,28 @@ function publishToken(token: string): void {
  * to, with an orphan account on the server. Deletion is the one moment when a
  * 401 means "as intended" rather than "heal me".
  */
-export function suspendReauth(): void {
+export function suspendReauth(): Promise<void> {
   suspended = true;
+  suspendAccountRequests();
+  // A request already sent may rotate the bearer. Let it settle before the
+  // deleter reads its token and sends DELETE; no renewal can then write after
+  // the local wipe or recreate the account after the remote deletion.
+  return inflight ? inflight.then(() => undefined) : Promise.resolve();
 }
 
 export function resumeReauth(): void {
   suspended = false;
+  resumeAccountRequests();
+}
+
+/** Called only after the old account's local data and identity are erased. */
+export function resetAccountReauth(): void {
+  suspendAccountRequests();
+  gone = false;
+  lastMinted = null;
+  for (const listener of goneListeners) {
+    try { listener(); } catch { /* advisory */ }
+  }
 }
 
 /** True once the account behind this device has been proven unrecoverable. */
@@ -158,7 +175,7 @@ export function accountGone(): boolean {
   return gone;
 }
 
-/** Fires once, when `accountGone()` first becomes true. App.tsx renders the
+/** Fires when `accountGone()` changes, including an explicit local reset. App.tsx renders the
  * terminal state from it: the alternative is an app that looks merely offline
  * while it is in fact signed in as nobody. */
 export function onAccountGone(listener: () => void): () => void {
@@ -256,6 +273,11 @@ async function mint(presented: string | null): Promise<ReauthResult> {
     }
     if (duress()) return 'silent';
 
+    // Read continuity BEFORE auth: the server must not get-or-create a
+    // replacement for an account that this profile says already existed.
+    const expectedUserId = (await db.loadProfile())?.userId;
+    if (duress()) return 'silent';
+
     const identityKey = await identityPublicKey();
     if (identityKey === null) {
       // Nothing to prove ownership with. NOT terminal: this is also what an
@@ -270,7 +292,7 @@ async function mint(presented: string | null): Promise<ReauthResult> {
     // The private key never crosses the bridge; only the signature comes back.
     const signature = await signAuthChallenge(challenge, API_BASE);
     if (duress()) return 'silent';
-    const { userId, authToken } = await apiAuth(identityKey, challenge, signature);
+    const { userId, authToken } = await apiAuth(identityKey, challenge, signature, expectedUserId);
     if (duress()) return 'silent';
 
     // `getOrCreateUserByIdentityKey` will happily CREATE an account for a known
@@ -294,7 +316,9 @@ async function mint(presented: string | null): Promise<ReauthResult> {
       // disabled by exactly the sequence it guards against.
       return 'error';
     }
-    if (selfUserId !== null && selfUserId !== userId) return latchGone();
+    if (duress()) return 'silent';
+    if ((expectedUserId !== undefined && expectedUserId !== userId) ||
+        (selfUserId !== null && selfUserId !== userId)) return latchGone();
 
     await setSecret(AUTH_TOKEN_KEY, authToken);
     lastMinted = authToken;
@@ -316,8 +340,14 @@ async function mint(presented: string | null): Promise<ReauthResult> {
     // never make, made permanent for the life of the process.
     if (failure?.status === 403 && failure.code === 'identity_tombstoned') return latchGone();
     if (failure?.status === 409 && failure.code === 'account_conflict') return latchGone();
+    if (failure?.status === 409 && failure.code === 'account_gone') return latchGone();
     return 'error';
   }
+}
+
+/** Only call after a signed-auth response proves the stored identity unusable. */
+export function reportAccountGone(): 'gone' {
+  return latchGone();
 }
 
 function latchGone(): 'gone' {

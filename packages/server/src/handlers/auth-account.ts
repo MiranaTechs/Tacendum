@@ -27,7 +27,7 @@ import { userRefForLog } from '../opaque-ref.js';
  *
  * Replaces phone + SMS. The client's libsignal identity key IS the account:
  * it asks for a nonce, signs it with the identity private key that never
- * leaves the Keychain, and the server verifies with libsignal. No phone
+ * leaves the native client store, and the server verifies with libsignal. No phone
  * number, no verification code, no carrier, and no directory anyone can search.
  *
  * WHAT THIS BUYS BEYOND DELETING SMS, stated precisely so nobody overclaims it
@@ -350,12 +350,26 @@ export const authHandler: Handler = async (event, deps) => {
     return errorResult(401, 'invalid_challenge', 'unknown or already-used challenge');
   }
 
-  const resolution = await deps.db.getOrCreateUserByIdentityKey(
-    identityKey,
-    deps.newUserId(),
-    deps.now(),
-    parsed.data.accountClass,
-  );
+  // A renewal carries the ID already on disk. Verify the signature FIRST,
+  // then read that exact row: calling get-or-create here resurrected deleted
+  // identities into orphan accounts. The read cannot create a row, including
+  // when deletion races the session write (ordinary bearer validation refuses
+  // an absent/tombstoned row). Initial registration keeps its existing path.
+  const expectedUser = parsed.data.expectedUserId === undefined
+    ? undefined
+    : await deps.db.getUserById(parsed.data.expectedUserId);
+  if (parsed.data.expectedUserId !== undefined &&
+      (!expectedUser || expectedUser.identityKeyPub !== identityKey || expectedUser.tombstoned)) {
+    return errorResult(409, 'account_gone', 'this device account no longer exists');
+  }
+  const resolution = expectedUser
+    ? { kind: 'ok' as const, user: expectedUser, created: false }
+    : await deps.db.getOrCreateUserByIdentityKey(
+        identityKey,
+        deps.newUserId(),
+        deps.now(),
+        parsed.data.accountClass,
+      );
   if (resolution.kind === 'conflict') {
     // Claim row resolves but the user row is gone — only reachable after a
     // partially-failed deletion. Answered rather than papered over: deleting

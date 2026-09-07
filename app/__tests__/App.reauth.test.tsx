@@ -208,6 +208,7 @@ test('a profile with no token re-authenticates the same identity instead of wipi
     IDENTITY_KEY,
     'Q0hBTExFTkdF',
     'sig(Q0hBTExFTkdF)',
+    USER_ID,
   );
   // …and never minted a second one, which would have been a second account.
   expect(crypto.generateAndStoreKeys).not.toHaveBeenCalled();

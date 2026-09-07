@@ -5,6 +5,7 @@ import {
   getWritingConnections,
   removeWritingConnection,
   saveWritingConnection,
+  selectExternalWritingProvider,
   selectWritingProvider,
 } from '../src/aiWritingService';
 import { WritingConnection } from '../src/ui/WritingConnection';
@@ -13,12 +14,15 @@ jest.mock('../src/aiWritingService', () => ({
   getWritingConnections: jest.fn(),
   saveWritingConnection: jest.fn(),
   removeWritingConnection: jest.fn(),
+  selectExternalWritingProvider: jest.fn(),
   selectWritingProvider: jest.fn(),
 }));
 
 const EMPTY = {
   status: 'completed' as const,
   state: {
+    mode: 'external' as const,
+    externalProvider: 'chatgpt' as const,
     selected: null,
     providers: {
       openai: { configured: false },
@@ -30,11 +34,21 @@ const EMPTY = {
 const OPENAI_SAVED = {
   status: 'completed' as const,
   state: {
+    mode: 'api' as const,
+    externalProvider: 'chatgpt' as const,
     selected: 'openai' as const,
     providers: {
       openai: { configured: true },
       anthropic: { configured: false },
     },
+  },
+};
+
+const CLAUDE_EXTERNAL = {
+  status: 'completed' as const,
+  state: {
+    ...EMPTY.state,
+    externalProvider: 'claude' as const,
   },
 };
 
@@ -82,18 +96,57 @@ beforeEach(() => {
   (getWritingConnections as jest.Mock).mockResolvedValue(EMPTY);
   (saveWritingConnection as jest.Mock).mockResolvedValue(OPENAI_SAVED);
   (removeWritingConnection as jest.Mock).mockResolvedValue(EMPTY);
+  (selectExternalWritingProvider as jest.Mock).mockResolvedValue(
+    CLAUDE_EXTERNAL,
+  );
   (selectWritingProvider as jest.Mock).mockResolvedValue(OPENAI_SAVED);
 });
 
-test('connection setup explains direct draft processing and separate API billing before save', async () => {
+test('consumer apps are primary and explain the explicit switch without promising integrated sign-in', async () => {
   const tree = await render();
   const words = copy(tree);
 
-  expect(words).toContain('Your draft goes directly to OpenAI or Claude');
-  expect(words).toContain(
-    'API billing is separate from ChatGPT and Claude subscriptions',
+  expect(words).toContain('Use ChatGPT or Claude');
+  expect(words).toMatch(/switch apps/i);
+  expect(words).toMatch(/does not make a paid API request/i);
+  expect(words).not.toMatch(/sign in|connected to your account/i);
+  expect(controlState(tree, 'writing-mode-external')).toMatchObject({
+    selected: true,
+  });
+  expect(tree.root.findAllByProps({ testID: 'writing-key-input' })).toHaveLength(
+    0,
   );
   expect(saveWritingConnection).not.toHaveBeenCalled();
+});
+
+test('choosing Claude stores only the external-app preference', async () => {
+  const onChanged = jest.fn();
+  const onDone = jest.fn();
+  const tree = await render({ onChanged, onDone });
+
+  await ReactTestRenderer.act(async () => {
+    await control(tree, 'writing-external-claude').props.onPress();
+  });
+
+  expect(selectExternalWritingProvider).toHaveBeenCalledWith('claude');
+  expect(saveWritingConnection).not.toHaveBeenCalled();
+  expect(onChanged).toHaveBeenCalledTimes(1);
+  expect(onDone).toHaveBeenCalledTimes(1);
+});
+
+test('API keys remain an explicit secondary mode with separate billing copy', async () => {
+  const tree = await render();
+
+  await ReactTestRenderer.act(async () => {
+    control(tree, 'writing-mode-api').props.onPress();
+  });
+
+  expect(controlState(tree, 'writing-mode-api')).toMatchObject({ selected: true });
+  expect(copy(tree)).toContain(
+    'API billing is separate from ChatGPT and Claude subscriptions',
+  );
+  expect(tree.root.findByProps({ testID: 'writing-key-input' })).toBeDefined();
+  expect(selectExternalWritingProvider).not.toHaveBeenCalled();
 });
 
 test('an empty connection panel can be dismissed without entering a key', async () => {
@@ -123,7 +176,9 @@ test('a denied connection read accepts no key and offers an explicit retry', asy
   await ReactTestRenderer.act(async () => {
     await control(tree, 'writing-connection-retry').props.onPress();
   });
-  expect(tree.root.findByProps({ testID: 'writing-key-input' })).toBeDefined();
+  expect(controlState(tree, 'writing-mode-external')).toMatchObject({
+    selected: true,
+  });
   expect(getWritingConnections).toHaveBeenCalledTimes(2);
 });
 
@@ -131,6 +186,9 @@ test('saving requires an explicit provider key and never exposes a saved key', a
   const onChanged = jest.fn();
   const onDone = jest.fn();
   const tree = await render({ onChanged, onDone });
+  await ReactTestRenderer.act(async () => {
+    control(tree, 'writing-mode-api').props.onPress();
+  });
   const input = tree.root.findByProps({ testID: 'writing-key-input' });
 
   expect(input.type).toBe(TextInput);
@@ -170,6 +228,9 @@ test('a rapid double press starts only one secure key save', async () => {
   (saveWritingConnection as jest.Mock).mockReturnValue(pending);
   const tree = await render();
   await ReactTestRenderer.act(async () => {
+    control(tree, 'writing-mode-api').props.onPress();
+  });
+  await ReactTestRenderer.act(async () => {
     tree.root
       .findByProps({ testID: 'writing-key-input' })
       .props.onChangeText('sk-one-write');
@@ -206,6 +267,9 @@ test('saved means configured and does not claim the provider verified it', async
 
 test('choosing a different provider clears the key before it can be saved', async () => {
   const tree = await render();
+  await ReactTestRenderer.act(async () => {
+    control(tree, 'writing-mode-api').props.onPress();
+  });
   const input = tree.root.findByProps({ testID: 'writing-key-input' });
 
   await ReactTestRenderer.act(async () => {
@@ -226,6 +290,8 @@ test('select and remove update saved metadata only after the storage verdict', a
   const BOTH_SAVED = {
     status: 'completed' as const,
     state: {
+      mode: 'api' as const,
+      externalProvider: 'chatgpt' as const,
       selected: 'openai' as const,
       providers: {
         openai: { configured: true },
@@ -241,6 +307,8 @@ test('select and remove update saved metadata only after the storage verdict', a
   (removeWritingConnection as jest.Mock).mockResolvedValue({
     status: 'completed',
     state: {
+      mode: 'api',
+      externalProvider: 'chatgpt',
       selected: 'openai',
       providers: {
         openai: { configured: true },
@@ -286,6 +354,10 @@ test('backgrounding clears a typed key and retires an in-flight save result', as
   const onChanged = jest.fn();
   const onDone = jest.fn();
   const tree = await render({ onChanged, onDone });
+
+  await ReactTestRenderer.act(async () => {
+    control(tree, 'writing-mode-api').props.onPress();
+  });
 
   await ReactTestRenderer.act(async () => {
     tree.root

@@ -49,11 +49,12 @@ const SPLITLINES = /\r\n|[\n\r\v\f\u001c\u001d\u001e\u0085\u2028\u2029]/;
 const ESC = '\u001b';
 const FS = '\u001c';
 
-/** The eight checks `runDoctor` always reports: home, identity, credential,
- * attend, api, clock, session, ws. One verdict line each and not one more —
+/** The nine checks `runDoctor` always reports: home, identity, credential,
+ * attend, ai, api, clock, session, ws. One verdict line each and not one more —
  * a count, because "no forged line" is a claim about how many lines there
- * are. A new check means changing this number on purpose (last: `attend`). */
-const DOCTOR_CHECKS = 8;
+ * are. The AI diagnostic added a ninth verdict; preserve the strict bound
+ * so an injected server line still fails this security check. */
+const DOCTOR_CHECKS = 9;
 
 const NAME = 'bot';
 const USER_ID = '01HFRGERY00000000000000000';

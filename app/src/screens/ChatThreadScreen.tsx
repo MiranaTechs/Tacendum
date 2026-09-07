@@ -4015,6 +4015,10 @@ export function ChatThreadScreen({
         return { status: 'failed', reason: 'stale' };
       }
       if (result.status === 'failed') return result;
+      // A handoff prompt belongs on the clipboard/provider side of the UI. It
+      // is never a candidate draft and can only return through the explicit
+      // pasted-reply validation path below.
+      if (result.status === 'handoff') return result;
       const restored = masked.restore(result.text);
       if (!restored) return { status: 'failed', reason: 'invalid_response' };
       writingCandidate.current = { source, result: restored };
@@ -4023,6 +4027,24 @@ export function ChatThreadScreen({
       signal.removeEventListener('abort', abort);
       if (writingAbort.current === controller) writingAbort.current = null;
     }
+  }, [writingSnapshot, writingSourceCurrent]);
+  const reviewPastedWriting = useCallback((text: string): AiWritingResult => {
+    if (!writingEligibleRef.current || drawerRef.current !== 'writing') {
+      return { status: 'failed', reason: 'stale' };
+    }
+    writingCandidate.current = null;
+    const source = writingSnapshot();
+    const masked = maskWritingMentions(source.text, source.chips);
+    if (!masked || !writingSourceCurrent(source)) {
+      return { status: 'failed', reason: 'stale' };
+    }
+    const restored = masked.restore(text);
+    if (!restored) return { status: 'failed', reason: 'invalid_response' };
+    if (!writingSourceCurrent(source) || drawerRef.current !== 'writing') {
+      return { status: 'failed', reason: 'stale' };
+    }
+    writingCandidate.current = { source, result: restored };
+    return { status: 'completed', text: restored.text };
   }, [writingSnapshot, writingSourceCurrent]);
   const replaceWritingDraft = useCallback((text: string, chips: MentionChip[]) => {
     setDraft(text);
@@ -5363,6 +5385,7 @@ export function ChatThreadScreen({
               <WritingAssistant
                 sourceKey={JSON.stringify([peerId, writingRevision.current, draft, liveChips, pending?.kind, pending?.row.msgId])}
                 onRequest={requestWriting}
+                onReview={reviewPastedWriting}
                 onUse={useWriting}
                 onClose={() => setDrawer('none')}
               />

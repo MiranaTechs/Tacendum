@@ -4,7 +4,6 @@ import * as dbModule from './db';
 import { currentToken } from './reauth';
 import { pickDiscoveryAnchor, type DiscoveryOutcome, type SimpleOutcome } from './accounts';
 import {
-  DISCOVERY_MIN_ACCOUNT_AGE_SECONDS,
   RESERVED_USERNAMES,
   RESERVED_USERNAME_SKELETONS,
   USERNAME_RENAME_COOLDOWN_SECONDS,
@@ -13,8 +12,8 @@ import {
   normalizeUsernameIdentifier,
   usernameSkeleton,
   type DiscoveryLookupResponse,
+  type UsernameEligibilityResponse,
 } from '@tacendum/shared';
-import { decodeTime } from 'ulid';
 
 /**
  * Username claim / rename / unlink + per-class consent + find-by-name,
@@ -81,6 +80,41 @@ function defaultDeps(): AccountsUsernameDeps {
   };
 }
 
+export interface UsernameEligibilityDeps {
+  api: {
+    usernameEligibility(token: string): Promise<UsernameEligibilityResponse>;
+  };
+  token(): Promise<string | null>;
+}
+
+function defaultEligibilityDeps(): UsernameEligibilityDeps {
+  return {
+    api: { usernameEligibility: apiModule.apiUsernameEligibility },
+    token: currentToken,
+  };
+}
+
+/**
+ * Read the authenticated caller's authoritative group-level possession
+ * proof before a claim, rename, or username lookup. A linked sibling's
+ * verified email or phone qualifies, so local identifier rows cannot answer
+ * this question. Refusals and transport failures stay indistinguishable to
+ * the UI and become a retryable availability state.
+ */
+export type UsernameEligibilityOutcome = 'eligible' | 'needs_verification' | 'unavailable';
+export async function getUsernameEligibility(
+  deps: UsernameEligibilityDeps = defaultEligibilityDeps(),
+): Promise<UsernameEligibilityOutcome> {
+  try {
+    const token = await deps.token();
+    if (!token) return 'unavailable';
+    const response = await deps.api.usernameEligibility(token);
+    return response.hasVerifiedIdentifier ? 'eligible' : 'needs_verification';
+  } catch {
+    return 'unavailable';
+  }
+}
+
 /** The accounts.ts rule verbatim: an http-level answer is a REFUSAL (the
  * collapsed 403 above all); everything else is a transport failure. */
 function isRefusal(error: unknown): boolean {
@@ -118,39 +152,6 @@ export function checkUsernameLocally(raw: string): UsernameLocalCheck {
   if ((RESERVED_USERNAMES as readonly string[]).includes(normalized)) return 'reserved';
   if (RESERVED_USERNAME_SKELETONS.has(usernameSkeleton(normalized))) return 'reserved';
   return 'ok';
-}
-
-/* ── the claim gate's preconditions, from this device's own knowledge ── */
-
-/**
- * The age gate, counted locally (a simulator-tested
- * report: every refusal is the reasonless 403 by design, so the two
- * preconditions this device CAN know are said before the tap). The account
- * ID is the ULID the server minted at creation, so its time half IS the
- * server's own `createdAt` stamp — the same clock the gate reads, no local
- * registration timestamp to keep. Whole hours still to wait, 0 when the
- * gate is already open, null when the ID does not decode (a fixture, a
- * malformed row): unknown is quiet, never a false warning. Surfaced, never
- * enforced — the server is the gate.
- */
-export function usernameClaimWaitHours(userId: string, nowMs: number): number | null {
-  const opensAt = usernameClaimOpensAtMs(userId);
-  if (opensAt === null) return null;
-  const remainingMs = opensAt - nowMs;
-  return remainingMs > 0 ? Math.ceil(remainingMs / 3_600_000) : 0;
-}
-
-/** When the §4.5 age gate opens for this account, in milliseconds since the
- * epoch — the server-minted ID's own time half plus the three days the
- * server counts on the CALLER's createdAt; null for an ID that does not
- * decode. The screen arms a timer on it so a wait that ends on-screen
- * re-enables the claim button. */
-export function usernameClaimOpensAtMs(userId: string): number | null {
-  try {
-    return decodeTime(userId) + DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000;
-  } catch {
-    return null;
-  }
 }
 
 /** Whether an unlink this device performed still holds the cool-down

@@ -288,12 +288,28 @@ function discoverySuite(
       return store;
     };
 
-    /** A gate-passing caller: verified email + ≥72 h (its own clock move). */
+    /** A gate-passing username caller: possession proof, with no age wait. */
     const mkCaller = async (db: TestOnlyDataLayer, deps: TestDeps): Promise<Acct & { groupId: string }> => {
-      const caller = await verifiedAcct(db, deps);
-      deps.advanceMs(DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000);
-      return caller;
+      return verifiedAcct(db, deps);
     };
+
+    gated('a newly verified account can resolve a consented username immediately while fresh email and phone lookups retain the age gate', async () => {
+      const { db } = on();
+      const deps = freshDeps(db);
+      const f = family();
+      const caller = await verifiedAcct(db, deps);
+      const target = await verifiedAcct(db, deps);
+      const targetEmail = `${target.userId}@example.test`;
+      const targetNumber = freshNumber();
+      await attachPhone(db, deps, target, targetNumber);
+      expect((await claimName(deps, target, f('fresh'), true)).statusCode).toBe(200);
+      expect((await setDiscoverableRoute(post(target.token, { discoverable: true }), deps)).statusCode).toBe(204);
+      expect((await setPhoneDiscoverableRoute(post(target.token, { discoverable: true }), deps)).statusCode).toBe(204);
+
+      expect((await lookup(deps, caller.token, { username: `  ${f('fresh').toUpperCase()}  ` })).statusCode).toBe(200);
+      expectUniform(await lookup(deps, caller.token, { email: targetEmail }));
+      expectUniform(await lookup(deps, caller.token, { phone: targetNumber }));
+    });
 
     gated('THE USERNAME ORACLE (uniform refusals): {miss, registered-not-discoverable, LIVE TOMBSTONE} answer ONE byte-stream and ONE object; only a consented live claim resolves to the minimum with NO name byte; consent OFF is immediate; the former owner reclaims through the tombstone; an ELAPSED tombstone reads as a miss, is reaped, and frees the name', async () => {
       const { db } = on();

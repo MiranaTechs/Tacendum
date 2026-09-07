@@ -5,6 +5,9 @@ import { Platform, Settings } from 'react-native';
  * NSUserDefaults does not. A boot that finds lock keys in the Keychain but
  * no install marker is a REINSTALL — the data the lock guarded is gone, and
  * demanding a code that protects nothing would brick the fresh start.
+ * App.tsx additionally requires confirmed native identity absence before
+ * clearing the lock: a retained App Group can still contain an identity
+ * and unread plaintext, which the surviving lock must continue to protect.
  *
  * ANDROID: the heal is iOS-only,
  * forever. Android app data — Keystore key and secret files alike — dies

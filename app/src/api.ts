@@ -17,6 +17,7 @@ import {
   type LinkOfferInitRequest,
   type UploadKeysRequest,
   TurnCredentialsResponse,
+  UsernameEligibilityResponse,
   WsTicketResponse,
   type CallMetricReport,
 } from '@tacendum/shared';
@@ -24,6 +25,7 @@ import { MAX_ATTACHMENT_BYTES } from '@tacendum/shared';
 import { API_BASE } from './config';
 import { currentToken, reauthenticate } from './reauth';
 import { session } from './session';
+import { accountRequestGeneration, accountRequestsSuspended } from './accountLifecycle';
 // TYPE ONLY, and it has to stay that way: `updateGate` imports this module,
 // so a value import here would be a runtime cycle. The gate owns the
 // vocabulary of why a check is happening; this module owns what that costs
@@ -217,12 +219,23 @@ async function request(
   // generation-captured by call wiring; snapshotting here keeps an old REST
   // completion from reaching a newly armed replacement callback at all.
   const authRenewedSnapshot = [...apiAuthRenewedListeners];
+  const accountGeneration = accountRequestGeneration();
+  const assertAccountCurrent = () => {
+    // Deletion must still reach its own route. Every other authenticated
+    // request belongs to the identity that began it, including a delayed
+    // 200 or a 401 arriving after a NEW identity has already registered.
+    if (session.mode === 'duress' || (opts.token !== undefined && (
+      accountGeneration !== accountRequestGeneration() ||
+      (accountRequestsSuspended() && path !== '/v1/account')
+    ))) throw new TypeError('Network request failed');
+  };
   // ONE retry, never a loop. A second 401 on a token minted seconds ago is a
   // server-side truth (revoked, deleted, clock skew), not a token problem, and
   // looping on it turns a dead session into a self-inflicted DoS on our own
   // auth route. Everything above this function — messaging, screens — stays
   // unchanged and inherits the renewal without knowing the word.
   for (let attempt = 0; ; attempt++) {
+    assertAccountCurrent();
     // The duress rule, at the transport boundary: "Duress sessions are
     // network-silent. No socket, no REST call, no push registration."
     //
@@ -260,6 +273,7 @@ async function request(
         signal,
       }),
     );
+    assertAccountCurrent();
 
     if (
       res.status === 401 &&
@@ -275,6 +289,7 @@ async function request(
       // The bearer that ACTUALLY FAILED, not "the current token" — the whole
       // stale-bearer check turns on that distinction (reauth.ts).
       const outcome = await reauthenticate(bearer ?? null);
+      assertAccountCurrent();
       if (outcome === 'ok') {
         const fresh = await currentToken();
         if (fresh) {
@@ -302,6 +317,14 @@ async function request(
       }
       throw new ApiRequestError(detail, res.status, code);
     }
+    // Fetch can resolve at headers while its JSON body is still arriving.
+    // Keep the same account fence through the reader every DTO wrapper uses.
+    const readJson = res.json.bind(res);
+    res.json = async () => {
+      const body: unknown = await readJson();
+      assertAccountCurrent();
+      return body;
+    };
     return res;
   }
 }
@@ -398,8 +421,11 @@ export async function apiAuth(
   identityKey: string,
   challenge: string,
   signature: string,
+  expectedUserId?: string,
 ): Promise<AuthResponse> {
-  const res = await request('POST', '/v1/auth', { body: { identityKey, challenge, signature } });
+  const res = await request('POST', '/v1/auth', {
+    body: { identityKey, challenge, signature, ...(expectedUserId ? { expectedUserId } : {}) },
+  });
   return parseDto(AuthResponse, 'AuthResponse', await res.json());
 }
 
@@ -904,6 +930,18 @@ export async function apiSetUsernameDiscoverable(
     body: { discoverable },
     token,
   });
+}
+
+/** GET /v1/identifiers/username/eligibility — caller-owned possession-
+ * proof readiness for claim and username lookup. The response deliberately
+ * carries one boolean and no identifier, target, age, or refusal reason. */
+export async function apiUsernameEligibility(token: string): Promise<UsernameEligibilityResponse> {
+  const res = await request('GET', '/v1/identifiers/username/eligibility', { token });
+  return parseDto(
+    UsernameEligibilityResponse,
+    'UsernameEligibilityResponse',
+    await res.json(),
+  );
 }
 
 /** POST /v1/discovery/lookup with the {username} field — the same route,

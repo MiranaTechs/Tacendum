@@ -1,7 +1,9 @@
 import {
   AI_WRITING_INPUT_MAX,
   AI_WRITING_OUTPUT_MAX,
+  AI_WRITING_EXTERNAL_URLS,
   aiWritingInstructions,
+  buildExternalWritingHandoff,
   parseAnthropicWritingResponse,
   parseOpenAiWritingResponse,
   validateAiWritingRequest,
@@ -43,6 +45,52 @@ describe('private writing assistant domain', () => {
         action: { kind: 'shorter' },
       }),
     ).toBe(false);
+  });
+
+  it.each([
+    ['chatgpt', 'https://chatgpt.com/'],
+    ['claude', 'https://claude.ai/'],
+  ] as const)(
+    'builds a bounded %s handoff with a fixed origin and only the requested task and draft',
+    (provider, expectedUrl) => {
+      const draft = 'Hi [[TACENDUM_MENTION_0_0]], can we meet at 8?';
+      const handoff = buildExternalWritingHandoff(
+        { draft, action: { kind: 'warmer' } },
+        provider,
+      );
+
+      expect(handoff).not.toBeNull();
+      expect(handoff).toMatchObject({ provider, url: expectedUrl });
+      expect(AI_WRITING_EXTERNAL_URLS[provider]).toBe(expectedUrl);
+      expect(new URL(handoff!.url)).toMatchObject({
+        search: '',
+        hash: '',
+      });
+      expect(handoff!.prompt).toContain('Make the draft warmer');
+      expect(handoff!.prompt).toContain(JSON.stringify(draft));
+      expect(handoff!.prompt).not.toMatch(/recipient|conversation history|api key/i);
+      expect(handoff!.prompt.length).toBeLessThanOrEqual(
+        AI_WRITING_INPUT_MAX + 1_000,
+      );
+    },
+  );
+
+  it('refuses invalid handoff input and never truncates a private draft', () => {
+    expect(
+      buildExternalWritingHandoff(
+        { draft: '', action: { kind: 'improve' } },
+        'chatgpt',
+      ),
+    ).toBeNull();
+    expect(
+      buildExternalWritingHandoff(
+        {
+          draft: 'x'.repeat(AI_WRITING_INPUT_MAX + 1),
+          action: { kind: 'shorter' },
+        },
+        'claude',
+      ),
+    ).toBeNull();
   });
 
   it('accepts one completed OpenAI plaintext output', () => {

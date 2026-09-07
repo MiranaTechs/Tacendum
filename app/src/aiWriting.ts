@@ -2,6 +2,8 @@
 
 export const AI_WRITING_INPUT_MAX = 4_000;
 export const AI_WRITING_OUTPUT_MAX = 8_000;
+/** JSON escaping can expand one UTF-16 code unit to a six-character escape. */
+export const AI_WRITING_HANDOFF_MAX = AI_WRITING_INPUT_MAX * 6 + 1_000;
 export const AI_WRITING_MAX_OUTPUT_TOKENS = 4_096;
 export const AI_WRITING_TIMEOUT_MS = 30_000;
 
@@ -11,9 +13,35 @@ export const ANTHROPIC_WRITING_MODEL = 'claude-haiku-4-5-20251001';
 export const AI_WRITING_PROVIDERS = ['openai', 'anthropic'] as const;
 export type AiWritingProvider = (typeof AI_WRITING_PROVIDERS)[number];
 
+/** Consumer products opened by an explicit app handoff. These are separate
+ * from provider APIs: no consumer credential or subscription token enters
+ * Tacendum. */
+export const AI_WRITING_EXTERNAL_PROVIDERS = ['chatgpt', 'claude'] as const;
+export type AiWritingExternalProvider =
+  (typeof AI_WRITING_EXTERNAL_PROVIDERS)[number];
+export type AiWritingMode = 'external' | 'api';
+
 export const AI_WRITING_PROVIDER_LABELS: Record<AiWritingProvider, string> = {
   openai: 'OpenAI',
   anthropic: 'Claude',
+};
+
+export const AI_WRITING_EXTERNAL_PROVIDER_LABELS: Record<
+  AiWritingExternalProvider,
+  string
+> = {
+  chatgpt: 'ChatGPT',
+  claude: 'Claude',
+};
+
+/** Fixed origins only. Draft text is copied after an explicit press and is
+ * never placed in a URL, query, fragment, deep link, or referrer. */
+export const AI_WRITING_EXTERNAL_URLS: Record<
+  AiWritingExternalProvider,
+  string
+> = {
+  chatgpt: 'https://chatgpt.com/',
+  claude: 'https://claude.ai/',
 };
 
 export const AI_WRITING_LANGUAGES = [
@@ -61,9 +89,17 @@ export type AiWritingFailure =
 
 export type AiWritingResult =
   | { status: 'completed'; text: string }
+  | {
+      status: 'handoff';
+      provider: AiWritingExternalProvider;
+      prompt: string;
+      url: string;
+    }
   | { status: 'failed'; reason: AiWritingFailure };
 
 export interface AiWritingConnectionState {
+  mode: AiWritingMode;
+  externalProvider: AiWritingExternalProvider;
   selected: AiWritingProvider | null;
   providers: Record<AiWritingProvider, { configured: boolean }>;
 }
@@ -89,6 +125,15 @@ export function isAiWritingProvider(
   return (
     typeof value === 'string' &&
     (AI_WRITING_PROVIDERS as readonly string[]).includes(value)
+  );
+}
+
+export function isAiWritingExternalProvider(
+  value: unknown,
+): value is AiWritingExternalProvider {
+  return (
+    typeof value === 'string' &&
+    (AI_WRITING_EXTERNAL_PROVIDERS as readonly string[]).includes(value)
   );
 }
 
@@ -143,6 +188,34 @@ export function validateAiWritingRequest(request: AiWritingRequest): boolean {
     request.draft.length <= AI_WRITING_INPUT_MAX &&
     aiWritingInstructions(request.action) !== null
   );
+}
+
+/**
+ * Compose the text a person explicitly copies into a provider's own app.
+ * JSON string encoding keeps draft bytes visibly separate from the fixed task
+ * without truncating or interpreting any part of the person's text.
+ */
+export function buildExternalWritingHandoff(
+  request: AiWritingRequest,
+  provider: AiWritingExternalProvider,
+): Extract<AiWritingResult, { status: 'handoff' }> | null {
+  if (
+    !validateAiWritingRequest(request) ||
+    !isAiWritingExternalProvider(provider)
+  ) {
+    return null;
+  }
+  const instructions = aiWritingInstructions(request.action)!;
+  const handoff: Extract<AiWritingResult, { status: 'handoff' }> = {
+    status: 'handoff',
+    provider,
+    url: AI_WRITING_EXTERNAL_URLS[provider],
+    prompt:
+      `${instructions}\n\n` +
+      'The draft is the following JSON string. Rewrite only its decoded text:\n' +
+      JSON.stringify(request.draft),
+  };
+  return handoff.prompt.length <= AI_WRITING_HANDOFF_MAX ? handoff : null;
 }
 
 function record(value: unknown): Record<string, unknown> | null {

@@ -117,13 +117,14 @@ const phoneDispatchRoutes: ReadonlyArray<[name: string, route: Handler]> = PHONE
   },
 );
 
-/** The four username route keys resolved from
- * the REAL AWS dispatch table for the same reason. */
+/** The username route keys (including caller eligibility), resolved from
+ * the REAL AWS dispatch table for the same finding-13 reason. */
 const USERNAME_ROUTE_KEYS = [
   'POST /v1/identifiers/username/claim',
   'POST /v1/identifiers/username/rename',
   'POST /v1/identifiers/username/unlink',
   'POST /v1/identifiers/username/discoverable',
+  'GET /v1/identifiers/username/eligibility',
 ] as const;
 const usernameDispatchRoutes: ReadonlyArray<[name: string, route: Handler]> =
   USERNAME_ROUTE_KEYS.map((key) => {

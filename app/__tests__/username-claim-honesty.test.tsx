@@ -4,10 +4,9 @@
  *  1. "On the simulator it never succeeds": thirteen "try again later"s for
  *     names the server refused BY DESIGN (a different name after an unlink
  *     waits 30 days; then the day's claim budget). The wire never says why,
- *     so the claim form now says what THIS device can know BEFORE the tap —
- *     the account's age (from the server-minted ID), a verified email or
- *     phone number (from its own rows), and the cool-down of the unlink it
- *     performed (from its own memory) — each its own sentence, none a block.
+ *     so the claim form now says what can be known BEFORE the tap — the
+ *     caller group's authoritative verified email/phone eligibility and the
+ *     cool-down of the unlink this device performed.
  *
  *  2. "Where is find-by-username?": the Start a chat door said "Find by
  *     email", the room it opens defaulted to the Email chip, and the held
@@ -20,7 +19,6 @@
 
 import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
-import { ulid } from 'ulid';
 import * as accounts from '../src/accounts';
 import * as accountsUsername from '../src/accountsUsername';
 import { ACCOUNTS_USERNAME_COPY } from '../src/accountsUsernameCopy';
@@ -43,8 +41,7 @@ jest.mock('../src/usernameUi', () => ({
   },
 }));
 
-const HOUR_MS = 3_600_000;
-const DAY_MS = 24 * HOUR_MS;
+const DAY_MS = 24 * 3_600_000;
 const NOW_MS = 1_756_000_000_000;
 const ANCHOR = '01HQZZZZ00000000000000000A';
 const HELD: db.UsernameIdentifierRow = { username: 'alice_7', claimedAt: 1, discoverable: true };
@@ -56,17 +53,6 @@ const EMAIL_ROW: db.AccountIdentifierRow = {
   pendingRequestedAt: null,
   restoredAt: null,
 };
-/** A profile whose ID the server minted `ageMs` ago — the ULID's time half
- * IS the server's createdAt stamp, so the device can count from it. */
-const profileAged = (ageMs: number): db.ProfileRow => ({
-  userId: ulid(NOW_MS - ageMs),
-  registrationId: 7,
-  displayName: '',
-  about: '',
-  avatarB64: '',
-  profileVersion: 0,
-});
-
 async function render(el: React.ReactElement): Promise<ReactTestRenderer.ReactTestRenderer> {
   let tree!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(async () => {
@@ -109,19 +95,18 @@ const chipSelected = (tree: ReactTestRenderer.ReactTestRenderer, testID: string)
 function stubRows(opts: {
   row?: db.UsernameIdentifierRow | null;
   email?: db.AccountIdentifierRow | null;
-  profile?: db.ProfileRow | null;
   unlink?: db.UsernameUnlinkRow | null;
 }): void {
   jest.spyOn(db, 'loadUsernameIdentifier').mockImplementation(async () => opts.row ?? null);
   jest.spyOn(db, 'loadUsernameNotice').mockResolvedValue(null);
   jest.spyOn(db, 'loadAccountIdentifier').mockImplementation(async () => opts.email ?? null);
   jest.spyOn(db, 'loadPhoneIdentifier').mockResolvedValue(null);
-  jest.spyOn(db, 'loadProfile').mockImplementation(async () => opts.profile ?? null);
   jest.spyOn(db, 'loadUsernameUnlink').mockImplementation(async () => opts.unlink ?? null);
 }
 
 beforeEach(() => {
   jest.spyOn(Date, 'now').mockReturnValue(NOW_MS);
+  jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('eligible');
 });
 
 afterEach(() => {
@@ -129,65 +114,29 @@ afterEach(() => {
   jest.restoreAllMocks();
 });
 
-/* ── 1. the age gate, counted from the server-minted ID ─────────────── */
+/* ── 1. authoritative group-level eligibility ─────────────────────── */
 
-describe('the age gate is counted from the ID the server minted, and said before the tap', () => {
-  it('the module: hours still to wait, 0 once the 72 h have passed, null for an ID that does not decode', () => {
-    expect(accountsUsername.usernameClaimWaitHours(ulid(NOW_MS - HOUR_MS), NOW_MS)).toBe(71);
-    expect(accountsUsername.usernameClaimWaitHours(ulid(NOW_MS - 71.5 * HOUR_MS), NOW_MS)).toBe(1);
-    expect(accountsUsername.usernameClaimWaitHours(ulid(NOW_MS - 72 * HOUR_MS), NOW_MS)).toBe(0);
-    expect(accountsUsername.usernameClaimWaitHours(ulid(NOW_MS - 400 * DAY_MS), NOW_MS)).toBe(0);
-    expect(accountsUsername.usernameClaimWaitHours('01HQSELF000000000000000000', NOW_MS)).toBeNull();
-    expect(accountsUsername.usernameClaimWaitHours('', NOW_MS)).toBeNull();
-  });
-
-  it('a young account sees the 3-day sentence with the wait — the form stays, the server is the gate', async () => {
-    stubRows({ email: EMAIL_ROW, profile: profileAged(60 * HOUR_MS) });
-    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
-    expect(has(tree, 'account-username-needs-age')).toBe(true);
-    const text = rendered(tree);
-    expect(text).toContain('Your account needs to be 3 days old to claim a username.');
-    expect(text).toContain('about 12 hours');
-    // The identifier sentence is quiet: an email IS verified here.
-    expect(has(tree, 'account-username-needs-identifier')).toBe(false);
-    // Surfaced, never enforced.
-    expect(has(tree, 'account-username-input')).toBe(true);
-    tree.unmount();
-  });
-
-  it('the wait is said in rounded days past 48 h; an aged account and an undecodable ID are both quiet', async () => {
-    expect(ACCOUNTS_USERNAME_COPY.needsAge(52)).toContain('about 2 days');
-    expect(ACCOUNTS_USERNAME_COPY.needsAge(1)).toContain('about 1 hour.');
-    // A CONDITION, never a promise (fix): the age is one of several server
-    // gates, so the sentence says when the three days end and never that a
-    // claim will land.
-    expect(ACCOUNTS_USERNAME_COPY.needsAge(12)).toContain('the three days are up in about 12 hours.');
-    expect(ACCOUNTS_USERNAME_COPY.needsAge(12)).not.toMatch(/will go through|will succeed|will land/);
-    stubRows({ email: EMAIL_ROW, profile: profileAged(10 * HOUR_MS) });
-    const young = await render(<AccountUsernameScreen onBack={jest.fn()} />);
-    expect(rendered(young)).toContain('about 3 days');
-    young.unmount();
+describe('the caller-owned eligibility read', () => {
+  it('maps only an explicit proof boolean to an eligible answer; token and wire failures stay unavailable', async () => {
     jest.restoreAllMocks();
-    jest.spyOn(Date, 'now').mockReturnValue(NOW_MS);
-    stubRows({ email: EMAIL_ROW, profile: profileAged(4 * DAY_MS) });
-    const aged = await render(<AccountUsernameScreen onBack={jest.fn()} />);
-    expect(has(aged, 'account-username-needs-age')).toBe(false);
-    aged.unmount();
-    jest.restoreAllMocks();
-    jest.spyOn(Date, 'now').mockReturnValue(NOW_MS);
-    stubRows({ email: EMAIL_ROW, profile: { ...profileAged(0), userId: '01HQSELF000000000000000000' } });
-    const unknown = await render(<AccountUsernameScreen onBack={jest.fn()} />);
-    expect(has(unknown, 'account-username-needs-age')).toBe(false);
-    unknown.unmount();
-  });
-
-  it('no verified identifier: the sentence leads with the step to take, and still names the three days', async () => {
-    stubRows({ profile: profileAged(4 * DAY_MS) });
-    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
-    expect(has(tree, 'account-username-needs-identifier')).toBe(true);
-    expect(rendered(tree)).toContain('Link and verify an email address or phone number first');
-    expect(rendered(tree)).toContain('three days old');
-    tree.unmount();
+    const deps = (answer: boolean): accountsUsername.UsernameEligibilityDeps => ({
+      api: { usernameEligibility: async () => ({ hasVerifiedIdentifier: answer }) },
+      token: async () => 'bearer',
+    });
+    expect(await accountsUsername.getUsernameEligibility(deps(true))).toBe('eligible');
+    expect(await accountsUsername.getUsernameEligibility(deps(false))).toBe('needs_verification');
+    expect(
+      await accountsUsername.getUsernameEligibility({
+        api: { usernameEligibility: async () => ({ hasVerifiedIdentifier: true }) },
+        token: async () => null,
+      }),
+    ).toBe('unavailable');
+    expect(
+      await accountsUsername.getUsernameEligibility({
+        api: { usernameEligibility: async () => { throw new Error('offline'); } },
+        token: async () => 'bearer',
+      }),
+    ).toBe('unavailable');
   });
 });
 
@@ -264,7 +213,7 @@ describe('the unlink memory: written by the module on a landed unlink, cleared b
   });
 
   it('a later visit reads the persisted memory: the claim form warns, names the reclaimable name, and says 30 days', async () => {
-    stubRows({ email: EMAIL_ROW, profile: profileAged(4 * DAY_MS), unlink: { username: 'alice_7', unlinkedAt: NOW_MS - DAY_MS } });
+    stubRows({ email: EMAIL_ROW, unlink: { username: 'alice_7', unlinkedAt: NOW_MS - DAY_MS } });
     const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
     expect(has(tree, 'account-username-cooldown')).toBe(true);
     const text = rendered(tree);
@@ -276,7 +225,7 @@ describe('the unlink memory: written by the module on a landed unlink, cleared b
   });
 
   it('a memory with an empty name still warns: the rule and the reclaim fact stand, no name is invented', async () => {
-    stubRows({ email: EMAIL_ROW, profile: profileAged(4 * DAY_MS), unlink: { username: '', unlinkedAt: NOW_MS - DAY_MS } });
+    stubRows({ email: EMAIL_ROW, unlink: { username: '', unlinkedAt: NOW_MS - DAY_MS } });
     const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
     expect(has(tree, 'account-username-cooldown')).toBe(true);
     const text = rendered(tree);
@@ -303,7 +252,7 @@ describe('the unlink memory: written by the module on a landed unlink, cleared b
   });
 
   it('a landed claim on the surface takes the warning down', async () => {
-    stubRows({ email: EMAIL_ROW, profile: profileAged(4 * DAY_MS), unlink: { username: 'alice_7', unlinkedAt: NOW_MS - DAY_MS } });
+    stubRows({ email: EMAIL_ROW, unlink: { username: 'alice_7', unlinkedAt: NOW_MS - DAY_MS } });
     jest.spyOn(accountsUsername, 'claimUsername').mockResolvedValue('claimed');
     const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
     expect(has(tree, 'account-username-cooldown')).toBe(true);
@@ -438,7 +387,7 @@ describe('the find flow: a bare handle typed with no chip chosen runs the userna
 
 describe('unchecking consent on the CLAIM form says what a claim with findability off means', () => {
   it('never "You hold this name" before the name is held', async () => {
-    stubRows({ email: EMAIL_ROW, profile: profileAged(4 * DAY_MS) });
+    stubRows({ email: EMAIL_ROW });
     const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
     expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.claimUnfindable);
     await press(tree, 'account-username-consent');
@@ -462,71 +411,63 @@ describe('unchecking consent on the CLAIM form says what a claim with findabilit
   });
 });
 
-/* ── 7. the preconditions stop inviting a doomed tap ── */
+/* ── 7. the proof precondition stops inviting a doomed tap ─────────── */
 
-describe('the claim preconditions: a door beside the identifier sentence, and a button that waits out the age gate', () => {
-  it('no verified identifier on this device: the sentence carries a "Link an email" door; the form stays (a sibling may hold the verification)', async () => {
-    stubRows({ profile: profileAged(4 * DAY_MS) });
+describe('the authoritative claim precondition', () => {
+  it('missing group proof shows the verification door and disables claim', async () => {
+    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('needs_verification');
+    stubRows({});
     const onOpenAccountEmail = jest.fn();
     const tree = await render(
       <AccountUsernameScreen onBack={jest.fn()} onOpenAccountEmail={onOpenAccountEmail} />,
     );
     expect(has(tree, 'account-username-needs-identifier')).toBe(true);
     expect(has(tree, 'account-username-input')).toBe(true);
+    await type(tree, 'account-username-input', 'alice_7');
+    const submit = tree.root
+      .findAllByProps({ testID: 'account-username-submit' })
+      .find(n => n.props.disabled !== undefined)!;
+    expect(submit.props.disabled).toBe(true);
     await press(tree, 'account-username-link-email');
     expect(onOpenAccountEmail).toHaveBeenCalledTimes(1);
     tree.unmount();
   });
 
   it('without the door wired, the sentence stands alone', async () => {
-    stubRows({ profile: profileAged(4 * DAY_MS) });
+    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('needs_verification');
+    stubRows({});
     const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
     expect(has(tree, 'account-username-needs-identifier')).toBe(true);
     expect(has(tree, 'account-username-link-email')).toBe(false);
     tree.unmount();
   });
 
-  it('a young account: the button is disabled under the hours sentence, and re-arms on its own when the three days are up', async () => {
-    // The age is this device's own account-level truth (the server counts the
-    // CALLER's createdAt, which the ULID carries), so refusing the tap locally
-    // costs nothing true. Fake timers drive the re-arm; the clock and the
-    // timers move together.
-    jest.restoreAllMocks();
-    jest.useFakeTimers({ now: NOW_MS });
-    try {
-      // 71 h old: sixty minutes to go — "about 1 hour" until the gate opens.
-      stubRows({ email: EMAIL_ROW, profile: profileAged(71 * HOUR_MS) });
-      const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
-      await type(tree, 'account-username-input', 'alice_7');
-      const submit = () =>
-        tree.root.findAllByProps({ testID: 'account-username-submit' }).find(n => n.props.onPress !== undefined)!;
-      expect(has(tree, 'account-username-needs-age')).toBe(true);
-      expect(rendered(tree)).toContain('about 1 hour');
-      expect(submit().props.disabled).toBe(true);
-
-      // 31 minutes on: 29 to go, still "about 1 hour" (the hours round up),
-      // still refused. The 60 s ticks have re-rendered it thirty-one times.
-      await ReactTestRenderer.act(async () => {
-        jest.advanceTimersByTime(31 * 60_000);
-      });
-      expect(rendered(tree)).toContain('about 1 hour');
-      expect(submit().props.disabled).toBe(true);
-
-      // …and the moment the three days are up, the button re-arms on its own.
-      await ReactTestRenderer.act(async () => {
-        jest.advanceTimersByTime(30 * 60_000);
-      });
-      expect(has(tree, 'account-username-needs-age')).toBe(false);
-      expect(submit().props.disabled).toBe(false);
-      tree.unmount();
-    } finally {
-      jest.useRealTimers();
-    }
+  it('an unavailable eligibility read says connection, keeps claim disabled, and Retry rechecks', async () => {
+    jest
+      .spyOn(accountsUsername, 'getUsernameEligibility')
+      .mockResolvedValueOnce('unavailable')
+      .mockResolvedValue('eligible');
+    stubRows({});
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    await type(tree, 'account-username-input', 'alice_7');
+    expect(has(tree, 'account-username-eligibility-unavailable')).toBe(true);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.eligibilityUnavailable);
+    const submit = () =>
+      tree.root.findAllByProps({ testID: 'account-username-submit' }).find(n => n.props.disabled !== undefined)!;
+    expect(submit().props.disabled).toBe(true);
+    await press(tree, 'account-username-eligibility-retry');
+    expect(has(tree, 'account-username-eligibility-unavailable')).toBe(false);
+    expect(submit().props.disabled).toBe(false);
+    tree.unmount();
   });
 
-  it('the module: when the claim gate opens, in milliseconds since the epoch; null for an ID that does not decode', () => {
-    const created = NOW_MS - HOUR_MS;
-    expect(accountsUsername.usernameClaimOpensAtMs(ulid(created))).toBe(created + 72 * HOUR_MS);
-    expect(accountsUsername.usernameClaimOpensAtMs('01HQSELF000000000000000000')).toBeNull();
+  it('proof removal never disables consent or unlink cleanup for a held name', async () => {
+    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('needs_verification');
+    stubRows({ row: HELD });
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(tree, 'account-username-needs-identifier')).toBe(false);
+    await press(tree, 'account-username-unlink');
+    expect(has(tree, 'account-username-unlink-confirm')).toBe(true);
+    tree.unmount();
   });
 });

@@ -50,6 +50,8 @@ jest.mock('../src/ws', () => {
 });
 
 jest.mock('../src/registration', () => ({
+  hasPendingAccountDeletion: jest.fn(async () => false),
+  clearStaleInstallationCredentials: jest.fn(async () => undefined),
   createOrRestoreAccount: jest.fn(),
 }));
 

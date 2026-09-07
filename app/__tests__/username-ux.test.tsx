@@ -54,7 +54,9 @@ import App from '../App';
 import * as api from '../src/api';
 import { ApiRequestError } from '../src/api';
 import * as accounts from '../src/accounts';
+import { ACCOUNTS_COPY } from '../src/accountsCopy';
 import * as accountsUsername from '../src/accountsUsername';
+import { ACCOUNTS_PHONE_COPY } from '../src/accountsPhoneCopy';
 import { ACCOUNTS_USERNAME_COPY } from '../src/accountsUsernameCopy';
 import * as db from '../src/db';
 import { handleAccountsNoticeFrame, type LinkingDeps } from '../src/linking';
@@ -66,6 +68,8 @@ import { DiscoveryScreen } from '../src/screens/DiscoveryScreen';
 import { SettingsScreen } from '../src/screens/SettingsScreen';
 
 jest.mock('../src/registration', () => ({
+  hasPendingAccountDeletion: jest.fn(async () => false),
+  clearStaleInstallationCredentials: jest.fn(async () => true),
   createOrRestoreAccount: jest.fn(),
 }));
 
@@ -181,6 +185,10 @@ const frame = (payload: object): AccountsNoticeFrame => ({
   ts: NOW_MS,
 });
 
+beforeEach(() => {
+  jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('eligible');
+});
+
 afterEach(() => {
   mockUsernameUiEnabled = true;
   session.setMode('real');
@@ -232,6 +240,7 @@ describe('with USERNAME_UI_ENABLED off (the shipped value), the username surface
       jest.spyOn(api, 'apiUnlinkUsername'),
       jest.spyOn(api, 'apiSetUsernameDiscoverable'),
       jest.spyOn(api, 'apiDiscoveryLookupUsername'),
+      jest.spyOn(api, 'apiUsernameEligibility'),
     ];
     const paths: string[] = [];
     const realFetch = globalThis.fetch;
@@ -317,18 +326,30 @@ describe('the claim surface (pin ON): local pre-checks, consent-at-claim, the pr
     tree.unmount();
   });
 
-  it('the claim gate precondition is SURFACED from this device\'s own rows — shown with no verified identifier, quiet with one, never a block', async () => {
+  it('the authoritative group proof gate disables claim and offers verification; a linked sibling proof enables it despite empty local rows', async () => {
+    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('needs_verification');
     stubRows({});
-    const none = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    const openEmail = jest.fn();
+    const claim = jest.spyOn(accountsUsername, 'claimUsername');
+    const none = await render(
+      <AccountUsernameScreen onBack={jest.fn()} onOpenAccountEmail={openEmail} />,
+    );
     expect(has(none, 'account-username-needs-identifier')).toBe(true);
-    expect(rendered(none)).toContain('three days old');
-    // Surfaced, not enforced: the form stays, the server is the gate.
     expect(has(none, 'account-username-input')).toBe(true);
+    await type(none, 'account-username-input', 'alice_7');
+    expect(submitDisabled(none)).toBe(true);
+    await press(none, 'account-username-link-email');
+    expect(openEmail).toHaveBeenCalledTimes(1);
+    expect(claim).not.toHaveBeenCalled();
     none.unmount();
+
     jest.restoreAllMocks();
-    stubRows({ email: EMAIL_ROW });
+    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('eligible');
+    stubRows({});
     const some = await render(<AccountUsernameScreen onBack={jest.fn()} />);
     expect(has(some, 'account-username-needs-identifier')).toBe(false);
+    await type(some, 'account-username-input', 'alice_7');
+    expect(submitDisabled(some)).toBe(false);
     some.unmount();
   });
 
@@ -351,6 +372,7 @@ describe('the claim surface (pin ON): local pre-checks, consent-at-claim, the pr
 describe('the refusal render: taken, the generic retry, and the connection sentence are three distinct renders', () => {
   async function claimWith(outcome: accountsUsername.UsernameClaimOutcome): Promise<string> {
     jest.restoreAllMocks();
+    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('eligible');
     stubRows({ email: EMAIL_ROW });
     jest.spyOn(accountsUsername, 'claimUsername').mockResolvedValue(outcome);
     const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
@@ -681,6 +703,48 @@ describe('the revocation notice: a usernameRevoked frame through the REAL parser
 /* ── 6. find by username ────────────────────────────────────────────── */
 
 describe('find by username: the chip is shown and chosen, the typed handle rides to the card, the chat is marked discovery-username', () => {
+  it('checks caller proof before a target query; missing proof shows the email door and never becomes a no-match', async () => {
+    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('needs_verification');
+    const lookup = jest.spyOn(accountsUsername, 'discoverySearchByUsername');
+    const openEmail = jest.fn();
+    const tree = await render(
+      <DiscoveryScreen
+        onBack={jest.fn()}
+        onOpenChat={jest.fn()}
+        onOpenAccountEmail={openEmail}
+      />,
+    );
+    await type(tree, 'discovery-input', 'alice_7');
+    await press(tree, 'discovery-search');
+    expect(accountsUsername.getUsernameEligibility).toHaveBeenCalled();
+    expect(lookup).not.toHaveBeenCalled();
+    expect(has(tree, 'discovery-username-needs-identifier')).toBe(true);
+    expect(has(tree, 'discovery-no-match')).toBe(false);
+    await press(tree, 'discovery-username-link-email');
+    expect(openEmail).toHaveBeenCalledTimes(1);
+    tree.unmount();
+  });
+
+  it('leaving while the proof check is pending never starts the target lookup afterward', async () => {
+    let resolveEligibility!: (value: accountsUsername.UsernameEligibilityOutcome) => void;
+    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockImplementation(
+      () =>
+        new Promise(resolve => {
+          resolveEligibility = resolve;
+        }),
+    );
+    const lookup = jest.spyOn(accountsUsername, 'discoverySearchByUsername');
+    const tree = await render(<DiscoveryScreen onBack={jest.fn()} onOpenChat={jest.fn()} />);
+    await type(tree, 'discovery-input', 'alice_7');
+    await press(tree, 'discovery-search');
+    tree.unmount();
+    await ReactTestRenderer.act(async () => {
+      resolveEligibility('eligible');
+      await Promise.resolve();
+    });
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
   it('the result card carries the handle VERBATIM (case and spacing included) and never a ULID; the header names the class', async () => {
     jest.spyOn(db, 'loadAccountIdentifier').mockResolvedValue(EMAIL_ROW);
     jest.spyOn(db, 'loadPhoneIdentifier').mockResolvedValue(null);
@@ -770,6 +834,9 @@ describe('find by username: the chip is shown and chosen, the typed handle rides
     await press(tree, 'discovery-search');
     expect(has(tree, 'discovery-no-match')).toBe(true);
     expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.findNoMatch);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_COPY.discoverNeedsOwnEmail);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_PHONE_COPY.discoverNeedsOwnIdentifier);
+    expect(has(tree, 'discovery-username-needs-identifier')).toBe(false);
     await press(tree, 'discovery-info');
     for (const line of ACCOUNTS_USERNAME_COPY.findExplain) expect(rendered(tree)).toContain(line);
     // The design: a username never buys search rights — the explainer says so.
@@ -893,6 +960,7 @@ describe('Settings → ACCOUNT: the username row (pin ON) is labeled from the de
     });
     // No verified identifier of either class: the sentence carries the door.
     stubRows({});
+    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('needs_verification');
     // The boot now ASKS THE SERVER what build it still talks to, before the
     // socket. Left to the environment's real
     // `fetch`, that request is an outbound connection this suite never

@@ -13,6 +13,7 @@ import {
   USERNAME_TAKEN_STATUS,
   USERNAME_TOMBSTONE_TTL_SECONDS,
   UsernameClaimRequest,
+  UsernameEligibilityResponse,
   UsernameIdentifier,
   UsernameTakenResponse,
   UsernameUnlinkRequest,
@@ -317,6 +318,27 @@ describe('DiscoveryLookupRequest: the THIRD parallel field (server-first; one-of
       { username: 'ålice' }, // non-ASCII outside the fold
     ]) {
       expect(DiscoveryLookupRequest.safeParse(bad).success, JSON.stringify(bad)).toBe(false);
+    }
+  });
+});
+
+describe('UsernameEligibilityResponse: caller-owned possession proof only', () => {
+  it('accepts one strict boolean and refuses reason, age, identifier, or target fields', () => {
+    expect(UsernameEligibilityResponse.parse({ hasVerifiedIdentifier: true })).toEqual({
+      hasVerifiedIdentifier: true,
+    });
+    expect(UsernameEligibilityResponse.parse({ hasVerifiedIdentifier: false })).toEqual({
+      hasVerifiedIdentifier: false,
+    });
+    for (const bad of [
+      {},
+      { hasVerifiedIdentifier: 'yes' },
+      { hasVerifiedIdentifier: false, reason: 'missing_email' },
+      { hasVerifiedIdentifier: true, ageHours: 72 },
+      { hasVerifiedIdentifier: true, email: 'a@example.test' },
+      { hasVerifiedIdentifier: true, username: 'alice' },
+    ]) {
+      expect(UsernameEligibilityResponse.safeParse(bad).success).toBe(false);
     }
   });
 });

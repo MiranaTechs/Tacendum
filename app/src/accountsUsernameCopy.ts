@@ -46,25 +46,17 @@ export const ACCOUNTS_USERNAME_COPY = {
   invalid:
     'That is not a valid username. Use 3 to 32 lowercase letters, digits or underscores, starting with a letter.',
   reserved: 'That name is reserved — try another.',
-  /** The two preconditions the claim gate enforces, each surfaced
-   * up front from THIS device's own knowledge and each with its own
-   * sentence (build 24 — simulator testing typed names into thirteen
-   * "try again later"s): a name is free to hold, never free to mint. */
+  /** The possession-proof precondition for claim and username lookup,
+   * surfaced from the server's caller-owned group answer. */
   /**
    * The door beside the sentence above: the step it names, one tap away.
    * Opens the email surface — the class every binary can link. */
   needsIdentifierAction: 'Link an email',
   needsIdentifier:
-    'Link and verify an email address or phone number first — a username can only be claimed by an account that holds one and is at least three days old. This keeps names from being grabbed by the thousand.',
-  /** The age gate, said with the wait left: the account's birth is the
-   * server's own stamp on this device's ID, so the device can count. A
-   * CONDITION, never a promise: the age is one of several server
-   * gates (identifier possession, cool-down, budget, name taken), so this
-   * sentence says when the three days end — not that a claim will land. */
-  needsAge: (hoursLeft: number) =>
-    `Your account needs to be 3 days old to claim a username. Yours is younger — the three days are up in about ${
-      hoursLeft >= 48 ? `${Math.round(hoursLeft / 24)} days` : `${hoursLeft} hour${hoursLeft === 1 ? '' : 's'}`
-    }.`,
+    'Link and verify an email address or phone number first. A verified identifier keeps names and searches from being automated at scale.',
+  eligibilityChecking: 'Checking whether this account can use usernames…',
+  eligibilityUnavailable: 'Could not check username access. Check your connection and try again.',
+  eligibilityRetry: 'Try again',
   /** The claim form after an unlink THIS device performed (an unlink
    * stamps the same 30-day cool-down a rename does, and only the exact
    * unlinked name is reclaimable inside it). The server's refusal of a
@@ -150,7 +142,7 @@ export const ACCOUNTS_USERNAME_COPY = {
    * number on the searcher's own account does). */
   findExplain: [
     'If a miss looked different from “registered but not findable”, typing a username would reveal whether its owner uses Tacendum — without their consent. So every refusal is identical, including the one your own daily search budget causes.',
-    'Searching needs a verified email or phone number on your own account, and an account at least three days old — holding a username is not enough. That makes bulk scraping expensive without changing what you see here.',
+    'Searching needs a verified email or phone number on your own account — holding a username is not enough. That makes bulk scraping expensive without changing what you see here.',
   ],
   /* ── the revocation notice (FIXED copy) ── */
   /** Rendered when a `usernameRevoked` notice landed: kind only on the wire,

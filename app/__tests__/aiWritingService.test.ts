@@ -7,6 +7,7 @@ const OWNER = '01KYWRITINGOWNER00000000001';
 const OTHER_OWNER = '01KYWRITINGOWNER00000000002';
 const OPENAI_KEY_NAME = 'aiWriting.openai';
 const ANTHROPIC_KEY_NAME = 'aiWriting.anthropic';
+const EXTERNAL_PREFERENCE_NAME = 'aiWriting.external';
 const OPENAI_KEY = 'sk-openai-example';
 const ANTHROPIC_KEY = 'sk-ant-example';
 
@@ -75,6 +76,13 @@ function record(ownerId: string, key: string, selected: boolean): string {
   return JSON.stringify({ v: 1, ownerId, key, selected });
 }
 
+function externalPreference(
+  ownerId: string,
+  provider: 'chatgpt' | 'claude',
+): string {
+  return JSON.stringify({ v: 1, ownerId, provider });
+}
+
 async function until(check: () => boolean): Promise<void> {
   for (let i = 0; i < 30; i += 1) {
     if (check()) return;
@@ -132,6 +140,54 @@ afterEach(() => {
 });
 
 describe('writing access and connection storage', () => {
+  it('defaults to a ChatGPT account handoff when no API choice or external preference exists', async () => {
+    arm();
+
+    await expect(service.getWritingConnections()).resolves.toEqual({
+      status: 'completed',
+      state: {
+        mode: 'external',
+        externalProvider: 'chatgpt',
+        selected: null,
+        providers: {
+          openai: { configured: false },
+          anthropic: { configured: false },
+        },
+      },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('stores only an owner-bound external provider preference and never contacts it', async () => {
+    arm();
+
+    const result = await service.selectExternalWritingProvider('claude');
+
+    expect(result).toMatchObject({
+      status: 'completed',
+      state: { mode: 'external', externalProvider: 'claude' },
+    });
+    expect(JSON.parse(crypto.__keychain.get(EXTERNAL_PREFERENCE_NAME)!)).toEqual(
+      { v: 1, ownerId: OWNER, provider: 'claude' },
+    );
+    expect(JSON.stringify(result)).not.toContain('key');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('drops an external preference owned by another account', async () => {
+    crypto.__keychain.set(
+      EXTERNAL_PREFERENCE_NAME,
+      externalPreference(OTHER_OWNER, 'claude'),
+    );
+    arm();
+
+    await expect(service.getWritingConnections()).resolves.toMatchObject({
+      status: 'completed',
+      state: { mode: 'external', externalProvider: 'chatgpt' },
+    });
+    expect(crypto.deleteSecret).toHaveBeenCalledWith(EXTERNAL_PREFERENCE_NAME);
+  });
+
   it('starts denied without touching secure storage or the network', async () => {
     await expect(service.getWritingConnections()).resolves.toEqual({
       status: 'failed',
@@ -183,6 +239,8 @@ describe('writing access and connection storage', () => {
     expect(result).toEqual({
       status: 'completed',
       state: {
+        mode: 'api',
+        externalProvider: 'chatgpt',
         selected: 'openai',
         providers: {
           openai: { configured: true },
@@ -225,6 +283,8 @@ describe('writing access and connection storage', () => {
     expect(state).toEqual({
       status: 'completed',
       state: {
+        mode: 'external',
+        externalProvider: 'chatgpt',
         selected: null,
         providers: {
           openai: { configured: false },
@@ -235,7 +295,7 @@ describe('writing access and connection storage', () => {
     expect(crypto.deleteSecret).toHaveBeenCalledWith(OPENAI_KEY_NAME);
     await expect(
       service.generateWriting({ draft: 'hello', action: { kind: 'improve' } }),
-    ).resolves.toEqual({ status: 'failed', reason: 'not_configured' });
+    ).resolves.toMatchObject({ status: 'handoff', provider: 'chatgpt' });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -253,7 +313,7 @@ describe('writing access and connection storage', () => {
     });
     await expect(
       service.generateWriting({ draft: 'hello', action: { kind: 'improve' } }),
-    ).resolves.toEqual({ status: 'failed', reason: 'not_configured' });
+    ).resolves.toMatchObject({ status: 'handoff', provider: 'chatgpt' });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -405,6 +465,37 @@ describe('writing access and connection storage', () => {
 });
 
 describe('provider requests', () => {
+  it('returns a fixed external-account handoff by default without network or consumer credentials', async () => {
+    arm();
+    const draft = 'Private draft [[TACENDUM_MENTION_0_0]]';
+
+    const result = await service.generateWriting({
+      draft,
+      action: { kind: 'improve' },
+    });
+
+    expect(result).toMatchObject({
+      status: 'handoff',
+      provider: 'chatgpt',
+      url: 'https://chatgpt.com/',
+    });
+    expect(result.status === 'handoff' ? result.prompt : '').toContain(
+      JSON.stringify(draft),
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('uses a prior explicit API-key selection when migrating from the released record format', async () => {
+    crypto.__keychain.set(OPENAI_KEY_NAME, record(OWNER, OPENAI_KEY, true));
+    arm();
+    installFetch(jest.fn(async () => response(200, openAiAnswer())));
+
+    await expect(
+      service.generateWriting({ draft: 'hello', action: { kind: 'shorter' } }),
+    ).resolves.toEqual({ status: 'completed', text: 'Clearer words.' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('sends only the masked draft and fixed writing fields to OpenAI', async () => {
     arm();
     await save('openai', OPENAI_KEY);

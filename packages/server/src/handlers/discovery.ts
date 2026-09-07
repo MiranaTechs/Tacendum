@@ -177,14 +177,15 @@ const discoveryLookupHandler: AuthedHandler = async (event, deps, auth) => {
   }
 
   // THE ANTI-SYBIL CALLER GATE: the
-  // caller must hold a VERIFIED identifier of its own — a real inbox
-  // round-trip per attacker identity, priced by the send budgets — and be
-  // at least 72 h old. Identity keypairs are free; these two are what a
-  // freshly minted fleet of them cannot have. Both refusals are the uniform
-  // exit: the gate must not become its own oracle about the CALLER either.
+  // caller must hold a VERIFIED possession identifier of its own — a real
+  // inbox round-trip per attacker identity, priced by the send budgets.
+  // Email and phone lookup retain the 72 h age gate. Username lookup accepts
+  // a fresh verified account so a new user can use its public-name flow;
+  // its group/user/fleet budgets below remain unchanged. Every refusal is
+  // the uniform exit: the gate must not become an oracle about the caller.
   const caller = await deps.db.getUserById(auth.userId);
   if (!identifierEligible(caller)) return discoveryRefusal();
-  if (deps.now() - caller.createdAt < DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000) {
+  if (!usernameClassed && deps.now() - caller.createdAt < DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000) {
     return discoveryRefusal();
   }
   if (caller.groupId === undefined) return discoveryRefusal();
@@ -227,7 +228,7 @@ const discoveryLookupHandler: AuthedHandler = async (event, deps, auth) => {
   // so one aged user could re-mint `disc:` up to 11 times a day (~220
   // lookups) and the documented 100-aged-user fleet price collapsed to ~10.
   // The user row is the anchor churn cannot shed: a fresh userId means a
-  // fresh 72 h clock. Same pinned constant, ONE more window — an admitted
+  // fresh caller identity. Same pinned constant, ONE more window — an admitted
   // lookup spends BOTH, so a 3-member group still shares 20/day total (the
   // group collapse stands; this window only ever shrinks capacity, never
   // grants). One cross-charge direction exists: a user-window refusal here

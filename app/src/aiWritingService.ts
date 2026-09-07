@@ -5,6 +5,8 @@ import {
   ANTHROPIC_WRITING_MODEL,
   OPENAI_WRITING_MODEL,
   aiWritingInstructions,
+  buildExternalWritingHandoff,
+  isAiWritingExternalProvider,
   isAiWritingProvider,
   parseAnthropicWritingResponse,
   parseOpenAiWritingResponse,
@@ -12,6 +14,7 @@ import {
   type AiWritingClearResult,
   type AiWritingConnectionResult,
   type AiWritingConnectionState,
+  type AiWritingExternalProvider,
   type AiWritingProvider,
   type AiWritingRequest,
   type AiWritingResult,
@@ -29,6 +32,7 @@ const SECRET_NAMES: Record<AiWritingProvider, string> = {
   openai: 'aiWriting.openai',
   anthropic: 'aiWriting.anthropic',
 };
+const EXTERNAL_PREFERENCE_NAME = 'aiWriting.external';
 
 interface StoredConnection {
   v: 1;
@@ -38,6 +42,12 @@ interface StoredConnection {
 }
 
 type StoredConnections = Record<AiWritingProvider, StoredConnection | null>;
+
+interface StoredExternalPreference {
+  v: 1;
+  ownerId: string;
+  provider: AiWritingExternalProvider;
+}
 
 interface AccessSnapshot {
   ownerId: string;
@@ -150,6 +160,27 @@ function parseStoredConnection(
   return candidate as StoredConnection;
 }
 
+function parseStoredExternalPreference(
+  raw: string,
+  ownerId: string,
+): StoredExternalPreference | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return null;
+  }
+  const candidate = parsed as Partial<StoredExternalPreference>;
+  return candidate.v === 1 &&
+    candidate.ownerId === ownerId &&
+    isAiWritingExternalProvider(candidate.provider)
+    ? (candidate as StoredExternalPreference)
+    : null;
+}
+
 type ReadOneResult =
   | { status: 'completed'; connection: StoredConnection | null }
   | { status: 'failed'; reason: 'storage_unavailable' | 'stale' };
@@ -206,6 +237,57 @@ async function readBoth(
   };
 }
 
+type ReadPreferenceResult =
+  | { status: 'completed'; preference: StoredExternalPreference | null }
+  | { status: 'failed'; reason: 'storage_unavailable' | 'stale' };
+
+async function readExternalPreference(
+  snapshot: AccessSnapshot,
+  stillCurrent: () => boolean = () => accessStillCurrent(snapshot),
+): Promise<ReadPreferenceResult> {
+  if (!stillCurrent()) return { status: 'failed', reason: 'stale' };
+  let raw: string | null;
+  try {
+    raw = await getSecret(EXTERNAL_PREFERENCE_NAME);
+  } catch {
+    return { status: 'failed', reason: 'storage_unavailable' };
+  }
+  if (!stillCurrent()) return { status: 'failed', reason: 'stale' };
+  if (raw === null) return { status: 'completed', preference: null };
+  const preference = parseStoredExternalPreference(raw, snapshot.ownerId);
+  if (preference !== null) return { status: 'completed', preference };
+  try {
+    await deleteSecret(EXTERNAL_PREFERENCE_NAME);
+  } catch {
+    return { status: 'failed', reason: 'storage_unavailable' };
+  }
+  if (!stillCurrent()) return { status: 'failed', reason: 'stale' };
+  return { status: 'completed', preference: null };
+}
+
+type ReadWritingStateResult =
+  | {
+      status: 'completed';
+      connections: StoredConnections;
+      preference: StoredExternalPreference | null;
+    }
+  | { status: 'failed'; reason: 'storage_unavailable' | 'stale' };
+
+async function readWritingState(
+  snapshot: AccessSnapshot,
+  stillCurrent: () => boolean = () => accessStillCurrent(snapshot),
+): Promise<ReadWritingStateResult> {
+  const connections = await readBoth(snapshot, stillCurrent);
+  if (connections.status === 'failed') return connections;
+  const preference = await readExternalPreference(snapshot, stillCurrent);
+  if (preference.status === 'failed') return preference;
+  return {
+    status: 'completed',
+    connections: connections.connections,
+    preference: preference.preference,
+  };
+}
+
 function selectedProvider(
   connections: StoredConnections,
 ): AiWritingProvider | null {
@@ -215,9 +297,15 @@ function selectedProvider(
   return selected.length === 1 ? selected[0]! : null;
 }
 
-function publicState(connections: StoredConnections): AiWritingConnectionState {
+function publicState(
+  connections: StoredConnections,
+  preference: StoredExternalPreference | null,
+): AiWritingConnectionState {
+  const selected = selectedProvider(connections);
   return {
-    selected: selectedProvider(connections),
+    mode: preference !== null || selected === null ? 'external' : 'api',
+    externalProvider: preference?.provider ?? 'chatgpt',
+    selected,
     providers: {
       openai: { configured: connections.openai !== null },
       anthropic: { configured: connections.anthropic !== null },
@@ -239,10 +327,13 @@ export function getWritingConnections(): Promise<AiWritingConnectionResult> {
   return serializeStorage(async () => {
     if (!accessStillCurrent(snapshot))
       return { status: 'failed', reason: 'stale' };
-    const read = await readBoth(snapshot);
+    const read = await readWritingState(snapshot);
     return read.status === 'failed'
       ? connectionFailure(read.reason)
-      : { status: 'completed', state: publicState(read.connections) };
+      : {
+          status: 'completed',
+          state: publicState(read.connections, read.preference),
+        };
   });
 }
 
@@ -254,6 +345,31 @@ async function writeConnection(
   if (!accessStillCurrent(snapshot)) return 'stale';
   try {
     await setSecret(SECRET_NAMES[provider], JSON.stringify(connection));
+  } catch {
+    return 'storage_unavailable';
+  }
+  return accessStillCurrent(snapshot) ? 'completed' : 'stale';
+}
+
+async function writeExternalPreference(
+  preference: StoredExternalPreference,
+  snapshot: AccessSnapshot,
+): Promise<'completed' | 'storage_unavailable' | 'stale'> {
+  if (!accessStillCurrent(snapshot)) return 'stale';
+  try {
+    await setSecret(EXTERNAL_PREFERENCE_NAME, JSON.stringify(preference));
+  } catch {
+    return 'storage_unavailable';
+  }
+  return accessStillCurrent(snapshot) ? 'completed' : 'stale';
+}
+
+async function removeExternalPreference(
+  snapshot: AccessSnapshot,
+): Promise<'completed' | 'storage_unavailable' | 'stale'> {
+  if (!accessStillCurrent(snapshot)) return 'stale';
+  try {
+    await deleteSecret(EXTERNAL_PREFERENCE_NAME);
   } catch {
     return 'storage_unavailable';
   }
@@ -284,7 +400,7 @@ export function saveWritingConnection(
   return serializeStorage(async () => {
     if (!accessStillCurrent(snapshot))
       return { status: 'failed', reason: 'stale' };
-    const read = await readBoth(snapshot);
+    const read = await readWritingState(snapshot);
     if (read.status === 'failed') return connectionFailure(read.reason);
     const connections = read.connections;
     const other: AiWritingProvider =
@@ -305,7 +421,11 @@ export function saveWritingConnection(
     const written = await writeConnection(provider, saved, snapshot);
     if (written !== 'completed') return connectionFailure(written);
     connections[provider] = saved;
-    return { status: 'completed', state: publicState(connections) };
+    if (read.preference !== null) {
+      const removed = await removeExternalPreference(snapshot);
+      if (removed !== 'completed') return connectionFailure(removed);
+    }
+    return { status: 'completed', state: publicState(connections, null) };
   });
 }
 
@@ -322,7 +442,7 @@ export function removeWritingConnection(
   return serializeStorage(async () => {
     if (!accessStillCurrent(snapshot))
       return { status: 'failed', reason: 'stale' };
-    const read = await readBoth(snapshot);
+    const read = await readWritingState(snapshot);
     if (read.status === 'failed') return connectionFailure(read.reason);
     try {
       await deleteSecret(SECRET_NAMES[provider]);
@@ -332,7 +452,10 @@ export function removeWritingConnection(
     if (!accessStillCurrent(snapshot))
       return { status: 'failed', reason: 'stale' };
     read.connections[provider] = null;
-    return { status: 'completed', state: publicState(read.connections) };
+    return {
+      status: 'completed',
+      state: publicState(read.connections, read.preference),
+    };
   });
 }
 
@@ -349,7 +472,7 @@ export function selectWritingProvider(
   return serializeStorage(async () => {
     if (!accessStillCurrent(snapshot))
       return { status: 'failed', reason: 'stale' };
-    const read = await readBoth(snapshot);
+    const read = await readWritingState(snapshot);
     if (read.status === 'failed') return connectionFailure(read.reason);
     const connections = read.connections;
     const chosen = connections[provider];
@@ -370,7 +493,44 @@ export function selectWritingProvider(
       if (written !== 'completed') return connectionFailure(written);
       connections[provider] = selected;
     }
-    return { status: 'completed', state: publicState(connections) };
+    if (read.preference !== null) {
+      const removed = await removeExternalPreference(snapshot);
+      if (removed !== 'completed') return connectionFailure(removed);
+    }
+    return { status: 'completed', state: publicState(connections, null) };
+  });
+}
+
+/** Select a consumer app/account handoff. The record contains only this local
+ * choice and its owning Tacendum account; no provider account data is read or
+ * stored. Existing API keys remain available as an explicit secondary mode. */
+export function selectExternalWritingProvider(
+  provider: AiWritingExternalProvider,
+): Promise<AiWritingConnectionResult> {
+  if (allowedSnapshot() === null) {
+    return Promise.resolve({ status: 'failed', reason: 'not_allowed' });
+  }
+  if (!isAiWritingExternalProvider(provider)) {
+    return Promise.resolve({ status: 'failed', reason: 'not_configured' });
+  }
+  const snapshot = mutationSnapshot()!;
+  return serializeStorage(async () => {
+    if (!accessStillCurrent(snapshot)) {
+      return { status: 'failed', reason: 'stale' };
+    }
+    const read = await readBoth(snapshot);
+    if (read.status === 'failed') return connectionFailure(read.reason);
+    const preference: StoredExternalPreference = {
+      v: 1,
+      ownerId: snapshot.ownerId,
+      provider,
+    };
+    const written = await writeExternalPreference(preference, snapshot);
+    if (written !== 'completed') return connectionFailure(written);
+    return {
+      status: 'completed',
+      state: publicState(read.connections, preference),
+    };
   });
 }
 
@@ -385,7 +545,11 @@ export function clearWritingConnections(): Promise<AiWritingClearResult> {
     return Promise.resolve({ status: 'completed' });
   return serializeStorage(async () => {
     let failed = false;
-    for (const provider of ['openai', 'anthropic'] as const) {
+    for (const name of [
+      SECRET_NAMES.openai,
+      SECRET_NAMES.anthropic,
+      EXTERNAL_PREFERENCE_NAME,
+    ] as const) {
       // A real-session cleanup can sit behind a native write. If the app has
       // entered duress while it waited, never begin another Keychain call.
       if (session.mode !== 'real') {
@@ -393,7 +557,7 @@ export function clearWritingConnections(): Promise<AiWritingClearResult> {
         break;
       }
       try {
-        await deleteSecret(SECRET_NAMES[provider]);
+        await deleteSecret(name);
       } catch {
         failed = true;
       }
@@ -480,23 +644,27 @@ function httpFailure(status: number): AiWritingResult {
   return { status: 'failed', reason: 'invalid_response' };
 }
 
-type CredentialResult =
-  | { status: 'completed'; provider: AiWritingProvider; key: string }
+type WritingRouteResult =
+  | { status: 'external'; provider: AiWritingExternalProvider }
+  | { status: 'api'; provider: AiWritingProvider; key: string }
   | {
       status: 'failed';
       reason: 'not_configured' | 'storage_unavailable' | 'stale';
     };
 
-async function selectedCredential(
+async function selectedWritingRoute(
   snapshot: AccessSnapshot,
   stillCurrent: () => boolean,
-): Promise<CredentialResult> {
-  const read = await readBoth(snapshot, stillCurrent);
+): Promise<WritingRouteResult> {
+  const read = await readWritingState(snapshot, stillCurrent);
   if (read.status === 'failed') return read;
+  if (read.preference !== null) {
+    return { status: 'external', provider: read.preference.provider };
+  }
   const provider = selectedProvider(read.connections);
-  if (provider === null) return { status: 'failed', reason: 'not_configured' };
+  if (provider === null) return { status: 'external', provider: 'chatgpt' };
   return {
-    status: 'completed',
+    status: 'api',
     provider,
     key: read.connections[provider]!.key,
   };
@@ -569,32 +737,40 @@ export async function generateWriting(
     const operationCurrent = (): boolean =>
       requestState(snapshot, id, callerSignal) === 'current' &&
       !controller.signal.aborted;
-    const credentialPending = serializeStorage(async () => {
+    const routePending = serializeStorage(async () => {
       if (!operationCurrent())
         return { status: 'failed', reason: 'stale' } as const;
-      return selectedCredential(snapshot, operationCurrent);
+      return selectedWritingRoute(snapshot, operationCurrent);
     });
-    const credentialOrAbort = await Promise.race([credentialPending, aborted]);
-    if (credentialOrAbort === ABORTED) {
+    const routeOrAbort = await Promise.race([routePending, aborted]);
+    if (routeOrAbort === ABORTED) {
       return interrupted() ?? { status: 'failed', reason: 'cancelled' };
     }
-    const credential = credentialOrAbort;
+    const route = routeOrAbort;
     const interruptedBeforeFetch = interrupted();
     if (interruptedBeforeFetch !== null) return interruptedBeforeFetch;
-    if (credential.status === 'failed') {
+    if (route.status === 'failed') {
       const state = requestState(snapshot, id, callerSignal);
       return {
         status: 'failed',
-        reason: state === 'current' ? credential.reason : state,
+        reason: state === 'current' ? route.reason : state,
       };
+    }
+    if (route.status === 'external') {
+      return (
+        buildExternalWritingHandoff(request, route.provider) ?? {
+          status: 'failed',
+          reason: 'invalid_request',
+        }
+      );
     }
 
     let outcome: ProviderOutcome | typeof ABORTED;
     try {
       outcome = await Promise.race([
         providerRequest(
-          credential.provider,
-          credential.key,
+          route.provider,
+          route.key,
           request,
           instructions,
           controller.signal,
@@ -616,7 +792,7 @@ export async function generateWriting(
     if (outcome.kind === 'invalid') {
       return { status: 'failed', reason: 'invalid_response' };
     }
-    return credential.provider === 'openai'
+    return route.provider === 'openai'
       ? parseOpenAiWritingResponse(outcome.body)
       : parseAnthropicWritingResponse(outcome.body);
   } finally {

@@ -1,12 +1,12 @@
 import {
   type AccountsNotice,
-  DISCOVERY_MIN_ACCOUNT_AGE_SECONDS,
   RESERVED_USERNAMES,
   RESERVED_USERNAME_SKELETONS,
   USERNAME_RENAME_COOLDOWN_SECONDS,
   USERNAME_TAKEN_BODY,
   USERNAME_TAKEN_STATUS,
   UsernameClaimRequest,
+  type UsernameEligibilityResponse,
   UsernameUnlinkRequest,
   normalizeUsernameIdentifier,
   usernameSkeleton,
@@ -50,7 +50,7 @@ import {
  * What `taken` discloses is namespace occupancy of a self-chosen public
  * label, never linkage (not who, not whether discoverable, no fact about any
  * possession-proof identifier), and only as the priced side effect of an
- * authenticated, identifier-verified, aged, budget-charged WRITE attempt.
+ * authenticated, identifier-verified, budget-charged WRITE attempt.
  * Reserved names, skeleton conflicts, and live tombstones answer the SAME
  * bytes, so the one distinguishable answer stays one bit. (Byte- and
  * status-uniform, not TIME-uniform: a reserved name returns before any
@@ -111,39 +111,37 @@ function isReservedUsername(normalized: string, skeleton: string): boolean {
  * decides nothing the group state does not). Priced BEFORE resolution, in
  * this order and for these reasons:
  *
- * 1. the caller-keyed route budget (`idroute:`), then the K_id set and the
- * parse — pure CPU, nothing spent on a malformed body;
- * 2. THE CLAIM GATE: a live human caller, ≥72 h old
- * (DISCOVERY_MIN_ACCOUNT_AGE_SECONDS reused), whose GROUP holds at least
- * one verified POSSESSION-PROOF identifier (email or phone — a username
- * never qualifies, the Sybil arithmetic on the record for: free
- * identities × 10/day would otherwise saturate any fleet ceiling and
- * squat thousands of names monthly at zero cost). Refused: the frozen
- * bytes, never an oracle about the caller either;
- * 3. the rename cool-down as a caller-state precheck for a HOLDER (the
- * transaction's `usernameRenamedAt` condition is the enforcement) — a
- * holder inside its 30 days spends nothing on a rename that cannot
- * commit;
- * 4. the caller bucket `unameclaim:<group>` (10/day, its OWN window, never
- * the shared attach budget) and then the fleet ceiling
- * `unameclaim-fleet` (2,000/day), taken AFTER the gate so free
- * identities can never draw the shared budget down; the field-free
- * admitted counter fires here, BEFORE resolution, for every attempt
- * that reaches the namespace (claim and rename alike — the 50% alarm
- * twin's metric);
- * 5. the denylist, on plaintext, before hashing; then, for a NON-holder
- * inside the cool-down (unlink stamps it — the anti-hoarding
- * rule: claim→unlink→claim-another is a rename in two verbs), a
- * pre-read of the exact-name row at every active version: the caller's
- * OWN live tombstone at any of them admits the reclaim
- * (`reclaimingOwn`, the former-owner right — on a retiring
- * version too), anything else is the frozen refusal without a
- * transaction — this precheck needs the claim keys, so it sits after
- * the hash and the budgets (a refused attempt burns budget, never the
- * cool-down); then
- * the transaction — `claimUsername` for a group holding no name,
- * `renameUsername` (the five-item Put-overwrite transaction) for a
- * holder.
+ *  1. the caller-keyed route budget (`idroute:`), then the K_id set and the
+ *     parse — pure CPU, nothing spent on a malformed body;
+ *  2. THE CLAIM GATE: a live human caller whose GROUP holds at least
+ *     one verified POSSESSION-PROOF identifier (email or phone — a username
+ *     never qualifies). Fresh verified accounts may claim immediately;
+ *     proof plus the caller and fleet budgets retain the anti-automation
+ *     cost. Refused: the frozen bytes, never an oracle about the caller;
+ *  3. the rename cool-down as a caller-state precheck for a HOLDER (the
+ *     transaction's `usernameRenamedAt` condition is the enforcement) — a
+ *     holder inside its 30 days spends nothing on a rename that cannot
+ *     commit;
+ *  4. the caller bucket `unameclaim:<group>` (10/day, its OWN window, never
+ *     the shared attach budget) and then the fleet ceiling
+ *     `unameclaim-fleet` (2,000/day), taken AFTER the gate so free
+ *     identities can never draw the shared budget down; the field-free
+ *     admitted counter fires here, BEFORE resolution, for every attempt
+ *     that reaches the namespace (claim and rename alike — the 50% alarm
+ *     twin's metric);
+ *  5. the denylist, on plaintext, before hashing; then, for a NON-holder
+ *     inside the cool-down (unlink stamps it — the anti-hoarding
+ *     fix: claim→unlink→claim-another is a rename in two verbs), a
+ *     pre-read of the exact-name row at every active version: the caller's
+ *     OWN live tombstone at any of them admits the reclaim
+ *     (`reclaimingOwn`, the former-owner right — on a retiring
+ *     version too), anything else is the frozen refusal without a
+ *     transaction — this precheck needs the claim keys, so it sits after
+ *     the hash and the budgets (a refused attempt burns budget, never the
+ *     cool-down); then
+ *     the transaction — `claimUsername` for a group holding no name,
+ *     `renameUsername` (the five-item Put-overwrite transaction) for a
+ *     holder.
  */
 const usernameClaimHandler: AuthedHandler = async (event, deps, auth) => {
   if ((await deps.rateLimit.take(`idroute:${auth.userId}`, LIMITS.identifierRoute)) > 0) {
@@ -164,9 +162,6 @@ const usernameClaimHandler: AuthedHandler = async (event, deps, auth) => {
   if (!identifierEligible(caller)) return usernameRefusal();
   const nowMs = deps.now();
   const nowSeconds = Math.floor(nowMs / 1000);
-  if (nowMs - caller.createdAt < DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000) {
-    return usernameRefusal();
-  }
   // Grouped by construction: the possession-proof gate below can only
   // be satisfied by a group, and a solo device holds no refs at all.
   if (caller.groupId === undefined) return usernameRefusal();
@@ -308,6 +303,37 @@ const usernameClaimHandler: AuthedHandler = async (event, deps, auth) => {
 };
 
 /**
+ * GET /v1/identifiers/username/eligibility — the caller's own readiness for
+ * username claim and lookup. It accepts no name or target and returns only
+ * whether this account group holds an email or phone possession proof. The
+ * group read means a verified linked sibling qualifies even when this device
+ * has no local identifier row.
+ */
+const usernameEligibilityHandler: AuthedHandler = async (_event, deps, auth) => {
+  if ((await deps.rateLimit.take(`idroute:${auth.userId}`, LIMITS.identifierRoute)) > 0) {
+    return usernameRefusal();
+  }
+  // The pointer is authorization-adjacent: an amicable unlink can leave a
+  // stale eventual read naming the former group. Read it strongly, then
+  // require the caller in the authoritative roster before consuming any of
+  // that group's proof state.
+  const caller = await deps.db.getUserById(auth.userId, undefined, { consistent: true });
+  if (!identifierEligible(caller)) return usernameRefusal();
+
+  let hasVerifiedIdentifier = false;
+  if (caller.groupId !== undefined) {
+    const group = await deps.db.getAccountGroup(caller.groupId);
+    if (group?.members.some((member) => member.userId === auth.userId)) {
+      hasVerifiedIdentifier =
+        classRefs(group.identifierRefs, EMAIL_CLAIM_KEY_PREFIX).length > 0 ||
+        classRefs(group.identifierRefs, PHONE_CLAIM_KEY_PREFIX).length > 0;
+    }
+  }
+  const response: UsernameEligibilityResponse = { hasVerifiedIdentifier };
+  return json(200, response);
+};
+
+/**
  * POST /v1/identifiers/username/unlink — the per-class twin of the email and
  * phone unlinks: only THIS class leaves — the claim row and its
  * skeleton row become former-owner tombstones (never deletes), the ref
@@ -424,3 +450,4 @@ export async function revokeUsernameAndNotify(
 export const usernameClaimRoute: Handler = accountsUsernameRoute(usernameClaimHandler);
 export const usernameRenameRoute: Handler = accountsUsernameRoute(usernameClaimHandler);
 export const usernameUnlinkRoute: Handler = accountsUsernameRoute(usernameUnlinkHandler);
+export const usernameEligibilityRoute: Handler = accountsUsernameRoute(usernameEligibilityHandler);

@@ -49,6 +49,8 @@ jest.mock('../src/ws', () => {
 });
 
 jest.mock('../src/registration', () => ({
+  hasPendingAccountDeletion: jest.fn(async () => false),
+  clearStaleInstallationCredentials: jest.fn(async () => undefined),
   createOrRestoreAccount: jest.fn(),
 }));
 
@@ -64,6 +66,7 @@ import { session } from '../src/session';
 import * as calling from '../src/call';
 import { getWritingConnections } from '../src/aiWritingService';
 import { SettingsScreen } from '../src/screens/SettingsScreen';
+import { ProfileScreen } from '../src/screens/ProfileScreen';
 
 interface FakeDb {
   name: string;
@@ -240,6 +243,38 @@ test('Lock now revokes writing before waiting for call teardown', async () => {
     await flush();
   });
   expect(currentRoute()).toBe('locked');
+});
+
+test('a stale profile deletion completion cannot replace a newer lock or unlock', async () => {
+  const tree = await unlockWritingWorkspace();
+  const nav = (globalThis as unknown as {
+    TacendumDevNav: (route: { name: string; from?: string }) => void;
+  }).TacendumDevNav;
+  await ReactTestRenderer.act(async () => nav({ name: 'profile', from: 'chats' }));
+  const oldProfile = tree.root.findByType(ProfileScreen).props;
+  await ReactTestRenderer.act(async () => nav({ name: 'settings', from: 'profile' }));
+  await ReactTestRenderer.act(async () => {
+    await tree.root.findByType(SettingsScreen).props.onLockNow();
+    await flush();
+  });
+  expect(currentRoute()).toBe('locked');
+  await ReactTestRenderer.act(async () => {
+    oldProfile.onSignedOut();
+    oldProfile.onDeletionPending();
+    await flush();
+  });
+  expect(currentRoute()).toBe('locked');
+  for (const key of ['1', '2', '3', '4', '5', '6']) await press(tree, `pin-key-${key}`);
+  await press(tree, 'pin-submit');
+  await ReactTestRenderer.act(flush);
+  expect(currentRoute()).toBe('chats');
+  await ReactTestRenderer.act(async () => {
+    oldProfile.onSignedOut();
+    oldProfile.onDeletionPending();
+    await flush();
+  });
+  expect(currentRoute()).toBe('chats');
+  expect(tree.root.findAllByProps({ testID: 'account-deletion-pending' })).toHaveLength(0);
 });
 
 /** The jest.setup factory's own read, restorable after the failure leg. */

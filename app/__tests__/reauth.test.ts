@@ -337,6 +337,48 @@ test('a suspended re-auth is silent: deletion is when a 401 is the point', async
   expect(await reauth.reauthenticate(STALE)).toBe('ok');
 });
 
+test('deletion waits for an already-issued renewal and reads its final bearer', async () => {
+  let answer!: (value: { userId: string; authToken: string }) => void;
+  let issued!: () => void;
+  const started = new Promise<void>(resolve => { issued = resolve; });
+  api.apiAuth.mockImplementation(() => {
+    issued();
+    return new Promise(resolve => { answer = resolve; });
+  });
+  const renewal = reauth.reauthenticate(STALE);
+  await started;
+  let settled = false;
+  const stopped = Promise.resolve(reauth.suspendReauth()).then(() => { settled = true; });
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  expect(await reauth.reauthenticate(STALE)).toBe('silent');
+  answer({ userId: USER_ID, authToken: 'renewed-before-deletion' });
+  await stopped;
+  expect(await renewal).toBe('ok');
+  expect(await reauth.currentToken()).toBe('renewed-before-deletion');
+});
+
+test('renewal sends the original ID so a deleted identity cannot create an orphan account', async () => {
+  db.loadProfile.mockResolvedValue({ userId: USER_ID });
+  expect(await reauth.reauthenticate(STALE)).toBe('ok');
+  expect(api.apiAuth).toHaveBeenCalledWith(IDENTITY_KEY, CHALLENGE, expect.any(String), USER_ID);
+});
+
+test('a deleted expected account is terminal without adopting a new bearer', async () => {
+  api.apiAuth.mockRejectedValue(apiError(409, 'account_gone'));
+  expect(await reauth.reauthenticate(STALE)).toBe('gone');
+  expect(crypto.__keychain.get(reauth.AUTH_TOKEN_KEY)).toBe(STALE);
+});
+
+test('duress entering during the continuity read prevents publication', async () => {
+  db.loadProfile.mockImplementation(async () => {
+    session.setMode('duress');
+    return { userId: USER_ID };
+  });
+  expect(await reauth.reauthenticate(STALE)).toBe('silent');
+  expect(crypto.__keychain.get(reauth.AUTH_TOKEN_KEY)).toBe(STALE);
+});
+
 test('a profile that cannot be read fails CLOSED, adopting nothing', async () => {
   // The database is shut behind the lock screen, so the userId continuity check
   // cannot run. Accepting the token anyway — the first draft's behaviour — puts

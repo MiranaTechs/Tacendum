@@ -86,15 +86,25 @@ Copy may describe those modes but must not characterize provider retention,
 training, or terms beyond the operator's applicable agreement. Vendor terms
 can change; the statements above are dated rather than permanent assurances.
 
-### 2.2 Optional writing assistant (2026-09-07)
+### 2.2 Optional writing assistant (build 31, 2026-09-07)
 
-The writing assistant has a separate, direct data flow. A person may save an
-OpenAI or Anthropic API key in the phone's protected native store. ChatGPT and
-Claude subscriptions do not cover API billing. Setup states this before saving.
+The default option uses the person's existing ChatGPT or Claude account in the
+provider's own app or website. Choosing a writing action copies a prepared
+request and opens a fixed official HTTPS origin without any draft text in its
+URL. The person pastes the request there, then returns and pastes the reply into
+Tacendum for review. This requires switching apps. Tacendum never collects
+consumer subscription credentials or makes an API request in this mode. Account
+availability and limits remain the provider's. The explicitly copied request
+stays on the OS clipboard until replaced; Tacendum never automatically reads it.
+
+API keys remain a separate optional mode. A person may save an OpenAI or
+Anthropic API key in the phone's protected native store. API billing is separate
+from ChatGPT and Claude subscriptions. Existing explicitly selected API settings
+survive the update. There is no automatic API fallback from account handoff.
 
 Opening Improve reads connection metadata but does not generate. Choosing
-Improve, Shorter, Warmer or Translate sends the unsent draft directly over
-HTTPS to the selected provider, named in the panel. Only transformation
+Improve, Shorter, Warmer or Translate in API mode sends the unsent draft over
+HTTPS to the selected provider, named in the panel. In either mode only transformation
 instructions and the draft are included. Picked mentions are replaced by
 opaque tokens; IDs and picked display names stay local. Other personal
 information typed into the draft still reaches the provider. No chat history,
@@ -106,7 +116,7 @@ is not a zero-retention claim. Processing, retention and billing follow the
 person's provider agreement; Tacendum cannot delete a request already received
 by the provider. Consumer sign-in is not used to authorize these API requests.
 
-The result stays in memory until Use text adopts it into the ordinary local
+The generated or manually pasted result stays in memory until Use text adopts it into the ordinary local
 draft. It is not a chat message, agent reply or recipient notification. Send
 remains separate, after human review. Undo restores the original only while
 the adopted draft is unchanged. The integration-account origin marker below
@@ -116,7 +126,10 @@ drafts merely because their author used a writing aid.
 Provider keys never enter the Tacendum relay, database, sync, notifications or
 diagnostics. Native records are account-bound and cleared on disconnect,
 successful real account deletion and initial installation cleanup. Lock,
-duress and background transitions revoke access and retire results. Saved
+duress and background transitions revoke access and retire results. Returning
+from the provider requires reopening Improve and manually pasting into an empty
+reply field; the unsent draft remains in place. Provider preferences are also
+owner-bound and cleared during account cleanup. Saved
 means saved: the UI does not claim a key is verified before a successful
 request. Implementation: `app/src/aiWritingService.ts`,
 `app/src/aiWritingDraft.ts`, and the composer integration.
