@@ -149,6 +149,29 @@ describe('the local preview mirrors only the front camera', () => {
     await expect(calling.flipCamera()).rejects.toThrow();
     expect(calling.localMediaState().frontCamera).toBe(true);
   });
+
+  it('does not let a late flip change the next call’s preview', async () => {
+    const nextCid = '01J0000000000000000000000Q';
+    await inCall(true);
+    let finish: () => void = () => undefined;
+    (native.switchCamera as jest.Mock).mockImplementationOnce(
+      () =>
+        new Promise<void>(resolve => {
+          finish = resolve;
+        }),
+    );
+
+    const oldFlip = calling.flipCamera();
+    await flush();
+    await calling.callController().hangup();
+    await calling.callController().placeCall(PEER, nextCid, true);
+    expect(calling.localMediaState().frontCamera).toBe(true);
+
+    finish();
+    await oldFlip;
+
+    expect(calling.localMediaState().frontCamera).toBe(true);
+  });
 });
 
 /**
@@ -394,11 +417,271 @@ describe('the quality indicator is fed a real number', () => {
     }
   });
 
-  it('starts optimistic rather than at one bar', async () => {
-    // An indicator that opens on "poor" and climbs is worse than none: the
-    // first frame is what the person reads.
+  it('stops sampling when the calling integration is torn down', async () => {
+    jest.useFakeTimers();
+    try {
+      await inCall(false);
+      await calling.callController().onIceStateChanged(CID, 'connected');
+      (native.sampleQuality as jest.Mock).mockClear();
+
+      teardown?.();
+      teardown = undefined;
+      await jest.advanceTimersByTimeAsync(30_000);
+
+      expect(native.sampleQuality).not.toHaveBeenCalled();
+      expect(calling.localMediaState()).toMatchObject({
+        quality: -1,
+        qualityStatus: 'unavailable',
+      });
+    } finally {
+      calling.resetCallingForTests();
+      jest.useRealTimers();
+    }
+  });
+
+  it('starts as checking instead of claiming a measurement', async () => {
+    // Connected has not supplied a packet sample yet. Three bars here would
+    // claim a good connection from absence of evidence; one bar would make
+    // the same mistake in the other direction.
     await inCall(false);
-    expect(calling.localMediaState().quality).toBe(3);
+    expect(calling.localMediaState()).toMatchObject({
+      quality: -1,
+      qualityStatus: 'checking',
+    });
+  });
+
+  it('shows explicit unknown when native has no packets yet', async () => {
+    jest.useFakeTimers();
+    try {
+      (native.sampleQuality as jest.Mock).mockResolvedValueOnce(-1);
+      await inCall(false);
+      await calling.callController().onIceStateChanged(CID, 'connected');
+
+      await jest.advanceTimersByTimeAsync(3_000);
+
+      expect(calling.localMediaState()).toMatchObject({
+        quality: -1,
+        qualityStatus: 'unavailable',
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it.each([0, 4, 2.5, Number.NaN])(
+    'rejects malformed native level %p instead of drawing bars',
+    async level => {
+      jest.useFakeTimers();
+      try {
+        (native.sampleQuality as jest.Mock).mockResolvedValueOnce(level);
+        await inCall(false);
+        await calling.callController().onIceStateChanged(CID, 'connected');
+
+        await jest.advanceTimersByTimeAsync(3_000);
+
+        expect(calling.localMediaState()).toMatchObject({
+          quality: -1,
+          qualityStatus: 'unavailable',
+        });
+      } finally {
+        jest.useRealTimers();
+      }
+    },
+  );
+
+  it('accepts only the three measured levels', async () => {
+    jest.useFakeTimers();
+    try {
+      (native.sampleQuality as jest.Mock)
+        .mockResolvedValueOnce(1)
+        .mockResolvedValueOnce(2)
+        .mockResolvedValueOnce(3);
+      await inCall(false);
+      await calling.callController().onIceStateChanged(CID, 'connected');
+
+      for (const expected of [1, 2, 3]) {
+        await jest.advanceTimersByTimeAsync(3_000);
+        expect(calling.localMediaState()).toMatchObject({
+          quality: expected,
+          qualityStatus: 'measured',
+        });
+      }
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('clears a prior good reading when the next sample fails', async () => {
+    jest.useFakeTimers();
+    try {
+      (native.sampleQuality as jest.Mock)
+        .mockResolvedValueOnce(3)
+        .mockRejectedValueOnce(new Error('stats unavailable'));
+      await inCall(false);
+      await calling.callController().onIceStateChanged(CID, 'connected');
+
+      await jest.advanceTimersByTimeAsync(3_000);
+      expect(calling.localMediaState().quality).toBe(3);
+      await jest.advanceTimersByTimeAsync(3_000);
+
+      expect(calling.localMediaState()).toMatchObject({
+        quality: -1,
+        qualityStatus: 'unavailable',
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('marks one hung sample unavailable without overlapping it or accepting its late answer', async () => {
+    jest.useFakeTimers();
+    try {
+      let finishOld: (level: number) => void = () => undefined;
+      (native.sampleQuality as jest.Mock)
+        .mockImplementationOnce(
+          () =>
+            new Promise<number>(resolve => {
+              finishOld = resolve;
+            }),
+        )
+        .mockResolvedValueOnce(2);
+      await inCall(false);
+      await calling.callController().onIceStateChanged(CID, 'connected');
+
+      await jest.advanceTimersByTimeAsync(3_000);
+      expect(native.sampleQuality).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(3_000);
+      expect(native.sampleQuality).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(2_000);
+      expect(calling.localMediaState()).toMatchObject({
+        quality: -1,
+        qualityStatus: 'unavailable',
+      });
+
+      await jest.advanceTimersByTimeAsync(1_000);
+      expect(native.sampleQuality).toHaveBeenCalledTimes(1);
+
+      finishOld(3);
+      await flush();
+      expect(calling.localMediaState()).toMatchObject({
+        quality: -1,
+        qualityStatus: 'unavailable',
+      });
+
+      await jest.advanceTimersByTimeAsync(3_000);
+      expect(native.sampleQuality).toHaveBeenCalledTimes(2);
+      expect(calling.localMediaState().quality).toBe(2);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('invalidates an old sample across reconnect and starts the new lifetime checking', async () => {
+    jest.useFakeTimers();
+    try {
+      let finishOld: (level: number) => void = () => undefined;
+      (native.sampleQuality as jest.Mock)
+        .mockImplementationOnce(
+          () =>
+            new Promise<number>(resolve => {
+              finishOld = resolve;
+            }),
+        )
+        .mockResolvedValueOnce(1);
+      await inCall(false);
+      await calling.callController().onIceStateChanged(CID, 'connected');
+      await jest.advanceTimersByTimeAsync(3_000);
+
+      await calling.callController().onIceStateChanged(CID, 'disconnected');
+      expect(calling.localMediaState()).toMatchObject({
+        quality: -1,
+        qualityStatus: 'unavailable',
+      });
+      await calling.callController().onIceStateChanged(CID, 'connected');
+      expect(calling.localMediaState()).toMatchObject({
+        quality: -1,
+        qualityStatus: 'checking',
+      });
+
+      await jest.advanceTimersByTimeAsync(3_000);
+      expect(native.sampleQuality).toHaveBeenCalledTimes(1);
+      finishOld(3);
+      await flush();
+
+      // The old lifetime's answer retires the native request but cannot paint
+      // this one. Its next scheduled tick is the first safe retry.
+      expect(calling.localMediaState().quality).toBe(-1);
+      await jest.advanceTimersByTimeAsync(3_000);
+      expect(calling.localMediaState().quality).toBe(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('bounds checking after reconnect while one same-cid native request never settles', async () => {
+    jest.useFakeTimers();
+    try {
+      (native.sampleQuality as jest.Mock).mockImplementationOnce(
+        () => new Promise<number>(() => undefined),
+      );
+      await inCall(false);
+      await calling.callController().onIceStateChanged(CID, 'connected');
+      await jest.advanceTimersByTimeAsync(3_000);
+
+      await calling.callController().onIceStateChanged(CID, 'disconnected');
+      await calling.callController().onIceStateChanged(CID, 'connected');
+      expect(calling.localMediaState().qualityStatus).toBe('checking');
+
+      await jest.advanceTimersByTimeAsync(8_000);
+
+      expect(native.sampleQuality).toHaveBeenCalledTimes(1);
+      expect(calling.localMediaState()).toMatchObject({
+        quality: -1,
+        qualityStatus: 'unavailable',
+      });
+    } finally {
+      teardown?.();
+      teardown = undefined;
+      calling.resetCallingForTests();
+      jest.useRealTimers();
+    }
+  });
+
+  it('lets a new cid sample while rejecting the ended call’s delayed result', async () => {
+    jest.useFakeTimers();
+    try {
+      const nextCid = '01J0000000000000000000000T';
+      let finishOld: (level: number) => void = () => undefined;
+      (native.sampleQuality as jest.Mock)
+        .mockImplementationOnce(
+          () =>
+            new Promise<number>(resolve => {
+              finishOld = resolve;
+            }),
+        )
+        .mockResolvedValueOnce(2);
+      await inCall(false);
+      await calling.callController().onIceStateChanged(CID, 'connected');
+      await jest.advanceTimersByTimeAsync(3_000);
+
+      await calling.callController().hangup();
+      await calling.callController().placeCall(PEER, nextCid, false);
+      await calling.callController().onIceStateChanged(nextCid, 'connected');
+      await jest.advanceTimersByTimeAsync(3_000);
+
+      expect(native.sampleQuality).toHaveBeenLastCalledWith(nextCid);
+      expect(calling.localMediaState()).toMatchObject({
+        quality: 2,
+        qualityStatus: 'measured',
+      });
+
+      finishOld(3);
+      await flush();
+      expect(calling.localMediaState().quality).toBe(2);
+    } finally {
+      calling.resetCallingForTests();
+      jest.useRealTimers();
+    }
   });
 
   it('never lets the stats themselves cross the bridge', async () => {
@@ -642,8 +925,27 @@ describe('mute honours the native verdict', () => {
     sent.mockClear();
     (native.setAudioEnabled as jest.Mock).mockResolvedValueOnce(false);
 
-    await calling.toggleMute();
+    const result = await calling.toggleMute();
 
+    expect(result).toBe('refused');
+    expect(calling.localMediaState().muted).toBe(false);
+    expect(sent.mock.calls.some(c => c[1]?.tcm === 'call.media')).toBe(false);
+  });
+
+  it('a reconnecting call whose live track refused mute stays visibly and actually live', async () => {
+    // This call already had media. `reconnecting` is not the pre-track window:
+    // accepting `false` as queued intent here put a muted button over the
+    // unchanged live microphone and told the peer it was muted.
+    await inCall(true);
+    await calling.callController().onIceStateChanged(CID, 'connected');
+    await calling.callController().onIceStateChanged(CID, 'disconnected');
+    const sent = messaging.sendCallEnvelope as jest.Mock;
+    sent.mockClear();
+    (native.setAudioEnabled as jest.Mock).mockResolvedValueOnce(false);
+
+    const result = await calling.toggleMute();
+
+    expect(result).toBe('refused');
     expect(calling.localMediaState().muted).toBe(false);
     expect(sent.mock.calls.some(c => c[1]?.tcm === 'call.media')).toBe(false);
   });
@@ -717,6 +1019,25 @@ describe('mute honours the native verdict', () => {
     await placing;
     await flush();
     expect(native.setVideoEnabled).toHaveBeenCalledWith(CID, false);
+  });
+
+  it('returns the camera verdict and never changes the selected audio route', async () => {
+    await inCall(true);
+    (native.setSpeaker as jest.Mock).mockClear();
+    (native.setVideoEnabled as jest.Mock).mockResolvedValueOnce(false);
+
+    const refused = await calling.toggleVideo();
+
+    expect(refused).toBe('refused');
+    expect(calling.localMediaState().videoEnabled).toBe(true);
+    expect(native.setSpeaker).not.toHaveBeenCalled();
+
+    (native.setVideoEnabled as jest.Mock).mockResolvedValueOnce(true);
+    const applied = await calling.toggleVideo();
+
+    expect(applied).toBe('applied');
+    expect(calling.localMediaState().videoEnabled).toBe(false);
+    expect(native.setSpeaker).not.toHaveBeenCalled();
   });
 });
 

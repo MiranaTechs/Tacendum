@@ -564,9 +564,8 @@ class TacendumCallModule(private val reactContext: ReactApplicationContext) :
   override fun sampleQuality(cid: String, promise: Promise) {
     val pc = call(cid)
     if (pc == null) {
-      // 3 when there is no such call, so a sample racing a hangup cannot
-      // paint the last frame "poor".
-      promise.resolve(3.0)
+      // Explicit unknown. JS generation-checks a sample racing hangup.
+      promise.resolve(-1.0)
       return
     }
     pc.sampleQuality { bars -> promise.resolve(bars.toDouble()) }

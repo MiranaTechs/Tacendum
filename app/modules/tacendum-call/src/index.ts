@@ -271,7 +271,7 @@ export function stopMonitoringPressure(): Promise<void> {
   return NativeTacendumCall.stopMonitoringPressure();
 }
 
-/** 0–3 bars. Reduced natively, so no stats payload crosses the bridge. */
+/** Measured 1–3, or -1 when unknown. No stats payload crosses the bridge. */
 export function sampleQuality(cid: string): Promise<number> {
   return NativeTacendumCall.sampleQuality(cid);
 }

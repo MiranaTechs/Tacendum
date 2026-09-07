@@ -127,6 +127,13 @@ function renderScreen(
   return { tree, props, byLabel, rerender, toJSON: () => tree.toJSON() };
 }
 
+function visibleStrings(tree: ReactTestRenderer.ReactTestRenderer): string[] {
+  return tree.root
+    .findAllByType(require('react-native').Text)
+    .flatMap(n => [n.props.children].flat())
+    .filter((value): value is string => typeof value === 'string');
+}
+
 /** Capture only the grace deadline. React's own scheduling stays native. */
 function captureGraceTimer() {
   const nativeSetTimeout = globalThis.setTimeout;
@@ -402,6 +409,119 @@ describe('status', () => {
         ),
       ).toHaveLength(0);
     }
+  });
+});
+
+describe('measured connection quality and reconnect recovery', () => {
+  it.each([
+    [1, 'Connection poor'],
+    [2, 'Connection fair'],
+    [3, 'Connection good'],
+  ] as const)('labels measured level %i as %s', (quality, label) => {
+    const { byLabel } = renderScreen({ quality, qualityStatus: 'measured' });
+    expect(byLabel(label)).toBeTruthy();
+  });
+
+  it('shows checking without drawing fabricated bars before a sample', () => {
+    const { tree, byLabel } = renderScreen({
+      quality: -1,
+      qualityStatus: 'checking',
+    });
+    expect(visibleStrings(tree)).toContain('Checking connection…');
+    expect(byLabel('Connection good')).toBeUndefined();
+    expect(byLabel('Connection fair')).toBeUndefined();
+    expect(byLabel('Connection poor')).toBeUndefined();
+  });
+
+  it('says when quality is unavailable without turning unknown into poor', () => {
+    const { tree, byLabel } = renderScreen({
+      quality: -1,
+      qualityStatus: 'unavailable',
+    });
+    expect(visibleStrings(tree)).toContain('Connection quality unavailable');
+    expect(byLabel('Connection poor')).toBeUndefined();
+  });
+
+  it('gives an audio call useful reconnect guidance', () => {
+    const { tree } = renderScreen({
+      state: state({ name: 'reconnecting', video: false }),
+      quality: -1,
+      qualityStatus: 'unavailable',
+    });
+    expect(visibleStrings(tree)).toContain(
+      'Connection interrupted. Audio may pause while Tacendum reconnects.',
+    );
+  });
+
+  it('offers camera-off recovery for video without changing the audio route', async () => {
+    const onToggleVideo = jest.fn(async () => 'applied' as const);
+    const onToggleSpeaker = jest.fn();
+    const { tree } = renderScreen({
+      state: state({ name: 'reconnecting', video: true }),
+      videoEnabled: true,
+      speakerOn: true,
+      onToggleVideo,
+      onToggleSpeaker,
+      quality: -1,
+      qualityStatus: 'unavailable',
+    });
+    expect(visibleStrings(tree)).toContain(
+      'Connection interrupted. Audio and video may pause while Tacendum reconnects.',
+    );
+    const recovery = tree.root.findAll(
+      n => n.props.testID === 'call-reconnect-camera-off',
+    )[0]!;
+
+    await ReactTestRenderer.act(async () => recovery.props.onPress());
+
+    expect(onToggleVideo).toHaveBeenCalledTimes(1);
+    expect(onToggleSpeaker).not.toHaveBeenCalled();
+  });
+
+  it('keeps the local preview below reconnect guidance as the header grows', () => {
+    const { tree } = renderScreen({
+      state: state({
+        name: 'reconnecting',
+        video: true,
+        peerVideo: true,
+      }),
+      videoEnabled: true,
+    });
+    const header = tree.root.findAll(
+      node => node.props.testID === 'call-header',
+    )[0]!;
+
+    ReactTestRenderer.act(() => {
+      header.props.onLayout({ nativeEvent: { layout: { height: 310 } } });
+    });
+
+    const preview = StyleSheet.flatten(pipWrapper(tree)!.props.style);
+    expect(preview.top).toBe(310 + PIP_MARGIN);
+  });
+
+  it('shrinks the preview into the clear band when large text makes the header tall', () => {
+    const { tree } = renderScreen({
+      state: state({
+        name: 'reconnecting',
+        video: true,
+        peerVideo: true,
+      }),
+      videoEnabled: true,
+    });
+    const header = tree.root.findAll(
+      node => node.props.testID === 'call-header',
+    )[0]!;
+
+    ReactTestRenderer.act(() => {
+      header.props.onLayout({ nativeEvent: { layout: { height: 600 } } });
+    });
+
+    const preview = StyleSheet.flatten(pipWrapper(tree)!.props.style);
+    const controlsEdge = 844 - 34 - 96;
+    expect(preview.top).toBe(600 + PIP_MARGIN);
+    expect(preview.top + preview.height).toBeCloseTo(controlsEdge);
+    expect(preview.height).toBeLessThan(PIP_HEIGHT);
+    expect(preview.width / preview.height).toBeCloseTo(PIP_WIDTH / PIP_HEIGHT);
   });
 });
 
@@ -1074,6 +1194,105 @@ describe('controls are usable with VoiceOver', () => {
       byLabel('End call').props.onPress();
     });
     expect(props.onHangup).toHaveBeenCalled();
+  });
+
+  it('owns one camera request at a time and reports an actual refusal', async () => {
+    let finish: (result: 'refused') => void = () => undefined;
+    const onToggleVideo = jest.fn(
+      () =>
+        new Promise<'refused'>(resolve => {
+          finish = resolve;
+        }),
+    );
+    const { tree, byLabel } = renderScreen({
+      state: state({ video: true }),
+      videoEnabled: true,
+      onToggleVideo,
+    });
+    const camera = byLabel('Turn camera off');
+
+    ReactTestRenderer.act(() => {
+      camera.props.onPress();
+      camera.props.onPress();
+    });
+
+    expect(onToggleVideo).toHaveBeenCalledTimes(1);
+    expect(byLabel('Turn camera off').props.accessibilityState).toMatchObject({
+      busy: true,
+      disabled: true,
+    });
+
+    await ReactTestRenderer.act(async () => {
+      finish('refused');
+      await Promise.resolve();
+    });
+
+    expect(visibleStrings(tree)).toContain(
+      'Couldn’t turn the camera off. Try again.',
+    );
+    expect(byLabel('Turn camera off').props.accessibilityState.busy).toBeUndefined();
+  });
+
+  it('reports a refused mute without claiming the microphone changed', async () => {
+    const onToggleMute = jest.fn(async () => 'refused' as const);
+    const { tree, byLabel } = renderScreen({
+      muted: false,
+      onToggleMute,
+    });
+
+    await ReactTestRenderer.act(async () => byLabel('Mute').props.onPress());
+
+    expect(onToggleMute).toHaveBeenCalledTimes(1);
+    expect(visibleStrings(tree)).toContain(
+      'Couldn’t mute the microphone. Try again.',
+    );
+    expect(byLabel('Mute').props.accessibilityState.selected).toBe(false);
+  });
+
+  it('does not let an old connected lifetime clear or report over a new operation', async () => {
+    let finishOld: (result: 'refused') => void = () => undefined;
+    let finishNew: (result: 'applied') => void = () => undefined;
+    const onToggleMute = jest
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<'refused'>(resolve => {
+            finishOld = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<'applied'>(resolve => {
+            finishNew = resolve;
+          }),
+      );
+    const view = renderScreen({ onToggleMute });
+
+    ReactTestRenderer.act(() => {
+      void view.byLabel('Mute').props.onPress();
+    });
+    view.rerender({ state: state({ name: 'reconnecting' }) });
+    view.rerender({ state: state({ name: 'connected' }) });
+    ReactTestRenderer.act(() => {
+      void view.byLabel('Mute').props.onPress();
+    });
+    expect(onToggleMute).toHaveBeenCalledTimes(2);
+
+    await ReactTestRenderer.act(async () => {
+      finishOld('refused');
+      await Promise.resolve();
+    });
+
+    expect(visibleStrings(view.tree)).not.toContain(
+      'Couldn’t mute the microphone. Try again.',
+    );
+    expect(view.byLabel('Mute').props.accessibilityState.busy).toBe(true);
+
+    await ReactTestRenderer.act(async () => {
+      finishNew('applied');
+      await Promise.resolve();
+    });
+    expect(view.byLabel('Mute').props.accessibilityState.busy).toBeUndefined();
   });
 });
 

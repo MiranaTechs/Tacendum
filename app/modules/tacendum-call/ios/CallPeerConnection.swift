@@ -497,7 +497,8 @@ final class CallPeerConnection: NSObject {
   }
 
   /**
-   * 0–3 bars for the local quality indicator.
+   * A measured 1–3 level for the local quality indicator, or -1
+   * when this interval has no received packets to measure.
    *
    * Reduced to a single integer HERE rather than in JS, and that is the point:
    * `statsJson` below is already stripped of candidate addresses, but the
@@ -527,11 +528,9 @@ final class CallPeerConnection: NSObject {
     stateLock.unlock()
 
     // Nothing arrived in this window — the usual reason is that the call has
-    // only just connected. Three bars rather than one: an indicator that
-    // opens on "poor" and climbs is worse than no indicator, because the
-    // person reads the first frame and decides the call is bad.
+    // only just connected. Absence of packets proves neither good nor poor.
     let total = deltaLost + deltaReceived
-    guard total > 0 else { return 3 }
+    guard total > 0 else { return -1 }
 
     let loss = deltaLost / total
     // Jitter is seconds. 100 ms is where a conversation starts to break up;

@@ -1,4 +1,10 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   AccessibilityInfo,
   Animated,
@@ -40,7 +46,10 @@ import { tileName, UNNAMED } from '../ui/CallTile';
 // the suite's included — keeps meaning what it meant.
 import {
   PIP_ACCESSIBILITY_ACTIONS,
+  PIP_BOTTOM_CLEARANCE,
   PIP_HEIGHT,
+  PIP_MARGIN,
+  PIP_TOP_CLEARANCE,
   PIP_WIDTH,
   pipCornerForAction,
   type PipCorner,
@@ -50,6 +59,8 @@ import { useOutgoingRingback } from '../ui/ringback';
 import { useVideoReadiness } from '../ui/videoReadiness';
 import { useTheme } from '../theme';
 import { useReduceMotion } from '../useReduceMotion';
+import type { CallMediaControlResult } from '../call';
+import type { CallQualityStatus } from '../call/quality';
 
 export {
   PIP_ACCESSIBILITY_ACTIONS,
@@ -99,8 +110,10 @@ export interface CallScreenProps {
    * Swift picks `.front`), so a caller that has not wired the flip through
    * still gets the correct preview until the first flip. */
   frontCamera?: boolean;
-  /** 0–3 bars from local getStats. Never leaves the device. */
+  /** `-1` until local getStats has a measured 1–3 level. Never leaves the
+   * device. */
   quality?: number;
+  qualityStatus?: CallQualityStatus;
   /**
    * The design device-pressure notice — "Reduced quality", "Low Power Mode",
    * "Video paused to cool down" — or absent, which is the ordinary case.
@@ -119,8 +132,14 @@ export interface CallScreenProps {
    * ending someone's video call to save power is their decision. */
   offerVoice?: boolean;
   onSwitchToVoice?(): void;
-  onToggleMute(): void;
-  onToggleVideo(): void;
+  onToggleMute():
+    | void
+    | CallMediaControlResult
+    | Promise<void | CallMediaControlResult>;
+  onToggleVideo():
+    | void
+    | CallMediaControlResult
+    | Promise<void | CallMediaControlResult>;
   onFlipCamera(): void;
   onToggleSpeaker(): void;
   onHangup(): void;
@@ -296,7 +315,11 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
     videoEnabled,
     speakerOn,
     frontCamera = true,
-    quality = 0,
+    quality = -1,
+    qualityStatus =
+      quality === 1 || quality === 2 || quality === 3
+        ? 'measured'
+        : 'checking',
     pressureNotice = null,
     pressureRestorable = false,
     onRestoreQuality,
@@ -322,6 +345,114 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
   // above the idle early-return like every other hook here.
   useOutgoingRingback(state);
   const [tick, setTick] = useState(() => now());
+  type PendingMediaControl = 'mute' | 'video';
+  const pendingMediaRef = useRef(new Set<PendingMediaControl>());
+  const mediaOperationRef = useRef(
+    new Map<PendingMediaControl, { generation: number; operation: number }>(),
+  );
+  const mediaOperationSerialRef = useRef(0);
+  const controlGenerationRef = useRef(0);
+  const [pendingMedia, setPendingMedia] = useState<ReadonlySet<PendingMediaControl>>(
+    () => new Set(),
+  );
+  const [controlFailure, setControlFailure] = useState<{
+    control: PendingMediaControl;
+    message: string;
+  } | null>(null);
+  const [headerHeight, setHeaderHeight] = useState(0);
+  const controlLifetime = `${state.call?.cid ?? ''}:${state.name}`;
+  const controlsMountedRef = useRef(false);
+
+  // A bridge promise can finish after reconnect, hangup, glare, or a new
+  // call. Its feedback belongs only to the exact lifecycle that started it.
+  useLayoutEffect(() => {
+    const mediaOperations = mediaOperationRef.current;
+    const pendingControls = pendingMediaRef.current;
+    controlsMountedRef.current = true;
+    controlGenerationRef.current += 1;
+    mediaOperations.clear();
+    pendingControls.clear();
+    setPendingMedia(new Set());
+    setControlFailure(null);
+    return () => {
+      controlsMountedRef.current = false;
+      controlGenerationRef.current += 1;
+      mediaOperations.clear();
+      pendingControls.clear();
+    };
+  }, [controlLifetime]);
+
+  // Clear a refusal once another path actually changes the corresponding
+  // applied state (CallKit, device pressure, or a later successful tap).
+  useEffect(() => {
+    setControlFailure(previous =>
+      previous?.control === 'mute' ? null : previous,
+    );
+  }, [muted]);
+  useEffect(() => {
+    setControlFailure(previous =>
+      previous?.control === 'video' ? null : previous,
+    );
+  }, [videoEnabled]);
+
+  const runMediaControl = async (
+    control: PendingMediaControl,
+    action: () =>
+      | void
+      | CallMediaControlResult
+      | Promise<void | CallMediaControlResult>,
+    refusalMessage: string,
+  ): Promise<void> => {
+    if (pendingMediaRef.current.has(control)) return;
+    const owner = {
+      generation: controlGenerationRef.current,
+      operation: ++mediaOperationSerialRef.current,
+    };
+    mediaOperationRef.current.set(control, owner);
+    pendingMediaRef.current.add(control);
+    setPendingMedia(new Set(pendingMediaRef.current));
+    setControlFailure(null);
+
+    let result: void | CallMediaControlResult;
+    try {
+      result = await action();
+    } catch {
+      result = 'refused';
+    }
+
+    if (
+      !controlsMountedRef.current ||
+      controlGenerationRef.current !== owner.generation ||
+      mediaOperationRef.current.get(control) !== owner
+    ) {
+      return;
+    }
+    if (result === 'refused') {
+      setControlFailure({ control, message: refusalMessage });
+    } else if (result === 'applied') {
+      setControlFailure(null);
+    }
+    mediaOperationRef.current.delete(control);
+    pendingMediaRef.current.delete(control);
+    setPendingMedia(new Set(pendingMediaRef.current));
+  };
+
+  const runMuteControl = () =>
+    runMediaControl(
+      'mute',
+      onToggleMute,
+      muted
+        ? 'Couldn’t unmute the microphone. Try again.'
+        : 'Couldn’t mute the microphone. Try again.',
+    );
+  const runVideoControl = () =>
+    runMediaControl(
+      'video',
+      onToggleVideo,
+      videoEnabled
+        ? 'Couldn’t turn the camera off. Try again.'
+        : 'Couldn’t turn the camera on. Try again.',
+    );
   /**
    * Which stream fills the screen.
    *
@@ -356,6 +487,31 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
    * control bands — is the hook's own default.
    */
   const frame = useSafeAreaFrame();
+  // Reconnect guidance and a media-control failure can both wrap under
+  // Dynamic Type. The preview's historical fixed top band only accounted
+  // for the ordinary status header, so the live camera covered the new copy
+  // and action. Reserve the height React Native actually laid out, plus the
+  // same edge margin the preview keeps everywhere else.
+  const pipTopClearance = Math.max(
+    PIP_TOP_CLEARANCE,
+    headerHeight + PIP_MARGIN - insets.top,
+  );
+  const pipAvailableHeight = Math.max(
+    0,
+    frame.height -
+      insets.bottom -
+      PIP_BOTTOM_CLEARANCE -
+      (insets.top + pipTopClearance),
+  );
+  // `pipAnchor` deliberately centres an over-large box when its top and
+  // bottom bands cross. That is a sound general fallback, but here it would
+  // put the preview back over the very guidance we measured. Keep the
+  // ordinary 110pt preview whenever it fits; only a constrained Dynamic
+  // Type layout scales the same live surface down to the space that remains.
+  const pipScale =
+    frame.height > 0 ? Math.min(1, pipAvailableHeight / PIP_HEIGHT) : 1;
+  const pipWidth = PIP_WIDTH * pipScale;
+  const pipHeight = PIP_HEIGHT * pipScale;
   const pip = usePipDrag({
     frame: { width: frame.width, height: frame.height },
     insets: {
@@ -363,6 +519,12 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
       bottom: insets.bottom,
       left: insets.left,
       right: insets.right,
+    },
+    box: {
+      width: pipWidth,
+      height: pipHeight,
+      topClearance: pipTopClearance,
+      bottomClearance: PIP_BOTTOM_CLEARANCE,
     },
     reduceMotion,
     motion: theme.motion,
@@ -469,6 +631,11 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
     );
   }, [pressureNotice, pressureRestorable]);
 
+  useEffect(() => {
+    if (Platform.OS !== 'ios' || controlFailure === null) return;
+    AccessibilityInfo.announceForAccessibility(controlFailure.message);
+  }, [controlFailure]);
+
   if (state.name === 'idle' || !call) return null;
 
   // Apply the id-refusal rule used by PeerFace and PeerBackdrop to the three
@@ -569,6 +736,8 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
             {
               left: pip.home.x,
               top: pip.home.y,
+              width: pipWidth,
+              height: pipHeight,
               transform: pip.shift.getTranslateTransform(),
             },
           ]}
@@ -638,7 +807,16 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
         />
       )}
 
-      <View style={[styles.header, { paddingTop: insets.top + 12 }]}>
+      <View
+        testID="call-header"
+        style={[styles.header, { paddingTop: insets.top + 12 }]}
+        onLayout={event => {
+          const measured = event.nativeEvent.layout.height;
+          setHeaderHeight(previous =>
+            previous === measured ? previous : measured,
+          );
+        }}
+      >
         {/* Minimize: put the call away, keep it
             going. At the head of the header, where every messaging app keeps
             it, and only when App.tsx offers it — a connected or reconnecting
@@ -692,7 +870,44 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
           <Text style={styles.status} accessibilityLiveRegion="polite">Video starting…</Text>
         )}
         {state.name === 'connected' && (
-          <QualityBars level={quality} theme={theme} />
+          <QualityBars level={quality} status={qualityStatus} theme={theme} />
+        )}
+
+        {state.name === 'reconnecting' && (
+          <View style={styles.reconnectNotice}>
+            <Text
+              style={styles.notice}
+              accessibilityLiveRegion="polite"
+            >
+              {state.call.video
+                ? 'Connection interrupted. Audio and video may pause while Tacendum reconnects.'
+                : 'Connection interrupted. Audio may pause while Tacendum reconnects.'}
+            </Text>
+            {state.call.video && videoEnabled && (
+              <Pressable
+                testID="call-reconnect-camera-off"
+                style={styles.reconnectAction}
+                onPress={runVideoControl}
+                disabled={pendingMedia.has('video')}
+                accessibilityRole="button"
+                accessibilityLabel="Turn camera off while reconnecting"
+                accessibilityState={{
+                  disabled: pendingMedia.has('video'),
+                  busy: pendingMedia.has('video'),
+                }}
+              >
+                <Text style={styles.switchVoiceLabel}>
+                  Turn camera off while reconnecting
+                </Text>
+              </Pressable>
+            )}
+          </View>
+        )}
+
+        {controlFailure !== null && (
+          <Text style={styles.controlFailure} accessibilityLiveRegion="polite">
+            {controlFailure.message}
+          </Text>
         )}
 
         {/* The design. The video changing under you without explanation is the
@@ -752,7 +967,9 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
           label={muted ? 'Unmute' : 'Mute'}
           glyph={muted ? 'mic-muted' : 'mic'}
           active={muted}
-          onPress={onToggleMute}
+          disabled={pendingMedia.has('mute')}
+          busy={pendingMedia.has('mute')}
+          onPress={runMuteControl}
           theme={theme}
         />
         {/* Offered only on a call that NEGOTIATED video (`call.video`): an
@@ -767,14 +984,16 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
               label={videoEnabled ? 'Turn camera off' : 'Turn camera on'}
               glyph="camera"
               active={!videoEnabled}
-              onPress={onToggleVideo}
+              disabled={pendingMedia.has('video')}
+              busy={pendingMedia.has('video')}
+              onPress={runVideoControl}
               theme={theme}
             />
             <ControlButton
               label="Flip camera"
               glyph="camera-flip"
               active={false}
-              disabled={!videoEnabled}
+              disabled={!videoEnabled || pendingMedia.has('video')}
               onPress={onFlipCamera}
               theme={theme}
             />
@@ -857,6 +1076,25 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       color: theme.color.mediaInkMuted,
       fontSize: 13,
       marginTop: 6,
+      textAlign: 'center',
+    },
+    reconnectNotice: {
+      alignItems: 'center',
+      marginTop: 2,
+    },
+    reconnectAction: {
+      minHeight: 44,
+      justifyContent: 'center',
+      marginTop: 4,
+      paddingHorizontal: 14,
+      borderRadius: 999,
+      borderWidth: 1,
+      borderColor: theme.color.mediaLine,
+    },
+    controlFailure: {
+      color: theme.color.mediaInk,
+      fontSize: 13,
+      marginTop: 8,
       textAlign: 'center',
     },
     /** The tappable shape: padding brings the target to ~45pt (HIG minimum

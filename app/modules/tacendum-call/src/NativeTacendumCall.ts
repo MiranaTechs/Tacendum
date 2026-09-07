@@ -215,7 +215,8 @@ export interface Spec extends TurboModule {
   applyVideoCap(cid: string, maxLongEdge: number, maxFps: number): Promise<void>;
 
   /**
-   * 0–3 bars for the in-call quality indicator.
+   * A measured 1–3 level for the in-call quality indicator, or -1
+   * when no packet-backed measurement is available.
    *
    * Returns the LEVEL, not the stats. `getStats` output must never leave the
    * device; reducing to an integer natively means no stats payload

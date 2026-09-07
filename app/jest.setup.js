@@ -355,7 +355,7 @@ jest.mock('tacendum-call', () => {
     startMonitoringPressure: jest.fn(async () => undefined),
     stopMonitoringPressure: jest.fn(async () => undefined),
     applyVideoCap: jest.fn(async () => undefined),
-    sampleQuality: jest.fn(async () => 3),
+    sampleQuality: jest.fn(async () => -1),
     events: {
       iceState: on('iceState'),
       iceCandidate: on('iceCandidate'),

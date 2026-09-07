@@ -300,13 +300,20 @@ describe('blocking makes itself true in the same transaction', () => {
     expect(sql[3]).toBe('DELETE FROM ai_work_events WHERE peerId = ?');
     expect(sql[4]).toBe('DELETE FROM ai_agent_state WHERE peerId = ?');
     expect(sql[5]).toBe('DELETE FROM ai_notify_preferences WHERE peerId = ?');
-    for (const table of ['approvals', 'ai_work_events', 'ai_agent_state', 'ai_notify_preferences']) {
+    expect(sql[6]).toBe('DELETE FROM ai_task_templates WHERE peerId = ?');
+    for (const table of [
+      'approvals',
+      'ai_work_events',
+      'ai_agent_state',
+      'ai_notify_preferences',
+      'ai_task_templates',
+    ]) {
       expect(callsOf(`DELETE FROM ${table} WHERE peerId = ?`).at(-1)?.[1]).toEqual([PEER]);
     }
-    expect(sql[6]).toContain('DELETE FROM outbox');
-    expect(sql[7]).toContain("UPDATE messages SET status = 'error'");
-    expect(sql[8]).toBe('COMMIT');
-    expect(sql).toHaveLength(9);
+    expect(sql[7]).toContain('DELETE FROM outbox');
+    expect(sql[8]).toContain("UPDATE messages SET status = 'error'");
+    expect(sql[9]).toBe('COMMIT');
+    expect(sql).toHaveLength(10);
   });
 
   it('purges only that person’s queued envelopes', async () => {

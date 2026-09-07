@@ -2799,13 +2799,14 @@ function AppContent() {
             speakerOn={media.speakerOn}
             frontCamera={media.frontCamera}
             quality={media.quality}
+            qualityStatus={media.qualityStatus}
             pressureNotice={media.pressureNotice}
             pressureRestorable={media.pressureRestorable}
             onRestoreQuality={() => void restoreVideoQuality()}
             offerVoice={media.offerVoice}
             onSwitchToVoice={() => void switchToVoice()}
-            onToggleMute={() => void toggleMute()}
-            onToggleVideo={() => void toggleVideo()}
+            onToggleMute={toggleMute}
+            onToggleVideo={toggleVideo}
             onFlipCamera={() => void flipCamera()}
             onToggleSpeaker={() => void toggleSpeaker()}
             onHangup={() => void callController().hangup()}

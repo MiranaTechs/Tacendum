@@ -21,6 +21,10 @@ import {
   mentionWho,
   previewFor,
 } from './envelope';
+import {
+  AI_SAVED_TASK_MAX,
+  normalizeAiTaskTemplate,
+} from './aiTasks';
 import { publishGroupNames, publishPeerNames } from './nse';
 import { personName } from './person';
 
@@ -1057,6 +1061,18 @@ export async function initSchema(d: Handle): Promise<void> {
         CHECK (requestedRoutine IS NULL OR requestedRoutine IN ('all','quiet')),
       requestedAt INTEGER,
       acknowledgedAt INTEGER
+    )`);
+  // User-authored AI request shortcuts are private workspace content. They
+  // never ride a profile or message envelope, and every lookup stays scoped
+  // to the peer whose reviewed task composer owns them.
+  await d.execute(`
+    CREATE TABLE IF NOT EXISTS ai_task_templates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      peerId TEXT NOT NULL,
+      name TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      createdAt INTEGER NOT NULL,
+      updatedAt INTEGER NOT NULL
     )`);
   // Backfill for chats that predate `createdAt`: their first known moment is
   // their last message. Idempotent (the guard is `IS NULL`), so it is safe on
@@ -2399,6 +2415,7 @@ export const DB_TABLES = [
   'ai_work_events',
   'ai_agent_state',
   'ai_notify_preferences',
+  'ai_task_templates',
   // Which contacts are the real account's machines. A row here names
   // a relationship the server refuses to enumerate; surviving sign-out into
   // the decoy workspace would hand a coerced unlock exactly that list.
@@ -4033,6 +4050,7 @@ export async function deleteChat(peerId: string): Promise<void> {
       await d.execute(`DELETE FROM ai_work_events WHERE peerId = ?`, [peerId]);
       await d.execute(`DELETE FROM ai_agent_state WHERE peerId = ?`, [peerId]);
       await d.execute(`DELETE FROM ai_notify_preferences WHERE peerId = ?`, [peerId]);
+      await d.execute(`DELETE FROM ai_task_templates WHERE peerId = ?`, [peerId]);
       await d.execute(`DELETE FROM messages WHERE peerId = ?`, [peerId]);
       await d.execute(`DELETE FROM chats WHERE peerId = ?`, [peerId]);
       await d.execute('COMMIT');
@@ -5202,6 +5220,7 @@ export async function blockPeer(peerId: string, at: number): Promise<void> {
       await d.execute(`DELETE FROM ai_work_events WHERE peerId = ?`, [peerId]);
       await d.execute(`DELETE FROM ai_agent_state WHERE peerId = ?`, [peerId]);
       await d.execute(`DELETE FROM ai_notify_preferences WHERE peerId = ?`, [peerId]);
+      await d.execute(`DELETE FROM ai_task_templates WHERE peerId = ?`, [peerId]);
       // The member's LIVE room legs, read before the purge (see the block
       // comment above): these settle, they are never deleted.
       const legs = (
@@ -7212,7 +7231,8 @@ export async function listApprovals(
         // Supplementary metadata is fail-soft; q/p remain renderable.
       }
     }
-    const { workJson: _workJson, ...stored } = row;
+    const { workJson, ...stored } = row;
+    void workJson;
     return {
       ...stored,
       kind:
@@ -7315,6 +7335,170 @@ export async function lapseApproval(
     [peerId, q],
   );
   return (res.rowsAffected ?? 0) > 0;
+}
+
+// --- saved AI requests ---
+
+export interface AiTaskTemplateRow {
+  id: number;
+  peerId: string;
+  name: string;
+  prompt: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+function aiTaskTemplateTime(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+/** Create one local shortcut only while its peer is a live, unblocked chat.
+ * The count and insert share one immediate transaction, so concurrent taps
+ * cannot cross the per-agent limit. */
+export async function createAiTaskTemplate(
+  peerId: string,
+  name: string,
+  prompt: string,
+  at: number,
+): Promise<AiTaskTemplateRow | null> {
+  const input = normalizeAiTaskTemplate(name, prompt);
+  if (!input || !aiTaskTemplateTime(at)) return null;
+  const d = conn();
+  return runExclusive(async () => {
+    await d.execute('BEGIN IMMEDIATE');
+    try {
+      const inserted = await d.execute(
+        `INSERT INTO ai_task_templates
+           (peerId, name, prompt, createdAt, updatedAt)
+         SELECT ?, ?, ?, ?, ?
+         WHERE EXISTS (
+           SELECT 1 FROM chats c
+           WHERE c.peerId = ? AND c.identityChangedAt IS NULL
+         )
+           AND NOT EXISTS (
+             SELECT 1 FROM blocked_peers b WHERE b.peerId = ?
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM revoked_machine_peers r WHERE r.peerId = ?
+           )
+           AND (SELECT COUNT(*) FROM ai_task_templates WHERE peerId = ?)
+             < ${AI_SAVED_TASK_MAX}`,
+        [
+          peerId,
+          input.name,
+          input.prompt,
+          at,
+          at,
+          peerId,
+          peerId,
+          peerId,
+          peerId,
+        ],
+      );
+      if ((inserted.rowsAffected ?? 0) !== 1) {
+        await d.execute('COMMIT');
+        return null;
+      }
+      const id = inserted.insertId;
+      if (typeof id !== 'number' || !Number.isSafeInteger(id) || id < 1) {
+        throw new Error('saved request id unavailable');
+      }
+      await d.execute('COMMIT');
+      return {
+        id,
+        peerId,
+        name: input.name,
+        prompt: input.prompt,
+        createdAt: at,
+        updatedAt: at,
+      };
+    } catch (err) {
+      await d.execute('ROLLBACK');
+      throw err;
+    }
+  });
+}
+
+/** Newest edited shortcuts first. Lifecycle joins make an old screen refresh
+ * empty as soon as the peer is deleted, blocked or revoked. */
+export async function listAiTaskTemplates(
+  peerId: string,
+): Promise<AiTaskTemplateRow[]> {
+  const res = await conn().execute(
+    `SELECT t.id, t.peerId, t.name, t.prompt, t.createdAt, t.updatedAt
+     FROM ai_task_templates t
+     INNER JOIN chats c ON c.peerId = t.peerId
+     WHERE t.peerId = ? AND c.identityChangedAt IS NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM blocked_peers b WHERE b.peerId = t.peerId
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM revoked_machine_peers r WHERE r.peerId = t.peerId
+       )
+     ORDER BY t.updatedAt DESC, t.id DESC`,
+    [peerId],
+  );
+  return res.rows as unknown as AiTaskTemplateRow[];
+}
+
+/** Edit only the selected peer's row, under the same lifecycle guards used at
+ * creation. A stale screen can therefore fail, but cannot restore retired
+ * text. */
+export async function updateAiTaskTemplate(
+  peerId: string,
+  id: number,
+  name: string,
+  prompt: string,
+  at: number,
+): Promise<boolean> {
+  const input = normalizeAiTaskTemplate(name, prompt);
+  if (!input || !Number.isSafeInteger(id) || id < 1 || !aiTaskTemplateTime(at)) {
+    return false;
+  }
+  const d = conn();
+  return runExclusive(async () => {
+    await d.execute('BEGIN IMMEDIATE');
+    try {
+      const updated = await d.execute(
+        `UPDATE ai_task_templates
+         SET name = ?, prompt = ?, updatedAt = ?
+         WHERE id = ? AND peerId = ?
+           AND EXISTS (
+             SELECT 1 FROM chats c
+             WHERE c.peerId = ai_task_templates.peerId
+               AND c.identityChangedAt IS NULL
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM blocked_peers b
+             WHERE b.peerId = ai_task_templates.peerId
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM revoked_machine_peers r
+             WHERE r.peerId = ai_task_templates.peerId
+           )`,
+        [input.name, input.prompt, at, id, peerId],
+      );
+      await d.execute('COMMIT');
+      return (updated.rowsAffected ?? 0) === 1;
+    } catch (err) {
+      await d.execute('ROLLBACK');
+      throw err;
+    }
+  });
+}
+
+/** Delete by both local id and peer so a stale row from another profile can
+ * never be removed through an id collision. */
+export async function deleteAiTaskTemplate(
+  peerId: string,
+  id: number,
+): Promise<boolean> {
+  if (!Number.isSafeInteger(id) || id < 1) return false;
+  const result = await conn().execute(
+    `DELETE FROM ai_task_templates WHERE peerId = ? AND id = ?`,
+    [peerId, id],
+  );
+  return (result.rowsAffected ?? 0) === 1;
 }
 
 // --- structured AI work facts (AI workflows A3) ---
@@ -7860,7 +8044,8 @@ export async function listRecentAiWorkEvents(now: number): Promise<AiWorkEventRo
       ...(context === null ? {} : { context }),
     });
     if (!candidate.success) continue;
-    const { contextJson: _contextJson, timeTrusted, ...stored } = raw;
+    const { contextJson, timeTrusted, ...stored } = raw;
+    void contextJson;
     rows.push({ ...stored, timeTrusted: timeTrusted === 1, context });
   }
   return rows;
@@ -8091,6 +8276,7 @@ export async function recordMachineRevoked(
       await d.execute(`DELETE FROM ai_work_events WHERE peerId = ?`, [peerId]);
       await d.execute(`DELETE FROM ai_agent_state WHERE peerId = ?`, [peerId]);
       await d.execute(`DELETE FROM ai_notify_preferences WHERE peerId = ?`, [peerId]);
+      await d.execute(`DELETE FROM ai_task_templates WHERE peerId = ?`, [peerId]);
       await d.execute('COMMIT');
     } catch (err) {
       await d.execute('ROLLBACK');

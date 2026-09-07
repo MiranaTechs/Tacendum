@@ -39,6 +39,12 @@ import {
   relayForPeer,
   type PressureInputs,
 } from './policy';
+import {
+  measuredCallQuality,
+  UNKNOWN_CALL_QUALITY,
+  type CallQuality,
+  type CallQualityStatus,
+} from './quality';
 
 /**
  * The app's single call controller, wired to the real everything.
@@ -124,14 +130,26 @@ let localMedia = {
    * this object when the next cid starts, so a phone still in Low Power Mode
    * starts its next call capped again. */
   pressureRestored: false,
-  /** 0–3 bars. Starts optimistic: an indicator that opens on "poor"
-   * and climbs is worse than none, because the first frame is what the person
-   * reads. */
-  quality: 3,
+  /** `-1` until native has a packet-backed measurement; only 1–3 draw bars. */
+  quality: UNKNOWN_CALL_QUALITY as CallQuality,
+  qualityStatus: 'checking' as CallQualityStatus,
 };
 
 /** Quality polling, live only while a call is connected. */
 let qualityTimer: ReturnType<typeof setInterval> | null = null;
+let qualityFreshnessTimer: ReturnType<typeof setTimeout> | null = null;
+let qualityGeneration = 0;
+let qualityAttemptSerial = 0;
+type QualityAttempt = {
+  generation: number;
+  attempt: number;
+  cid: string;
+  acceptResult: boolean;
+  timeout: ReturnType<typeof setTimeout> | null;
+};
+/** One native getStats request per peer connection at a time. A UI timeout
+ * invalidates its answer but does not pretend the native work stopped. */
+const qualityInFlight = new Map<string, QualityAttempt>();
 
 /**
  * Sample the connection quality every few seconds while connected.
@@ -145,26 +163,180 @@ let qualityTimer: ReturnType<typeof setInterval> | null = null;
  * the device. An integer cannot leak one.
  */
 const QUALITY_INTERVAL_MS = 3_000;
+// A stuck native stats callback makes the display unavailable. It remains the
+// sole request for that cid until it actually settles, so getStats calls never
+// overlap and mutate native cumulative baselines out of order.
+const QUALITY_SAMPLE_TIMEOUT_MS = 5_000;
+const QUALITY_INITIAL_WAIT_MS = QUALITY_INTERVAL_MS + QUALITY_SAMPLE_TIMEOUT_MS;
+// A once-good measurement is not a permanent statement about the call.
+const QUALITY_STALE_MS = 9_000;
+
+function clearQualityFreshnessTimer(): void {
+  if (qualityFreshnessTimer) clearTimeout(qualityFreshnessTimer);
+  qualityFreshnessTimer = null;
+}
+
+function setQualityUnknown(status: Exclude<CallQualityStatus, 'measured'>): void {
+  if (
+    localMedia.quality === UNKNOWN_CALL_QUALITY &&
+    localMedia.qualityStatus === status
+  ) {
+    return;
+  }
+  localMedia = {
+    ...localMedia,
+    quality: UNKNOWN_CALL_QUALITY,
+    qualityStatus: status,
+  };
+  notifyMedia();
+}
+
+function armQualityDisplayDeadline(
+  generation: number,
+  cid: string,
+  delay: number,
+): void {
+  clearQualityFreshnessTimer();
+  qualityFreshnessTimer = setTimeout(() => {
+    if (
+      qualityGeneration !== generation ||
+      current.name !== 'connected' ||
+      current.call?.cid !== cid
+    ) {
+      return;
+    }
+    // The native request still owns this cid until it settles. Only its UI
+    // authority expires here, preventing a late answer from reviving stale
+    // bars while also preventing overlapping getStats calls.
+    const pending = qualityInFlight.get(cid);
+    if (pending?.generation === generation) pending.acceptResult = false;
+    qualityFreshnessTimer = null;
+    setQualityUnknown('unavailable');
+  }, delay);
+}
 
 function stopQualityPolling(): void {
   if (qualityTimer) clearInterval(qualityTimer);
   qualityTimer = null;
+  clearQualityFreshnessTimer();
+  qualityGeneration += 1;
+}
+
+function retireQualityAttempt(cid: string): void {
+  const attempt = qualityInFlight.get(cid);
+  if (!attempt) return;
+  if (attempt.timeout) clearTimeout(attempt.timeout);
+  qualityInFlight.delete(cid);
 }
 
 function startQualityPolling(cid: string): void {
   stopQualityPolling();
-  qualityTimer = setInterval(() => {
-    void native
-      .sampleQuality(cid)
-      .then(level => {
-        // Guard on the cid: a sample in flight when the call ends must not
-        // repaint the NEXT call's indicator with the last one's number.
-        if (current.call?.cid !== cid || level === localMedia.quality) return;
-        localMedia = { ...localMedia, quality: level };
-        notifyMedia();
+  const generation = qualityGeneration;
+  localMedia = {
+    ...localMedia,
+    quality: UNKNOWN_CALL_QUALITY,
+    qualityStatus: 'checking',
+  };
+  // This also bounds reconnects waiting behind an older same-cid native
+  // request. The request remains serialized, but "Checking" does not remain
+  // on screen indefinitely when native never calls back.
+  armQualityDisplayDeadline(generation, cid, QUALITY_INITIAL_WAIT_MS);
+
+  const sample = () => {
+    if (
+      qualityInFlight.has(cid) ||
+      qualityGeneration !== generation ||
+      current.name !== 'connected' ||
+      current.call?.cid !== cid
+    ) {
+      return;
+    }
+
+    const attempt = ++qualityAttemptSerial;
+    const request: QualityAttempt = {
+      generation,
+      attempt,
+      cid,
+      acceptResult: true,
+      timeout: null,
+    };
+    qualityInFlight.set(cid, request);
+    request.timeout = setTimeout(() => {
+      if (
+        qualityInFlight.get(cid) !== request ||
+        request.generation !== generation ||
+        request.attempt !== attempt
+      ) {
+        return;
+      }
+      request.acceptResult = false;
+      request.timeout = null;
+      if (
+        qualityGeneration !== generation ||
+        current.name !== 'connected' ||
+        current.call?.cid !== cid
+      ) {
+        return;
+      }
+      clearQualityFreshnessTimer();
+      setQualityUnknown('unavailable');
+    }, QUALITY_SAMPLE_TIMEOUT_MS);
+
+    let nativeSample: Promise<number>;
+    try {
+      nativeSample = native.sampleQuality(cid);
+    } catch (error) {
+      nativeSample = Promise.reject(error);
+    }
+    void nativeSample
+      .then(value => {
+        if (qualityInFlight.get(cid) !== request) return;
+        qualityInFlight.delete(cid);
+        if (request.timeout) clearTimeout(request.timeout);
+        request.timeout = null;
+        if (
+          !request.acceptResult ||
+          qualityGeneration !== generation ||
+          current.name !== 'connected' ||
+          current.call?.cid !== cid
+        ) {
+          return;
+        }
+        const level = measuredCallQuality(value);
+        if (level === null) {
+          clearQualityFreshnessTimer();
+          setQualityUnknown('unavailable');
+          return;
+        }
+
+        if (
+          level !== localMedia.quality ||
+          localMedia.qualityStatus !== 'measured'
+        ) {
+          localMedia = { ...localMedia, quality: level, qualityStatus: 'measured' };
+          notifyMedia();
+        }
+
+        armQualityDisplayDeadline(generation, cid, QUALITY_STALE_MS);
       })
-      .catch(() => undefined);
-  }, QUALITY_INTERVAL_MS);
+      .catch(() => {
+        if (qualityInFlight.get(cid) !== request) return;
+        qualityInFlight.delete(cid);
+        if (request.timeout) clearTimeout(request.timeout);
+        request.timeout = null;
+        if (
+          qualityGeneration !== generation ||
+          current.name !== 'connected' ||
+          current.call?.cid !== cid
+        ) {
+          return;
+        }
+        clearQualityFreshnessTimer();
+        setQualityUnknown('unavailable');
+      });
+  };
+
+  qualityTimer = setInterval(sample, QUALITY_INTERVAL_MS);
 }
 
 /**
@@ -198,6 +370,13 @@ function notify(state: CallState): void {
   // abandoned one's flags, so answering an incoming VIDEO call through glare
   // showed the camera as off — the same false claim, one call later.
   const nextCid = state.call?.cid ?? null;
+  if (previousCid !== null && previousCid !== nextCid) {
+    // A reconnect keeps the same cid and therefore keeps its native getStats
+    // serialization lock. A terminal exit or glare replacement cannot ever
+    // use the old peer connection again, so retaining a hung request would
+    // leak one map entry per ended call.
+    retireQualityAttempt(previousCid);
+  }
   if (nextCid !== null && nextCid !== previousCid) {
     const video = state.call?.video === true;
     localMedia = {
@@ -216,7 +395,8 @@ function notify(state: CallState): void {
       offerVoice: false,
       pressureRestorable: false,
       pressureRestored: false,
-      quality: 3,
+      quality: UNKNOWN_CALL_QUALITY,
+      qualityStatus: 'checking',
     };
     if (video && nextCid) {
       // AND THE FLAG ABOVE FOLLOWS THE ROUTE, not the intent. `.catch(() =>
@@ -286,7 +466,15 @@ function notify(state: CallState): void {
     // connected after a reconnect re-asserting it is fine.
     if (state.call?.video && previousName !== 'connected') void applyPressure();
   } else {
+    const hadLiveQualityPolling = qualityTimer !== null;
     stopQualityPolling();
+    if (hadLiveQualityPolling) {
+      localMedia = {
+        ...localMedia,
+        quality: UNKNOWN_CALL_QUALITY,
+        qualityStatus: 'unavailable',
+      };
+    }
   }
   for (const s of subscribers) s(state);
 }
@@ -1271,6 +1459,14 @@ export async function startCalling(): Promise<() => void> {
     for (const s of subs) s.remove();
     appState.remove();
     videoPausedForBackground = null;
+    const stoppedCid = current.call?.cid ?? null;
+    stopQualityPolling();
+    if (stoppedCid) retireQualityAttempt(stoppedCid);
+    localMedia = {
+      ...localMedia,
+      quality: UNKNOWN_CALL_QUALITY,
+      qualityStatus: 'unavailable',
+    };
     c.stop();
     // The session goes with the controller. `c.stop()` disposes the 1:1
     // service; a coordinator left holding N leg services, a live roster and
@@ -1806,8 +2002,13 @@ function announceMedia(): void {
     .catch(() => undefined);
 }
 
-export async function toggleMute(): Promise<void> {
-  await applyMute(!localMedia.muted);
+export type CallMediaControlResult = 'applied' | 'refused' | 'stale';
+
+let muteOperation = 0;
+let videoOperation = 0;
+
+export function toggleMute(): Promise<CallMediaControlResult> {
+  return applyMute(!localMedia.muted);
 }
 
 /**
@@ -1831,20 +2032,27 @@ export async function toggleMute(): Promise<void> {
  *    `createAnswer` resolves — the wrapped native below is what makes that
  *    moment observable here.
  */
-async function applyMute(muted: boolean): Promise<void> {
+async function applyMute(muted: boolean): Promise<CallMediaControlResult> {
   const cid = current.call?.cid;
-  if (!cid) return;
+  if (!cid) return 'stale';
+  const operation = ++muteOperation;
   const applied = await native.setAudioEnabled(cid, !muted).catch(() => false);
-  if (current.call?.cid !== cid) return;
-  if (!applied && current.name === 'connected') return;
+  if (current.call?.cid !== cid || operation !== muteOperation) return 'stale';
+  // Once this call has ever connected, its audio track has been born.
+  // Reconnecting is therefore not the pre-track intent window: a false
+  // verdict there means mute was not applied to the live track and must not
+  // be presented or announced as though it were.
+  if (!applied && current.call.connectedAt != null) return 'refused';
   localMedia = { ...localMedia, muted };
   announceMedia();
   notifyMedia();
+  return 'applied';
 }
 
-export async function toggleVideo(): Promise<void> {
+export async function toggleVideo(): Promise<CallMediaControlResult> {
   const cid = current.call?.cid;
-  if (!cid) return;
+  if (!cid) return 'stale';
+  const operation = ++videoOperation;
   const next = !localMedia.videoEnabled;
   // THE VERDICT, HONOURED (the group arm already does). An audio call
   // negotiated no video m-line and has no local video track; `false` here
@@ -1852,10 +2060,12 @@ export async function toggleVideo(): Promise<void> {
   // preview locally and sent `call.media{v:true}` — which turned the PEER's
   // whole screen into a black video surface with no track behind it.
   const applied = await native.setVideoEnabled(cid, next).catch(() => false);
-  if (!applied || current.call?.cid !== cid) return;
+  if (current.call?.cid !== cid || operation !== videoOperation) return 'stale';
+  if (!applied) return 'refused';
   localMedia = { ...localMedia, videoEnabled: next };
   announceMedia();
   notifyMedia();
+  return 'applied';
 }
 
 /**
@@ -1985,6 +2195,7 @@ export async function flipCamera(): Promise<void> {
   const cid = current.call?.cid;
   if (!cid) return;
   await native.switchCamera(cid);
+  if (current.call?.cid !== cid) return;
   // After the native call, so a failed flip does not leave the preview
   // mirrored the wrong way round for a camera that never changed.
   localMedia = { ...localMedia, frontCamera: !localMedia.frontCamera };
@@ -2080,6 +2291,10 @@ export function resetCallingForTests(): void {
   subscribers = new Set();
   current = idleState();
   stopQualityPolling();
+  for (const attempt of qualityInFlight.values()) {
+    if (attempt.timeout) clearTimeout(attempt.timeout);
+  }
+  qualityInFlight.clear();
   coordinator?.dispose();
   coordinator = null;
   groupSubscribers = new Set();
@@ -2100,7 +2315,8 @@ export function resetCallingForTests(): void {
     offerVoice: false,
     pressureRestorable: false,
     pressureRestored: false,
-    quality: 3,
+    quality: UNKNOWN_CALL_QUALITY,
+    qualityStatus: 'checking',
   };
   pressure = { thermal: 'nominal', lowPower: false, battery: null, video: false };
   alwaysRelay = false;

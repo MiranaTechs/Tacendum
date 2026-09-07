@@ -10,6 +10,10 @@ import {
 } from '../ui/CallControlGlyphs';
 import { PhoneGlyph, VideoGlyph } from '../ui/CallGlyph';
 import { useTheme } from '../theme';
+import {
+  measuredCallQuality,
+  type CallQualityStatus,
+} from '../call/quality';
 
 /**
  * The in-call control bar's parts, shared by the 1:1 screen and the
@@ -67,13 +71,34 @@ export function durationAnnouncementFrom(
  * so only this integer ever reaches the UI. */
 export function QualityBars({
   level,
+  status = measuredCallQuality(level) === null ? 'checking' : 'measured',
   theme,
 }: {
   level: number;
+  status?: CallQualityStatus;
   theme: ReturnType<typeof useTheme>;
 }): React.JSX.Element {
+  const measured = measuredCallQuality(level);
+  if (status !== 'measured' || measured === null) {
+    const label =
+      status === 'checking'
+        ? 'Checking connection…'
+        : 'Connection quality unavailable';
+    return (
+      <Text
+        style={{ color: theme.color.mediaInkMuted, fontSize: 13, marginTop: 6 }}
+        accessibilityLiveRegion="polite"
+      >
+        {label}
+      </Text>
+    );
+  }
   const label =
-    level >= 3 ? 'Connection good' : level === 2 ? 'Connection fair' : 'Connection poor';
+    measured === 3
+      ? 'Connection good'
+      : measured === 2
+        ? 'Connection fair'
+        : 'Connection poor';
   return (
     <View
       style={{ flexDirection: 'row', gap: 3, marginTop: 6 }}
@@ -91,7 +116,8 @@ export function QualityBars({
             width: 3,
             height: 4 + bar * 3,
             borderRadius: 1,
-            backgroundColor: bar <= level ? theme.color.mediaInk : theme.color.mediaLine,
+            backgroundColor:
+              bar <= measured ? theme.color.mediaInk : theme.color.mediaLine,
           }}
         />
       ))}
@@ -143,6 +169,7 @@ export function ControlButton({
   active,
   danger,
   disabled,
+  busy = false,
   onPress,
   theme,
   testID,
@@ -153,6 +180,7 @@ export function ControlButton({
   active: boolean;
   danger?: boolean;
   disabled?: boolean;
+  busy?: boolean;
   onPress(): void;
   theme: ReturnType<typeof useTheme>;
   /** Small-group additions. Both are omitted rather than passed as
@@ -169,7 +197,11 @@ export function ControlButton({
       accessibilityLabel={label}
       // `selected` is what tells VoiceOver that mute is currently ON — without
       // it the button reads identically in both states.
-      accessibilityState={{ selected: active, disabled: disabled === true }}
+      accessibilityState={{
+        selected: active,
+        disabled: disabled === true,
+        ...(busy ? { busy: true } : {}),
+      }}
       {...(accessibilityHint ? { accessibilityHint } : {})}
       {...(testID ? { testID } : {})}
       // 44×44 regardless of Dynamic Type; the glyph may grow, the target may not.

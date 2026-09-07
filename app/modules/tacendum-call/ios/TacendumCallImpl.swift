@@ -933,15 +933,15 @@ extension TacendumCallImpl {
     send("thermalStateChanged", payload)
   }
 
-  /// 0–3 bars for the quality indicator. 3 when there is no such call,
-  /// so a sample racing a hangup cannot paint the last frame "poor".
+  /// A measured 1–3 level for the quality indicator, or -1 when
+  /// there is no such call. JS also generation-checks a sample racing hangup.
   @objc public func sampleQuality(
     cid: String,
     resolve: @escaping (Any?) -> Void,
     reject: @escaping (String, String, Error?) -> Void
   ) {
     guard let pc = call(cid) else {
-      resolve(3)
+      resolve(-1)
       return
     }
     Task { resolve(await pc.sampleQuality()) }

@@ -201,7 +201,7 @@ afterEach(async () => {
 test('profileVersion 0 emits one inert quiet carrier to every peer device and persists before encryption', async () => {
   const observedDuringEncryption: db.AiNotifyPreferenceRow[] = [];
   crypto.encryptText.mockImplementation(
-    async (_self: string, _to: string, plaintext: string) => {
+    async (_self: string, _to: string, _plaintext: string) => {
       observedDuringEncryption.push(await db.getAiNotifyPreference(AGENT));
       return {
         msgType: 'ciphertext',
