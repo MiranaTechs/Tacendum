@@ -54,6 +54,7 @@ import {
   TextAction,
 } from '../ui/primitives';
 import { InfoDisclosure } from '../ui/InfoDisclosure';
+import { AiAgentSection } from '../ui/AiAgentSection';
 import { QuietRoom } from '../ui/QuietRoom';
 import { useCoalescedSubscribe } from '../ui/useCoalescedSubscribe';
 import { VaultSection } from '../ui/VaultSection';
@@ -387,6 +388,11 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
   const [pairRecords, setPairRecords] = useState<Map<string, db.PeerPairSafetyRow>>(
     new Map(),
   );
+  /** Source-backed integration facts only. A historical machine marker is
+   * not enough to claim current configured capabilities or usage. */
+  const [aiState, setAiState] = useState<db.AiAgentStateRow | null>(null);
+  const [aiNotifyPreference, setAiNotifyPreference] =
+    useState<db.AiNotifyPreferenceRow | null>(null);
 
   const refresh = useCallback(() => {
     const seq = ++refreshSeq.current;
@@ -411,6 +417,22 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
     // The database, not messaging's enforcement Set: the Set is empty in a
     // duress session, where the decoy workspace's own rows are the truth.
     void db.getBlockedAt(peerId).then(setBlockedAt, () => {});
+    void db.getAiAgentState(peerId).then(
+      value => {
+        if (seq === refreshSeq.current) setAiState(value);
+      },
+      () => {
+        if (seq === refreshSeq.current) setAiState(null);
+      },
+    );
+    void db.getAiNotifyPreference(peerId).then(
+      value => {
+        if (seq === refreshSeq.current) setAiNotifyPreference(value);
+      },
+      () => {
+        if (seq === refreshSeq.current) setAiNotifyPreference(null);
+      },
+    );
     // Re-read on every notify, so the standing warning leaves the moment a
     // reconcile finally rewrites the mirror — and arrives if one fails.
     setBlockPartial(messaging.isBlockNotificationMirrorStale());
@@ -459,6 +481,8 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
     setAccepted(false);
     setNickSaved(false);
     setIdCopied(false);
+    setAiState(null);
+    setAiNotifyPreference(null);
   }, [peerId]);
 
   // The two notices' timers go with the screen, or with the peer they were
@@ -844,6 +868,16 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
               </Text>
             ) : null}
           </View>
+
+          {/* AI workflows are the primary purpose of a source-backed agent
+              connection, so they follow the identity the owner just opened.
+              Ordinary contacts have no aiState and retain the longstanding
+              profile order with no empty section inserted. */}
+          <AiAgentSection
+            peerId={peerId}
+            state={aiState}
+            preference={aiNotifyPreference}
+          />
 
           <View style={styles.nickname}>
             <Text style={[t.type.utilityLabel, { color: t.color.inkMuted }]}>
@@ -2048,10 +2082,15 @@ function MachineSection({
         else await apiIntegrationRevoke(token, peerId);
         // The one moment the app KNOWS (rule in machine.ts): a 204
         // from either owner-called route is the server confirming this peer
-        // is a machine this account paired. Record it — the AI badge and the
-        // roster attribution derive from this record and from nothing a peer
-        // can send. Refusals never reach this line, so they record nothing.
-        await db.recordMachinePeer(peerId, Date.now()).catch(() => {});
+        // is a machine this account paired. Revoke additionally records the
+        // retired lifecycle and burns its approval rows in one transaction;
+        // unlike the historical badge hint, that safety fact is not
+        // best-effort. Refusals never reach this line, so they change neither.
+        if (which === 'adopt') {
+          await db.recordMachinePeer(peerId, Date.now()).catch(() => {});
+        } else {
+          await db.recordMachineRevoked(peerId, Date.now());
+        }
         // Sibling sync 'machines': siblings hear the machine roster moved —
         // what lets a surviving device name a revoked sibling's agents.
         void messaging.syncMachinePeers();

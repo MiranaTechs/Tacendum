@@ -61,6 +61,7 @@ export type SurfaceRouteName =
   | 'register'
   | 'chats'
   | 'calls'
+  | 'attention'
   | 'newChat'
   | 'newRoom'
   | 'thread'

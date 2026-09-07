@@ -1,7 +1,18 @@
-import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, writeSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  writeSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import { ErrorCode, LibSignalErrorBase } from '@signalapp/libsignal-client';
 import { apiGetAttachmentUrl, downloadBlob, type Credential } from './api.js';
+import { applyOwnerNotifyPreference, composeNotifyPreferenceAck } from './ai-notify-preference.js';
 import { BlobCipherError, decryptBlob } from './attachments.js';
 import { b64ToBytes } from './bytes.js';
 import { decryptEnvelope, isIdentityChange } from './messaging.js';
@@ -14,6 +25,8 @@ import { CliError } from './exit.js';
 import { writeFileAtomic, type FileStores } from './stores.js';
 import { stateDir } from './config.js';
 import { withFileLock, withFileLockAsync } from './lock.js';
+import { readProfile } from './profile.js';
+import { AuthSession } from './session.js';
 import type { WsClient } from './wsclient.js';
 
 /**
@@ -58,6 +71,10 @@ export interface InboundOptions {
    * and `tacendum inbox --detail` is where a spooled detail is read.
    */
   detail?: boolean | undefined;
+  /** Test seam for the owner preference acknowledgement. Production routes
+   * through send.ts's connect-before-ratchet transport below. */
+  notifyPreferenceAck?:
+    ((message: { to: string; body: string; notify: false }) => Promise<void>) | undefined;
 }
 
 export interface Inbound {
@@ -237,10 +254,7 @@ export function describeUndecryptable(err: unknown): string {
  *  4. everything else — tampered or corrupt ciphertext.
  */
 export type DecryptDisposition =
-  | 'identity-change'
-  | 'local-failure'
-  | 'ratchet-duplicate'
-  | 'undecryptable';
+  'identity-change' | 'local-failure' | 'ratchet-duplicate' | 'undecryptable';
 
 export function classifyDecryptFailure(
   err: unknown,
@@ -309,7 +323,7 @@ export function purgeRatchetDuplicate(args: {
   try {
     // dir:'in' only: an outbound LEDGER row under a colliding id is not
     // proof this inbound message was ever delivered.
-    delivered = args.log.read({ dir: 'in' }).some(rec => rec.id === args.msgId);
+    delivered = args.log.read({ dir: 'in' }).some((rec) => rec.id === args.msgId);
   } catch {
     // An unreadable spool cannot prove delivery, so it is reported below as
     // though it had not happened — a false alarm over a silent loss.
@@ -670,8 +684,36 @@ async function saveInboundAttachment(
   }
 }
 
+/**
+ * Return a durable owner preference acknowledgement through send.ts's
+ * one-shot authenticated transport. The inbound decrypt proved this pair has
+ * a session; the transport still connects before touching the ratchet and
+ * seals under the shared account lock. The carrier is deliberately quiet so
+ * changing notification delivery cannot itself create a notification.
+ */
+async function sendNotifyPreferenceAck(args: {
+  account: string;
+  stores: FileStores;
+  to: string;
+  body: string;
+}): Promise<void> {
+  // Dynamic to keep send.ts's command-time inbound attachment from forming
+  // a module-initialization cycle. The runtime operation itself is still the
+  // one authorized send implementation: it dials before bootstrap/encrypt,
+  // takes the ratchet lock, sends, and waits for the receipt.
+  const { sendEncryptedAll } = await import('./send.js');
+  await sendEncryptedAll({
+    stores: args.stores,
+    auth: new AuthSession(args.account, args.stores),
+    to: args.to,
+    messages: [{ body: args.body, notify: false }],
+  });
+}
+
 export function attachInbound(opts: InboundOptions): Inbound {
   const { name, userId, stores, ws, report, log, consume } = opts;
+  const profileRead = readProfile(name);
+  const ownerUserId = profileRead.kind === 'ok' ? profileRead.profile.ownerUserId : undefined;
   const probe = probeStorePersistence(stores);
   // Retention parity for the quarantine: `applyRetention` runs on every
   // consuming command, so its sibling file must too — a preserved row must
@@ -685,7 +727,9 @@ export function attachInbound(opts: InboundOptions): Inbound {
     queue = queue
       .then(async () => {
         if (frame.type === 'error') {
-          report.note(`server error: ${sanitizeServerField(frame.code, 64)}: ${sanitizeServerField(frame.detail, 200)}`);
+          report.note(
+            `server error: ${sanitizeServerField(frame.code, 64)}: ${sanitizeServerField(frame.detail, 200)}`,
+          );
           return;
         }
         if (frame.type !== 'msg') return;
@@ -921,9 +965,49 @@ export function attachInbound(opts: InboundOptions): Inbound {
             }
           }
 
+          // The preference rides an ordinary encrypted profile frame so old
+          // clients keep their existing carrier behaviour. Authority comes
+          // from the authenticated frame sender matching this integration's
+          // immutable owner binding; profile prose and displayed names never
+          // participate. Persist before deleting the relay copy. If the
+          // preference file cannot be written, the owner sees no application
+          // ack and can retry in a fresh encrypted frame; redelivering this
+          // ciphertext cannot help because the receive ratchet has advanced.
+          let notifyPreferenceAck: string | undefined;
+          if (!blocked) {
+            try {
+              const applied = applyOwnerNotifyPreference(name, frame.from, ownerUserId, text);
+              if (applied !== null) notifyPreferenceAck = composeNotifyPreferenceAck(applied);
+            } catch {
+              report.note(
+                '!! notification preference could not be saved — request not applied; retry from phone',
+              );
+            }
+          }
+
           stores.markSeen(frame.msgId);
           ws.send({ type: 'ack', msgId: frame.msgId });
           consumed += 1;
+
+          // Application acknowledgement is separate from the relay ack. A
+          // lost receipt does not roll back the durable setting and must not
+          // re-enter the decrypt classifier below. Retrying the same q causes
+          // `applyOwnerNotifyPreference` to return the stored pair and sends
+          // this acknowledgement again without rebinding anything.
+          if (notifyPreferenceAck !== undefined) {
+            try {
+              const message = { to: frame.from, body: notifyPreferenceAck, notify: false as const };
+              if (opts.notifyPreferenceAck !== undefined) {
+                await opts.notifyPreferenceAck(message);
+              } else {
+                await sendNotifyPreferenceAck({ account: name, stores, ...message });
+              }
+            } catch {
+              report.note(
+                '!! notification preference applied; acknowledgement could not be sent — retry from phone',
+              );
+            }
+          }
 
           // THE ACK IS THE END OF THE DECRYPT. Everything below is rendering,
           // and it gets its own catch because the one below is a DECRYPT
@@ -1102,7 +1186,7 @@ export function attachInbound(opts: InboundOptions): Inbound {
               stores,
               ws,
               log,
-              note: text => report.note(text),
+              note: (text) => report.note(text),
             });
             return;
           }

@@ -61,6 +61,7 @@ import { GroupCallScreen } from './src/screens/GroupCallScreen';
 import { CallsScreen } from './src/screens/CallsScreen';
 import { IncomingCallScreen } from './src/screens/IncomingCallScreen';
 import { ChatListScreen } from './src/screens/ChatListScreen';
+import { AttentionScreen } from './src/screens/AttentionScreen';
 import { GroupCreateScreen } from './src/screens/GroupCreateScreen';
 import { ChatThreadScreen } from './src/screens/ChatThreadScreen';
 import { AccountEmailScreen } from './src/screens/AccountEmailScreen';
@@ -131,6 +132,7 @@ import { onPendingOffer, onRecoveryNotice, pendingOfferWaiting } from './src/lin
 import { recoveryIntent, recoveryRowVisible, setRecoveryIntent } from './src/accounts';
 import { nextMsgId } from './src/msgid';
 import { personName } from './src/person';
+import type { PipCorner } from './src/ui/pipDrag';
 import { retractSelfId } from './src/nse';
 import { consumePendingNav } from './src/pushnav';
 import {
@@ -216,9 +218,15 @@ export type Route =
   | { name: 'register' }
   | { name: 'chats' }
   | { name: 'calls' }
+  | { name: 'attention' }
   | { name: 'newChat' }
   | { name: 'newRoom' }
-  | { name: 'thread'; peerId: string; from?: 'chats' | 'calls' }
+  | {
+      name: 'thread';
+      peerId: string;
+      from?: 'chats' | 'calls' | 'attention';
+      focusedApprovalQ?: string;
+    }
   // ORIGINS. These three are pushed from more than one place, and
   // until this field existed the table below guessed — so a profile opened
   // on the Calls tab dropped a person on Chats, and the App Lock nudge sent
@@ -259,13 +267,17 @@ export type Route =
   | {
       name: 'peerProfile';
       peerId: string;
-      from?: 'chats' | 'calls';
+      from?: 'chats' | 'calls' | 'attention';
       // Where the profile was opened from when not its own thread: a room
       // member's profile pops back to the ROOM profile, never into a 1:1
       // with someone you only share a room with.
       via?: { name: 'groupProfile'; groupId: string };
     }
-  | { name: 'groupProfile'; groupId: string; from?: 'chats' | 'calls' }
+  | {
+      name: 'groupProfile';
+      groupId: string;
+      from?: 'chats' | 'calls' | 'attention';
+    }
   | {
       name: 'photoViewer';
       peerId: string;
@@ -275,7 +287,7 @@ export type Route =
       // exits (its close control and hardware back) rebuild the thread, and
       // a rebuild without `from` forgets that a Calls-origin thread pops to
       // Calls — the second back would land on Chats.
-      from?: 'chats' | 'calls';
+      from?: 'chats' | 'calls' | 'attention';
     };
 
 /**
@@ -298,6 +310,7 @@ export type Route =
 const PANE_PROJECTED: ReadonlySet<Route['name']> = new Set<Route['name']>([
   'chats',
   'calls',
+  'attention',
   'newChat',
   'newRoom',
   'thread',
@@ -336,6 +349,7 @@ export const CALL_OVERLAY_SURFACE: Record<Route['name'], 'full' | 'window'> = {
   // The workspace.
   chats: 'window',
   calls: 'window',
+  attention: 'window',
   newChat: 'window',
   newRoom: 'window',
   thread: 'window',
@@ -471,6 +485,21 @@ function AppContent() {
   const callMinimizedRef = useRef(callMinimized);
   callMinimizedRef.current = callMinimized;
   const liveCallCid = call.call?.cid ?? null;
+  // The two video layout choices belong to this call, not to a particular
+  // mount of its full-screen surface. Keep them through minimize/restore,
+  // then synchronously reset before a different cid's first render.
+  const callVideoPresentation = useRef<{
+    cid: string | null;
+    swapped: boolean;
+    pipCorner: PipCorner;
+  }>({ cid: liveCallCid, swapped: false, pipCorner: 'top-right' });
+  if (callVideoPresentation.current.cid !== liveCallCid) {
+    callVideoPresentation.current = {
+      cid: liveCallCid,
+      swapped: false,
+      pipCorner: 'top-right',
+    };
+  }
   const [previousMinimizedCid, setPreviousMinimizedCid] = useState(liveCallCid);
   if (previousMinimizedCid !== liveCallCid) {
     setPreviousMinimizedCid(liveCallCid);
@@ -1840,20 +1869,26 @@ function AppContent() {
     // Dev-only: lets scripts/app-verify.sh drive navigation (the same
     // setRoute the screens call). Never attached outside __DEV__.
     if (__DEV__) {
-      (globalThis as unknown as Record<string, unknown>).TacendumDevNav = (
-        r: Route,
-      ) => setRoute(r);
+      const dev = globalThis as unknown as Record<string, unknown>;
+      dev.TacendumDevNav = (r: Route) => setRoute(r);
+      dev.TacendumDevOpenAttention = () => setRoute({ name: 'attention' });
+      dev.TacendumDevOpenApproval = (peerId: string, q: string) =>
+        setRoute({
+          name: 'thread',
+          peerId,
+          from: 'attention',
+          focusedApprovalQ: q,
+        });
       // The scripted lock checks need the same unlock path the LockScreen
       // uses (verify → single-flight verdict), minus the pad UI (jest covers
       // the pad).
-      (globalThis as unknown as Record<string, unknown>).TacendumDevUnlock =
-        async (code: string) => {
-          const result = await lock.verify(code);
-          if (result.verdict === 'real' || result.verdict === 'duress') {
-            applyVerdict(result.verdict);
-          }
-          return result.verdict;
-        };
+      dev.TacendumDevUnlock = async (code: string) => {
+        const result = await lock.verify(code);
+        if (result.verdict === 'real' || result.verdict === 'duress') {
+          applyVerdict(result.verdict);
+        }
+        return result.verdict;
+      };
     }
   }, [applyVerdict]);
 
@@ -2092,6 +2127,7 @@ function AppContent() {
         // prop the screen deliberately offers no control, which is the
         // LockNudge's rule that nothing may promise a route it was not given.
         onOpenSettings={() => setRoute({ name: 'settings', from: 'chats' })}
+        onOpenAttention={() => setRoute({ name: 'attention' })}
       />
     ));
   const callsSurface = profile && (
@@ -2296,6 +2332,23 @@ function AppContent() {
 
         {route.name === 'calls' && callsSurface}
 
+        {route.name === 'attention' && (
+          <AttentionScreen
+            onBack={() => setRoute({ name: 'chats' })}
+            onOpenApproval={(peerId, q) =>
+              setRoute({
+                name: 'thread',
+                peerId,
+                from: 'attention',
+                focusedApprovalQ: q,
+              })
+            }
+            onOpenConversation={peerId =>
+              setRoute({ name: 'thread', peerId, from: 'attention' })
+            }
+          />
+        )}
+
 
         {route.name === 'newChat' && profile && (
           <StartChatScreen
@@ -2334,11 +2387,10 @@ function AppContent() {
             // foreground push redemption — reused the mounted screen with a
             // new peerId, and its composer state (draft, reply chip, failed
             // photo) crossed over with it.
-            key={route.peerId}
+            key={`${route.peerId}:${route.focusedApprovalQ ?? ''}`}
             peerId={route.peerId}
-            onBack={() =>
-              setRoute(route.from === 'calls' ? { name: 'calls' } : { name: 'chats' })
-            }
+            focusedApprovalQ={route.focusedApprovalQ}
+            onBack={() => popRoute(route)}
             onOpenPeerProfile={() =>
               setRoute({
                 name: 'peerProfile',
@@ -2693,6 +2745,7 @@ function AppContent() {
           from both. */}
       {call.name === 'incoming_ringing' && call.call && (
         <IncomingCallScreen
+          peerId={call.call.peerId}
           peerName={callPeerName ?? personName(call.call.peerId)}
           peerAvatarB64={callPeerAvatar}
           withVideo={call.call.peerVideo}
@@ -2756,6 +2809,18 @@ function AppContent() {
             onFlipCamera={() => void flipCamera()}
             onToggleSpeaker={() => void toggleSpeaker()}
             onHangup={() => void callController().hangup()}
+            initialSwapped={callVideoPresentation.current.swapped}
+            initialPipCorner={callVideoPresentation.current.pipCorner}
+            onSwappedChange={swapped => {
+              if (callVideoPresentation.current.cid === call.call?.cid) {
+                callVideoPresentation.current.swapped = swapped;
+              }
+            }}
+            onPipCornerChange={pipCorner => {
+              if (callVideoPresentation.current.cid === call.call?.cid) {
+                callVideoPresentation.current.pipCorner = pipCorner;
+              }
+            }}
             // Offered only where the window can take over: a connected or
             // reconnecting call, on a route and in a session the window is
             // allowed on. A ringing call keeps the full screen (its ringback
@@ -2984,7 +3049,9 @@ function routeKey(route: Route): string {
   if (route.name === 'peerProfile') {
     return `${route.name}:${route.peerId}${route.via ? `:via:${route.via.groupId}` : ''}`;
   }
-  return route.name === 'thread' ? `${route.name}:${route.peerId}` : route.name;
+  return route.name === 'thread'
+    ? `${route.name}:${route.peerId}:${route.focusedApprovalQ ?? ''}`
+    : route.name;
 }
 
 /**
@@ -3005,6 +3072,7 @@ const DEPTH: Record<Route['name'], number> = {
   chats: 1,
   // A sibling of chats, not a descent: switching tabs slides neither way.
   calls: 1,
+  attention: 2,
   newChat: 2,
   newRoom: 2,
   thread: 2,
@@ -3066,10 +3134,16 @@ export function backDestination(route: Route): Route | null {
       return { name: 'chats' };
     case 'newRoom':
       return { name: 'chats' };
+    case 'attention':
+      return { name: 'chats' };
     case 'thread':
       // A thread respects its origin: opened from the Calls tab, its chevron
       // reads route.from and goes back to calls — back agrees.
-      return route.from === 'calls' ? { name: 'calls' } : { name: 'chats' };
+      return route.from === 'calls'
+        ? { name: 'calls' }
+        : route.from === 'attention'
+          ? { name: 'attention' }
+          : { name: 'chats' };
     case 'profile':
       // The Calls tab has its own profile door: opened there,
       // Back returns there. Unmarked doors are the chat list's, as they

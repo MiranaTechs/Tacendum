@@ -185,6 +185,18 @@ describe('the machine record: the server’s positive answers are remembered, it
       String(sql).includes('INSERT INTO machine_peers'),
     );
   };
+  const revokedInserts = () => {
+    const instance = sqlite.instances.get('tacendum.sqlite')!;
+    return instance.execute.mock.calls.filter(([sql]: [string]) =>
+      String(sql).includes('INSERT INTO revoked_machine_peers'),
+    );
+  };
+  const approvalPurges = () => {
+    const instance = sqlite.instances.get('tacendum.sqlite')!;
+    return instance.execute.mock.calls.filter(([sql]: [string]) =>
+      String(sql).includes('DELETE FROM approvals WHERE peerId'),
+    );
+  };
 
   it('adopt success records this peer as a machine — the one moment the app KNOWS', async () => {
     adoptMock.mockResolvedValueOnce(undefined);
@@ -215,6 +227,18 @@ describe('the machine record: the server’s positive answers are remembered, it
     const calls = inserts();
     expect(calls).toHaveLength(1);
     expect(calls[0]![1]).toEqual(expect.arrayContaining([PEER]));
+    expect(revokedInserts()).toHaveLength(1);
+    expect(revokedInserts()[0]![1]).toEqual(expect.arrayContaining([PEER]));
+    expect(approvalPurges()).toHaveLength(1);
+  });
+
+  it('a failed revoke writes neither lifecycle history nor an approval purge', async () => {
+    revokeMock.mockRejectedValueOnce(new TypeError('Network request failed'));
+    const tree = await mount();
+    await press(tree, 'peer-machine-revoke');
+    await press(tree, 'peer-machine-revoke-confirm');
+    expect(revokedInserts()).toHaveLength(0);
+    expect(approvalPurges()).toHaveLength(0);
   });
 
   it('the record is append-once at rest and in the sign-out wipe', async () => {
@@ -229,6 +253,7 @@ describe('the machine record: the server’s positive answers are remembered, it
     // Wiped on sign-out with everything else: the decoy workspace must never
     // inherit which contacts are the real account's machines.
     expect(db.DB_TABLES).toContain('machine_peers');
+    expect(db.DB_TABLES).toContain('revoked_machine_peers');
   });
 
   it('listMachinePeers returns the recorded ids', async () => {

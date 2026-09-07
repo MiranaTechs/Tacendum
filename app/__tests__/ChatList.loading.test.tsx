@@ -18,7 +18,7 @@
  */
 
 import React from 'react';
-import { Text } from 'react-native';
+import { Text, StyleSheet } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import * as db from '../src/db';
 import { ChatListScreen } from '../src/screens/ChatListScreen';
@@ -109,7 +109,9 @@ afterEach(async () => {
   await db.close();
 });
 
-async function mount(): Promise<ReactTestRenderer.ReactTestRenderer> {
+async function mount(
+  onOpenAttention?: () => void,
+): Promise<ReactTestRenderer.ReactTestRenderer> {
   let tree!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(() => {
     tree = ReactTestRenderer.create(
@@ -119,6 +121,7 @@ async function mount(): Promise<ReactTestRenderer.ReactTestRenderer> {
         onOpenProfile={jest.fn()}
         onStartChat={jest.fn()}
         onStartRoom={jest.fn()}
+        onOpenAttention={onOpenAttention}
       />,
     );
   });
@@ -147,6 +150,15 @@ async function answer(rows: ChatRows): Promise<void> {
 }
 
 describe('the chat list before its first answer', () => {
+  test('the attention door remains discoverable even with no chat row to render', async () => {
+    const onOpen = jest.fn();
+    const tree = await mount(onOpen);
+
+    const door = tree.root.findByProps({ testID: 'open-attention' });
+    await ReactTestRenderer.act(async () => door.props.onPress());
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
   test('nothing is painted where the empty state goes — no title, no steps', async () => {
     const tree = await mount();
     expect(reads.length).toBe(1); // the read is genuinely still in flight
@@ -219,4 +231,16 @@ describe('the chat list before its first answer', () => {
 
     await ReactTestRenderer.act(() => again.unmount());
   });
+});
+
+
+test('zero pending requests keeps a compact AI entry without an empty attention card', async () => {
+  jest.spyOn(db, 'listPendingApprovalSummaries').mockResolvedValue([]);
+  const tree = await mount(jest.fn());
+  const door = tree.root.findByProps({ testID: 'open-attention' });
+  expect(door.props.accessibilityLabel).toBe('AI activity and setup');
+  expect(texts(tree)).toContain('AI activity and setup');
+  expect(texts(tree)).not.toContain('Needs attention');
+  expect(StyleSheet.flatten(door.props.style({ pressed: false })).minHeight).toBe(44);
+  await ReactTestRenderer.act(() => tree.unmount());
 });

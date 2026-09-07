@@ -14,10 +14,9 @@ import com.facebook.react.viewmanagers.TacendumVideoViewManagerInterface
  * setters below one at a time, and the iOS file records what happens when each
  * one resubscribes on its own: the binding starts depending on the order and
  * completeness of the writes rather than on the props, and a recycled view
- * carries its previous life's track into the next call. So the setters record,
- * and every one of them then asks the host to bind from BOTH values — which is
- * idempotent, so the redundant calls cost nothing and the outcome is a pure
- * function of the props whatever order they arrive in.
+ * carries its previous life's track into the next call. Setters record the
+ * props; the completed transaction binds them together with the surface token.
+ * No intermediate binding may report a frame for the new view lifetime.
  */
 @ReactModule(name = TacendumVideoViewManager.NAME)
 class TacendumVideoViewManager :
@@ -29,6 +28,7 @@ class TacendumVideoViewManager :
   /** Per-view prop state, so a bind always sees both halves. */
   private val pendingCid = HashMap<TacendumVideoHost, String>()
   private val pendingRole = HashMap<TacendumVideoHost, String>()
+  private val pendingSurface = HashMap<TacendumVideoHost, String>()
 
   override fun getDelegate(): ViewManagerDelegate<TacendumVideoHost> = delegate
 
@@ -39,12 +39,14 @@ class TacendumVideoViewManager :
 
   override fun setCid(view: TacendumVideoHost, value: String?) {
     pendingCid[view] = value ?: ""
-    rebind(view)
   }
 
   override fun setTrack(view: TacendumVideoHost, value: String?) {
     pendingRole[view] = value ?: DEFAULT_TRACK
-    rebind(view)
+  }
+
+  override fun setSurfaceId(view: TacendumVideoHost, value: String?) {
+    pendingSurface[view] = value ?: ""
   }
 
   override fun setMirror(view: TacendumVideoHost, value: Boolean) {
@@ -55,9 +57,14 @@ class TacendumVideoViewManager :
     view.setObjectFit(value)
   }
 
-  private fun rebind(view: TacendumVideoHost) {
-    view.bind(pendingCid[view] ?: "", pendingRole[view] ?: DEFAULT_TRACK)
+  override fun onAfterUpdateTransaction(view: TacendumVideoHost) {
+    super.onAfterUpdateTransaction(view)
+    view.bind(pendingCid[view] ?: "", pendingRole[view] ?: DEFAULT_TRACK, pendingSurface[view] ?: "")
+    view.publishReadiness()
   }
+
+  override fun getExportedCustomDirectEventTypeConstants(): Map<String, Any> =
+      mapOf("topFrameReady" to mapOf("registrationName" to "onFrameReady"))
 
   /**
    * Fabric is done with this view — it goes back to the recycle pool, alive.
@@ -70,6 +77,7 @@ class TacendumVideoViewManager :
   override fun onDropViewInstance(view: TacendumVideoHost) {
     pendingCid.remove(view)
     pendingRole.remove(view)
+    pendingSurface.remove(view)
     view.resetForRecycle()
     super.onDropViewInstance(view)
   }

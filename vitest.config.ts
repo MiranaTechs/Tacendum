@@ -180,6 +180,11 @@ const heavy = [
   // 3. Spawns the real CLI as a child process (`node --import tsx main.ts`).
   'packages/cli/test/attend.test.ts',
   'packages/cli/test/crew.test.ts',
+  // Runs fixed git commands in two temporary repositories to prove captured
+  // context ignores inherited repository-selection environment variables.
+  'packages/cli/test/ai-work-context.test.ts',
+  // Initializes a disposable Git repository for exact approval/work context.
+  'packages/cli/test/gate.ai-origin.test.ts',
   'packages/cli/test/gate.binding-survives-refusal.test.ts',
   // Never appeared in a red run, and here anyway, because the rule above is
   // "classify by what a file touches", not "classify by what has been

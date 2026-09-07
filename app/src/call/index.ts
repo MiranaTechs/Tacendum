@@ -2021,13 +2021,14 @@ export async function acceptIncomingCall(
 /**
  * Whether a video answer can be offered right now: the camera has not been
  * REFUSED. "Undetermined" still counts — `acceptIncomingCall` asks at the
- * tap, exactly as a dial does. Total: a module that cannot say answers yes,
- * and the tap's own request settles it. */
+ * tap, exactly as a dial does. An unavailable status read keeps the audio
+ * answer available without advertising an unknown video capability.
+ */
 export async function cameraAvailableForAnswer(): Promise<boolean> {
   return native
     .cameraPermission()
     .then(state => state !== 'denied')
-    .catch(() => true);
+    .catch(() => false);
 }
 
 /**

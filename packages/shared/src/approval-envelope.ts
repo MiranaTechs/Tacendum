@@ -30,6 +30,7 @@
 
 import { z } from 'zod';
 import { aiOrigin } from './ai-origin.js';
+import { aiWorkMetadata } from './ai-work.js';
 import { Ulid } from './group-fold.js';
 
 /**
@@ -141,6 +142,9 @@ export const ApprovalRequestEnvelope = z.object({
    * and a malformed value collapses to unmarked rather than costing the
    * request. */
   ai: aiOrigin,
+  /** Supplementary sender-observed work facts. The immutable q/p journal
+   * remains the authorization; malformed metadata costs only itself. */
+  work: aiWorkMetadata,
 });
 
 /**

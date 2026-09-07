@@ -21,6 +21,7 @@
  */
 
 import React from 'react';
+import { FlatList } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import * as db from '../src/db';
 import { messaging } from '../src/messaging';
@@ -53,6 +54,7 @@ type SeedRow = Record<string, string | number | null>;
 
 let seeded: SeedRow[] = [];
 let sendReplySpy: jest.SpyInstance;
+let scrollToIndexSpy: jest.SpyInstance;
 
 function approvalRow(overrides: Partial<SeedRow> = {}): SeedRow {
   return {
@@ -80,6 +82,9 @@ beforeEach(async () => {
   sendReplySpy = jest
     .spyOn(messaging, 'sendReply')
     .mockResolvedValue(undefined);
+  scrollToIndexSpy = jest
+    .spyOn(FlatList.prototype, 'scrollToIndex')
+    .mockImplementation(() => {});
   await db.close();
   sqlite.reset();
   db.setWorkspace('real');
@@ -97,11 +102,14 @@ beforeEach(async () => {
 
 afterEach(async () => {
   sendReplySpy.mockRestore();
+  scrollToIndexSpy.mockRestore();
   await db.close();
   jest.useRealTimers();
 });
 
-async function renderThread(): Promise<ReactTestRenderer.ReactTestRenderer> {
+async function renderThread(
+  focusedApprovalQ?: string,
+): Promise<ReactTestRenderer.ReactTestRenderer> {
   let tree!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(() => {
     tree = ReactTestRenderer.create(
@@ -110,6 +118,7 @@ async function renderThread(): Promise<ReactTestRenderer.ReactTestRenderer> {
         onBack={jest.fn()}
         onOpenPeerProfile={jest.fn()}
         onOpenPhoto={jest.fn()}
+        focusedApprovalQ={focusedApprovalQ}
       />,
     );
   });
@@ -153,6 +162,10 @@ describe('the pending card', () => {
     seeded = [approvalRow()];
     const tree = await renderThread();
 
+    await ReactTestRenderer.act(() => {
+      pressable(tree, `approval-${Q_PENDING}-details`)!.props.onPress();
+    });
+
     // The card exists and the payload appears EXACTLY — both lines, one
     // node, nothing trimmed, nothing markdown-ed.
     expect(
@@ -162,9 +175,11 @@ describe('the pending card', () => {
 
     // The fixed header copy and the session tag — never sender prose.
     const texts = renderedText(tree);
-    expect(texts).toContain('APPROVAL');
+    expect(texts).toContain('Approval');
     expect(texts).toContain('Run a command');
     expect(texts).toContain('s-7c2e');
+    expect(texts).not.toContain('This room is ready.');
+    expect(texts).not.toContain('Write the first message.');
 
     // Both declared verbs, as buttons.
     expect(pressable(tree, `approval-${Q_PENDING}-approve`)).toBeTruthy();
@@ -212,6 +227,9 @@ describe('answering', () => {
   test('approve sends the ordinary reply — ref = the wire msgId — then settles; a double-tap lands ONE answer', async () => {
     seeded = [approvalRow()];
     const tree = await renderThread();
+    await ReactTestRenderer.act(() => {
+      pressable(tree, `approval-${Q_PENDING}-details`)!.props.onPress();
+    });
     const approve = pressable(tree, `approval-${Q_PENDING}-approve`)!;
 
     await ReactTestRenderer.act(async () => {
@@ -249,6 +267,9 @@ describe('answering', () => {
     // buttons — the exact race the handler's own clock check exists for.
     seeded = [approvalRow({ arrivedAt: Date.now() - 600_000 + 400 })];
     const tree = await renderThread();
+    await ReactTestRenderer.act(() => {
+      pressable(tree, `approval-${Q_PENDING}-details`)!.props.onPress();
+    });
     const approve = pressable(tree, `approval-${Q_PENDING}-approve`)!;
 
     await ReactTestRenderer.act(() => {
@@ -275,7 +296,7 @@ describe('settled and lapsed states', () => {
     await unmount(tree);
   });
 
-  test('an answered row renders the receipt: verb · when · from this device', async () => {
+  test('an answered row says the answer was queued and waits for host evidence', async () => {
     seeded = [
       approvalRow({
         state: 'answered',
@@ -284,14 +305,16 @@ describe('settled and lapsed states', () => {
       }),
     ];
     const tree = await renderThread();
-    // Under jest's default iOS Platform the device-noun token renders
-    // "iPhone" — the same receipt says "from this phone/tablet/iPad" on the
-    // other idioms (device-noun.test.ts pins the token itself).
-    const receipt = renderedText(tree).find(s =>
-      s.includes('from this iPhone'),
-    );
+    const receipt = renderedText(tree).find(s => s.includes('saved here'));
     expect(receipt).toBeTruthy();
-    expect(receipt).toContain('Approved');
+    expect(receipt).toContain('Approve answer queued');
+    expect(renderedText(tree)).toContain(
+      'Waiting for an update from the agent.',
+    );
+    await ReactTestRenderer.act(() => {
+      pressable(tree, `approval-${Q_PENDING}-info`)!.props.onPress();
+    });
+    expect(renderedText(tree)).toContain('A queued answer is not proof that the operation ran.');
     expect(pressable(tree, `approval-${Q_PENDING}-approve`)).toBeUndefined();
     await unmount(tree);
   });
@@ -365,6 +388,26 @@ describe('two approvals in one thread', () => {
       'in',
       'deny',
     );
+    await unmount(tree);
+  });
+
+  test('a routed request id lands on that exact card', async () => {
+    seeded = [
+      approvalRow(),
+      approvalRow({
+        q: Q_SECOND,
+        wireMsgId: '01APPROVALWIRE000000000002',
+        ts: Date.now() + 1,
+      }),
+    ];
+
+    const tree = await renderThread(Q_SECOND);
+
+    expect(scrollToIndexSpy).toHaveBeenCalledWith({
+      index: 1,
+      viewPosition: 0.5,
+      animated: true,
+    });
     await unmount(tree);
   });
 });

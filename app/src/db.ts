@@ -1,6 +1,15 @@
 import { open, type DB, type QueryResult, type Scalar } from '@op-engineering/op-sqlite';
 import {
+  AiWorkCapabilitiesSchema,
+  AiWorkContextSchema,
+  AiWorkMetadataSchema,
+  AiWorkUsageSchema,
   CallMetricReport,
+  displayAiWorkTimestamp,
+  type AiWorkCapabilities,
+  type AiWorkContext,
+  type AiWorkMetadata,
+  type AiWorkUsage,
   type CallEndReason,
   type DeviceClass,
 } from '@tacendum/shared';
@@ -1035,6 +1044,20 @@ export async function initSchema(d: Handle): Promise<void> {
       await d.execute(`ALTER TABLE chats ADD COLUMN ${ddl}`);
     }
   }
+  // Owner-requested routine notification mode for one authenticated agent.
+  // `effectiveRoutine` changes only when that same peer echoes the exact
+  // pending q+value; a queued request is visible but never painted as active.
+  await d.execute(`
+    CREATE TABLE IF NOT EXISTS ai_notify_preferences (
+      peerId TEXT PRIMARY KEY,
+      effectiveRoutine TEXT NOT NULL DEFAULT 'all'
+        CHECK (effectiveRoutine IN ('all','quiet')),
+      pendingQ TEXT,
+      requestedRoutine TEXT
+        CHECK (requestedRoutine IS NULL OR requestedRoutine IN ('all','quiet')),
+      requestedAt INTEGER,
+      acknowledgedAt INTEGER
+    )`);
   // Backfill for chats that predate `createdAt`: their first known moment is
   // their last message. Idempotent (the guard is `IS NULL`), so it is safe on
   // a partially migrated file and a no-op on every later launch.
@@ -1466,8 +1489,18 @@ export async function initSchema(d: Handle): Promise<void> {
     CREATE TABLE IF NOT EXISTS drafts (
       peerId TEXT PRIMARY KEY,
       text TEXT NOT NULL,
+      mentionState TEXT,
       updatedAt INTEGER NOT NULL
     )`);
+  // Mention intent shipped after ordinary string drafts. It remains on the
+  // same row so words and their exact local recipient binding are replaced
+  // and deleted together; old rows simply read NULL and stay plain text.
+  const draftColumns = (
+    (await d.execute(`PRAGMA table_info(drafts)`)).rows as { name: string }[]
+  ).map(r => r.name);
+  if (!draftColumns.includes('mentionState')) {
+    await d.execute(`ALTER TABLE drafts ADD COLUMN mentionState TEXT`);
+  }
   // Blocking (local-only, this device). Its OWN table, deliberately not a
   // column on `chats`: deleteChat() runs `DELETE FROM chats WHERE peerId = ?`,
   // so a blockedAt column would be erased by deleting the conversation —
@@ -1756,6 +1789,110 @@ export async function initSchema(d: Handle): Promise<void> {
       settledAt INTEGER,
       PRIMARY KEY (peerId, q)
     )`);
+  // Supplementary work facts never participate in the approval binding. The
+  // original q/p pair above remains the complete authorization; these
+  // columns only explain captured context and later host observations.
+  const approvalColumns = (
+    (await d.execute(`PRAGMA table_info(approvals)`)).rows as { name: string }[]
+  ).map(r => r.name);
+  for (const [column, ddl] of [
+    ['workJson', 'workJson TEXT'],
+    ['workReceivedAt', 'workReceivedAt INTEGER'],
+    ['hostObservation', 'hostObservation TEXT'],
+    ['hostObservationProvider', 'hostObservationProvider TEXT'],
+    ['hostObservationSourceAt', 'hostObservationSourceAt INTEGER'],
+    ['hostObservationReceivedAt', 'hostObservationReceivedAt INTEGER'],
+  ] as const) {
+    if (!approvalColumns.includes(column)) {
+      await d.execute(`ALTER TABLE approvals ADD COLUMN ${ddl}`);
+    }
+  }
+  // Canonical event ids are deduplicated only within their authenticated
+  // peer. runTag stays a display/grouping hint and cannot occupy this key.
+  await d.execute(`
+    CREATE TABLE IF NOT EXISTS ai_work_events (
+      peerId TEXT NOT NULL,
+      eventId TEXT NOT NULL,
+      wireMsgId TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      event TEXT NOT NULL,
+      project TEXT,
+      projectReceivedAt INTEGER,
+      requestId TEXT,
+      runTag TEXT,
+      originKind TEXT NOT NULL DEFAULT 'profile',
+      sourceRef TEXT,
+      workJson TEXT NOT NULL,
+      contextJson TEXT,
+      contextReceivedAt INTEGER,
+      sourceAt INTEGER NOT NULL,
+      displayAt INTEGER NOT NULL,
+      timeTrusted INTEGER NOT NULL,
+      receivedAt INTEGER NOT NULL,
+      PRIMARY KEY (peerId, eventId)
+    )`);
+  const aiWorkEventColumns = (
+    (await d.execute(`PRAGMA table_info(ai_work_events)`)).rows as { name: string }[]
+  ).map(row => row.name);
+  if (!aiWorkEventColumns.includes('originKind')) {
+    await d.execute(
+      `ALTER TABLE ai_work_events ADD COLUMN originKind TEXT NOT NULL DEFAULT 'profile'`,
+    );
+  }
+  if (!aiWorkEventColumns.includes('sourceRef')) {
+    await d.execute(`ALTER TABLE ai_work_events ADD COLUMN sourceRef TEXT`);
+  }
+  for (const [column, ddl] of [
+    ['projectReceivedAt', 'projectReceivedAt INTEGER'],
+    ['contextJson', 'contextJson TEXT'],
+    ['contextReceivedAt', 'contextReceivedAt INTEGER'],
+  ] as const) {
+    if (!aiWorkEventColumns.includes(column)) {
+      await d.execute(`ALTER TABLE ai_work_events ADD COLUMN ${ddl}`);
+    }
+  }
+  await d.execute(
+    `CREATE INDEX IF NOT EXISTS idx_ai_work_events_received
+     ON ai_work_events (receivedAt, peerId, eventId)`,
+  );
+  // Latest source-backed facts for one integration. Optional fields merge
+  // independently: an event with no usage must not erase a previously
+  // reported budget, while an explicit unavailable context does replace it.
+  await d.execute(`
+    CREATE TABLE IF NOT EXISTS ai_agent_state (
+      peerId TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      project TEXT,
+      projectReceivedAt INTEGER,
+      projectWireMsgId TEXT,
+      projectOriginKind TEXT,
+      capabilitiesJson TEXT,
+      capabilitiesReceivedAt INTEGER,
+      contextJson TEXT,
+      contextReceivedAt INTEGER,
+      contextWireMsgId TEXT,
+      contextOriginKind TEXT,
+      usageJson TEXT,
+      usageReceivedAt INTEGER,
+      lastSourceAt INTEGER NOT NULL,
+      lastDisplayAt INTEGER NOT NULL,
+      lastTimeTrusted INTEGER NOT NULL,
+      lastReceivedAt INTEGER NOT NULL
+    )`);
+  const aiAgentStateColumns = (
+    (await d.execute(`PRAGMA table_info(ai_agent_state)`)).rows as { name: string }[]
+  ).map(row => row.name);
+  for (const [column, ddl] of [
+    ['projectReceivedAt', 'projectReceivedAt INTEGER'],
+    ['projectWireMsgId', 'projectWireMsgId TEXT'],
+    ['projectOriginKind', 'projectOriginKind TEXT'],
+    ['contextWireMsgId', 'contextWireMsgId TEXT'],
+    ['contextOriginKind', 'contextOriginKind TEXT'],
+  ] as const) {
+    if (!aiAgentStateColumns.includes(column)) {
+      await d.execute(`ALTER TABLE ai_agent_state ADD COLUMN ${ddl}`);
+    }
+  }
   // Machines this account PAIRED, as the server itself confirmed them
   // (the knowledge-source rule is in machine.ts).
   // Written in exactly two places — the adopt and revoke 204 handlers on the
@@ -1769,6 +1906,16 @@ export async function initSchema(d: Handle): Promise<void> {
     CREATE TABLE IF NOT EXISTS machine_peers (
       peerId TEXT PRIMARY KEY,
       learnedAt INTEGER NOT NULL
+    )`);
+  // Successful integration revocations, learned only from the owner-called
+  // server route. Unlike machine_peers' immutable class, this is lifecycle:
+  // once this key is retired, late/replayed approval frames may never become
+  // actionable again. Separate so historical AI attribution survives while
+  // live capability does not.
+  await d.execute(`
+    CREATE TABLE IF NOT EXISTS revoked_machine_peers (
+      peerId TEXT PRIMARY KEY,
+      revokedAt INTEGER NOT NULL
     )`);
   // The consent record (DARK). This user's own per-agent decision, keyed to the agent
   // account: 'consented' or 'refused', undecided = no row. LOCAL ONLY in
@@ -2246,10 +2393,19 @@ export const DB_TABLES = [
   // machine's pending commands, which is exactly the disclosure the decoy
   // exists to prevent.
   'approvals',
+  // Structured agent events can contain repository/branch/result evidence;
+  // the state row also names configured capabilities and usage. Both belong
+  // to the real account and must never survive a wipe into the decoy.
+  'ai_work_events',
+  'ai_agent_state',
+  'ai_notify_preferences',
   // Which contacts are the real account's machines. A row here names
   // a relationship the server refuses to enumerate; surviving sign-out into
   // the decoy workspace would hand a coerced unlock exactly that list.
   'machine_peers',
+  // A server-confirmed retired integration is account relationship state.
+  // It must survive conversation deletion but never sign-out/duress switch.
+  'revoked_machine_peers',
   // The consent record (dark). Which agents this person consented
   // to — or pointedly refused — is a relationship map like the one above,
   // and a refusal surviving into the decoy would disclose exactly the
@@ -3870,6 +4026,13 @@ export async function deleteChat(peerId: string): Promise<void> {
       await d.execute(`DELETE FROM call_relay_prefs WHERE peerId = ?`, [
         peerId,
       ]);
+      // Approval payloads are conversation-owned exact command/file bytes.
+      // Leaving them behind would let recreating this chat revive an old
+      // authorisation request under the same (peerId, q).
+      await d.execute(`DELETE FROM approvals WHERE peerId = ?`, [peerId]);
+      await d.execute(`DELETE FROM ai_work_events WHERE peerId = ?`, [peerId]);
+      await d.execute(`DELETE FROM ai_agent_state WHERE peerId = ?`, [peerId]);
+      await d.execute(`DELETE FROM ai_notify_preferences WHERE peerId = ?`, [peerId]);
       await d.execute(`DELETE FROM messages WHERE peerId = ?`, [peerId]);
       await d.execute(`DELETE FROM chats WHERE peerId = ?`, [peerId]);
       await d.execute('COMMIT');
@@ -4896,6 +5059,13 @@ export async function aggregateFanoutStatus(localMsgId: string): Promise<void> {
 
 // --- drafts (unsent words, this device only, never sent anywhere) ---
 
+export interface ComposerDraft {
+  text: string;
+  /** Opaque, locally produced mention binding. The compose model validates
+   * room, full text, ranges, ids and current names before it can be used. */
+  mentionState: string | null;
+}
+
 /** The saved draft for a chat, or '' when there is none. */
 export async function getDraft(peerId: string): Promise<string> {
   const res = await conn().execute(`SELECT text FROM drafts WHERE peerId = ?`, [
@@ -4904,17 +5074,38 @@ export async function getDraft(peerId: string): Promise<string> {
   return (res.rows[0] as { text?: string } | undefined)?.text ?? '';
 }
 
+/** Read the words and their optional local mention binding atomically. */
+export async function getComposerDraft(
+  peerId: string,
+): Promise<ComposerDraft> {
+  const res = await conn().execute(
+    `SELECT text, mentionState FROM drafts WHERE peerId = ?`,
+    [peerId],
+  );
+  const row = res.rows[0] as
+    | { text?: string; mentionState?: string | null }
+    | undefined;
+  return {
+    text: row?.text ?? '',
+    mentionState: row?.mentionState ?? null,
+  };
+}
+
 /** Save a draft, or drop the row when there is nothing left to keep — an
  * empty draft must not linger as a stored fragment of what someone typed. */
-export async function setDraft(peerId: string, text: string): Promise<void> {
+export async function setDraft(
+  peerId: string,
+  text: string,
+  mentionState: string | null = null,
+): Promise<void> {
   const d = conn();
   if (text.trim() === '') {
     await d.execute(`DELETE FROM drafts WHERE peerId = ?`, [peerId]);
     return;
   }
   await d.execute(
-    `INSERT OR REPLACE INTO drafts (peerId, text, updatedAt) VALUES (?, ?, ?)`,
-    [peerId, text, Date.now()],
+    `INSERT OR REPLACE INTO drafts (peerId, text, mentionState, updatedAt) VALUES (?, ?, ?, ?)`,
+    [peerId, text, mentionState, Date.now()],
   );
 }
 
@@ -5004,6 +5195,13 @@ export async function blockPeer(peerId: string, at: number): Promise<void> {
          ON CONFLICT(peerId) DO NOTHING`,
         [peerId, at],
       );
+      // A blocked peer cannot receive an answer. Burn any request already on
+      // this phone in the same transaction as the block so lifting the block
+      // cannot revive stale executable/file payloads.
+      await d.execute(`DELETE FROM approvals WHERE peerId = ?`, [peerId]);
+      await d.execute(`DELETE FROM ai_work_events WHERE peerId = ?`, [peerId]);
+      await d.execute(`DELETE FROM ai_agent_state WHERE peerId = ?`, [peerId]);
+      await d.execute(`DELETE FROM ai_notify_preferences WHERE peerId = ?`, [peerId]);
       // The member's LIVE room legs, read before the purge (see the block
       // comment above): these settle, they are never deleted.
       const legs = (
@@ -6797,6 +6995,36 @@ export interface ApprovalRow {
   state: ApprovalState;
   answerVerb: string | null;
   settledAt: number | null;
+  /** Supplementary sender facts for this exact request. They never replace
+   * q/p as the authorization and disappear with the sensitive payload. */
+  work?: AiWorkMetadata | null;
+  workReceivedAt?: number | null;
+  /** What the authenticated host later said it observed. This is deliberately
+   * separate from the phone's queued answer and never means the operation ran. */
+  hostObservation?: AiWorkMetadata['approvalObservation'] | null;
+  hostObservationProvider?: AiWorkMetadata['provider'] | null;
+  hostObservationSourceAt?: number | null;
+  hostObservationReceivedAt?: number | null;
+}
+
+/**
+ * The payload-free shape used by the workspace attention inbox.  Keeping the
+ * exact request body out of this query is deliberate: the inbox may be
+ * visible beside another pane, while ApprovalCard remains the one place that
+ * renders the bytes a decision authorises.
+ */
+export interface PendingApprovalSummaryRow {
+  peerId: string;
+  q: string;
+  kind: ApprovalKind;
+  sessionTag: string | null;
+  ts: number;
+  arrivedAt: number;
+  deadline: number;
+  displayName: string | null;
+  localName: string | null;
+  /** Server-confirmed historical machine classification, never peer copy. */
+  machine: boolean;
 }
 
 /** UTF-8 byte length without Buffer (Hermes has no node builtins). Counts
@@ -6836,6 +7064,7 @@ export async function insertApproval(approval: {
   verbs: string[];
   ts: number;
   arrivedAt: number;
+  work?: AiWorkMetadata;
 }): Promise<boolean> {
   const res = await conn().execute(
     `INSERT INTO approvals
@@ -6845,6 +7074,9 @@ export async function insertApproval(approval: {
      WHERE (SELECT COUNT(*) FROM approvals
             WHERE peerId = ? AND state = 'pending' AND arrivedAt + ttlSec * 1000 > ?)
            < ${PENDING_APPROVALS_PER_PEER_CAP}
+       AND NOT EXISTS (
+         SELECT 1 FROM revoked_machine_peers WHERE peerId = ?
+       )
      ON CONFLICT(peerId, q) DO NOTHING`,
     [
       approval.peerId,
@@ -6860,9 +7092,23 @@ export async function insertApproval(approval: {
       approval.arrivedAt,
       approval.peerId,
       approval.arrivedAt,
+      approval.peerId,
     ],
   );
-  return (res.rowsAffected ?? 0) > 0;
+  const stored = (res.rowsAffected ?? 0) > 0;
+  if (!stored || approval.work === undefined) return stored;
+
+  // Supplementary context is accepted only when it names this exact request.
+  // A missing or different requestId costs only the context; the original
+  // q/p row above remains intact and actionable.
+  const parsed = AiWorkMetadataSchema.safeParse(approval.work);
+  if (!parsed.success || parsed.data.requestId !== approval.q) return stored;
+  await conn().execute(
+    `UPDATE approvals SET workJson = ?, workReceivedAt = ?
+     WHERE peerId = ? AND q = ?`,
+    [JSON.stringify(parsed.data), approval.arrivedAt, approval.peerId, approval.q],
+  );
+  return stored;
 }
 
 /**
@@ -6880,38 +7126,73 @@ export async function insertApproval(approval: {
  * `now` is a parameter, not a Date.now() call, so every caller — the screen
  * and the tests — moves the same clock.
  */
+async function maintainApprovals(
+  d: Handle,
+  now: number,
+  peerId?: string,
+): Promise<void> {
+  if (peerId !== undefined) {
+    // Keep these statements byte-stable for the focused approval-store test
+    // interpreter; the global arm below owns the same three policies.
+    await d.execute(
+      `UPDATE approvals
+       SET state = 'lapsed', settledAt = arrivedAt + ttlSec * 1000
+       WHERE peerId = ? AND state = 'pending'
+         AND arrivedAt + ttlSec * 1000 <= ?`,
+      [peerId, now],
+    );
+    await d.execute(
+      `UPDATE approvals SET payload = '', workJson = NULL
+       WHERE peerId = ? AND state != 'pending' AND settledAt IS NOT NULL
+         AND ? - settledAt >= ${APPROVAL_REDACT_AFTER_MS} AND payload != ''`,
+      [peerId, now],
+    );
+    await d.execute(
+      `DELETE FROM approvals
+       WHERE peerId = ? AND ? - COALESCE(settledAt, arrivedAt) >= ${APPROVAL_RETAIN_MS}`,
+      [peerId, now],
+    );
+    return;
+  }
+
+  await d.execute(
+    `UPDATE approvals
+     SET state = 'lapsed', settledAt = arrivedAt + ttlSec * 1000
+     WHERE state = 'pending' AND arrivedAt + ttlSec * 1000 <= ?`,
+    [now],
+  );
+  await d.execute(
+    `UPDATE approvals SET payload = '', workJson = NULL
+     WHERE state != 'pending' AND settledAt IS NOT NULL
+       AND ? - settledAt >= ${APPROVAL_REDACT_AFTER_MS} AND payload != ''`,
+    [now],
+  );
+  await d.execute(
+    `DELETE FROM approvals
+     WHERE ? - COALESCE(settledAt, arrivedAt) >= ${APPROVAL_RETAIN_MS}`,
+    [now],
+  );
+}
+
 export async function listApprovals(
   peerId: string,
   now: number,
 ): Promise<ApprovalRow[]> {
   const d = conn();
-  await d.execute(
-    `UPDATE approvals
-     SET state = 'lapsed', settledAt = arrivedAt + ttlSec * 1000
-     WHERE peerId = ? AND state = 'pending'
-       AND arrivedAt + ttlSec * 1000 <= ?`,
-    [peerId, now],
-  );
-  await d.execute(
-    `UPDATE approvals SET payload = ''
-     WHERE peerId = ? AND state != 'pending' AND settledAt IS NOT NULL
-       AND ? - settledAt >= ${APPROVAL_REDACT_AFTER_MS} AND payload != ''`,
-    [peerId, now],
-  );
-  await d.execute(
-    `DELETE FROM approvals
-     WHERE peerId = ? AND ? - COALESCE(settledAt, arrivedAt) >= ${APPROVAL_RETAIN_MS}`,
-    [peerId, now],
-  );
+  await maintainApprovals(d, now, peerId);
   const res = await d.execute(
     `SELECT peerId, q, wireMsgId, kind, payload, payloadBytes, ttlSec,
-            sessionTag, verbs, ts, arrivedAt, state, answerVerb, settledAt
+            sessionTag, verbs, ts, arrivedAt, state, answerVerb, settledAt,
+            workJson, workReceivedAt, hostObservation,
+            hostObservationProvider, hostObservationSourceAt,
+            hostObservationReceivedAt
      FROM approvals WHERE peerId = ? ORDER BY ts ASC, q ASC`,
     [peerId],
   );
-  return (res.rows as unknown as (Omit<ApprovalRow, 'verbs' | 'kind'> & {
+  return (res.rows as unknown as (Omit<ApprovalRow, 'verbs' | 'kind' | 'work'> & {
     verbs: string;
     kind: string;
+    workJson: string | null;
   })[]).map(row => {
     let verbs: string[] = [];
     try {
@@ -6922,13 +7203,76 @@ export async function listApprovals(
     } catch {
       // A row this build cannot read renders no buttons — never a crash.
     }
+    let work: AiWorkMetadata | null = null;
+    if (row.workJson) {
+      try {
+        const parsed = AiWorkMetadataSchema.safeParse(JSON.parse(row.workJson));
+        if (parsed.success) work = parsed.data;
+      } catch {
+        // Supplementary metadata is fail-soft; q/p remain renderable.
+      }
+    }
+    const { workJson: _workJson, ...stored } = row;
     return {
-      ...row,
+      ...stored,
       kind:
         row.kind === 'exec' || row.kind === 'file' ? row.kind : ('other' as const),
       verbs,
+      work,
     };
   });
+}
+
+/**
+ * Every live approval this workspace can safely surface, nearest deadline
+ * first.  Maintenance is global so a request does not keep command/file bytes
+ * merely because its thread was never opened.  The final read is one query:
+ * no per-chat cap and no N+1 that could silently lose a valid request.
+ *
+ * A chat preview is intentionally not required.  Messaging durably creates
+ * the chat before the approval row, and an approval can be the first thing a
+ * machine sends.  The inner chat join also keeps a deleted conversation's
+ * legacy orphan rows invisible; deleteChat now removes those rows at source.
+ */
+export async function listPendingApprovalSummaries(
+  now: number,
+): Promise<PendingApprovalSummaryRow[]> {
+  const d = conn();
+  await maintainApprovals(d, now);
+
+  const res = await d.execute(
+    `SELECT a.peerId, a.q, a.kind, a.sessionTag, a.ts, a.arrivedAt,
+            a.arrivedAt + a.ttlSec * 1000 AS deadline,
+            c.displayName, c.localName,
+            CASE WHEN mp.peerId IS NULL THEN 0 ELSE 1 END AS machine
+     FROM approvals a
+     INNER JOIN chats c ON c.peerId = a.peerId
+     LEFT JOIN machine_peers mp ON mp.peerId = a.peerId
+     WHERE a.state = 'pending'
+       AND a.hostObservation IS NULL
+       AND a.arrivedAt + a.ttlSec * 1000 > ?
+       AND c.identityChangedAt IS NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM blocked_peers b WHERE b.peerId = a.peerId
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM revoked_machine_peers r WHERE r.peerId = a.peerId
+       )
+     ORDER BY deadline ASC, a.arrivedAt DESC, a.peerId ASC, a.q ASC`,
+    [now],
+  );
+
+  return (res.rows as unknown as (Omit<PendingApprovalSummaryRow, 'kind' | 'machine'> & {
+    kind: string;
+    machine: number;
+  })[]).map(row => ({
+    ...row,
+    kind:
+      row.kind === 'exec' || row.kind === 'file'
+        ? row.kind
+        : ('other' as const),
+    machine: row.machine === 1,
+  }));
 }
 
 /**
@@ -6973,6 +7317,729 @@ export async function lapseApproval(
   return (res.rowsAffected ?? 0) > 0;
 }
 
+// --- structured AI work facts (AI workflows A3) ---
+
+/** Structured activity is a short local digest, not a second transcript. */
+export const AI_WORK_EVENT_RETAIN_MS = 7 * 24 * 60 * 60 * 1000;
+/** Repository, branch, result summary and project labels are short-lived
+ * context, even when their carrier is a profile snapshot. */
+export const AI_WORK_CONTEXT_RETAIN_MS = 24 * 60 * 60 * 1000;
+/** Old usage remains useful when labelled stale, but is not kept forever. */
+export const AI_WORK_USAGE_RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
+export const AI_WORK_EVENT_LIST_LIMIT = 250;
+export type AiWorkOriginKind = 'message' | 'approval' | 'profile';
+
+export interface AiWorkEventRow {
+  peerId: string;
+  eventId: string;
+  wireMsgId: string;
+  provider: AiWorkMetadata['provider'];
+  event: NonNullable<AiWorkMetadata['event']>;
+  project: string | null;
+  projectReceivedAt: number | null;
+  requestId: string | null;
+  runTag: string | null;
+  originKind: AiWorkOriginKind;
+  sourceRef: string;
+  sourceAt: number;
+  displayAt: number;
+  timeTrusted: boolean;
+  receivedAt: number;
+  displayName: string | null;
+  localName: string | null;
+  context: AiWorkContext | null;
+}
+
+export interface AiAgentStateRow {
+  peerId: string;
+  provider: AiWorkMetadata['provider'];
+  project: string | null;
+  projectReceivedAt: number | null;
+  capabilities: AiWorkCapabilities | null;
+  capabilitiesReceivedAt: number | null;
+  context: AiWorkContext | null;
+  contextReceivedAt: number | null;
+  usage: AiWorkUsage[] | null;
+  usageReceivedAt: number | null;
+  lastSourceAt: number;
+  lastDisplayAt: number;
+  lastTimeTrusted: boolean;
+  lastReceivedAt: number;
+  displayName: string | null;
+  localName: string | null;
+}
+
+interface StoredAiAgentState {
+  peerId: string;
+  provider: AiWorkMetadata['provider'];
+  project: string | null;
+  projectReceivedAt: number | null;
+  capabilitiesJson: string | null;
+  capabilitiesReceivedAt: number | null;
+  contextJson: string | null;
+  contextReceivedAt: number | null;
+  usageJson: string | null;
+  usageReceivedAt: number | null;
+  lastSourceAt: number;
+  lastDisplayAt: number;
+  lastTimeTrusted: number;
+  lastReceivedAt: number;
+  displayName: string | null;
+  localName: string | null;
+}
+
+function parseCapabilitiesJson(value: string | null): AiWorkCapabilities | null {
+  if (!value) return null;
+  try {
+    const parsed = AiWorkCapabilitiesSchema.safeParse(JSON.parse(value));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseContextJson(value: string | null): AiWorkContext | null {
+  if (!value) return null;
+  try {
+    const parsed = AiWorkContextSchema.safeParse(JSON.parse(value));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseUsageJson(value: string | null): AiWorkUsage[] | null {
+  if (!value) return null;
+  try {
+    const raw = JSON.parse(value) as unknown;
+    if (!Array.isArray(raw) || raw.length === 0 || raw.length > 8) return null;
+    const usage: AiWorkUsage[] = [];
+    for (const item of raw) {
+      const parsed = AiWorkUsageSchema.safeParse(item);
+      if (!parsed.success) return null;
+      usage.push(parsed.data);
+    }
+    return usage;
+  } catch {
+    return null;
+  }
+}
+
+function decodeAiAgentState(raw: StoredAiAgentState): AiAgentStateRow {
+  return {
+    peerId: raw.peerId,
+    provider: raw.provider,
+    project: raw.project,
+    projectReceivedAt: raw.projectReceivedAt,
+    capabilities: parseCapabilitiesJson(raw.capabilitiesJson),
+    capabilitiesReceivedAt: raw.capabilitiesReceivedAt,
+    context: parseContextJson(raw.contextJson),
+    contextReceivedAt: raw.contextReceivedAt,
+    usage: parseUsageJson(raw.usageJson),
+    usageReceivedAt: raw.usageReceivedAt,
+    lastSourceAt: raw.lastSourceAt,
+    lastDisplayAt: raw.lastDisplayAt,
+    lastTimeTrusted: raw.lastTimeTrusted === 1,
+    lastReceivedAt: raw.lastReceivedAt,
+    displayName: raw.displayName,
+    localName: raw.localName,
+  };
+}
+
+/**
+ * Remove structured copies as soon as their source no longer exists. The
+ * source predicates include logical expiry, so a disappearing message or
+ * approval stops surfacing before a different screen happens to sweep it.
+ */
+async function maintainAiWork(d: Handle, now: number): Promise<void> {
+  // The normalized columns are the event record. This legacy-required cell
+  // never keeps a second copy of result summaries, usage, or capabilities.
+  await d.execute(`UPDATE ai_work_events SET workJson = '{}' WHERE workJson != '{}'`);
+  await d.execute(
+    `DELETE FROM ai_work_events
+     WHERE ? - receivedAt >= ${AI_WORK_EVENT_RETAIN_MS}
+        OR (originKind = 'message' AND NOT EXISTS (
+          SELECT 1 FROM messages m
+          WHERE m.peerId = ai_work_events.peerId
+            AND m.msgId = COALESCE(ai_work_events.sourceRef, ai_work_events.wireMsgId)
+            AND m.direction = 'in'
+            AND m.body != ''
+            AND (m.expiresAt IS NULL OR m.expiresAt > ?)
+        ))
+        OR (originKind = 'approval' AND NOT EXISTS (
+          SELECT 1 FROM approvals a
+          WHERE a.peerId = ai_work_events.peerId
+            AND a.wireMsgId = COALESCE(ai_work_events.sourceRef, ai_work_events.wireMsgId)
+            AND a.state = 'pending'
+            AND a.arrivedAt + a.ttlSec * 1000 > ?
+            AND a.workJson IS NOT NULL
+        ))`,
+    [now, now, now],
+  );
+  await d.execute(
+    `UPDATE ai_work_events
+     SET project = NULL, projectReceivedAt = NULL,
+         contextJson = NULL, contextReceivedAt = NULL
+     WHERE (project IS NOT NULL OR contextJson IS NOT NULL)
+       AND (COALESCE(projectReceivedAt, contextReceivedAt) IS NULL
+         OR ? - COALESCE(projectReceivedAt, contextReceivedAt)
+              >= ${AI_WORK_CONTEXT_RETAIN_MS})`,
+    [now],
+  );
+
+  await d.execute(
+    `UPDATE ai_agent_state
+     SET project = NULL, projectReceivedAt = NULL,
+         projectWireMsgId = NULL, projectOriginKind = NULL
+     WHERE project IS NOT NULL AND (
+       projectReceivedAt IS NULL OR projectOriginKind IS NULL
+       OR ? - projectReceivedAt >= ${AI_WORK_CONTEXT_RETAIN_MS}
+       OR (projectOriginKind = 'message' AND NOT EXISTS (
+         SELECT 1 FROM messages m
+         WHERE m.peerId = ai_agent_state.peerId
+           AND m.msgId = ai_agent_state.projectWireMsgId
+           AND m.direction = 'in'
+           AND m.body != ''
+           AND (m.expiresAt IS NULL OR m.expiresAt > ?)
+       ))
+       OR (projectOriginKind = 'approval' AND NOT EXISTS (
+         SELECT 1 FROM approvals a
+         WHERE a.peerId = ai_agent_state.peerId
+           AND a.wireMsgId = ai_agent_state.projectWireMsgId
+           AND a.state = 'pending'
+           AND a.arrivedAt + a.ttlSec * 1000 > ?
+           AND a.workJson IS NOT NULL
+       ))
+     )`,
+    [now, now, now],
+  );
+
+  await d.execute(
+    `UPDATE ai_agent_state
+     SET contextJson = NULL, contextReceivedAt = NULL,
+         contextWireMsgId = NULL, contextOriginKind = NULL
+     WHERE contextJson IS NOT NULL AND (
+       contextReceivedAt IS NULL OR contextOriginKind IS NULL
+       OR ? - contextReceivedAt >= ${AI_WORK_CONTEXT_RETAIN_MS}
+       OR (contextOriginKind = 'message' AND NOT EXISTS (
+         SELECT 1 FROM messages m
+         WHERE m.peerId = ai_agent_state.peerId
+           AND m.msgId = ai_agent_state.contextWireMsgId
+           AND m.direction = 'in'
+           AND m.body != ''
+           AND (m.expiresAt IS NULL OR m.expiresAt > ?)
+       ))
+       OR (contextOriginKind = 'approval' AND NOT EXISTS (
+         SELECT 1 FROM approvals a
+         WHERE a.peerId = ai_agent_state.peerId
+           AND a.wireMsgId = ai_agent_state.contextWireMsgId
+           AND a.state = 'pending'
+           AND a.arrivedAt + a.ttlSec * 1000 > ?
+           AND a.workJson IS NOT NULL
+       ))
+     )`,
+    [now, now, now],
+  );
+
+  await d.execute(
+    `UPDATE ai_agent_state
+     SET usageJson = NULL, usageReceivedAt = NULL
+     WHERE usageJson IS NOT NULL
+       AND ? - usageReceivedAt >= ${AI_WORK_USAGE_RETAIN_MS}`,
+    [now],
+  );
+}
+
+/**
+ * Persist authenticated sender facts. Local receipt order is authoritative;
+ * sender time is retained only as a labelled display hint. Event identity is
+ * exactly (peerId,eventId), while runTag remains a collision-prone label.
+ *
+ * A successful block/revoke/delete and this write share runExclusive, and the
+ * INSERT guards lifecycle state inside the transaction. Replayed late facts
+ * therefore cannot recreate a retired integration after its chat is rebuilt.
+ */
+export async function recordAiWork(
+  peerId: string,
+  wireMsgId: string,
+  receivedAt: number,
+  work: AiWorkMetadata,
+  originKind: AiWorkOriginKind = 'profile',
+  sourceRef: string = wireMsgId,
+): Promise<void> {
+  const parsed = AiWorkMetadataSchema.safeParse(work);
+  if (!parsed.success) return;
+  const value = parsed.data;
+  const display = displayAiWorkTimestamp(value.updatedAt, receivedAt);
+  const d = conn();
+
+  await runExclusive(async () => {
+    await d.execute('BEGIN IMMEDIATE');
+    try {
+      await maintainAiWork(d, receivedAt);
+
+      let acceptsFacts = true;
+      if (value.event !== undefined && value.eventId !== undefined) {
+        const eventInsert = await d.execute(
+          `INSERT INTO ai_work_events
+             (peerId, eventId, wireMsgId, provider, event,
+              project, projectReceivedAt, requestId, runTag, originKind,
+              sourceRef, workJson, contextJson, contextReceivedAt,
+              sourceAt, displayAt, timeTrusted, receivedAt)
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           WHERE EXISTS (
+             SELECT 1 FROM chats c
+             WHERE c.peerId = ? AND c.identityChangedAt IS NULL
+           )
+             AND NOT EXISTS (
+               SELECT 1 FROM blocked_peers b WHERE b.peerId = ?
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM revoked_machine_peers r WHERE r.peerId = ?
+             )
+           ON CONFLICT(peerId, eventId) DO NOTHING`,
+          [
+            peerId,
+            value.eventId,
+            wireMsgId,
+            value.provider,
+            value.event,
+            value.project ?? null,
+            value.project === undefined ? null : receivedAt,
+            value.requestId ?? null,
+            value.runTag ?? null,
+            originKind,
+            sourceRef,
+            '{}',
+            value.context === undefined ? null : JSON.stringify(value.context),
+            value.context === undefined ? null : receivedAt,
+            value.updatedAt,
+            display.at,
+            display.trusted ? 1 : 0,
+            receivedAt,
+            peerId,
+            peerId,
+            peerId,
+          ],
+        );
+        // A duplicate canonical event is the same fact, not a fresh snapshot.
+        // It cannot refresh age or roll capability/usage/context backwards.
+        acceptsFacts = (eventInsert.rowsAffected ?? 0) > 0;
+      }
+
+      if (acceptsFacts) await d.execute(
+        `INSERT INTO ai_agent_state
+           (peerId, provider, project, projectReceivedAt,
+            projectWireMsgId, projectOriginKind,
+            capabilitiesJson, capabilitiesReceivedAt,
+            contextJson, contextReceivedAt, contextWireMsgId, contextOriginKind,
+            usageJson, usageReceivedAt,
+            lastSourceAt, lastDisplayAt, lastTimeTrusted, lastReceivedAt)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE EXISTS (
+           SELECT 1 FROM chats c
+           WHERE c.peerId = ? AND c.identityChangedAt IS NULL
+         )
+           AND NOT EXISTS (
+             SELECT 1 FROM blocked_peers b WHERE b.peerId = ?
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM revoked_machine_peers r WHERE r.peerId = ?
+           )
+         ON CONFLICT(peerId) DO UPDATE SET
+           provider = excluded.provider,
+           project = CASE
+             WHEN excluded.provider != ai_agent_state.provider
+               THEN excluded.project
+             ELSE COALESCE(excluded.project, ai_agent_state.project)
+           END,
+           projectReceivedAt = CASE
+             WHEN excluded.provider != ai_agent_state.provider
+               THEN excluded.projectReceivedAt
+             ELSE COALESCE(excluded.projectReceivedAt, ai_agent_state.projectReceivedAt)
+           END,
+           projectWireMsgId = CASE
+             WHEN excluded.provider != ai_agent_state.provider
+               THEN excluded.projectWireMsgId
+             ELSE COALESCE(excluded.projectWireMsgId, ai_agent_state.projectWireMsgId)
+           END,
+           projectOriginKind = CASE
+             WHEN excluded.provider != ai_agent_state.provider
+               THEN excluded.projectOriginKind
+             ELSE COALESCE(excluded.projectOriginKind, ai_agent_state.projectOriginKind)
+           END,
+           capabilitiesJson = CASE
+             WHEN excluded.provider != ai_agent_state.provider
+               THEN excluded.capabilitiesJson
+             ELSE COALESCE(excluded.capabilitiesJson, ai_agent_state.capabilitiesJson)
+           END,
+           capabilitiesReceivedAt = CASE
+             WHEN excluded.provider != ai_agent_state.provider
+               THEN excluded.capabilitiesReceivedAt
+             ELSE COALESCE(
+               excluded.capabilitiesReceivedAt,
+               ai_agent_state.capabilitiesReceivedAt
+             )
+           END,
+           contextJson = CASE
+             WHEN excluded.provider != ai_agent_state.provider
+               THEN excluded.contextJson
+             ELSE COALESCE(excluded.contextJson, ai_agent_state.contextJson)
+           END,
+           contextReceivedAt = CASE
+             WHEN excluded.provider != ai_agent_state.provider
+               THEN excluded.contextReceivedAt
+             ELSE COALESCE(excluded.contextReceivedAt, ai_agent_state.contextReceivedAt)
+           END,
+           contextWireMsgId = CASE
+             WHEN excluded.provider != ai_agent_state.provider
+               THEN excluded.contextWireMsgId
+             ELSE COALESCE(excluded.contextWireMsgId, ai_agent_state.contextWireMsgId)
+           END,
+           contextOriginKind = CASE
+             WHEN excluded.provider != ai_agent_state.provider
+               THEN excluded.contextOriginKind
+             ELSE COALESCE(excluded.contextOriginKind, ai_agent_state.contextOriginKind)
+           END,
+           usageJson = CASE
+             WHEN excluded.provider != ai_agent_state.provider
+               THEN excluded.usageJson
+             ELSE COALESCE(excluded.usageJson, ai_agent_state.usageJson)
+           END,
+           usageReceivedAt = CASE
+             WHEN excluded.provider != ai_agent_state.provider
+               THEN excluded.usageReceivedAt
+             ELSE COALESCE(excluded.usageReceivedAt, ai_agent_state.usageReceivedAt)
+           END,
+           lastSourceAt = excluded.lastSourceAt,
+           lastDisplayAt = excluded.lastDisplayAt,
+           lastTimeTrusted = excluded.lastTimeTrusted,
+           lastReceivedAt = excluded.lastReceivedAt
+         WHERE excluded.lastReceivedAt >= ai_agent_state.lastReceivedAt`,
+        [
+          peerId,
+          value.provider,
+          value.project ?? null,
+          value.project === undefined ? null : receivedAt,
+          value.project === undefined ? null : sourceRef,
+          value.project === undefined ? null : originKind,
+          value.capabilities === undefined
+            ? null
+            : JSON.stringify(value.capabilities),
+          value.capabilities === undefined ? null : receivedAt,
+          value.context === undefined ? null : JSON.stringify(value.context),
+          value.context === undefined ? null : receivedAt,
+          value.context === undefined ? null : sourceRef,
+          value.context === undefined ? null : originKind,
+          value.usage === undefined ? null : JSON.stringify(value.usage),
+          value.usage === undefined ? null : receivedAt,
+          value.updatedAt,
+          display.at,
+          display.trusted ? 1 : 0,
+          receivedAt,
+          peerId,
+          peerId,
+          peerId,
+        ],
+      );
+
+      if (
+        acceptsFacts &&
+        value.approvalObservation !== undefined &&
+        value.requestId !== undefined
+      ) {
+        await d.execute(
+          `UPDATE approvals
+           SET hostObservation = ?, hostObservationProvider = ?,
+               hostObservationSourceAt = ?, hostObservationReceivedAt = ?
+           WHERE peerId = ? AND q = ?
+             AND (
+               hostObservation IS NULL
+               OR CASE ?
+                    WHEN 'answer-received' THEN 1
+                    WHEN 'decision-returned' THEN 2
+                    WHEN 'provider-received' THEN 3
+                    WHEN 'expired' THEN 4
+                    ELSE 0
+                  END
+                  > CASE hostObservation
+                    WHEN 'answer-received' THEN 1
+                    WHEN 'decision-returned' THEN 2
+                    WHEN 'provider-received' THEN 3
+                    WHEN 'expired' THEN 4
+                    ELSE 0
+                  END
+             )
+             AND EXISTS (
+               SELECT 1 FROM chats c
+               WHERE c.peerId = approvals.peerId
+                 AND c.identityChangedAt IS NULL
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM blocked_peers b WHERE b.peerId = approvals.peerId
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM revoked_machine_peers r
+               WHERE r.peerId = approvals.peerId
+             )`,
+          [
+            value.approvalObservation,
+            value.provider,
+            value.updatedAt,
+            receivedAt,
+            peerId,
+            value.requestId,
+            value.approvalObservation,
+          ],
+        );
+      }
+
+      await d.execute('COMMIT');
+    } catch (err) {
+      await d.execute('ROLLBACK');
+      throw err;
+    }
+  });
+}
+
+/** Recent structured events, in this phone's receive order. */
+export async function listRecentAiWorkEvents(now: number): Promise<AiWorkEventRow[]> {
+  const d = conn();
+  await maintainApprovals(d, now);
+  await maintainAiWork(d, now);
+  const res = await d.execute(
+    `SELECT e.peerId, e.eventId, e.wireMsgId, e.provider, e.event,
+            e.project, e.projectReceivedAt, e.requestId, e.runTag, e.originKind,
+            COALESCE(e.sourceRef, e.wireMsgId) AS sourceRef,
+            e.contextJson, e.contextReceivedAt, e.sourceAt,
+            e.displayAt, e.timeTrusted, e.receivedAt,
+            c.displayName, c.localName
+     FROM ai_work_events e
+     INNER JOIN chats c ON c.peerId = e.peerId
+     WHERE c.identityChangedAt IS NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM blocked_peers b WHERE b.peerId = e.peerId
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM revoked_machine_peers r WHERE r.peerId = e.peerId
+       )
+     ORDER BY e.receivedAt DESC, e.peerId ASC, e.eventId ASC
+     LIMIT ${AI_WORK_EVENT_LIST_LIMIT}`,
+  );
+  const rows: AiWorkEventRow[] = [];
+  for (const raw of res.rows as unknown as Array<{
+    peerId: string;
+    eventId: string;
+    wireMsgId: string;
+    provider: AiWorkMetadata['provider'];
+    event: NonNullable<AiWorkMetadata['event']>;
+    project: string | null;
+    projectReceivedAt: number | null;
+    requestId: string | null;
+    runTag: string | null;
+    originKind: AiWorkOriginKind;
+    sourceRef: string;
+    contextJson: string | null;
+    contextReceivedAt: number | null;
+    sourceAt: number;
+    displayAt: number;
+    timeTrusted: number;
+    receivedAt: number;
+    displayName: string | null;
+    localName: string | null;
+  }>) {
+    const context = parseContextJson(raw.contextJson);
+    const candidate = AiWorkMetadataSchema.safeParse({
+      provider: raw.provider,
+      updatedAt: raw.sourceAt,
+      event: raw.event,
+      eventId: raw.eventId,
+      ...(raw.project === null ? {} : { project: raw.project }),
+      ...(raw.requestId === null ? {} : { requestId: raw.requestId }),
+      ...(raw.runTag === null ? {} : { runTag: raw.runTag }),
+      ...(context === null ? {} : { context }),
+    });
+    if (!candidate.success) continue;
+    const { contextJson: _contextJson, timeTrusted, ...stored } = raw;
+    rows.push({ ...stored, timeTrusted: timeTrusted === 1, context });
+  }
+  return rows;
+}
+
+/** Latest independently merged facts for one integration. */
+export async function getAiAgentState(peerId: string): Promise<AiAgentStateRow | null> {
+  const d = conn();
+  await maintainAiWork(d, Date.now());
+  const res = await d.execute(
+    `SELECT s.peerId, s.provider, s.project,
+            s.projectReceivedAt,
+            s.capabilitiesJson, s.capabilitiesReceivedAt,
+            s.contextJson, s.contextReceivedAt,
+            s.usageJson, s.usageReceivedAt,
+            s.lastSourceAt, s.lastDisplayAt, s.lastTimeTrusted,
+            s.lastReceivedAt, c.displayName, c.localName
+     FROM ai_agent_state s
+     INNER JOIN chats c ON c.peerId = s.peerId
+     WHERE s.peerId = ? AND c.identityChangedAt IS NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM blocked_peers b WHERE b.peerId = s.peerId
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM revoked_machine_peers r WHERE r.peerId = s.peerId
+       )`,
+    [peerId],
+  );
+  const raw = res.rows[0] as unknown as StoredAiAgentState | undefined;
+  if (!raw) return null;
+  return decodeAiAgentState(raw);
+}
+
+/** Every non-retired integration with source-backed state, newest receipt first. */
+export async function listAiAgentStates(now: number): Promise<AiAgentStateRow[]> {
+  const d = conn();
+  await maintainAiWork(d, now);
+  const res = await d.execute(
+    `SELECT s.peerId, s.provider, s.project, s.projectReceivedAt,
+            s.capabilitiesJson, s.capabilitiesReceivedAt,
+            s.contextJson, s.contextReceivedAt,
+            s.usageJson, s.usageReceivedAt,
+            s.lastSourceAt, s.lastDisplayAt, s.lastTimeTrusted,
+            s.lastReceivedAt, c.displayName, c.localName
+     FROM ai_agent_state s
+     INNER JOIN chats c ON c.peerId = s.peerId
+     WHERE c.identityChangedAt IS NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM blocked_peers b WHERE b.peerId = s.peerId
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM revoked_machine_peers r WHERE r.peerId = s.peerId
+       )
+     ORDER BY s.lastReceivedAt DESC, s.peerId ASC`,
+  );
+  return (res.rows as unknown as StoredAiAgentState[]).map(decodeAiAgentState);
+}
+
+export type AiRoutineNotificationMode = 'all' | 'quiet';
+
+export interface AiNotifyPreferenceRow {
+  peerId: string;
+  effectiveRoutine: AiRoutineNotificationMode;
+  pendingQ: string | null;
+  requestedRoutine: AiRoutineNotificationMode | null;
+  requestedAt: number | null;
+  acknowledgedAt: number | null;
+}
+
+const defaultAiNotifyPreference = (peerId: string): AiNotifyPreferenceRow => ({
+  peerId,
+  effectiveRoutine: 'all',
+  pendingQ: null,
+  requestedRoutine: null,
+  requestedAt: null,
+  acknowledgedAt: null,
+});
+
+/** Current effective mode plus any owner request awaiting an exact host ack. */
+export async function getAiNotifyPreference(
+  peerId: string,
+): Promise<AiNotifyPreferenceRow> {
+  const res = await conn().execute(
+    `SELECT peerId, effectiveRoutine, pendingQ, requestedRoutine,
+            requestedAt, acknowledgedAt
+     FROM ai_notify_preferences WHERE peerId = ?`,
+    [peerId],
+  );
+  const raw = res.rows[0] as unknown as AiNotifyPreferenceRow | undefined;
+  if (
+    !raw ||
+    (raw.effectiveRoutine !== 'all' && raw.effectiveRoutine !== 'quiet') ||
+    (raw.requestedRoutine !== null &&
+      raw.requestedRoutine !== 'all' &&
+      raw.requestedRoutine !== 'quiet')
+  ) {
+    return defaultAiNotifyPreference(peerId);
+  }
+  return raw;
+}
+
+/**
+ * Persist the request before its carrier can flush. Last choice wins: an ack
+ * for an older q is ignored once the owner has requested a newer value.
+ */
+export async function beginAiNotifyPreference(
+  peerId: string,
+  q: string,
+  routine: AiRoutineNotificationMode,
+  requestedAt: number,
+): Promise<boolean> {
+  const res = await conn().execute(
+    `INSERT INTO ai_notify_preferences
+       (peerId, effectiveRoutine, pendingQ, requestedRoutine, requestedAt,
+        acknowledgedAt)
+     SELECT ?, 'all', ?, ?, ?, NULL
+     WHERE EXISTS (
+       SELECT 1 FROM chats c
+       WHERE c.peerId = ? AND c.identityChangedAt IS NULL
+     )
+       AND NOT EXISTS (
+         SELECT 1 FROM blocked_peers b WHERE b.peerId = ?
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM revoked_machine_peers r WHERE r.peerId = ?
+       )
+     ON CONFLICT(peerId) DO UPDATE SET
+       pendingQ = excluded.pendingQ,
+       requestedRoutine = excluded.requestedRoutine,
+       requestedAt = excluded.requestedAt
+     WHERE NOT EXISTS (
+       SELECT 1 FROM blocked_peers b WHERE b.peerId = excluded.peerId
+     )
+       AND NOT EXISTS (
+         SELECT 1 FROM revoked_machine_peers r WHERE r.peerId = excluded.peerId
+       )`,
+    [peerId, q, routine, requestedAt, peerId, peerId, peerId],
+  );
+  return (res.rowsAffected ?? 0) > 0;
+}
+
+/** Apply only the authenticated peer's exact q+value echo. */
+export async function applyAiNotifyPreferenceAck(
+  peerId: string,
+  q: string,
+  routine: AiRoutineNotificationMode,
+  acknowledgedAt: number,
+): Promise<boolean> {
+  const res = await conn().execute(
+    `UPDATE ai_notify_preferences
+     SET effectiveRoutine = requestedRoutine,
+         pendingQ = NULL, requestedRoutine = NULL, requestedAt = NULL,
+         acknowledgedAt = ?
+     WHERE peerId = ? AND pendingQ = ? AND requestedRoutine = ?
+       AND NOT EXISTS (
+         SELECT 1 FROM blocked_peers b WHERE b.peerId = ai_notify_preferences.peerId
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM revoked_machine_peers r
+         WHERE r.peerId = ai_notify_preferences.peerId
+       )`,
+    [acknowledgedAt, peerId, q, routine],
+  );
+  return (res.rowsAffected ?? 0) > 0;
+}
+
+/** Undo only the request whose carrier failed before becoming durable. */
+export async function clearAiNotifyPreferenceRequest(
+  peerId: string,
+  q: string,
+): Promise<void> {
+  await conn().execute(
+    `UPDATE ai_notify_preferences
+     SET pendingQ = NULL, requestedRoutine = NULL, requestedAt = NULL
+     WHERE peerId = ? AND pendingQ = ?`,
+    [peerId, q],
+  );
+}
+
 // --- the machine record ---
 
 /**
@@ -6994,6 +8061,42 @@ export async function recordMachinePeer(
      ON CONFLICT(peerId) DO NOTHING`,
     [peerId, learnedAt],
   );
+}
+
+/**
+ * Persist the owner route's successful revoke and burn every approval from
+ * that retired key atomically. A failed server call never reaches this
+ * function. The lifecycle row survives deleteChat, and insertApproval checks
+ * it in its INSERT statement so a late/replayed frame cannot revive work.
+ */
+export async function recordMachineRevoked(
+  peerId: string,
+  revokedAt: number,
+): Promise<void> {
+  const d = conn();
+  await runExclusive(async () => {
+    await d.execute('BEGIN IMMEDIATE');
+    try {
+      await d.execute(
+        `INSERT INTO machine_peers (peerId, learnedAt)
+         VALUES (?, ?) ON CONFLICT(peerId) DO NOTHING`,
+        [peerId, revokedAt],
+      );
+      await d.execute(
+        `INSERT INTO revoked_machine_peers (peerId, revokedAt)
+         VALUES (?, ?) ON CONFLICT(peerId) DO NOTHING`,
+        [peerId, revokedAt],
+      );
+      await d.execute(`DELETE FROM approvals WHERE peerId = ?`, [peerId]);
+      await d.execute(`DELETE FROM ai_work_events WHERE peerId = ?`, [peerId]);
+      await d.execute(`DELETE FROM ai_agent_state WHERE peerId = ?`, [peerId]);
+      await d.execute(`DELETE FROM ai_notify_preferences WHERE peerId = ?`, [peerId]);
+      await d.execute('COMMIT');
+    } catch (err) {
+      await d.execute('ROLLBACK');
+      throw err;
+    }
+  });
 }
 
 /** Every machine this account has been TOLD about, for the AI badge and the

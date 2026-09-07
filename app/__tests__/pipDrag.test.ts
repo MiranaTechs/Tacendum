@@ -16,6 +16,7 @@ import {
   pipDragClaims,
   usePipDrag,
   type PipBox,
+  type PipCorner,
   type PipDrag,
 } from '../src/ui/pipDrag';
 import * as fromCallScreen from '../src/screens/CallScreen';
@@ -24,6 +25,8 @@ import {
   OVERLAY_BOTTOM_CLEARANCE,
   OVERLAY_TOP_CLEARANCE,
   OVERLAY_VIDEO_BOX,
+  OVERLAY_VIDEO_CONTROL_GAP,
+  OVERLAY_VIDEO_END_SIZE,
 } from '../src/screens/CallOverlay';
 
 /**
@@ -116,7 +119,9 @@ describe('the box parameter (what the minimized window needs)', () => {
     // The video window is the SAME 110pt 16:9 picture the self-view is — one
     // family — with the clearances of the surface it floats over: the thread
     // header (56) plus air at the top, the composer band at the bottom.
-    expect(OVERLAY_VIDEO_BOX.width).toBe(PIP_WIDTH);
+    expect(OVERLAY_VIDEO_BOX.width).toBe(
+      PIP_WIDTH + OVERLAY_VIDEO_CONTROL_GAP + OVERLAY_VIDEO_END_SIZE,
+    );
     expect(OVERLAY_VIDEO_BOX.height).toBe(PIP_HEIGHT);
     expect(OVERLAY_TOP_CLEARANCE).toBeGreaterThanOrEqual(56 + 8);
     expect(OVERLAY_VIDEO_BOX.topClearance).toBe(OVERLAY_TOP_CLEARANCE);
@@ -127,7 +132,7 @@ describe('the box parameter (what the minimized window needs)', () => {
     expect(OVERLAY_AUDIO_BOX.bottomClearance).toBe(OVERLAY_BOTTOM_CLEARANCE);
     // Parked top-right by default, 16 in from the edge and under the header.
     const home = pipAnchor('top-right', FRAME, INSETS, OVERLAY_VIDEO_BOX);
-    expect(home.x).toBe(390 - PIP_MARGIN - PIP_WIDTH);
+    expect(home.x).toBe(390 - PIP_MARGIN - OVERLAY_VIDEO_BOX.width);
     expect(home.y).toBe(47 + OVERLAY_TOP_CLEARANCE);
   });
 });
@@ -172,11 +177,17 @@ describe('a box change mid-drag does not move the pip under the finger', () => {
   }
 
   let latest: PipDrag | null = null;
-  function Probe({ box }: { box: PipBox }) {
+  function Probe({ box, initialCorner, onCornerChange }: {
+    box: PipBox;
+    initialCorner?: PipCorner;
+    onCornerChange?(corner: PipCorner): void;
+  }) {
     const pip = usePipDrag({
       frame: FRAME,
       insets: INSETS,
       box,
+      initialCorner,
+      onCornerChange,
       reduceMotion: true,
       motion: { surface: 0, easing: (t: number) => t },
     });
@@ -202,6 +213,58 @@ describe('a box change mid-drag does not move the pip under the finger', () => {
       at: { x: host.props.style.left + shift.x, y: host.props.style.top + shift.y },
     };
   }
+
+  it('keeps the original base when a parent passes the reported corner back before remount', () => {
+    let tree!: ReactTestRenderer.ReactTestRenderer;
+    const onCornerChange = jest.fn();
+    ReactTestRenderer.act(() => {
+      tree = ReactTestRenderer.create(React.createElement(Probe, {
+        box: PILL,
+        initialCorner: 'top-right',
+        onCornerChange,
+      }));
+    });
+    const originalBase = pipAnchor('top-right', FRAME, INSETS, PILL);
+    ReactTestRenderer.act(() => latest!.snapTo('bottom-left'));
+    expect(onCornerChange).toHaveBeenCalledWith('bottom-left');
+    const reportedCorner = onCornerChange.mock.calls[0]![0] as PipCorner;
+    const parked = pipAnchor('bottom-left', FRAME, INSETS, PILL);
+    expect(position(tree).at).toEqual(parked);
+
+    // App retains the settled corner for restore. Any intervening App render
+    // passes it back while this hook is still mounted; that must not apply
+    // the same movement to both its base and its animated offset.
+    ReactTestRenderer.act(() => {
+      tree.update(React.createElement(Probe, {
+        box: PILL,
+        initialCorner: reportedCorner,
+        onCornerChange,
+      }));
+    });
+    expect(position(tree).base).toEqual(originalBase);
+    expect(position(tree).at).toEqual(parked);
+
+    ReactTestRenderer.act(() => {
+      tree.update(React.createElement(Probe, {
+        box: VIDEO,
+        initialCorner: reportedCorner,
+        onCornerChange,
+      }));
+    });
+    expect(position(tree).at).toEqual(pipAnchor('bottom-left', FRAME, INSETS, VIDEO));
+    ReactTestRenderer.act(() => tree.unmount());
+
+    // A new mount does use the retained corner as its initial base.
+    ReactTestRenderer.act(() => {
+      tree = ReactTestRenderer.create(React.createElement(Probe, {
+        box: VIDEO,
+        initialCorner: reportedCorner,
+      }));
+    });
+    expect(position(tree).base).toEqual(pipAnchor('bottom-left', FRAME, INSETS, VIDEO));
+    expect(position(tree).at).toEqual(position(tree).base);
+    ReactTestRenderer.act(() => tree.unmount());
+  });
 
   it('freezes the base at grant, clamps into the live window, and rebases on release', () => {
     let tree!: ReactTestRenderer.ReactTestRenderer;

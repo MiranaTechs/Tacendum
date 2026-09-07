@@ -91,6 +91,7 @@ const ROUTE_MATRIX: ReadonlyArray<{
   { route: { name: 'register' }, cover: true, coverWithCall: true, workspace: false, redeem: false, land: true, disclose: [] },
   { route: { name: 'chats' }, cover: true, coverWithCall: true, workspace: true, redeem: true, land: true, disclose: [] },
   { route: { name: 'calls' }, cover: true, coverWithCall: true, workspace: true, redeem: true, land: true, disclose: [] },
+  { route: { name: 'attention' }, cover: true, coverWithCall: true, workspace: true, redeem: true, land: true, disclose: [] },
   { route: { name: 'newChat' }, cover: true, coverWithCall: true, workspace: true, redeem: true, land: true, disclose: [] },
   { route: { name: 'newRoom' }, cover: true, coverWithCall: true, workspace: true, redeem: true, land: true, disclose: [] },
   { route: { name: 'thread', peerId: PEER }, cover: true, coverWithCall: true, workspace: true, redeem: true, land: true, disclose: [PEER] },
@@ -150,15 +151,14 @@ const OVERLAY_STATES: ReadonlyArray<{ label: string; overlays: OverlayFacts }> =
   { label: 'both call overlays', overlays: { call: true, groupCall: true } },
 ];
 
-test('the matrix covers the whole 23-name Route union, each name once', () => {
-  // 20 → 21: accountPhone joined THROUGH the module
-  // (§9 rule 9 — a new name in the union, no fifth consumer). 21 → 22:
-  // accountUsername, the same way. 22 → 23: updateRequired, the same way
-  // again.
+test('the matrix covers the whole 24-name Route union, each name once', () => {
+  // accountPhone, accountUsername and updateRequired joined through the
+  // visibility module; the payload-free AI attention inbox is the 24th
+  // route, an ordinary workspace surface.
   const names = ROUTE_MATRIX.map(c => c.route.name);
-  expect(names).toHaveLength(23);
-  expect(new Set(names).size).toBe(23);
-  // Compile-time: the union has no 24th name the table missed.
+  expect(names).toHaveLength(24);
+  expect(new Set(names).size).toBe(24);
+  // Compile-time: the union has no 25th name the table missed.
   const all: SurfaceRouteName[] = names;
   expect(all).toBeDefined();
 });

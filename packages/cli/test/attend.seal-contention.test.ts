@@ -51,12 +51,11 @@ const seams = vi.hoisted(() => ({
   driver: null as HostDriver | null,
 }));
 
-vi.mock('../src/attend-drivers.js', async importOriginal => {
+vi.mock('../src/attend-drivers.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../src/attend-drivers.js')>();
   return {
     ...real,
-    driverFor: (host: Parameters<typeof real.driverFor>[0]) =>
-      seams.driver ?? real.driverFor(host),
+    driverFor: (host: Parameters<typeof real.driverFor>[0]) => seams.driver ?? real.driverFor(host),
   };
 });
 
@@ -66,6 +65,7 @@ const { FileStores } = await import('../src/stores.js');
 const { MessageLog } = await import('../src/msglog.js');
 const { saveProfile } = await import('../src/profile.js');
 const { capChatHead, plainForChat } = await import('../src/hooks.js');
+const { AiWorkMetadataSchema } = await import('@tacendum/shared');
 
 const OWNER = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
 const SELF = '01HQXW0000000000000000SEAL';
@@ -90,7 +90,7 @@ async function poll(cond: () => boolean, ms = 15_000): Promise<void> {
   const until = Date.now() + ms;
   while (!cond()) {
     if (Date.now() > until) throw new Error('poll timed out');
-    await new Promise(r => setTimeout(r, 5));
+    await new Promise((r) => setTimeout(r, 5));
   }
 }
 
@@ -103,7 +103,7 @@ const clockIo = () => {
     now: () => t,
     sleep: async (ms: number): Promise<void> => {
       t += ms;
-      await new Promise(r => setTimeout(r, 2));
+      await new Promise((r) => setTimeout(r, 2));
     },
   };
 };
@@ -128,7 +128,7 @@ const sealHarness = (holdMs: number) => {
     try {
       await withFileLockAsync(lockPath, async () => {
         acquired.push(label);
-        await new Promise(r => setTimeout(r, holdMs));
+        await new Promise((r) => setTimeout(r, holdMs));
       });
       done.push(label);
     } catch (err) {
@@ -145,11 +145,7 @@ const sealingSend = (h: ReturnType<typeof sealHarness>) => {
   const sends: { body: string; id: string; notify?: false }[] = [];
   return {
     sends,
-    sendReply: async (
-      b: string,
-      _sess?: OutSess,
-      opts?: { notify?: boolean },
-    ): Promise<string> => {
+    sendReply: async (b: string, _sess?: OutSess, opts?: { notify?: boolean }): Promise<string> => {
       const label = b.startsWith('{"tcm":"edit"') ? 'send:final' : `send:${sends.length}`;
       await h.seal(label);
       const id = mid();
@@ -187,7 +183,7 @@ const sealingTyping = (h: ReturnType<typeof sealHarness>) => {
 const heldDriver = (reply: string) => {
   let stream: ((s: string) => void) | undefined;
   let release: (() => void) | undefined;
-  const released = new Promise<void>(r => {
+  const released = new Promise<void>((r) => {
     release = r;
   });
   const driver: HostDriver = {
@@ -232,9 +228,14 @@ beforeEach(() => {
   seq = 0;
   seams.driver = null;
   saveProfile({
-    name: 'bot', identityKey: 'AAAA', userId: SELF,
-    deviceId: 1, authToken: 'tok', registrationId: 1,
-    accountClass: 'integration', ownerUserId: OWNER,
+    name: 'bot',
+    identityKey: 'AAAA',
+    userId: SELF,
+    deviceId: 1,
+    authToken: 'tok',
+    registrationId: 1,
+    accountClass: 'integration',
+    ownerUserId: OWNER,
   });
 });
 
@@ -272,7 +273,12 @@ describe('same-process sealed emissions on the real ratchet lock (the e2e gate a
         // (7 500 ms fake, every 4th tick) to land beside a detached edit —
         // the gate's exact same-tick pairing — several times over.
         for (let i = 1; i <= 5; i++) {
-          fake.push(final.split(' ').slice(0, 2 + i).join(' '));
+          fake.push(
+            final
+              .split(' ')
+              .slice(0, 2 + i)
+              .join(' '),
+          );
           await poll(() => typing.edits.length >= i);
         }
       } finally {
@@ -292,25 +298,46 @@ describe('same-process sealed emissions on the real ratchet lock (the e2e gate a
       const [anchor, fin] = send.sends;
       expect(anchor?.body).toBe(funnel('R alpha'));
       expect(fin?.notify).toBe(false);
-      expect(JSON.parse(fin?.body ?? '{}')).toEqual({
+      const parsedFinal = JSON.parse(fin?.body ?? '{}') as Record<string, unknown>;
+      const { work: rawWork, ...legacyFinal } = parsedFinal;
+      expect(legacyFinal).toEqual({
         tcm: 'edit',
         ref: anchor?.id,
         text: funnel(final),
         // The Art. 50 marker: envelope bodies are marked ungated.
         ai: true,
       });
+      const work = AiWorkMetadataSchema.parse(rawWork);
+      expect(work).toMatchObject({
+        provider: 'codex',
+        event: 'turn-complete',
+        context: { availability: 'unavailable' },
+        capabilities: { notifications: false, approvals: false, tasks: false },
+        usage: [
+          {
+            source: 'local-budget',
+            unit: 'turns',
+            period: 'hour',
+            used: 1,
+            remaining: 9,
+            limit: 10,
+          },
+        ],
+      });
+      expect(work.eventId).toMatch(/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+      expect(work.usage?.[0]?.observedAt).toBe(work.updatedAt);
 
       // The cadence survived whole: every pushed change produced its edit,
       // seq strictly increasing (a8's shape — chatter never died mid-turn).
       expect(typing.edits.length).toBe(5);
-      expect(typing.edits.map(e => e.seq)).toEqual([1, 2, 3, 4, 5]);
+      expect(typing.edits.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]);
 
       // ORDER, off the lock sections themselves: the anchor sealed before
       // the first edit, edits sealed in seq order, and the durable final
       // sealed after the LAST intermediate — the FIFO's whole contract.
       const anchorAt = h.done.indexOf('send:0');
       const finalAt = h.done.indexOf('send:final');
-      const editAts = [1, 2, 3, 4, 5].map(n => h.done.indexOf(`edit:${n}`));
+      const editAts = [1, 2, 3, 4, 5].map((n) => h.done.indexOf(`edit:${n}`));
       expect(anchorAt).toBeGreaterThanOrEqual(0);
       expect(finalAt).toBeGreaterThanOrEqual(0);
       for (const at of editAts) expect(at).toBeGreaterThan(anchorAt);
@@ -320,7 +347,7 @@ describe('same-process sealed emissions on the real ratchet lock (the e2e gate a
       // The typing channel outlived the collisions: the initial start plus
       // at least one 7.5 s refresh — on the unfixed code the first burn's
       // throw would have been the channel's last word.
-      expect(typing.events.filter(e => e === 'start').length).toBeGreaterThanOrEqual(2);
+      expect(typing.events.filter((e) => e === 'start').length).toBeGreaterThanOrEqual(2);
     },
   );
 
@@ -362,7 +389,7 @@ describe('same-process sealed emissions on the real ratchet lock (the e2e gate a
       // lock's 10 s contended budget — and it still went out.
       expect(h.failures).toEqual([]);
       expect(afterFinish).toBeLessThan(2_500);
-      expect(send.sends.map(s => s.body)).toContain(funnel('the answer'));
+      expect(send.sends.map((s) => s.body)).toContain(funnel('the answer'));
       // FIFO: the typing emission's lock section completed before the
       // reply's began.
       expect(h.done.indexOf('typing:start')).toBeLessThan(h.done.indexOf('send:0'));
@@ -418,7 +445,7 @@ describe('same-process sealed emissions on the real ratchet lock (the e2e gate a
       // to surface, then hold the ledger of lock sections unchanged.
       expect(h.done[h.done.length - 1]).toBe('send:final');
       const sealedAtReturn = h.done.length;
-      await new Promise(r => setTimeout(r, 600));
+      await new Promise((r) => setTimeout(r, 600));
       expect(h.done.length).toBe(sealedAtReturn);
     },
   );

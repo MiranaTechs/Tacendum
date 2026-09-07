@@ -87,6 +87,9 @@ interface Props {
    * `onOpenSettings={() => setRoute({ name: 'settings', from: 'chats' })}`,
    * and `from` is what brings the person back here afterwards. */
   onOpenSettings?: () => void;
+  /** The durable approvals/work inbox. Kept outside the chat rows so the
+   * door remains present when an approval is the first thing a peer sends. */
+  onOpenAttention?: () => void;
 }
 
 const COPY = {
@@ -182,6 +185,13 @@ const COPY = {
   // get two different sentences.
   copied:
     'Copied. Paste it into a text — or read it out loud, four letters at a time.',
+
+  attentionTitle: 'Needs attention',
+  attentionUnknown: 'Review agent requests',
+  attentionCount: (count: number) =>
+    count === 0
+      ? 'No requests waiting'
+      : `${count} ${count === 1 ? 'request' : 'requests'} waiting`,
 
 } as const;
 
@@ -1520,6 +1530,7 @@ export function ChatListScreen({
   onStartRoom,
   onOpenAppLock,
   onOpenSettings,
+  onOpenAttention,
 }: Props) {
   const t = useTheme();
   const [chats, setChats] = useState<db.ChatRow[]>([]);
@@ -1565,6 +1576,12 @@ export function ChatListScreen({
   const [mentioned, setMentioned] = useState<Set<string>>(new Set());
   const [wsState, setWsState] = useState(messaging.wsState);
   const [query, setQuery] = useState('');
+  /** Payload-free count from the same durable aggregate as AttentionScreen.
+   * Null means the enhancement read failed; the door still works and makes
+   * no claim about how many requests exist. */
+  const [pendingApprovalCount, setPendingApprovalCount] = useState<
+    number | null
+  >(null);
   /**
    * Who this device blocks, read from the database rather than from messaging's
    * enforcement Set: the Set is empty in a duress session, where the decoy
@@ -1727,6 +1744,14 @@ export function ChatListScreen({
         // here anyway.
       },
     );
+    void db.listPendingApprovalSummaries(Date.now()).then(
+      pending => {
+        if (current()) setPendingApprovalCount(pending.length);
+      },
+      () => {
+        if (current()) setPendingApprovalCount(null);
+      },
+    );
     setWsState(messaging.wsState);
     setMirrorStale(messaging.isBlockNotificationMirrorStale());
     // My own id is the mention check's constant; everything else here reads
@@ -1780,11 +1805,8 @@ export function ChatListScreen({
   const openChat = useCallback(
     (peerId: string) => {
       setMenu(null);
-      // Written on navigate, so a message that arrives while you are already
-      // inside the thread marks the row until you back out and return.
-      void db.markChatOpened(peerId, Date.now());
-      // Sibling sync 'read': siblings clear their badge for this thread too.
-      void messaging.syncThreadRead(peerId);
+      // The thread reads the previous stamp before it clears unread state.
+      // Writing here races that read, including in the retained wide pane.
       onOpenChat(peerId);
     },
     [onOpenChat],
@@ -2392,6 +2414,57 @@ export function ChatListScreen({
         </View>
       ) : null}
 
+      {onOpenAttention ? (
+        <View style={[styles.attentionClamp, { maxWidth: t.layout.contentMax }]}>
+          <Pressable
+            onPress={onOpenAttention}
+            accessibilityRole="button"
+            accessibilityLabel={pendingApprovalCount === 0
+              ? 'AI activity and setup'
+              : `${COPY.attentionTitle}. ${pendingApprovalCount === null
+                ? COPY.attentionUnknown
+                : COPY.attentionCount(pendingApprovalCount)}`}
+            accessibilityHint={pendingApprovalCount === 0 ? 'Opens agent activity and setup' : 'Opens requests waiting for your decision'}
+            testID="open-attention"
+            style={({ pressed }) => [
+              styles.attentionDoor,
+              pendingApprovalCount === 0 && styles.attentionQuiet,
+              {
+                backgroundColor: pressed
+                  ? t.color.pineWash
+                  : t.color.paperSheet,
+                borderColor: t.color.lineSoft,
+                borderLeftColor: pendingApprovalCount === 0 ? t.color.lineSoft : t.color.warningMark,
+              },
+            ]}
+          >
+            <View style={styles.attentionCopy}>
+              {pendingApprovalCount === 0 ? (
+                <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>AI activity and setup</Text>
+              ) : <>
+              <Text style={[t.type.bodyStrong, { color: t.color.inkStrong }]}>
+                {COPY.attentionTitle}
+              </Text>
+              <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
+
+                {pendingApprovalCount === null
+                  ? COPY.attentionUnknown
+                  : COPY.attentionCount(pendingApprovalCount)}
+              </Text>
+              </>}
+            </View>
+            <Text
+              allowFontScaling={false}
+              accessibilityElementsHidden
+              importantForAccessibility="no"
+              style={[t.type.iconGlyph, { color: t.color.pine }]}
+            >
+              ›
+            </Text>
+          </Pressable>
+        </View>
+      ) : null}
+
       <FlatList
         data={visible}
         extraData={listExtra}
@@ -2570,6 +2643,25 @@ const styles = StyleSheet.create({
 
   /** Full width until contentMax caps it — CallsScreen's own expression. */
   clamp: { width: '100%', alignSelf: 'center' },
+  attentionClamp: {
+    width: '100%',
+    alignSelf: 'center',
+    paddingHorizontal: 16,
+    paddingBottom: 8,
+  },
+  attentionDoor: {
+    minHeight: 60,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderLeftWidth: 3,
+    borderRadius: 2,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  attentionQuiet: { minHeight: 44, borderLeftWidth: StyleSheet.hairlineWidth, paddingVertical: 4 },
+  attentionCopy: { flex: 1, gap: 2 },
 
   fab: {
     position: 'absolute',

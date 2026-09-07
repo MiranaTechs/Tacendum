@@ -57,9 +57,8 @@ export function LandingScreen({
 
   return (
     <View style={[styles.root, { backgroundColor: t.color.paperGround }]}>
-      {/* flexGrow + justifyContent centre reproduce the fixed layout exactly at
-          default text size; at an accessibility size the page scrolls instead
-          of pushing Get started off a screen with no gesture to recover it. */}
+      {/* Content keeps its natural height at accessibility sizes, so the
+          welcome and its actions stay reachable by scrolling. */}
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={[
@@ -70,14 +69,9 @@ export function LandingScreen({
         bounces={false}
       >
         <View style={styles.hero}>
-          {/* Unequal spacers instead of centring: the block sits a quarter of
-              the free height above centre, so the empty paper collects between
-              it and the button rather than above the name. */}
-          <View style={styles.spacerAbove} />
           {/* Sized by the wordmark; the lockup is a fixed-width object, so it
               steps down where the gutters leave it no room. */}
           <BrandLockup size={width <= t.layout.narrowWidth ? 30 : 36} animate />
-          <View style={styles.spacerMiddle} />
           <Text style={[t.type.body, styles.blurb, { color: t.color.inkBody }]}>
             Message the people who matter — one chat at a time.
           </Text>
@@ -90,7 +84,6 @@ export function LandingScreen({
           >
             {PROMISE}
           </Text>
-          <View style={styles.spacerBelow} />
         </View>
 
         <PrimaryButton
@@ -116,7 +109,7 @@ export function LandingScreen({
 
         <Text
           style={[
-            t.type.utilityData,
+            t.type.compactBody,
             styles.footer,
             { color: t.color.inkMuted },
           ]}
@@ -137,27 +130,21 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingBottom: 18,
   },
-  // flexGrow rather than flex, so the hero keeps its content height as its
-  // flex basis: `flex: 1` would let it shrink below its content and hide the
-  // overflow outside the scrollable extent at large text sizes.
-  // flexGrow holds the three blocks together in the optical centre while the
-  // button settles at the foot of the screen rather than trailing the text.
+  // Keep the welcome together on a tablet and preserve its intrinsic height
+  // when larger accessibility text needs the ScrollView to grow.
   hero: {
     flexGrow: 1,
-    alignSelf: 'stretch',
+    width: '100%',
+    maxWidth: 480,
     alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 64,
   },
-  // The three weights sum to 2, so the 0.5 above always leaves the lockup at
-  // 25% of the free height. Splitting the remaining 1.5 evenly moves the two
-  // lines of copy down to meet the button instead of stranding them mid-screen.
-  spacerAbove: { flex: 0.5 },
-  spacerMiddle: { flex: 0.75 },
-  spacerBelow: { flex: 0.75 },
-  // Each block is a separate thing to read: the name, what it does, what it
-  // refuses to do. The space between them is what makes them three.
-  blurb: { marginTop: 0, maxWidth: 330, textAlign: 'center' },
-  promise: { marginTop: 36, maxWidth: 330, textAlign: 'center' },
-  cta: { alignSelf: 'stretch', maxWidth: 342, marginTop: 32 },
+  blurb: { marginTop: 32, maxWidth: 330, textAlign: 'center' },
+  promise: { marginTop: 18, maxWidth: 330, textAlign: 'center' },
+  // A capped, stretched child starts at the left gutter on wide panes.
+  // Explicit width plus center alignment keeps the action under the lockup.
+  cta: { width: '100%', alignSelf: 'center', maxWidth: 342, marginTop: 24 },
   recover: { marginTop: 8, alignItems: 'center' },
   footer: { marginTop: 24, textAlign: 'center' },
 });

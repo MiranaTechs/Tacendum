@@ -1,5 +1,5 @@
 import { codegenNativeComponent, type ViewProps } from 'react-native';
-import type { WithDefault } from 'react-native/Libraries/Types/CodegenTypes';
+import type { DirectEventHandler, Int32, WithDefault } from 'react-native/Libraries/Types/CodegenTypes';
 
 /**
  * A surface that renders one call's video.
@@ -22,6 +22,14 @@ import type { WithDefault } from 'react-native/Libraries/Types/CodegenTypes';
 export interface NativeProps extends ViewProps {
   /** Which call. Empty renders an inert placeholder rather than failing. */
   cid: string;
+  /** Opaque local view lifetime; echoed so stale callbacks can be refused. */
+  surfaceId?: WithDefault<string, ''>;
+  /** True after a decoded frame reaches the renderer; false on reset. */
+  onFrameReady?: DirectEventHandler<Readonly<{
+    surfaceId: string;
+    generation: Int32;
+    ready: boolean;
+  }>>;
 
   /**
    * `remote` is the person you are talking to; `local` is this device's

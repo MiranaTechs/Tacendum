@@ -55,6 +55,7 @@ const FIXTURES: Record<Route['name'], Route> = {
   register: { name: 'register' },
   chats: { name: 'chats' },
   calls: { name: 'calls' },
+  attention: { name: 'attention' },
   newChat: { name: 'newChat' },
   newRoom: { name: 'newRoom' },
   thread: { name: 'thread', peerId: PEER },
@@ -198,6 +199,6 @@ describe('origins: Back returns to the surface a person actually came from', () 
     // `visibleSurface.ts` classifies by route NAME, so the 23-name matrix
     // must not have moved. Its own suite proves the cells; this proves the
     // count — a new name added here would have to register in eleven places.
-    expect(NAMES).toHaveLength(23);
+    expect(NAMES).toHaveLength(24);
   });
 });

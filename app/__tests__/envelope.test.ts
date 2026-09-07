@@ -55,6 +55,32 @@ describe('envelope round trip', () => {
     const withAvatar = { ...PROFILE, att: IMAGE.att, key: IMAGE.key };
     expect(parseEnvelope(encodeEnvelope(withAvatar))).toEqual(withAvatar);
   });
+
+  it('carries bounded AI notification requests and acknowledgements on profile cards', () => {
+    const withPreference = {
+      ...PROFILE,
+      notifyPref: {
+        q: '01J8MEAPPR0VAQ4X2C6TKN9RFW',
+        routine: 'quiet' as const,
+      },
+      notifyPrefAck: {
+        q: '01J8MEAPPR0VAQ4X2C6TKN9RFX',
+        routine: 'all' as const,
+      },
+    };
+    expect(parseEnvelope(encodeEnvelope(withPreference))).toEqual(withPreference);
+  });
+
+  it('drops only malformed AI notification metadata from an otherwise valid profile', () => {
+    expect(
+      parseEnvelope(
+        JSON.stringify({
+          ...PROFILE,
+          notifyPrefAck: { q: 'not-a-ulid', routine: 'silent' },
+        }),
+      ),
+    ).toEqual(PROFILE);
+  });
 });
 
 describe('envelope parsing is strict', () => {

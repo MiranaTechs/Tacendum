@@ -121,8 +121,8 @@ function makeStyles(t: Theme) {
      * toward the edge instead of letting its own text reflow. */
     bubbleShrink: { flexShrink: 1 },
     replyArrow: {
-      width: 32,
-      height: 32,
+      width: 28,
+      height: 28,
       marginLeft: space.s3,
       marginBottom: 1,
       alignItems: 'center',
@@ -135,8 +135,8 @@ function makeStyles(t: Theme) {
     quote: {
       borderLeftWidth: 2,
       paddingHorizontal: space.s4,
-      paddingVertical: space.s3,
-      marginBottom: space.s3,
+      paddingVertical: space.s2,
+      marginBottom: space.s4,
     },
     /** Secondary text at FULL alpha: the palette owns the colour (inkMuted on
      * paper, onBubbleOut on pine) and the type role owns the emphasis. The
@@ -144,24 +144,30 @@ function makeStyles(t: Theme) {
      * mark at ≈3.7:1, under the 4.5:1 AA floor. */
     quoteText: {},
     /** The quoted author's name over their words. */
-    quoteAuthor: { marginBottom: space.s1 },
+    quoteAuthor: { marginBottom: 0 },
+    messageClock: { fontSize: 11, lineHeight: 15, fontVariant: ['tabular-nums'] },
     editedMark: { marginTop: space.s1 },
     chip: {
       flexDirection: 'row',
       alignItems: 'center',
       borderWidth: StyleSheet.hairlineWidth,
       borderBottomWidth: 0,
-      paddingLeft: 0,
-      paddingRight: space.s2,
+      paddingLeft: space.s5,
+      paddingRight: space.s3,
       paddingVertical: space.s4,
       overflow: 'hidden',
     },
-    chipBar: { width: 3, alignSelf: 'stretch', marginRight: space.s5 },
+    chipBar: {
+      width: 2,
+      borderRadius: 1,
+      alignSelf: 'stretch',
+      marginRight: space.s4,
+    },
     chipBody: { flex: 1, flexShrink: 1 },
     chipText: { marginTop: 1 },
     chipCancel: {
-      width: 36,
-      height: 36,
+      width: 44,
+      height: 44,
       alignItems: 'center',
       justifyContent: 'center',
     },
@@ -206,10 +212,12 @@ function makeStyles(t: Theme) {
       justifyContent: 'center',
       paddingHorizontal: space.s5,
     },
-    reactionRow: { flexDirection: 'row', gap: space.s2, marginTop: space.s3 },
+    reactionRow: { flexDirection: 'row', flexWrap: 'wrap', gap: space.s2, marginTop: space.s3 },
     reactionChip: {
-      minHeight: 26,
-      minWidth: 30,
+      minHeight: 44,
+      minWidth: 44,
+      flexDirection: 'row',
+      gap: space.s2,
       borderWidth: 1,
       paddingHorizontal: space.s3,
       alignItems: 'center',
@@ -297,7 +305,7 @@ function makeStyles(t: Theme) {
       alignItems: 'flex-start',
     },
     jumpRow: {
-      minHeight: 40,
+      minHeight: 44,
       flexDirection: 'row',
       alignItems: 'center',
       justifyContent: 'center',

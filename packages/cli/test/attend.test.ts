@@ -1,5 +1,13 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -7,7 +15,7 @@ async function poll(cond: () => boolean, ms: number): Promise<void> {
   const until = Date.now() + ms;
   while (!cond()) {
     if (Date.now() > until) throw new Error('poll timed out');
-    await new Promise(r => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 20));
   }
 }
 import { tmpdir } from 'node:os';
@@ -27,8 +35,18 @@ process.env.TACENDUM_WS = 'ws://attend.test';
 const attendMod = await import('../src/attend.js');
 const {
   ATTEND_REPLY_CAP,
-  attendLoop, attendOnce, attendState, cmdAttendDisable, cmdAttendEnable, cmdAttendStatus,
-  loadAttendConfig, parseCapsFlag, route, saveAttendConfig, triggers, turnArgv,
+  attendLoop,
+  attendOnce,
+  attendState,
+  cmdAttendDisable,
+  cmdAttendEnable,
+  cmdAttendStatus,
+  loadAttendConfig,
+  parseCapsFlag,
+  route,
+  saveAttendConfig,
+  triggers,
+  turnArgv,
 } = attendMod;
 const { MAX_BODY_BYTES } = await import('../src/send.js');
 const { classifyRefusal, codexHomeDir } = await import('../src/attend-drivers.js');
@@ -83,7 +101,13 @@ function inRow(text: string, opts: { peer?: string; tcm?: string; ref?: string }
 function outRow(sessKey: string, host = 'claude', ts = Date.now()) {
   const id = mid();
   new MessageLog('bot').append({
-    id, dir: 'out', peer: OWNER, ts, tcm: '', text: '', read: true,
+    id,
+    dir: 'out',
+    peer: OWNER,
+    ts,
+    tcm: '',
+    text: '',
+    read: true,
     sess: { host, key: sessKey, tag: 'repo' },
   });
   return id;
@@ -94,13 +118,22 @@ beforeEach(() => {
   rmSync(join(home, 'state'), { recursive: true, force: true });
   seq = 0;
   saveProfile({
-    name: 'bot', identityKey: 'AAAA', userId: '01HQXW0000000000000000TEST',
-    deviceId: 1, authToken: 'tok', registrationId: 1,
-    accountClass: 'integration', ownerUserId: OWNER,
+    name: 'bot',
+    identityKey: 'AAAA',
+    userId: '01HQXW0000000000000000TEST',
+    deviceId: 1,
+    authToken: 'tok',
+    registrationId: 1,
+    accountClass: 'integration',
+    ownerUserId: OWNER,
   });
   saveAttendConfig('bot', {
-    host: 'claude', bin: '/opt/agent', workdir: '/w', caps: ['--permission-mode', 'plan'],
-    ownSession: OWN_SESSION, turnsPerHour: 10,
+    host: 'claude',
+    bin: '/opt/agent',
+    workdir: '/w',
+    caps: ['--permission-mode', 'plan'],
+    ownSession: OWN_SESSION,
+    turnsPerHour: 10,
   });
 });
 
@@ -111,12 +144,17 @@ const harness = () => {
   const turns: { argv: string[]; cwd: string; prompt: string }[] = [];
   let answer: Answer = { stdout: 'done: shipped', code: 0 };
   return {
-    replies, turns,
-    setAnswer: (a: Answer) => { answer = a; },
+    replies,
+    turns,
+    setAnswer: (a: Answer) => {
+      answer = a;
+    },
     io: {
       sendReply: async (b: string) => void replies.push(b),
-      runTurn: async (argv: string[], cwd: string, prompt: string) =>
-        (turns.push({ argv, cwd, prompt }), answer),
+      runTurn: async (argv: string[], cwd: string, prompt: string) => (
+        turns.push({ argv, cwd, prompt }),
+        answer
+      ),
     },
   };
 };
@@ -179,9 +217,9 @@ describe('the router, four rules', () => {
 
   it('rule 4: a ref to nothing answers ended; stale ledger rows are not live', () => {
     new MessageLog('bot').append(inRow('yes', { tcm: 'reply', ref: '01HQXWNEVERRECORDED0000000' }));
-    expect(
-      route('bot', new MessageLog('bot').read({ dir: 'in' }), Date.now(), 'claude').kind,
-    ).toBe('ended');
+    expect(route('bot', new MessageLog('bot').read({ dir: 'in' }), Date.now(), 'claude').kind).toBe(
+      'ended',
+    );
     const old = Date.now() - 3 * 60 * 60 * 1000;
     rmSync(join(home, 'state'), { recursive: true, force: true });
     outRow(SESSION_A, 'claude', old);
@@ -225,7 +263,9 @@ describe('the router, four rules', () => {
     // And the drivable one still wins on its own merits.
     outRow(SESSION_A, 'claude', now - 200);
     expect(route('bot', [inRow('status?')], now, 'claude')).toEqual({
-      kind: 'session', host: 'claude', key: SESSION_A,
+      kind: 'session',
+      host: 'claude',
+      key: SESSION_A,
     });
   });
 });
@@ -250,8 +290,13 @@ describe('one pass: turn, reply, cursor', () => {
     // same option appears twice the later one wins — so isolation last means
     // an operator's `--caps` can never quietly switch it back off.
     expect(h.turns[0]!.argv).toEqual([
-      '-p', `--resume=${SESSION_A}`, '--permission-mode', 'plan',
-      '--safe-mode', '--strict-mcp-config', '--setting-sources=',
+      '-p',
+      `--resume=${SESSION_A}`,
+      '--permission-mode',
+      'plan',
+      '--safe-mode',
+      '--strict-mcp-config',
+      '--setting-sources=',
     ]);
     expect(h.turns[0]!.prompt).toBe('**yes** proceed');
     expect(h.turns[0]!.cwd).toBe('/w');
@@ -310,14 +355,18 @@ describe('one pass: turn, reply, cursor', () => {
     const ledgerId = outRow(SESSION_A);
     new MessageLog('bot').append(inRow('go', { tcm: 'reply', ref: ledgerId }));
     const h = harness();
-    h.setAnswer({ stdout: 'I got halfway and then', stderr: 'Error: connection reset by peer\n', code: 1 });
+    h.setAnswer({
+      stdout: 'I got halfway and then',
+      stderr: 'Error: connection reset by peer\n',
+      code: 1,
+    });
     expect(await attendOnce('bot', h.io)).toBe('failed');
     expect(h.turns, 'a broken turn must not be run a second time').toHaveLength(1);
     expect(bucketTurns()).toBe(1);
     expect(h.replies[0]).toContain('I got halfway and then');
   });
 
-  it('a refusal QUOTED on stdout buys no second spawn — stderr is the host\'s channel', async () => {
+  it("a refusal QUOTED on stdout buys no second spawn — stderr is the host's channel", async () => {
     const ledgerId = outRow(SESSION_A);
     new MessageLog('bot').append(inRow('status?', { tcm: 'reply', ref: ledgerId }));
     const h = harness();
@@ -332,10 +381,13 @@ describe('one pass: turn, reply, cursor', () => {
   it('a refusal plus its recovery still spends exactly ONE hourly token', async () => {
     new MessageLog('bot').append(inRow('hello'));
     const h = harness();
-    await attendOnce('bot', scripted(h, [
-      { stdout: '', stderr: REFUSAL.inUse(OWN_SESSION), code: 1 },
-      { stdout: 'recovered', code: 0 },
-    ]));
+    await attendOnce(
+      'bot',
+      scripted(h, [
+        { stdout: '', stderr: REFUSAL.inUse(OWN_SESSION), code: 1 },
+        { stdout: 'recovered', code: 0 },
+      ]),
+    );
     expect(h.turns).toHaveLength(2);
     expect(bucketTurns(), 'the recovery spawn must ride the token the pass already took').toBe(1);
   });
@@ -362,7 +414,7 @@ describe('one pass: turn, reply, cursor', () => {
    * the child's output and was dropped on the floor (stderr was not even
    * read). The number is the one part of a failure nobody can act on.
    */
-  it('a failure reply carries the HOST\'s explanation, tagged and funnelled', async () => {
+  it("a failure reply carries the HOST's explanation, tagged and funnelled", async () => {
     // The OWN route, its recovery ALSO refused — since the reply-continuation
     // fallback (gate.reply-carry.test.ts), a routed session's no-conversation
     // refusal no longer lands in a failure reply at all: it runs a fresh own
@@ -661,8 +713,8 @@ describe('one pass: turn, reply, cursor', () => {
         stdio: 'ignore',
       }),
     );
-    const closed = Promise.all(kids.map(k => new Promise(res => k.on('close', res))));
-    await poll(() => readdirSync(dir).filter(n => n.startsWith('ready.')).length === 8, 30_000);
+    const closed = Promise.all(kids.map((k) => new Promise((res) => k.on('close', res))));
+    await poll(() => readdirSync(dir).filter((n) => n.startsWith('ready.')).length === 8, 30_000);
     writeFileSync(join(dir, 'go'), '');
     await closed;
 
@@ -688,16 +740,29 @@ describe('one pass: turn, reply, cursor', () => {
    * broken argv too, which is precisely how the old test blessed the bug.
    */
   const codexCfg = (over: Record<string, unknown> = {}) => ({
-    ...loadAttendConfig('bot')!, host: 'codex' as const, caps: ['-s', 'read-only'], ...over,
+    ...loadAttendConfig('bot')!,
+    host: 'codex' as const,
+    caps: ['-s', 'read-only'],
+    ...over,
   });
 
   it('codex argv: caps sit between `exec` and the `resume` subcommand', () => {
     expect(turnArgv(codexCfg(), { kind: 'session', host: 'codex', key: 'K1' })).toEqual([
-      'exec', '-s', 'read-only', 'resume', '--', 'K1',
+      'exec',
+      '-s',
+      'read-only',
+      'resume',
+      '--',
+      'K1',
     ]);
     const own = codexCfg({ ownSessionStarted: true });
     expect(turnArgv(own, { kind: 'own' })).toEqual([
-      'exec', '-s', 'read-only', 'resume', '--', own.ownSession,
+      'exec',
+      '-s',
+      'read-only',
+      'resume',
+      '--',
+      own.ownSession,
     ]);
     // The fresh-own branch has no subcommand — this is the shape that was
     // always valid, and it must not regress while fixing the ones that were not.
@@ -733,13 +798,22 @@ describe('one pass: turn, reply, cursor', () => {
   it('claude argv: the target rides as flags, caps stay at the tail', () => {
     const cfg = { ...loadAttendConfig('bot')!, host: 'claude' as const };
     expect(turnArgv(cfg, { kind: 'session', host: 'claude', key: 'K1' })).toEqual([
-      '-p', '--resume=K1', '--permission-mode', 'plan',
+      '-p',
+      '--resume=K1',
+      '--permission-mode',
+      'plan',
     ]);
     expect(turnArgv(cfg, { kind: 'own' })).toEqual([
-      '-p', `--session-id=${cfg.ownSession}`, '--permission-mode', 'plan',
+      '-p',
+      `--session-id=${cfg.ownSession}`,
+      '--permission-mode',
+      'plan',
     ]);
     expect(turnArgv({ ...cfg, ownSessionStarted: true }, { kind: 'own' })).toEqual([
-      '-p', `--resume=${cfg.ownSession}`, '--permission-mode', 'plan',
+      '-p',
+      `--resume=${cfg.ownSession}`,
+      '--permission-mode',
+      'plan',
     ]);
   });
 
@@ -908,7 +982,7 @@ describe('one pass: turn, reply, cursor', () => {
       sendReply: async (b: string) => void h.replies.push(b),
       runTurn: async (argv: string[], cwd: string, prompt: string) => {
         h.turns.push({ argv, cwd, prompt });
-        await new Promise(r => setTimeout(r, 300)); // the turn is in flight
+        await new Promise((r) => setTimeout(r, 300)); // the turn is in flight
         return { stdout: 'done: shipped', code: 0 };
       },
     };
@@ -917,9 +991,7 @@ describe('one pass: turn, reply, cursor', () => {
     await poll(() => h.turns.length >= 1, 5_000); // the first pass is inside its turn
     const second = await attendOnce('bot', io);
 
-    expect(second, 'the second pass must stand down, not answer alongside the first').toBe(
-      'busy',
-    );
+    expect(second, 'the second pass must stand down, not answer alongside the first').toBe('busy');
     expect(await first).toBe('answered');
     expect(h.turns, 'one pending row must produce exactly one agent turn').toHaveLength(1);
     expect(h.replies, 'one pending row must produce exactly one reply').toHaveLength(1);
@@ -955,7 +1027,7 @@ describe('one pass: turn, reply, cursor', () => {
     // which DID die reports that fact, rather than a bare poll timeout thirty
     // seconds later.
     const early = await Promise.race([
-      settled.then(e => ({ died: e })),
+      settled.then((e) => ({ died: e })),
       poll(() => attempts >= 2, 25_000).then(() => ({ died: null })),
     ]);
     expect(
@@ -974,9 +1046,14 @@ describe('one pass: turn, reply, cursor', () => {
   it('the attend UNIT refuses an account attend is not enabled for', () => {
     const { cmdAttendService } = attendMod;
     saveProfile({
-      name: 'nocfg', identityKey: 'AAAA', userId: '01HQXW0000000000000000NOCF',
-      deviceId: 1, authToken: 'tok', registrationId: 1,
-      accountClass: 'integration', ownerUserId: OWNER,
+      name: 'nocfg',
+      identityKey: 'AAAA',
+      userId: '01HQXW0000000000000000NOCF',
+      deviceId: 1,
+      authToken: 'tok',
+      registrationId: 1,
+      accountClass: 'integration',
+      ownerUserId: OWNER,
     });
     expect(() => cmdAttendService('install', 'nocfg', report(), { exec: () => '' })).toThrowError(
       /attend enable/,
@@ -985,8 +1062,13 @@ describe('one pass: turn, reply, cursor', () => {
 
   it('unpaired or unconfigured accounts refuse before any spawn', async () => {
     saveProfile({
-      name: 'loose', identityKey: 'AAAA', userId: '01HQXW0000000000000000LOOS',
-      deviceId: 1, authToken: 'tok', registrationId: 1, accountClass: 'integration',
+      name: 'loose',
+      identityKey: 'AAAA',
+      userId: '01HQXW0000000000000000LOOS',
+      deviceId: 1,
+      authToken: 'tok',
+      registrationId: 1,
+      accountClass: 'integration',
     });
     await expect(attendOnce('loose')).rejects.toThrowError(/attend enable/);
     saveAttendConfig('loose', loadAttendConfig('bot')!);
@@ -1030,7 +1112,9 @@ describe('attend status: the pure reader and its command', () => {
     // And with paths that are real, both flip — the check asks the machine,
     // not the config's memory of it.
     saveAttendConfig('bot', {
-      ...loadAttendConfig('bot')!, bin: process.execPath, workdir: tmpdir(),
+      ...loadAttendConfig('bot')!,
+      bin: process.execPath,
+      workdir: tmpdir(),
     });
     const ok = attendState('bot');
     if (ok.state === 'enabled') {
@@ -1106,7 +1190,7 @@ describe('attend status: the pure reader and its command', () => {
     const { rep, human } = capture();
     cmdAttendStatus(null, rep, { service: sio });
     expect(
-      human.some(l => l.startsWith('bot: attend enabled (claude)')),
+      human.some((l) => l.startsWith('bot: attend enabled (claude)')),
       'bare status must answer for every account, one line each',
     ).toBe(true);
     rmSync(unitDir, { recursive: true, force: true });
@@ -1114,7 +1198,9 @@ describe('attend status: the pure reader and its command', () => {
 
   it('reports the facts: the model pin, and the codex home the sign-in creates', () => {
     saveAttendConfig('bot', {
-      ...loadAttendConfig('bot')!, host: 'codex', caps: ['-s', 'read-only'],
+      ...loadAttendConfig('bot')!,
+      host: 'codex',
+      caps: ['-s', 'read-only'],
       codexModel: 'gpt-5-codex',
     });
     let s = attendState('bot');
@@ -1159,6 +1245,42 @@ describe('attend status: the pure reader and its command', () => {
     expect(human.join('\n')).toContain(`CODEX_HOME=${codexHomeDir('bot')} codex login`);
   });
 
+  it('observes Claude SDK package and API-key presence only for the SDK answerer', () => {
+    const base = loadAttendConfig('bot')!;
+    saveAttendConfig('bot', { ...base, host: 'claude', claudeDriver: 'sdk' });
+    let state = attendState('bot', {
+      claudeSdkInstalled: () => true,
+      claudeSdkApiKeyPresent: () => true,
+    });
+    expect(state).toMatchObject({
+      state: 'enabled',
+      claudeDriver: 'sdk',
+      claudeSdkInstalled: true,
+      claudeSdkApiKeyPresent: true,
+    });
+
+    state = attendState('bot', {
+      claudeSdkInstalled: () => false,
+      claudeSdkApiKeyPresent: () => false,
+    });
+    expect(state).toMatchObject({
+      state: 'enabled',
+      claudeDriver: 'sdk',
+      claudeSdkInstalled: false,
+      claudeSdkApiKeyPresent: false,
+    });
+
+    saveAttendConfig('bot', { ...base, host: 'claude', claudeDriver: 'subprocess' });
+    state = attendState('bot', {
+      claudeSdkInstalled: () => true,
+      claudeSdkApiKeyPresent: () => true,
+    });
+    if (state.state === 'enabled') {
+      expect(state.claudeSdkInstalled).toBeUndefined();
+      expect(state.claudeSdkApiKeyPresent).toBeUndefined();
+    }
+  });
+
   it('the approval journal surfaces as counts and ages, and a row pending past its TTL is named STALE — on a moving clock', () => {
     mkdirSync(join(home, 'state', 'bot'), { recursive: true });
     let now = Date.now();
@@ -1168,12 +1290,25 @@ describe('attend status: the pure reader and its command', () => {
         overCapRefusals: 2,
         rows: [
           {
-            id: 'r1', requestId: 'q1', host: 'claude', payload: 'SECRET-COMMAND-BYTES',
-            askedAt: now - 30_000, ttlMs: 60_000, state: 'pending', msgId: 'm1',
+            id: 'r1',
+            requestId: 'q1',
+            host: 'claude',
+            payload: 'SECRET-COMMAND-BYTES',
+            askedAt: now - 30_000,
+            ttlMs: 60_000,
+            state: 'pending',
+            msgId: 'm1',
           },
           {
-            id: 'r2', requestId: 'q2', host: 'claude', payload: '', bytes: 4,
-            askedAt: now - 300_000, ttlMs: 60_000, state: 'done', decision: 'deny',
+            id: 'r2',
+            requestId: 'q2',
+            host: 'claude',
+            payload: '',
+            bytes: 4,
+            askedAt: now - 300_000,
+            ttlMs: 60_000,
+            state: 'done',
+            decision: 'deny',
             settledAt: now - 250_000,
           },
         ],
@@ -1250,8 +1385,11 @@ describe('attend enable: the caps surface', () => {
     cmdAttendEnable(
       'bot',
       enableOpts({
-        host: 'codex', caps: ['-s', 'workspace-write'],
-        driver: 'app-server', approvalPolicy: 'on-request', turnsPerHour: 5,
+        host: 'codex',
+        caps: ['-s', 'workspace-write'],
+        driver: 'app-server',
+        approvalPolicy: 'on-request',
+        turnsPerHour: 5,
       }),
       report(),
     );
@@ -1354,9 +1492,15 @@ describe('attend enable: the caps surface', () => {
     // claude gained a second driver (sdk), so
     // the refusal names claude's own set — a codex value is still refused,
     // but "codex only" would now be a lie.
-    refuse({ host: 'claude', driver: 'app-server' }, /--driver for claude takes one of: subprocess, sdk/);
+    refuse(
+      { host: 'claude', driver: 'app-server' },
+      /--driver for claude takes one of: subprocess, sdk/,
+    );
     refuse({ driver: 'app-server' }, /--driver for claude takes one of/); // default host is claude
-    refuse({ host: 'codex', driver: 'daemon' }, /--driver for codex takes one of: exec, app-server/);
+    refuse(
+      { host: 'codex', driver: 'daemon' },
+      /--driver for codex takes one of: exec, app-server/,
+    );
     // --approval-policy binds to the app-server driver, stated on this line.
     refuse({ host: 'codex', approvalPolicy: 'untrusted' }, /--approval-policy applies only/);
     refuse(
@@ -1373,14 +1517,8 @@ describe('attend enable: the caps surface', () => {
     // build number, shape-checked only.
     refuse({ approvalsMinAppBuild: 42 }, /--approvals applies only/);
     refuse({ host: 'codex', approvalsMinAppBuild: 42 }, /--approvals applies only/);
-    refuse(
-      { host: 'codex', driver: 'exec', approvalsMinAppBuild: 42 },
-      /--approvals applies only/,
-    );
-    refuse(
-      { host: 'codex', driver: 'app-server', approvalsMinAppBuild: 0 },
-      /--approvals expects/,
-    );
+    refuse({ host: 'codex', driver: 'exec', approvalsMinAppBuild: 42 }, /--approvals applies only/);
+    refuse({ host: 'codex', driver: 'app-server', approvalsMinAppBuild: 0 }, /--approvals expects/);
     refuse(
       { host: 'codex', driver: 'app-server', approvalsMinAppBuild: 4.5 },
       /--approvals expects/,
@@ -1411,7 +1549,8 @@ describe('attend enable: the caps surface', () => {
     expect(second.codexDriver).toBe('app-server');
     expect(second.codexApprovalPolicy).toBe('never');
     expect(second.caps, "codex's default profile, not claude's leftovers").toEqual([
-      '-s', 'read-only',
+      '-s',
+      'read-only',
     ]);
     // The stated cost of re-statement: a fresh own session each run.
     expect(second.ownSession).not.toBe(first.ownSession);

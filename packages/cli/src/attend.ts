@@ -1,12 +1,27 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { accessSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import {
+  accessSync,
+  constants as fsConstants,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { monotonicFactory } from 'ulid';
 import { clientDir, stateDir } from './config.js';
 import { CliError, EXIT } from './exit.js';
-import { HOOK_CHAT_CAP, HOOK_HOSTS, capChatHead, hostSessionKey, plainForChat, sessionTag } from './hooks.js';
+import {
+  HOOK_CHAT_CAP,
+  HOOK_HOSTS,
+  capChatHead,
+  hostSessionKey,
+  plainForChat,
+  sessionTag,
+} from './hooks.js';
 import { MessageLog, REDACT_AFTER_MS, RETAIN_MS, type MessageRecord } from './msglog.js';
 import { type Reporter } from './output.js';
 import { loadProfile, readProfile } from './profile.js';
@@ -18,11 +33,27 @@ import { encryptText, hasSession } from './messaging.js';
 import { WsClient } from './wsclient.js';
 import {
   ApprovalRequestEnvelope,
+  AI_WORK_PROJECT_MAX,
+  AiWorkMetadataSchema,
   MAX_APPROVAL_PAYLOAD_BYTES,
   composeStreamEdit,
+  type AiWorkCapabilities,
+  type AiWorkMetadata,
 } from '@tacendum/shared';
 import { enqueueNotification } from './hooks.js';
-import { AI_DISCLOSURE_SENTENCE, markAgentBody, markerShapeOk } from './ai-origin.js';
+import {
+  AI_DISCLOSURE_SENTENCE,
+  markAgentBody,
+  markerAttested,
+  markerShapeOk,
+} from './ai-origin.js';
+import { readRoutineNotifyPreference } from './ai-notify-preference.js';
+import { captureAiWorkContext } from './ai-work-context.js';
+import {
+  aiAttendCapabilityFact,
+  observeCodexVersion,
+  readAiCapabilities,
+} from './ai-capabilities.js';
 import { cmdService, listAccounts, statusOf, type ServiceIo } from './service.js';
 import {
   APPROVAL_POLICIES,
@@ -38,7 +69,12 @@ import {
   type SteerableTurn,
 } from './attend-drivers.js';
 import { parseKeyPath, scanTomlStructure, splitTomlLines } from './toml-keys.js';
-import { operatorGeminiModel } from './hostconfig.js';
+import {
+  inspectHostConfig,
+  operatorGeminiModel,
+  type HostConfigInspection,
+  type SetupSurface,
+} from './hostconfig.js';
 import { CLAUDE_SDK_INSTALL_STEP, claudeSdkInstalled } from './claude-sdk.js';
 import { readMcpAskStepOver } from './mcp-ask.js';
 import { roomAgentAuthorIdsStrict, roomRefAuthor, sendRoomMessage } from './room-commands.js';
@@ -157,8 +193,11 @@ export interface AttendConfig {
    * RUN it when the resolved credential is a subscription sign-in or
    * anything else not recognised as a key (`system/init.apiKeySource`,
    * fail closed — claude-sdk.ts holds the measured argument). The honest
-   * product sentence this field carries: approvals work with codex on any
-   * sign-in, and with claude only when the operator supplies an API key.
+   * product sentence this field carries: phone approvals inside this remote
+   * SDK answerer require the operator-supplied API key. Claude Code's native
+   * interactive PermissionRequest hook is a separate lane that may use its
+   * own sign-in; the default noninteractive `claude -p` answerer does not fire
+   * that hook.
    * The same config-field-not-flag reasoning as `codexDriver`: switching
    * drivers changes what `caps` even means (the sdk driver translates
    * them to typed options, fail-closed), so it must never ride an upgrade
@@ -416,11 +455,7 @@ export interface AttendIo {
    * not ring a phone its anchor already rang); omitted means notify
    * normally, which is every pre-stream send unchanged.
    */
-  sendReply?: (
-    body: string,
-    sess?: OutSess,
-    opts?: { notify?: boolean },
-  ) => Promise<string | void>;
+  sendReply?: (body: string, sess?: OutSess, opts?: { notify?: boolean }) => Promise<string | void>;
   /**
    * The ROOM reply seam — `sendReply`'s sibling for a turn the
    * room predicate routed. The real one (`realSendRoomReply`) goes through
@@ -456,6 +491,20 @@ export interface AttendIo {
    * way it moves in production, only faster. Absent means a real setTimeout.
    */
   sleep?: (ms: number) => Promise<void>;
+  /** Read-only capability observation seams. Production uses the exact host
+   * registration reader and ordinary listener status; tests can point both
+   * at disposable fixtures without changing capability derivation. */
+  aiCapability?: AttendAiCapabilityIo;
+}
+
+export interface AttendAiCapabilityIo {
+  inspectHost?: (
+    surface: SetupSurface,
+    account: string,
+  ) => Pick<HostConfigInspection, 'notificationConfigured' | 'approvalsConfigured'>;
+  listenerStatus?: (account: string) => { installed: boolean; running: boolean };
+  claudeSdkInstalled?: () => boolean;
+  claudeSdkApiKeyPresent?: () => boolean;
 }
 
 /** A `dir:'out'` ledger row's session half — msglog's own shape, named so the
@@ -516,8 +565,7 @@ const configPath = (account: string): string => join(clientDir(account), 'attend
 const cursorPath = (account: string): string => join(stateDir(account), 'attend-cursor.json');
 const journalPath = (account: string): string => join(stateDir(account), 'attend-journal.json');
 const bucketPath = (account: string): string => join(stateDir(account), 'attend-bucket.json');
-const approvalsPath = (account: string): string =>
-  join(stateDir(account), 'attend-approvals.json');
+const approvalsPath = (account: string): string => join(stateDir(account), 'attend-approvals.json');
 const roomSessionsPath = (account: string): string =>
   join(stateDir(account), 'attend-room-sessions.json');
 
@@ -570,6 +618,20 @@ export function loadAttendConfig(account: string): AttendConfig | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Return the configured Codex executable for read-only compatibility probes.
+ *
+ * The path is deliberately kept out of `AttendState`: that object is also a
+ * user-facing status source, while this value is only an `execFile` input.
+ * Invalid, disabled, and non-Codex configurations fail closed.
+ */
+export function attendCodexBin(account: string): string | undefined {
+  const cfg = loadAttendConfig(account);
+  return cfg?.host === 'codex' && typeof cfg.bin === 'string' && cfg.bin.length > 0
+    ? cfg.bin
+    : undefined;
 }
 
 export function saveAttendConfig(account: string, cfg: AttendConfig): void {
@@ -766,12 +828,7 @@ export function triggers(
   // retro-fire of banked backlog), by an author the room's CURRENT fold
   // says is IN (the "room MEMBERS" operand, re-checked at trigger time so
   // a roster change between spool and trigger is honoured).
-  if (
-    row.tcm !== 'grp.msg' ||
-    row.grp === undefined ||
-    row.men !== true ||
-    rooms === undefined
-  ) {
+  if (row.tcm !== 'grp.msg' || row.grp === undefined || row.men !== true || rooms === undefined) {
     return false;
   }
   // THE CLASS CLAUSE, and it sits FIRST among the D3
@@ -855,9 +912,9 @@ export function pendingRows(
   const rows = new MessageLog(account).read({ dir: 'in' }).reverse(); // append order
   let start = 0;
   if (cursor.lastId) {
-    const at = rows.findIndex(r => r.id === cursor.lastId);
+    const at = rows.findIndex((r) => r.id === cursor.lastId);
     if (at >= 0) start = at + 1;
-    else if (cursor.lastTs) start = rows.findIndex(r => r.ts > (cursor.lastTs as number));
+    else if (cursor.lastTs) start = rows.findIndex((r) => r.ts > (cursor.lastTs as number));
     if (start < 0) start = rows.length;
   }
   // `readProfile`, never `loadProfile`: this reader serves `attendState` too,
@@ -874,7 +931,7 @@ export function pendingRows(
   // absent config yields the empty map: every room OFF, today's behaviour.
   // Built ONCE per sweep (the gate memoizes each flagged room's fold).
   const gate = roomTriggerGate(account, loadAttendConfig(account), onClassRead);
-  return rows.slice(start).filter(r => triggers(r, ownerUserId, selfUserId, gate));
+  return rows.slice(start).filter((r) => triggers(r, ownerUserId, selfUserId, gate));
 }
 
 /**
@@ -1077,19 +1134,18 @@ function routeIn(
   // ref is a conversation, not a guess; the cross-room case lands here too,
   // because continuing room B's session from room A is the confusion the
   // grp clause exists to kill).
-  const roomRow = batch.find(r => r.grp !== undefined);
+  const roomRow = batch.find((r) => r.grp !== undefined);
   if (roomRow?.grp !== undefined) {
     if (roomRow.men === true) return { kind: 'room', gid: roomRow.grp };
     const hit =
       roomRow.ref === undefined
         ? undefined
-        : ledger.find(r => r.id === roomRow.ref && r.grp !== undefined);
+        : ledger.find((r) => r.id === roomRow.ref && r.grp !== undefined);
     if (hit !== undefined && hit.grp === roomRow.grp) return { kind: 'room', gid: roomRow.grp };
     return { kind: 'ended' };
   }
-  const resolvable = (row: MessageRecord): string | undefined =>
-    hostSessionKey(row.sess?.key);
-  const refs = batch.map(r => r.ref).filter((r): r is string => Boolean(r));
+  const resolvable = (row: MessageRecord): string | undefined => hostSessionKey(row.sess?.key);
+  const refs = batch.map((r) => r.ref).filter((r): r is string => Boolean(r));
   if (refs.length > 0) {
     // The LAST ref wins — the operator's most recent aim.
     const target = refs[refs.length - 1] as string;
@@ -1097,7 +1153,7 @@ function routeIn(
     // session we can name back to the operator either — `unroutable` echoes a
     // TAG derived from the key, and deriving a tag from a value we have just
     // judged malformed is the same mistake one indirection further out.
-    const hit = ledger.find(r => r.id === target);
+    const hit = ledger.find((r) => r.id === target);
     const key = hit === undefined ? undefined : resolvable(hit);
     if (hit !== undefined && key !== undefined) {
       const on = hit.sess?.host ?? '';
@@ -1141,12 +1197,7 @@ function routeIn(
   return { kind: 'own' };
 }
 
-export function route(
-  account: string,
-  batch: MessageRecord[],
-  now: number,
-  host: string,
-): Route {
+export function route(account: string, batch: MessageRecord[], now: number, host: string): Route {
   return routeIn(new MessageLog(account).read({ dir: 'out' }), batch, now, host);
 }
 
@@ -1239,11 +1290,7 @@ const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
  * result through `plainForChat`/`capChatHead` like every other reply; nothing
  * here is a second, private path to the operator's phone.
  */
-export function hostExplanation(
-  stdout: string,
-  stderr: string,
-  refusal: HostRefusal,
-): string {
+export function hostExplanation(stdout: string, stderr: string, refusal: HostRefusal): string {
   // STDERR IS NEVER REPEATED BACK. It was, for one revision, and the reason it
   // is not is measurable: a failing host writes its environment into stderr.
   // A probe of that revision delivered
@@ -1262,7 +1309,7 @@ export function hostExplanation(
   // sentence for it — a closed set written here, never the host's text. The
   // operator still learns what to do; the host's stderr never leaves this
   // process.
-  if (stdout.trim() !== '') return stdout.trim().replace(UUID_RE, m => sessionTag(m));
+  if (stdout.trim() !== '') return stdout.trim().replace(UUID_RE, (m) => sessionTag(m));
   if (refusal === 'no-conversation') return 'that session is gone from this machine.';
   if (refusal === 'session-exists') return 'that session is already open.';
   if (refusal === 'live-session') return 'that session is running right now.';
@@ -1342,6 +1389,183 @@ export function takeTurnToken(account: string, cfg: AttendConfig, now: number): 
   });
 }
 
+/** Build the terminal fact from state this process has actually observed.
+ * The local hourly counter is the only usage source attend owns; malformed,
+ * stale, or implausibly future state is omitted rather than repaired or
+ * guessed. The event id is minted once by the caller-facing helper and then
+ * reused if a streamed final has to fall back to an ordinary reply. */
+const observedCodexVersions = new Map<string, string | null>();
+
+function terminalCapabilitySnapshot(
+  account: string,
+  cfg: AttendConfig,
+  io: AttendAiCapabilityIo = {},
+): AiWorkCapabilities {
+  let binRunnable = false;
+  try {
+    binRunnable = statSync(cfg.bin).isFile();
+    if (binRunnable) accessSync(cfg.bin, fsConstants.X_OK);
+  } catch {
+    binRunnable = false;
+  }
+  let workdirIsDirectory = false;
+  try {
+    workdirIsDirectory = statSync(cfg.workdir).isDirectory();
+  } catch {
+    workdirIsDirectory = false;
+  }
+  const listener = (io.listenerStatus ?? ((name) => statusOf(name, {}, 'listen')))(account);
+  const surface: SetupSurface = cfg.host === 'claude' ? 'claude-code' : cfg.host;
+  let hostRegistration: Pick<
+    HostConfigInspection,
+    'notificationConfigured' | 'approvalsConfigured'
+  > = { notificationConfigured: false, approvalsConfigured: false };
+  try {
+    hostRegistration = (io.inspectHost ?? inspectHostConfig)(surface, account);
+  } catch {
+    // An unreadable/future host file is absence of verified support. The
+    // answerer observation below remains independently useful.
+  }
+  let codexInstalledVersion: string | null | undefined;
+  if (cfg.host === 'codex' && (cfg.codexDriver ?? 'exec') === 'app-server') {
+    if (!observedCodexVersions.has(cfg.bin)) {
+      observedCodexVersions.set(cfg.bin, observeCodexVersion(cfg.bin));
+    }
+    codexInstalledVersion = observedCodexVersions.get(cfg.bin) ?? null;
+  }
+  const claudeSdk = cfg.host === 'claude' && cfg.claudeDriver === 'sdk';
+  const observeBoolean = (probe: () => boolean): boolean => {
+    try {
+      return probe() === true;
+    } catch {
+      return false;
+    }
+  };
+  const sdkInstalled = claudeSdk
+    ? observeBoolean(io.claudeSdkInstalled ?? claudeSdkInstalled)
+    : undefined;
+  const sdkApiKeyPresent = claudeSdk
+    ? observeBoolean(
+        io.claudeSdkApiKeyPresent ??
+          (() => {
+            const key = process.env.ANTHROPIC_API_KEY;
+            return typeof key === 'string' && key.trim() !== '';
+          }),
+      )
+    : undefined;
+  const attend = aiAttendCapabilityFact({
+    configured: true,
+    host: cfg.host,
+    // `attendOnce` reached this helper only after loading this account's
+    // profile and requiring its owner binding.
+    paired: true,
+    binRunnable,
+    workdirIsDirectory,
+    ...(cfg.host === 'codex'
+      ? {
+          codexSignedIn: existsSync(join(codexHomeDir(account), 'auth.json')),
+          codexDriver: cfg.codexDriver,
+          codexApprovalPolicy: cfg.codexApprovalPolicy,
+        }
+      : {}),
+    ...(cfg.host === 'claude' ? { claudeDriver: cfg.claudeDriver } : {}),
+    ...(sdkInstalled === undefined ? {} : { claudeSdkInstalled: sdkInstalled }),
+    ...(sdkApiKeyPresent === undefined ? {} : { claudeSdkApiKeyPresent: sdkApiKeyPresent }),
+  });
+  return readAiCapabilities({
+    provider: cfg.host,
+    // A runnable answerer sends its own terminal notifications. Exact host
+    // registration is a second source for notifications and, for Claude,
+    // the interactive PermissionRequest lane. Both reads bind the same
+    // provider and account; a legacy differently-hosted answerer therefore
+    // cannot inherit another host's hook facts.
+    notificationConfigured: hostRegistration.notificationConfigured,
+    nativeClaudePermissionConfigured: cfg.host === 'claude' && hostRegistration.approvalsConfigured,
+    listenerConfigured: listener.installed,
+    listenerRunning: listener.running,
+    attend,
+    ...(codexInstalledVersion === undefined ? {} : { codexInstalledVersion }),
+  }).capabilities;
+}
+
+function terminalWorkMetadata(
+  account: string,
+  cfg: AttendConfig,
+  event: 'turn-complete' | 'turn-failed',
+  updatedAt: number,
+  sess?: OutSess,
+  capabilityIo?: AttendAiCapabilityIo,
+): AiWorkMetadata {
+  const bucket = loadJson<Bucket>(bucketPath(account));
+  const validLimit = Number.isSafeInteger(cfg.turnsPerHour) && cfg.turnsPerHour > 0;
+  const validBucket =
+    bucket !== null &&
+    Number.isSafeInteger(bucket.windowStart) &&
+    Number.isSafeInteger(bucket.turns) &&
+    bucket.windowStart <= updatedAt + 5 * 60 * 1000 &&
+    updatedAt - bucket.windowStart < 60 * 60 * 1000 &&
+    bucket.turns >= 0;
+  const usage =
+    validLimit && validBucket
+      ? [
+          {
+            source: 'local-budget' as const,
+            unit: 'turns' as const,
+            period: 'hour' as const,
+            observedAt: updatedAt,
+            used: bucket.turns,
+            remaining: Math.max(0, cfg.turnsPerHour - bucket.turns),
+            limit: cfg.turnsPerHour,
+          },
+        ]
+      : undefined;
+  const context = captureAiWorkContext(cfg.workdir, updatedAt);
+  const project =
+    context.availability !== 'unavailable' &&
+    context.repository !== undefined &&
+    context.repository.length <= AI_WORK_PROJECT_MAX
+      ? context.repository
+      : undefined;
+  return AiWorkMetadataSchema.parse({
+    provider: cfg.host,
+    updatedAt,
+    event,
+    eventId: ulid(),
+    ...(sess === undefined ? {} : { runTag: sess.tag }),
+    ...(project === undefined ? {} : { project }),
+    context,
+    capabilities: terminalCapabilitySnapshot(account, cfg, capabilityIo),
+    ...(usage === undefined ? {} : { usage }),
+  });
+}
+
+/** A host-bound approval observation, correlated only by the immutable q.
+ * It is separate from terminal turn state because receiving a decision and
+ * completing a turn are distinct provider facts. */
+function approvalObservationMetadata(
+  provider: AttendHost,
+  requestId: string,
+  approvalObservation: 'decision-returned' | 'provider-received',
+  updatedAt: number,
+  sess?: OutSess,
+): AiWorkMetadata {
+  return AiWorkMetadataSchema.parse({
+    provider,
+    updatedAt,
+    requestId,
+    approvalObservation,
+    ...(sess === undefined ? {} : { runTag: sess.tag }),
+  });
+}
+
+/** Keep the observation's words readable on existing phones by placing them
+ * in the already-deployed reply envelope anchored to the approval prompt.
+ * New builds additionally consume the optional work fact injected by the
+ * single AI-origin funnel. */
+function approvalObservationBody(text: string, ref: string): string {
+  return JSON.stringify({ tcm: 'reply', ref, ofs: true, text });
+}
+
 /**
  * The refund for a PROVABLY undelivered steer, and for nothing else. The token is taken BEFORE `turn/steer` leaves — the brake binds
  * before the side effect, like every write order in this file — so the one
@@ -1380,7 +1604,7 @@ async function realRunTurn(
   prompt: string,
   env?: Readonly<Record<string, string>>,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
-  return new Promise(resolve => {
+  return new Promise((resolve) => {
     let child;
     try {
       // The driver names only the DELTA (codex's CODEX_HOME); it is merged
@@ -1413,15 +1637,15 @@ async function realRunTurn(
     child.stdin.end(prompt);
     let out = '';
     let err = '';
-    child.stdout.on('data', d => (out += String(d)));
+    child.stdout.on('data', (d) => (out += String(d)));
     // Kept, not discarded: this is the channel the host answers a bad session
     // argument on, and dropping it was why the only actionable line the
     // operator could have been given never left the process.
-    child.stderr.on('data', d => {
+    child.stderr.on('data', (d) => {
       if (err.length < STDERR_KEEP) err += String(d).slice(0, STDERR_KEEP - err.length);
     });
     child.on('error', () => resolve({ stdout: '', stderr: '', code: 127 }));
-    child.on('close', code => resolve({ stdout: out, stderr: err, code: code ?? 1 }));
+    child.on('close', (code) => resolve({ stdout: out, stderr: err, code: code ?? 1 }));
   });
 }
 
@@ -1467,13 +1691,13 @@ export function realSession(
     return {
       write: () => {},
       onLine: () => {},
-      onExit: cb => queueMicrotask(() => cb(127)),
+      onExit: (cb) => queueMicrotask(() => cb(127)),
       kill: () => {},
     };
   }
   child.stdin?.on('error', () => {});
   let buf = '';
-  child.stdout?.on('data', d => {
+  child.stdout?.on('data', (d) => {
     buf += String(d);
     let at;
     while ((at = buf.indexOf('\n')) >= 0) {
@@ -1484,15 +1708,15 @@ export function realSession(
   });
   child.stderr?.resume(); // drained, never stored — see the header
   child.on('error', () => onExit?.(127));
-  child.on('close', code => onExit?.(code));
+  child.on('close', (code) => onExit?.(code));
   return {
-    write: line => {
+    write: (line) => {
       child.stdin?.write(line + '\n');
     },
-    onLine: cb => {
+    onLine: (cb) => {
       onLine = cb;
     },
-    onExit: cb => {
+    onExit: (cb) => {
       onExit = cb;
     },
     kill: () => {
@@ -1816,7 +2040,7 @@ function noteSteered(account: string, id: string): void {
  * exactly once as the ordinary message it still is. */
 function unnoteSteered(account: string, id: string): void {
   const f = readJournalFile(account);
-  writeJournalFile(account, { ...f, steered: (f.steered ?? []).filter(v => v !== id) });
+  writeJournalFile(account, { ...f, steered: (f.steered ?? []).filter((v) => v !== id) });
 }
 
 /**
@@ -1873,10 +2097,10 @@ function settleJournal(
   add: { steered?: string[]; midTurn?: string[] } = {},
 ): void {
   const f = readJournalFile(account);
-  const steered = [...new Set([...(f.steered ?? []), ...(add.steered ?? [])])].filter(id =>
+  const steered = [...new Set([...(f.steered ?? []), ...(add.steered ?? [])])].filter((id) =>
     keep.has(id),
   );
-  const midTurn = [...new Set([...(f.midTurn ?? []), ...(add.midTurn ?? [])])].filter(id =>
+  const midTurn = [...new Set([...(f.midTurn ?? []), ...(add.midTurn ?? [])])].filter((id) =>
     keep.has(id),
   );
   // The room-fanout debt survives the retirement untouched: it is settled by
@@ -1912,6 +2136,10 @@ function settleJournal(
  * the operator verbatim or not at all (see `composeApprovalPrompt`). */
 export interface ApprovalAsk {
   payload: string;
+  /** Trusted working directory in which the proposed operation has meaning.
+   * It decorates the approval with bounded repository/branch evidence; the
+   * immutable authorization remains the existing exact q/p journal pair. */
+  contextCwd?: string;
   /** Proposed TTL; the supervisor clamps it — the TTL clock is the
    * supervisor's, like the funnel and the journal. */
   ttlMs?: number;
@@ -2076,6 +2304,11 @@ interface ApprovalRow {
    *              is the side-effecting one;
    *   done       the host acknowledged (the turn that carried the ask
    *              reported back);
+   *   returned   a native permission-hook process wrote the allow/deny
+   *              decision back across its stdout boundary. This says only
+   *              that Tacendum returned the decision to Claude's hook host;
+   *              it does not claim the operation ran or even that Claude
+   *              consumed stdout after the write completed;
    *   lapsed     restart found the row in-flight. Measurement showed a crash
    *              parks NOTHING host-side, so the pending callback is dead by
    *              definition: the id is burned, the operator is told once, and
@@ -2089,7 +2322,7 @@ interface ApprovalRow {
    *              replaced. The id is burned exactly as a lapse burns one: a
    *              late answer naming it approves nothing, ever.
    */
-  state: 'asking' | 'pending' | 'answering' | 'done' | 'lapsed' | 'superseded';
+  state: 'asking' | 'pending' | 'answering' | 'done' | 'returned' | 'lapsed' | 'superseded';
   /**
    * WHICH FORM the ask left in: `card` is the `x.approval`
    * envelope behind the attested floor, `text` the plain prompt.
@@ -2106,8 +2339,10 @@ interface ApprovalRow {
    * over-cap refusal (which denies because it cannot render), an `edit:`
    * (deny + supersede), or a `respond:` (deny + the text runs as the next
    * turn's prompt — the row it names gets a second life as an ordinary
-   * message, see `approvalKey`). */
-  via?: 'reply' | 'ttl' | 'overcap' | 'edit' | 'respond';
+   * message, see `approvalKey`). `mismatch` is a local journal integrity
+   * failure: the captured q/p/ref/TTL no longer matches the pending row, so
+   * the only decision allowed across the host boundary is deny. */
+  via?: 'reply' | 'ttl' | 'overcap' | 'edit' | 'respond' | 'mismatch';
   decidedAt?: number;
   /** The spool row (msgId) whose reply DECIDED this approval. */
   answerId?: string;
@@ -2169,8 +2404,8 @@ function mutateApprovals<T>(account: string, fn: (file: ApprovalFile) => T): T {
 }
 
 function patchApprovalRow(account: string, id: string, patch: Partial<ApprovalRow>): void {
-  mutateApprovals(account, file => {
-    const at = file.rows.findIndex(r => r.id === id);
+  mutateApprovals(account, (file) => {
+    const at = file.rows.findIndex((r) => r.id === id);
     if (at >= 0) file.rows[at] = { ...(file.rows[at] as ApprovalRow), ...patch };
   });
 }
@@ -2193,7 +2428,7 @@ function patchApprovalRow(account: string, id: string, patch: Partial<ApprovalRo
  * compartment it shares.
  */
 function sweepApprovals(account: string, now: number): { lapsed: number; lapsedCards: number } {
-  return mutateApprovals(account, file => {
+  return mutateApprovals(account, (file) => {
     let lapsed = 0;
     let lapsedCards = 0;
     for (let i = 0; i < file.rows.length; i += 1) {
@@ -2204,7 +2439,7 @@ function sweepApprovals(account: string, now: number): { lapsed: number; lapsedC
         if (row.form === 'card') lapsedCards += 1;
       }
     }
-    file.rows = file.rows.filter(r => now - (r.settledAt ?? r.askedAt) < RETAIN_MS);
+    file.rows = file.rows.filter((r) => now - (r.settledAt ?? r.askedAt) < RETAIN_MS);
     for (let i = 0; i < file.rows.length; i += 1) {
       const row = file.rows[i] as ApprovalRow;
       if (
@@ -2281,10 +2516,24 @@ function composeApprovalCard(args: {
   requestId: string;
   payload: string;
   ttlMs: number;
+  provider: AttendHost;
+  updatedAt: number;
+  contextCwd?: string;
   kind?: ApprovalAsk['kind'];
   sessionTag?: string;
   seq: number;
 }): string | null {
+  const work = AiWorkMetadataSchema.parse({
+    provider: args.provider,
+    updatedAt: args.updatedAt,
+    event: 'needs-review',
+    // One canonical identity is enough: the approval request itself is the
+    // work event, so its single-use q is also the event's stable identity.
+    eventId: args.requestId,
+    requestId: args.requestId,
+    context: captureAiWorkContext(args.contextCwd ?? '', args.updatedAt),
+    ...(args.sessionTag === undefined ? {} : { runTag: args.sessionTag }),
+  });
   const envelope = {
     tcm: 'x.approval' as const,
     q: args.requestId,
@@ -2309,7 +2558,7 @@ function composeApprovalCard(args: {
     a: ['approve', 'deny'],
     ...(args.seq > 1 && args.seq <= 64 ? { n: args.seq } : {}),
   };
-  const parsed = ApprovalRequestEnvelope.safeParse(envelope);
+  const parsed = ApprovalRequestEnvelope.safeParse({ ...envelope, work });
   if (!parsed.success) return null;
   // MARKED BEFORE THE CAP CHECK (the consent remediation's F10): the send
   // wrapper's funnel adds `"ai":true` to every envelope body UNGATED —
@@ -2320,7 +2569,440 @@ function composeApprovalCard(args: {
   // here is idempotent (the funnel re-marks byte-identically), so the guard
   // and the wire now judge the same bytes.
   const body = markAgentBody(JSON.stringify(parsed.data), false);
-  return Buffer.byteLength(body, 'utf8') <= MAX_BODY_BYTES ? body : null;
+  if (Buffer.byteLength(body, 'utf8') <= MAX_BODY_BYTES) return body;
+
+  // `work` is supplementary to the immutable authorization payload. Near
+  // the transport boundary, an otherwise valid approval must not become
+  // unapprovable merely because this build can decorate it with activity
+  // metadata. Re-parse the exact same q/p/decision fields without `work` and
+  // give that legacy-compatible card one chance; payload, request identity,
+  // expiry and verbs are unchanged. If those bytes still do not fit, the
+  // ordinary over-cap deny remains the only safe result.
+  const withoutWork = ApprovalRequestEnvelope.safeParse(envelope);
+  if (!withoutWork.success) return null;
+  const fallback = markAgentBody(JSON.stringify(withoutWork.data), false);
+  return Buffer.byteLength(fallback, 'utf8') <= MAX_BODY_BYTES ? fallback : null;
+}
+
+/**
+ * Everything needed by the one approval funnel, whether its parked host is
+ * an attend driver or Claude Code's native PermissionRequest hook. Keeping
+ * these seams explicit prevents the native hook from growing a second q/p
+ * journal, reply matcher, TTL clock, or card composer with subtly different
+ * authorization rules.
+ */
+interface ApprovalFunnelContext {
+  account: string;
+  cfg: Pick<AttendConfig, 'host' | 'approvalsMinAppBuild'>;
+  owner: string;
+  /** A room turn never lets a frame-borne session escape into a 1:1 card. */
+  allowSessionKey: boolean;
+  turnSess?: OutSess;
+  sentAt: number[];
+  askedRows: string[];
+  tick(): number;
+  sleep(ms: number): Promise<void>;
+  send(
+    body: string,
+    sess?: OutSess,
+    opts?: { notify?: boolean; work?: AiWorkMetadata },
+  ): Promise<string | void>;
+  reply(text: string, sess?: OutSess): Promise<void>;
+  isTurnOver(): boolean;
+}
+
+interface ApprovalFunnelResult {
+  decision: ApprovalDecision;
+  rowId: string;
+  requestId: string;
+  /** Wire anchor for the exact approval prompt/card, when one left. */
+  msgId?: string;
+}
+
+/**
+ * The shared approval funnel. The q/p pair is minted and stored here, before
+ * the card leaves; only a matching owner reply-ref can move it to answering.
+ * Callers own the final observable boundary: attend changes `answering` to
+ * `done` after its driver returns, while the native hook changes it to
+ * `returned` only after its JSON decision has been written.
+ */
+async function runApprovalFunnel(
+  ctx: ApprovalFunnelContext,
+  a: ApprovalAsk,
+): Promise<ApprovalFunnelResult> {
+  const {
+    account,
+    cfg,
+    owner,
+    allowSessionKey,
+    turnSess,
+    sentAt,
+    askedRows,
+    tick,
+    sleep,
+    send,
+    reply,
+    isTurnOver,
+  } = ctx;
+  const askedAt = tick();
+  const ttlMs = Math.min(
+    APPROVAL_TTL_MAX_MS,
+    Math.max(APPROVAL_TTL_MIN_MS, a.ttlMs ?? APPROVAL_TTL_DEFAULT_MS),
+  );
+  const rowId = ulid();
+  const requestId = ulid();
+  // The over-cap result has no message; a successful send supplies its id.
+  let approvalMsgId: string | undefined = undefined;
+  const result = (decision: ApprovalDecision): ApprovalFunnelResult => ({
+    decision,
+    rowId,
+    requestId,
+    ...(approvalMsgId === undefined ? {} : { msgId: approvalMsgId }),
+  });
+  askedRows.push(rowId);
+
+  // A frame-borne key is admitted only where the caller knows this is a 1:1
+  // turn. The PermissionRequest bridge deliberately supplies none: raw
+  // Claude session ids stay local and never become card correlation.
+  const askKey =
+    allowSessionKey && a.sessionKey !== undefined ? hostSessionKey(a.sessionKey) : undefined;
+  const askSess: OutSess | undefined =
+    turnSess ??
+    (askKey !== undefined ? { host: cfg.host, key: askKey, tag: sessionTag(askKey) } : undefined);
+
+  const attested =
+    Number.isInteger(cfg.approvalsMinAppBuild) && (cfg.approvalsMinAppBuild as number) >= 1;
+  const form: 'card' | 'text' = attested ? 'card' : 'text';
+  const minted: ApprovalRow = {
+    id: rowId,
+    requestId,
+    host: cfg.host,
+    ...(askSess?.key !== undefined ? { sessionKey: askSess.key } : {}),
+    payload: a.payload,
+    askedAt,
+    ttlMs,
+    state: 'asking',
+    form,
+  };
+
+  const seq = askedRows.length;
+  const noteParts: string[] = [];
+  if (seq > 1) noteParts.push(`approval ${seq} of this turn`);
+  if (sentAt.filter((t) => askedAt - t < 60_000).length >= 4) {
+    noteParts.push('your phone may not have rung — several messages within a minute');
+  }
+  const body =
+    form === 'card'
+      ? composeApprovalCard({
+          requestId,
+          payload: a.payload,
+          ttlMs,
+          provider: cfg.host,
+          updatedAt: askedAt,
+          ...(a.contextCwd === undefined ? {} : { contextCwd: a.contextCwd }),
+          ...(a.kind !== undefined ? { kind: a.kind } : {}),
+          ...(askSess?.tag !== undefined ? { sessionTag: askSess.tag } : {}),
+          seq,
+        })
+      : composeApprovalPrompt(
+          a.payload,
+          ttlMs,
+          noteParts.length > 0 ? noteParts.join('; ') : undefined,
+        );
+
+  if (body === null) {
+    mutateApprovals(account, (file) => {
+      file.overCapRefusals += 1;
+      file.rows.push(minted);
+    });
+    patchApprovalRow(account, rowId, {
+      decision: 'deny',
+      via: 'overcap',
+      decidedAt: tick(),
+      state: 'answering',
+    });
+    await reply(
+      form === 'card'
+        ? `The agent asked for approval of a ${Buffer.byteLength(a.payload, 'utf8')}-byte ` +
+            `action, which does not fit the ${MAX_APPROVAL_PAYLOAD_BYTES}-byte approval ` +
+            'card verbatim — and it is never summarised or truncated here, so it was ' +
+            'denied and nothing ran. Approve it from the machine if you want it.'
+        : `The agent asked for approval of a ${a.payload.length}-character command, which ` +
+            `does not fit the ${HOOK_CHAT_CAP}-character chat message verbatim — and it is ` +
+            'never summarised or truncated here, so it was denied and nothing ran. ' +
+            'Approve it from the machine if you want it.',
+      askSess,
+    );
+    return result('deny');
+  }
+
+  // Journal first, then send, then record the reply-ref target.
+  mutateApprovals(account, (file) => {
+    file.rows.push(minted);
+  });
+  const sentId = await send(body, askSess);
+  const msgId = typeof sentId === 'string' ? sentId : undefined;
+  approvalMsgId = msgId;
+  patchApprovalRow(account, rowId, {
+    ...(msgId !== undefined ? { msgId } : {}),
+    state: 'pending',
+  });
+
+  for (;;) {
+    const live = loadApprovals(account).rows.find((row) => row.id === rowId);
+    if (
+      live === undefined ||
+      live.state === 'lapsed' ||
+      live.state === 'done' ||
+      live.state === 'returned' ||
+      live.state === 'superseded'
+    ) {
+      return result('deny');
+    }
+    const nowT = tick();
+    // Re-assert the immutable binding at settlement, on the values already
+    // captured before the card left. This is deliberately byte equality,
+    // not a new digest: q/p/ref plus the journal's append-once discipline are
+    // the authorization. A locally altered row cannot be repaired or rebound
+    // to what the phone answered; it becomes a deny under its burned id.
+    if (
+      live.requestId !== requestId ||
+      live.payload !== a.payload ||
+      live.msgId !== msgId ||
+      live.askedAt !== askedAt ||
+      live.ttlMs !== ttlMs ||
+      live.host !== cfg.host
+    ) {
+      patchApprovalRow(account, rowId, {
+        decision: 'deny',
+        via: 'mismatch',
+        decidedAt: nowT,
+        state: 'answering',
+      });
+      return result('deny');
+    }
+    if (nowT - askedAt >= ttlMs) {
+      patchApprovalRow(account, rowId, {
+        decision: 'deny',
+        via: 'ttl',
+        decidedAt: nowT,
+        state: 'answering',
+      });
+      await reply(
+        form === 'card'
+          ? `No answer within ${fmtAge(ttlMs)} — that approval card expired and was ` +
+              'denied; nothing ran. If no card ever appeared, this phone runs an older ' +
+              'app build than attested at enable — re-run attend enable without ' +
+              '--approvals for plain-text approvals. Ask again if you still want it.'
+          : `No answer within ${fmtAge(ttlMs)} — that approval expired and was denied. ` +
+              'Nothing ran. Ask again if you still want it.',
+        askSess,
+      );
+      return result('deny');
+    }
+    if (msgId !== undefined) {
+      const answers = pendingRows(account, owner).filter((row) => row.ref === msgId);
+      const spentNow = [...(live.spent ?? [])];
+      let reAsked = live.reAsked === true;
+      for (const answer of answers) {
+        if (live.answerId === answer.id || spentNow.includes(answer.id)) continue;
+        const raw = answer.text.trim();
+        const verb = raw.toLowerCase();
+        if (verb === 'approve' || verb === 'deny') {
+          patchApprovalRow(account, rowId, {
+            decision: verb,
+            via: 'reply',
+            decidedAt: tick(),
+            answerId: answer.id,
+            state: 'answering',
+          });
+          return result(verb);
+        }
+        const edited = /^edit\s*:\s*(\S[\s\S]*)$/i.exec(raw);
+        if (edited !== null && a.kind === 'commandExecution') {
+          patchApprovalRow(account, rowId, {
+            decision: 'deny',
+            via: 'edit',
+            decidedAt: tick(),
+            answerId: answer.id,
+            state: 'answering',
+          });
+          await reply(
+            'That request was superseded and denied. The edited command was NOT run: the ' +
+              'agent can only accept or decline the command it proposed, and attend never ' +
+              'runs commands itself. Send it as an ordinary message if you want the agent ' +
+              'to run it.',
+            askSess,
+          );
+          return result('deny');
+        }
+        if (/^respond\s*:\s*(\S[\s\S]*)$/i.test(raw)) {
+          patchApprovalRow(account, rowId, {
+            decision: 'deny',
+            via: 'respond',
+            decidedAt: tick(),
+            answerId: answer.id,
+            state: 'answering',
+          });
+          return result('deny');
+        }
+        spentNow.push(answer.id);
+        patchApprovalRow(account, rowId, { spent: [...spentNow], reAsked: true });
+        if (!reAsked) {
+          reAsked = true;
+          await reply(
+            edited !== null
+              ? 'Only a command execution can be edited from here, and this approval is ' +
+                  'not one — a diff cannot be edited from a phone. Reply approve or deny; ' +
+                  'the request is unchanged.'
+              : 'Reply approve or deny — or edit: <command> to supersede a command, or ' +
+                  'respond: <text> to deny with guidance. The request is unchanged.',
+            askSess,
+          );
+        }
+      }
+    }
+    if (isTurnOver()) {
+      patchApprovalRow(account, rowId, { state: 'lapsed', settledAt: tick() });
+      return result('deny');
+    }
+    await sleep(ATTEND_POLL_MS);
+  }
+}
+
+export interface OwnerApprovalIo {
+  /** App-build attestation supplied by the explicit hook setup. Absent keeps
+   * the old-phone-compatible plain-text approval prompt. */
+  approvalsMinAppBuild?: number;
+  sendReply?: AttendIo['sendReply'];
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export type OwnerApprovalOutcome =
+  | { status: 'returned'; decision: ApprovalDecision; requestId: string }
+  | { status: 'busy'; decision: 'deny' };
+
+/**
+ * Run one provider-native approval under the SAME per-account turn lock as
+ * attend. A simultaneous native hook or attend pass receives a bounded deny
+ * and creates no row, card, cursor movement, or reply claim. `returnDecision`
+ * is called while the lock is held; only after it succeeds does the journal
+ * say `returned`.
+ */
+export async function requestOwnerApproval(
+  account: string,
+  ask: ApprovalAsk,
+  returnDecision: (decision: ApprovalDecision) => void | Promise<void>,
+  io: OwnerApprovalIo = {},
+): Promise<OwnerApprovalOutcome> {
+  const profile = loadProfile(account);
+  const owner = profile.ownerUserId;
+  if (owner === undefined) {
+    throw new CliError(EXIT.ERROR, 'the approval account is not paired');
+  }
+  const tick = (): number => io.now?.() ?? Date.now();
+  const sleep =
+    io.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
+  const got = await tryFileLockAsync(
+    turnLockPath(account),
+    async () => {
+      const sentAt: number[] = [];
+      const rawSend =
+        io.sendReply ??
+        ((body: string, sess?: OutSess, opts?: { notify?: boolean }) =>
+          realSendReply(account, body, sess, opts));
+      const send = async (
+        body: string,
+        sess?: OutSess,
+        opts?: { notify?: boolean; work?: AiWorkMetadata },
+      ): Promise<string | void> => {
+        sentAt.push(tick());
+        const marked = markAgentBody(body, markerAttested(account), opts?.work);
+        const transportOpts = opts?.notify === undefined ? undefined : { notify: opts.notify };
+        return enqueueSealed(account, () => rawSend(marked, sess, transportOpts));
+      };
+      const reply = async (text: string, sess?: OutSess): Promise<void> => {
+        await send(capChatHead(plainForChat(text), ATTEND_REPLY_CAP), sess);
+      };
+
+      // An earlier process that died can leave an in-flight row. The lock
+      // proves it is dead; burn the id and tell the owner once before asking
+      // the new question, on attend's existing restart rule.
+      const swept = sweepApprovals(account, tick());
+      if (swept.lapsed > 0) {
+        const noun = swept.lapsed === 1 && swept.lapsedCards === 1 ? 'approval card' : 'approval';
+        await reply(
+          swept.lapsed === 1
+            ? `An ${noun} lapsed while the approval bridge was restarting — nothing was ` +
+                'approved. Ask again if you still want it.'
+            : `${swept.lapsed} approvals lapsed while the approval bridge was restarting — ` +
+                'nothing was approved. Ask again if you still want them.',
+        );
+      }
+
+      const approvedRows: string[] = [];
+      const resolution = await runApprovalFunnel(
+        {
+          account,
+          cfg: {
+            host: 'claude',
+            ...(io.approvalsMinAppBuild === undefined
+              ? {}
+              : { approvalsMinAppBuild: io.approvalsMinAppBuild }),
+          },
+          owner,
+          allowSessionKey: false,
+          sentAt,
+          askedRows: approvedRows,
+          tick,
+          sleep,
+          send,
+          reply,
+          isTurnOver: () => false,
+        },
+        ask,
+      );
+      await returnDecision(resolution.decision);
+      patchApprovalRow(account, resolution.rowId, {
+        state: 'returned',
+        settledAt: tick(),
+      });
+      // stdout accepted the hook decision. That is the native bridge's one
+      // observable handoff boundary, so publish it as its own quiet fact. A
+      // failed supplementary send cannot retract a decision Claude already
+      // received and must never turn an allow into a retried provider write.
+      if (resolution.msgId !== undefined)
+        try {
+          await send(
+            approvalObservationBody('Approval decision returned to Claude.', resolution.msgId),
+            undefined,
+            {
+              notify: false,
+              work: approvalObservationMetadata(
+                'claude',
+                resolution.requestId,
+                'decision-returned',
+                tick(),
+              ),
+            },
+          );
+        } catch {
+          // The approval journal remains authoritative; this optional
+          // observation may be absent until a later source produces one.
+        }
+      return {
+        status: 'returned' as const,
+        decision: resolution.decision,
+        requestId: resolution.requestId,
+      };
+    },
+    TURN_LOCK_WAIT_MS,
+  );
+  if (got.held) return got.value;
+  await returnDecision('deny');
+  return { status: 'busy', decision: 'deny' };
 }
 
 /**
@@ -2433,7 +3115,6 @@ function carryContextLine(refText: string): string {
     : `[replying to: "${head}"]`;
 }
 
-
 /**
  * ---------------------------------------------------------------------------
  * ROUNDS (§3.3) — the prompt block, the split, the bounds.
@@ -2519,7 +3200,7 @@ export const ROUND_SIBLING_SKEW_MS = 60_000;
  */
 export function roundsPromptBlock(input: RoundPromptInput): string {
   const lines: string[] = [`[room: ${input.roomLabel}]`];
-  const members = input.members.map(m => (m.agent ? `${m.label} (AI agent)` : m.label));
+  const members = input.members.map((m) => (m.agent ? `${m.label} (AI agent)` : m.label));
   if (members.length > 0) lines.push(`[members: ${members.join(', ')}]`);
   // ASKS BEFORE SIBLINGS — §3.3's stated order, and the chronological one: a
   // sibling's answer is only legible AFTER the question it answers, and the
@@ -2769,9 +3450,9 @@ function roundsPromptFor(
     const fold = foldRoster(owner, store.listSlots(), ownerOnlyPolicy);
     const names = mentionNames(account, selfId);
     const agentIds = new Set(
-      fold.members.filter(id => fold.classes[id] === 'integration' && id !== selfId),
+      fold.members.filter((id) => fold.classes[id] === 'integration' && id !== selfId),
     );
-    const covered = new Set(group.map(r => r.id));
+    const covered = new Set(group.map((r) => r.id));
     // THE WINDOW IS FLOORED AT THIS ROUND (§3.3: "the spooled rows since the
     // LAST ANSWERED ROUND for this room"). Without it, after a quiet spell the
     // newest six agent rows are a PREVIOUS round's answers and the block
@@ -2792,7 +3473,7 @@ function roundsPromptFor(
     const siblings = new MessageLog(account)
       .read({ dir: 'in' })
       .filter(
-        r =>
+        (r) =>
           r.grp === gid &&
           r.text !== '' &&
           r.red !== true &&
@@ -2803,7 +3484,7 @@ function roundsPromptFor(
       )
       .slice(0, ROUND_SIBLING_ROWS)
       .reverse()
-      .map(r => {
+      .map((r) => {
         // `detail` is a later field on `MessageRecord` (§1.1): this
         // path composes the wire, and the reading side is threaded through
         // the spool afterwards. Read through a widening rather than left out,
@@ -2818,18 +3499,16 @@ function roundsPromptFor(
         return {
           label: personLabel(names, r.peer),
           brief: r.text,
-          ...(typeof detail === 'string' && detail !== ''
-            ? { detail: capDetail(detail) }
-            : {}),
+          ...(typeof detail === 'string' && detail !== '' ? { detail: capDetail(detail) } : {}),
         };
       });
     return roundsPromptBlock({
       roomLabel: roomLabel(store),
-      members: fold.members.map(id => ({
+      members: fold.members.map((id) => ({
         label: personLabel(names, id),
         agent: fold.classes[id] === 'integration',
       })),
-      asks: group.map(r => ({ label: personLabel(names, r.peer), text: bodyOf(r) })),
+      asks: group.map((r) => ({ label: personLabel(names, r.peer), text: bodyOf(r) })),
       siblings,
     });
   } catch {
@@ -2991,19 +3670,20 @@ async function attendPass(
   const send = async (
     body: string,
     sess?: OutSess,
-    opts?: { notify?: boolean },
+    opts?: { notify?: boolean; work?: AiWorkMetadata },
   ): Promise<string | void> => {
     sentAt.push(io.now?.() ?? Date.now());
-    const marked = markAgentBody(body, markerArmed);
+    const marked = markAgentBody(body, markerArmed, opts?.work);
+    const transportOpts = opts?.notify === undefined ? undefined : { notify: opts.notify };
     // Through the seal queue: a durable send must never reach the ratchet
     // file lock while a same-process detached chatter emit holds it — and
     // the queue is also what puts the durable final strictly after the last
     // queued intermediate (see `enqueueSealed`).
-    return enqueueSealed(account, () => rawSend(marked, sess, opts));
+    return enqueueSealed(account, () => rawSend(marked, sess, transportOpts));
   };
   const funnel = (text: string): string => capChatHead(plainForChat(text), ATTEND_REPLY_CAP);
-  const reply = async (text: string, sess?: OutSess): Promise<void> => {
-    await send(funnel(text), sess);
+  const reply = async (text: string, sess?: OutSess, work?: AiWorkMetadata): Promise<void> => {
+    await send(funnel(text), sess, work === undefined ? undefined : { work });
   };
 
   // THE LAPSE SWEEP RUNS FIRST, before the batch is even read: a card may be
@@ -3056,7 +3736,7 @@ async function attendPass(
     if (blind) noteClassBlind(account, gid, now);
     else clearClassBlind(account, gid);
   });
-  const batchIds = new Set(batch.map(r => r.id));
+  const batchIds = new Set(batch.map((r) => r.id));
   if (batch.length === 0) {
     // A journal with nothing left to cover is spent: its rows — the turn's
     // own AND any steered/mid-turn ids — are already behind the cursor, so
@@ -3110,7 +3790,7 @@ async function attendPass(
   const noteRoundKeys = (keys: readonly string[]): void => {
     if (keys.length === 0) return;
     const cursor = loadJson<Cursor>(cursorPath(account)) ?? {};
-    const kept = [...answeredRounds().filter(k => !keys.includes(k)), ...keys].slice(
+    const kept = [...answeredRounds().filter((k) => !keys.includes(k)), ...keys].slice(
       -ROUND_GUARD_KEEP,
     );
     writeFileAtomic(
@@ -3130,7 +3810,7 @@ async function attendPass(
   // than handed to a second execution. See `readJournal`.
   const journal = readJournal(account);
   if (journal) {
-    const at = batch.findIndex(r => r.id === journal.upTo);
+    const at = batch.findIndex((r) => r.id === journal.upTo);
     if (at >= 0) {
       // THE MAYBE-DELIVERED STEER: an id journalled before its
       // `turn/steer` left, with the turn now provably dead in between. The
@@ -3139,7 +3819,7 @@ async function attendPass(
       // over the row instead of handing a maybe-delivered message to a
       // second delivery.
       const crashFile = readJournalFile(account);
-      const maybeDelivered = (crashFile.steered ?? []).filter(id => batchIds.has(id)).length;
+      const maybeDelivered = (crashFile.steered ?? []).filter((id) => batchIds.has(id)).length;
       const interruptedSentence =
         'A turn was interrupted before it reported back — it may have partly run. ' +
         (maybeDelivered === 0
@@ -3190,8 +3870,8 @@ async function attendPass(
         for (const s of r.spent ?? []) consumedByCrash.add(s);
       }
       const rest = batch.slice(at + 1);
-      settleJournal(account, new Set(rest.map(r => r.id)), {
-        midTurn: rest.filter(r => !consumedByCrash.has(r.id)).map(r => r.id),
+      settleJournal(account, new Set(rest.map((r) => r.id)), {
+        midTurn: rest.filter((r) => !consumedByCrash.has(r.id)).map((r) => r.id),
       });
       return 'interrupted';
     }
@@ -3221,7 +3901,8 @@ async function attendPass(
   //           lapsed. Answered honestly, and NEVER re-bound: the requestId
   //           was single-use, and a lapse burned it.
   //
-  // Only settled rows (`done`/`lapsed`/`superseded`) are special-cased. A
+  // Only settled rows (`done`/`returned`/`lapsed`/`superseded`) are
+  // special-cased. A
   // `pending` row with no parked pass alive cannot exist — the sweep above
   // just lapsed any — so an answer falling through to ordinary routing is the
   // visible failure shape if that invariant ever breaks, not a silent consume.
@@ -3230,10 +3911,13 @@ async function attendPass(
     row.ref === undefined
       ? undefined
       : approvals.rows.find(
-          a =>
+          (a) =>
             a.msgId !== undefined &&
             a.msgId === row.ref &&
-            (a.state === 'done' || a.state === 'lapsed' || a.state === 'superseded'),
+            (a.state === 'done' ||
+              a.state === 'returned' ||
+              a.state === 'lapsed' ||
+              a.state === 'superseded'),
         );
   /**
    * A `respond:` decider's SECOND LIFE. The row denied its approval
@@ -3251,7 +3935,7 @@ async function attendPass(
   const respondTextOf = (row: MessageRecord): string | null => {
     if (row.ref === undefined) return null;
     const a = approvals.rows.find(
-      x => x.msgId === row.ref && x.answerId === row.id && x.via === 'respond',
+      (x) => x.msgId === row.ref && x.answerId === row.id && x.via === 'respond',
     );
     if (a === undefined) return null;
     const m = /^respond\s*:\s*(\S[\s\S]*)$/i.exec(row.text.trim());
@@ -3320,7 +4004,7 @@ async function attendPass(
       // pruned so the file cannot grow a history (the retention rule the
       // approval journal already follows).
       if (headConsumedKey === 'steered-spent') {
-        settleJournal(account, new Set(batch.slice(runEnd).map(r => r.id)));
+        settleJournal(account, new Set(batch.slice(runEnd).map((r) => r.id)));
       }
       return 'stepped';
     }
@@ -3336,10 +4020,10 @@ async function attendPass(
             'turn ran. Ask again if you still want it.'
         : a.state === 'superseded'
           ? 'That request was superseded by your edit — nothing was approved under it, and ' +
-              'this reply changed nothing.'
+            'this reply changed nothing.'
           : a.via === 'ttl'
             ? 'That approval expired before this answer arrived — it was denied and nothing ' +
-                'ran. Ask again if you still want it.'
+              'ran. Ask again if you still want it.'
             : 'That approval was already answered — this reply changed nothing.',
     );
     advanceTo(lastOfRun);
@@ -3364,7 +4048,7 @@ async function attendPass(
   // one token each, which is the budget accounted honestly rather than N turns'
   // worth of work billed as one.
   const ledger = new MessageLog(account).read({ dir: 'out' });
-  const routes = batch.map(row => routeIn(ledger, [row], now, cfg.host));
+  const routes = batch.map((row) => routeIn(ledger, [row], now, cfg.host));
   const head = routes[0] as Route;
   // The run key is the consumed classification where one applies — approval
   // answers AND steered rows both — so a batch of prompts never swallows a
@@ -3423,9 +4107,7 @@ async function attendPass(
   // redelivery of an earlier row of the same batch free to spawn a second
   // turn and post a second answer. `roundKey` above stays the row the
   // composed `ref` names: the answer answers the turn the human last took.
-  const roundKeys = roundsOn
-    ? group.map(roundKeyOf).filter((k): k is string => k !== null)
-    : [];
+  const roundKeys = roundsOn ? group.map(roundKeyOf).filter((k): k is string => k !== null) : [];
   // R2(b) — REPLY ONCE PER ROUND, consulted AFTER the route resolved and
   // BEFORE the token is taken: a round already answered spends no turn and no
   // token. The list lives beside the cursor rather than inside `triggers()`,
@@ -3435,7 +4117,7 @@ async function attendPass(
   // `takeTurnToken`/`turnsPerHour` stay the backstop (R2c), never the brake.
   if (roundKeys.length > 0) {
     const answered = answeredRounds();
-    if (roundKeys.some(k => answered.includes(k))) {
+    if (roundKeys.some((k) => answered.includes(k))) {
       advanceTo(last);
       return 'round-done';
     }
@@ -3680,299 +4362,30 @@ async function attendPass(
    * the classification at the top of this function is the other half.
    */
   const tick = (): number => io.now?.() ?? Date.now();
-  const sleep = io.sleep ?? ((ms: number) => new Promise<void>(res => setTimeout(res, ms)));
+  const sleep = io.sleep ?? ((ms: number) => new Promise<void>((res) => setTimeout(res, ms)));
   const askedRows: string[] = [];
+  const answeredApprovals: ApprovalFunnelResult[] = [];
   let turnOver = false;
   const askInner = async (a: ApprovalAsk): Promise<ApprovalDecision> => {
-    const askedAt = tick();
-    const ttlMs = Math.min(
-      APPROVAL_TTL_MAX_MS,
-      Math.max(APPROVAL_TTL_MIN_MS, a.ttlMs ?? APPROVAL_TTL_DEFAULT_MS),
+    const resolution = await runApprovalFunnel(
+      {
+        account,
+        cfg,
+        owner,
+        allowSessionKey: head.kind !== 'room',
+        ...(turnSess === undefined ? {} : { turnSess }),
+        sentAt,
+        askedRows,
+        tick,
+        sleep,
+        send: (body, sess, opts) => send(body, sess, opts),
+        reply,
+        isTurnOver: () => turnOver,
+      },
+      a,
     );
-    const rowId = ulid();
-    const requestId = ulid();
-    askedRows.push(rowId);
-    // What the CARD and its replies speak for: the routed session when one
-    // exists, else the key the DRIVER already knows mid-turn (the app-server
-    // thread id — `turnSess` cannot carry it, the id arrives on a frame
-    // after the route was decided). Gated through `hostSessionKey` exactly
-    // as a captured key is at turn end, and for the same reason: it came off
-    // a host frame and is about to be written where the router will trust
-    // it. Without this, a first-contact own turn's card writes a sessionless
-    // ledger row and a `respond:` to it can only route `ended`.
-    //
-    // NEVER FOR A ROOM TURN: the driver's mid-turn key there IS the room
-    // thread, and the card is a 1:1 side message — `turnSess`'s room rule
-    // holds for this arm too, or the leak it closes re-opens through the
-    // approval surface. The ANSWER path loses nothing: approve/deny/edit:/
-    // respond: all ride the ref to the card's wire msgId (the approval
-    // journal's own join), never the row's sess.
-    const askKey =
-      head.kind !== 'room' && a.sessionKey !== undefined
-        ? hostSessionKey(a.sessionKey)
-        : undefined;
-    const askSess: OutSess | undefined =
-      turnSess ??
-      (askKey !== undefined ? { host: cfg.host, key: askKey, tag: sessionTag(askKey) } : undefined);
-    // THE ATTESTATION GATE, and it FAILS CLOSED. The `x.approval`
-    // envelope leaves this process only when the operator attested — at
-    // `attend enable --approvals` — that their phone renders it; without the
-    // attestation the plain-text prompt is the only emission, forever
-    // (it is not transitional — an account that never attests never changes).
-    // The shape check here is deliberately the whole gate: a malformed field
-    // (a hand edit, a torn write) reads as un-attested, because the text
-    // path is the one every shipped build can answer.
-    const attested =
-      Number.isInteger(cfg.approvalsMinAppBuild) && (cfg.approvalsMinAppBuild as number) >= 1;
-    const form: 'card' | 'text' = attested ? 'card' : 'text';
-    const minted: ApprovalRow = {
-      id: rowId,
-      requestId,
-      host: cfg.host,
-      ...(askSess?.key !== undefined ? { sessionKey: askSess.key } : {}),
-      payload: a.payload,
-      askedAt,
-      ttlMs,
-      state: 'asking',
-      form,
-    };
-    // The head-of-card note: a running count from the second
-    // ask of one turn on — with one watermark cursor and one turn per pass
-    // there is never more than ONE pending approval, but one turn may ask
-    // N times in quick succession, and the count is what keeps the fourth
-    // card from reading like a re-send of the first — plus the hedged
-    // wake-budget line (`sentAt` above holds the honesty argument). The CARD
-    // form carries the count as the envelope's `n`; the hedge has no wire
-    // field and is dropped there — an under-claim, the honest direction, and
-    // the card is durable in the thread where a missed ring matters least.
-    const seq = askedRows.length;
-    const noteParts: string[] = [];
-    if (seq > 1) noteParts.push(`approval ${seq} of this turn`);
-    if (sentAt.filter(t => askedAt - t < 60_000).length >= 4) {
-      noteParts.push('your phone may not have rung — several messages within a minute');
-    }
-    const body =
-      form === 'card'
-        ? composeApprovalCard({
-            requestId,
-            payload: a.payload,
-            ttlMs,
-            ...(a.kind !== undefined ? { kind: a.kind } : {}),
-            ...(askSess?.tag !== undefined ? { sessionTag: askSess.tag } : {}),
-            seq,
-          })
-        : composeApprovalPrompt(
-            a.payload,
-            ttlMs,
-            noteParts.length > 0 ? noteParts.join('; ') : undefined,
-          );
-    if (body === null) {
-      // THE OVER-CAP REFUSAL (B-0 C10): unshown is unapprovable — a payload
-      // the form would clip or alter cannot be one-tapped, because the
-      // operator would be approving bytes they never saw. Denied, said why,
-      // size named (the SIZE, never the bytes, in this sentence),
-      // and counted — the counter is C11's ongoing measurement. Each form
-      // names ITS cap (`composeApprovalCard` holds the two-cap argument):
-      // the text funnel's 280 chars, the card schema's 16 KiB.
-      mutateApprovals(account, file => {
-        file.overCapRefusals += 1;
-        file.rows.push(minted);
-      });
-      patchApprovalRow(account, rowId, {
-        decision: 'deny',
-        via: 'overcap',
-        decidedAt: tick(),
-        state: 'answering',
-      });
-      await reply(
-        form === 'card'
-          ? `The agent asked for approval of a ${Buffer.byteLength(a.payload, 'utf8')}-byte ` +
-              `action, which does not fit the ${MAX_APPROVAL_PAYLOAD_BYTES}-byte approval ` +
-              'card verbatim — and it is never summarised or truncated here, so it was ' +
-              'denied and nothing ran. Approve it from the machine if you want it.'
-          : `The agent asked for approval of a ${a.payload.length}-character command, which ` +
-              `does not fit the ${HOOK_CHAT_CAP}-character chat message verbatim — and it is ` +
-              'never summarised or truncated here, so it was denied and nothing ran. ' +
-              'Approve it from the machine if you want it.',
-        askSess,
-      );
-      return 'deny';
-    }
-
-    // Write 1, BEFORE the request leaves the process: a crash between send
-    // and journal would leave a card on a phone that nothing can answer.
-    // BOTH forms leave through `send` — the raw seam, never the funnel: the
-    // text form already proved byte-identity through it at compose, and the
-    // envelope is wire bytes the funnel would mangle. In production that seam
-    // is `realSendReply`, which is what lands the wire msgId in the journal
-    // below — the reply-ref target the card's buttons answer — and writes
-    // the outbound ledger row TO THE OWNER, 1:1: an approval is never
-    // composed into a room (a pinned rule; the fan-out path is
-    // room-commands', and nothing here can reach it).
-    mutateApprovals(account, file => {
-      file.rows.push(minted);
-    });
-    const sentId = await send(body, askSess);
-    const msgId = typeof sentId === 'string' ? sentId : undefined;
-    // Write 2, after the send: the msgId is the row the phone will reply-ref.
-    // A seam that returned none leaves the row answerable only by its TTL —
-    // stated on `AttendIo.sendReply`, and honest: an unaddressable card
-    // expires rather than guessing which reply meant it.
-    patchApprovalRow(account, rowId, {
-      ...(msgId !== undefined ? { msgId } : {}),
-      state: 'pending',
-    });
-
-    for (;;) {
-      // Re-read our own row first: the post-turn settlement (an ask the
-      // driver abandoned) or a concurrent close may have ended it from
-      // outside, and a closed row decides deny with no further writes.
-      const live = loadApprovals(account).rows.find(r => r.id === rowId);
-      if (
-        live === undefined ||
-        live.state === 'lapsed' ||
-        live.state === 'done' ||
-        live.state === 'superseded'
-      ) {
-        return 'deny';
-      }
-      const nowT = tick();
-      if (nowT - askedAt >= ttlMs) {
-        // Write 3 (the TTL arm): recorded before the host hears the deny.
-        patchApprovalRow(account, rowId, {
-          decision: 'deny',
-          via: 'ttl',
-          decidedAt: nowT,
-          state: 'answering',
-        });
-        // The CARD form's expiry names the one failure the attestation copy
-        // warned about, because this sentence is its ONLY signal: an app
-        // build older than attested drops the card silently (the generic
-        // `x.*` drop), so the operator saw nothing and is owed the diagnosis
-        // and the way back, here, in the plain text every build renders.
-        await reply(
-          form === 'card'
-            ? `No answer within ${fmtAge(ttlMs)} — that approval card expired and was ` +
-                'denied; nothing ran. If no card ever appeared, this phone runs an older ' +
-                'app build than attested at enable — re-run attend enable without ' +
-                '--approvals for plain-text approvals. Ask again if you still want it.'
-            : `No answer within ${fmtAge(ttlMs)} — that approval expired and was denied. ` +
-                'Nothing ran. Ask again if you still want it.',
-          askSess,
-        );
-        return 'deny';
-      }
-      if (msgId !== undefined) {
-        const answers = pendingRows(account, owner).filter(r => r.ref === msgId);
-        const spentNow = [...(live.spent ?? [])];
-        let reAsked = live.reAsked === true;
-        for (const r of answers) {
-          if (live.answerId === r.id || spentNow.includes(r.id)) continue;
-          const raw = r.text.trim();
-          // Exact, case-insensitive, WHOLE-message match. "approve it" is not
-          // approve: a verb loosened here is an approval granted by fuzzy
-          // matching, which is the one direction this must never guess in.
-          const verb = raw.toLowerCase();
-          if (verb === 'approve' || verb === 'deny') {
-            // Write 3: the decision is journalled BEFORE it reaches the host
-            // — the host call is the side-effecting one, so a crash in the
-            // gap reads as "decided, not delivered", which the lapse rule
-            // then reports rather than re-runs.
-            patchApprovalRow(account, rowId, {
-              decision: verb,
-              via: 'reply',
-              decidedAt: tick(),
-              answerId: r.id,
-              state: 'answering',
-            });
-            return verb;
-          }
-          /**
-           * `edit: <command>` — and what it does is bounded by a
-           * MEASUREMENT, not by the plan's hope. The 0.144.0 decision enum
-           * admits accept / acceptForSession / decline / cancel and two
-           * POLICY amendments; `acceptWithExecpolicyAmendment` widens what
-           * may run unprompted later, it does not substitute a command (the
-           * vendored-type note in codex-appserver.ts quotes the schema's own
-           * doc). So an edited command cannot honestly ride any answer
-           * frame, and running it ourselves would bypass the sandbox and
-           * the whole approval model. What CAN be done honestly: the
-           * original request is SUPERSEDED — denied on the wire, its
-           * single-use id burned, its journal state naming what happened —
-           * and the operator is told, in one sentence, that the edited
-           * bytes were NOT run and how to run them (as an ordinary
-           * message, where the agent proposes and a FRESH approval binds
-           * fresh bytes). Only a command admits even that much; a diff
-           * cannot be edited from a phone at all.
-           */
-          const edited = /^edit\s*:\s*(\S[\s\S]*)$/i.exec(raw);
-          if (edited !== null && a.kind === 'commandExecution') {
-            patchApprovalRow(account, rowId, {
-              decision: 'deny',
-              via: 'edit',
-              decidedAt: tick(),
-              answerId: r.id,
-              state: 'answering',
-            });
-            await reply(
-              'That request was superseded and denied. The edited command was NOT run: the ' +
-                'agent can only accept or decline the command it proposed, and attend never ' +
-                'runs commands itself. Send it as an ordinary message if you want the agent ' +
-                'to run it.',
-              askSess,
-            );
-            return 'deny';
-          }
-          /**
-           * `respond: <text>` — deny WITH guidance, on the one honest
-           * channel that exists. The measured wire has no text on any
-           * decision, and `turn/steer` needs an `expectedTurnId`
-           * precondition (the work), so the text cannot reach the PARKED
-           * turn. It reaches the NEXT one instead: the decision here is a
-           * plain deny, and this very spool row — via `respondTextOf` — is
-           * re-presented on the next pass as an ordinary operator message,
-           * routed by its own `ref` to the session that asked. Nothing is
-           * copied anywhere: the text lives where the operator put it.
-           */
-          if (/^respond\s*:\s*(\S[\s\S]*)$/i.test(raw)) {
-            patchApprovalRow(account, rowId, {
-              decision: 'deny',
-              via: 'respond',
-              decidedAt: tick(),
-              answerId: r.id,
-              state: 'answering',
-            });
-            return 'deny';
-          }
-          // Anything else — a bare `edit:`/`respond:`, an `edit:` aimed at a
-          // diff, junk — gets ONE honest corrective sentence and consumes
-          // nothing of the approval; the row itself is consumed into `spent`
-          // so a later pass steps over it instead of answering it twice.
-          spentNow.push(r.id);
-          patchApprovalRow(account, rowId, { spent: [...spentNow], reAsked: true });
-          if (!reAsked) {
-            reAsked = true;
-            await reply(
-              edited !== null
-                ? 'Only a command execution can be edited from here, and this approval is ' +
-                    'not one — a diff cannot be edited from a phone. Reply approve or deny; ' +
-                    'the request is unchanged.'
-                : 'Reply approve or deny — or edit: <command> to supersede a command, or ' +
-                    'respond: <text> to deny with guidance. The request is unchanged.',
-              askSess,
-            );
-          }
-        }
-      }
-      if (turnOver) {
-        // The driver returned without awaiting its own ask. The callback is
-        // dead — same fact as a crash, same honest answer: the row lapses,
-        // and this floating loop ends instead of polling forever.
-        patchApprovalRow(account, rowId, { state: 'lapsed', settledAt: tick() });
-        return 'deny';
-      }
-      await sleep(ATTEND_POLL_MS);
-    }
+    answeredApprovals.push(resolution);
+    return resolution.decision;
   };
   /**
    * The in-flight count the typing cadence reads: a PARKED
@@ -3987,7 +4400,10 @@ async function attendPass(
   const ask = async (a: ApprovalAsk): Promise<ApprovalDecision> => {
     asksInFlight += 1;
     try {
-      return await askInner(a);
+      // `cfg.workdir` is the supervisor's validated execution cwd. Override
+      // any driver-supplied value so supplementary repository context cannot
+      // redirect its own evidence source.
+      return await askInner({ ...a, contextCwd: cfg.workdir });
     } finally {
       asksInFlight -= 1;
     }
@@ -4035,7 +4451,7 @@ async function attendPass(
    * what answers for it, the same way a dying `sendReply` answers to the
    * approval journal's boundary 1↔2.
    */
-  const groupIds = new Set(group.map(r => r.id));
+  const groupIds = new Set(group.map((r) => r.id));
   const steeredNow: string[] = [];
   let steerUnconfirmed = 0;
   let steerStarted = false;
@@ -4187,6 +4603,12 @@ async function attendPass(
   let streamLastSent = '';
   let streamEditBusy = false;
   let streamDead = false;
+  // Set once, when the first non-empty snapshot could become an anchor.
+  // A Quiet turn defers the whole preview to the ordinary terminal path:
+  // success stays quiet and failure keeps its existing notifying send. The
+  // choice cannot change underneath one stream after an early alert did or
+  // did not leave.
+  let streamQuietLatched: boolean | undefined;
   const streamTick = async (): Promise<void> => {
     if (!streamArmed || streamDead) return;
     if (asksInFlight > 0) return; // parked = waiting on the human; suppressed
@@ -4195,6 +4617,13 @@ async function attendPass(
     const text = funnel(snap);
     if (text === '') return;
     if (streamAnchorId === undefined) {
+      if (streamQuietLatched === undefined) {
+        streamQuietLatched = readRoutineNotifyPreference(account).routine === 'quiet';
+      }
+      if (streamQuietLatched) {
+        streamDead = true;
+        return;
+      }
       // THE ANCHOR'S SESSION: the routed key when the route knew
       // one up front, else the live thread key `steering` surfaced. The
       // anchor is the only bubble the operator can SEE mid-turn, so its row
@@ -4310,7 +4739,11 @@ async function attendPass(
    * plain interrupted reply, never a restart-sweep edit painted over an
    * anchor whose turn already answered below it.
    */
-  const finalizeStream = async (text: string, sess?: OutSess): Promise<boolean> => {
+  const finalizeStream = async (
+    text: string,
+    sess?: OutSess,
+    work?: AiWorkMetadata,
+  ): Promise<boolean> => {
     if (streamAnchorId === undefined) return false;
     const anchor = streamAnchorId;
     streamAnchorId = undefined;
@@ -4328,7 +4761,10 @@ async function attendPass(
     // into a rendered body — either falls back to the plain reply.
     if (text === '' || text.startsWith('{"tcm":')) return false;
     try {
-      await send(JSON.stringify({ tcm: 'edit', ref: anchor, text }), sess, { notify: false });
+      await send(JSON.stringify({ tcm: 'edit', ref: anchor, text }), sess, {
+        notify: false,
+        ...(work === undefined ? {} : { work }),
+      });
     } catch {
       return false;
     }
@@ -4402,7 +4838,7 @@ async function attendPass(
   const pollSleep: (ms: number) => Promise<void> =
     io.sleep ??
     ((ms: number) =>
-      new Promise<void>(res => {
+      new Promise<void>((res) => {
         // The loop's OWN real sleep, cancellable so turn end never trails a
         // poll tail — the shared `sleep` above stays plain on purpose: the
         // ask park must keep genuinely waiting, and an injected fake keeps
@@ -4434,13 +4870,13 @@ async function attendPass(
         const approvals = loadApprovals(account).rows;
         if (
           approvals.some(
-            r => r.state === 'asking' || r.state === 'pending' || r.state === 'answering',
+            (r) => r.state === 'asking' || r.state === 'pending' || r.state === 'answering',
           )
         ) {
           continue;
         }
         const answerRefs = new Set(
-          approvals.map(r => r.msgId).filter((m): m is string => typeof m === 'string'),
+          approvals.map((r) => r.msgId).filter((m): m is string => typeof m === 'string'),
         );
         const consumed = new Set(readJournalFile(account).steered ?? []);
         const ledgerNow = new MessageLog(account).read({ dir: 'out' });
@@ -4627,7 +5063,7 @@ async function attendPass(
   // the owner's mouth. The bare shape keeps the honest failure reply; the
   // context is the FIRST ref-bearing row's referent, the earliest message
   // this group answers.
-  const carriedRefId = group.map(r => r.ref).find((r): r is string => r !== undefined);
+  const carriedRefId = group.map((r) => r.ref).find((r): r is string => r !== undefined);
   let fellBack = false;
   if (
     head.kind === 'session' &&
@@ -4635,7 +5071,7 @@ async function attendPass(
     (turn.refusal === 'no-conversation' || turn.refusal === 'live-session') &&
     carriedRefId !== undefined
   ) {
-    const refRow = ledger.find(r => r.id === carriedRefId);
+    const refRow = ledger.find((r) => r.id === carriedRefId);
     const fallbackPrompt = `${carryContextLine(refRow?.text ?? '')}\n${joined}`;
     turn = await driverFor(cfg.host).runTurn(
       { cfg, route: { kind: 'own' }, prompt: fallbackPrompt, account, ask },
@@ -4689,7 +5125,7 @@ async function attendPass(
   // the restart rule applied without the restart.
   if (askedRows.length > 0) {
     const doneAt = tick();
-    mutateApprovals(account, file => {
+    mutateApprovals(account, (file) => {
       for (let i = 0; i < file.rows.length; i += 1) {
         const row = file.rows[i] as ApprovalRow;
         if (!askedRows.includes(row.id)) continue;
@@ -4709,6 +5145,39 @@ async function attendPass(
       }
     });
   }
+
+  // `runTurn` returned after each ask callback returned its decision to the
+  // driver. That proves the supervisor returned a decision, independent of
+  // whether the surrounding turn later reports success. It does NOT prove
+  // the host applied or even read that return, so the stronger
+  // `provider-received` observation is deliberately never emitted here.
+  // Publish after the terminal reply so it cannot interleave between a live
+  // stream anchor and its durable edit final. A failed supplementary send
+  // cannot change the already-observed host result.
+  const publishApprovalObservations = async (): Promise<void> => {
+    for (const resolution of answeredApprovals) {
+      if (resolution.msgId === undefined) continue;
+      try {
+        await send(
+          approvalObservationBody(`Approval decision returned to ${cfg.host}.`, resolution.msgId),
+          saidSess,
+          {
+            notify: false,
+            work: approvalObservationMetadata(
+              cfg.host,
+              resolution.requestId,
+              'decision-returned',
+              tick(),
+              saidSess,
+            ),
+          },
+        );
+      } catch {
+        // The journal and provider result are authoritative; activity
+        // context is supplemental and may be absent when delivery fails.
+      }
+    }
+  };
 
   // Written on EVERY path, success or failure, before the reply: a fact the
   // host just told us about its own store does not become less true because
@@ -4753,8 +5222,10 @@ async function attendPass(
       if (r.answerId !== undefined) consumed.add(r.answerId);
       for (const s of r.spent ?? []) consumed.add(s);
     }
-    const arrived = after.filter(r => !batchIds.has(r.id) && !consumed.has(r.id)).map(r => r.id);
-    settleJournal(account, new Set(after.map(r => r.id)), {
+    const arrived = after
+      .filter((r) => !batchIds.has(r.id) && !consumed.has(r.id))
+      .map((r) => r.id);
+    settleJournal(account, new Set(after.map((r) => r.id)), {
       steered: steeredNow,
       midTurn: arrived,
     });
@@ -4773,6 +5244,16 @@ async function attendPass(
           'they were not re-run — send them again if you still want them.';
 
   const said = hostExplanation(turn.stdout, turn.stderr, turn.refusal);
+  // Room turns have no workspace-attention grant. Their conversational
+  // answer remains inside the room's existing consent/fan-out boundary, and
+  // the 1:1 machinery notices around it do not manufacture a workspace event.
+  // For a 1:1 turn, mint exactly one terminal fact and reuse it across the
+  // streamed-final fallback so an uncertain first send can never become two
+  // different events.
+  const terminalWork = (event: 'turn-complete' | 'turn-failed'): AiWorkMetadata | undefined =>
+    head.kind === 'room'
+      ? undefined
+      : terminalWorkMetadata(account, cfg, event, tick(), saidSess, io.aiCapability);
   // EVERY turn-end path below owes a minted anchor its durable final
   // (`finalizeStream`): failure sentences included, because a bubble frozen
   // mid-sentence over a turn that died is exactly the stuck bubble the
@@ -4784,7 +5265,11 @@ async function attendPass(
         ? 'The agent binary is missing or not runnable on this machine. Nothing was executed.'
         : `The agent binary is missing or not runnable on this machine: ${said}`) +
       unconfirmedClause;
-    if (!(await finalizeStream(funnel(failText), saidSess))) await reply(failText, saidSess);
+    const work = terminalWork('turn-failed');
+    if (!(await finalizeStream(funnel(failText), saidSess, work))) {
+      await reply(failText, saidSess, work);
+    }
+    await publishApprovalObservations();
     advanceTo(last);
     settleTurn();
     return 'failed';
@@ -4794,7 +5279,11 @@ async function attendPass(
       (said === ''
         ? `The turn failed (exit ${turn.code}) and said nothing.`
         : `The turn failed (exit ${turn.code}): ${said}`) + unconfirmedClause;
-    if (!(await finalizeStream(funnel(failText), saidSess))) await reply(failText, saidSess);
+    const work = terminalWork('turn-failed');
+    if (!(await finalizeStream(funnel(failText), saidSess, work))) {
+      await reply(failText, saidSess, work);
+    }
+    await publishApprovalObservations();
     advanceTo(last);
     settleTurn();
     return 'failed';
@@ -4807,6 +5296,20 @@ async function attendPass(
   // 20,000-char MAX_GROUP_BODY, so the fan-out's own bound can never refuse
   // what the funnel passed.
   const body = funnel(turn.stdout);
+  const completedWork = terminalWork('turn-complete');
+  // This preference is owner-authenticated and durable before its request is
+  // acknowledged by inbound.ts. Read it at the terminal send so a change
+  // applied while a long turn runs governs that turn's completion. Its scope
+  // is deliberately exact: one successful 1:1 turn-complete push. Failure,
+  // approval, input/review and every room fan-out keep their existing wake.
+  const completionQuiet =
+    head.kind !== 'room' &&
+    (streamQuietLatched ?? readRoutineNotifyPreference(account).routine === 'quiet');
+  const completionDelivery = completionQuiet
+    ? { notify: false as const, ...(completedWork === undefined ? {} : { work: completedWork }) }
+    : completedWork === undefined
+      ? undefined
+      : { work: completedWork };
   // THE SPLIT RUNS ON RAW STDOUT (§3.4), before the funnel — `plainForChat`
   // strips exactly the scaffolding the model delimits the halves with. The
   // funnelled `body` above is untouched and still decides emptiness (step 9)
@@ -4912,11 +5415,16 @@ async function attendPass(
     // agentMessage) still gets the honest final: the same sentence today's
     // path sends, in the bubble instead of beside it.
     const noneText = 'Turn finished, no output.';
-    if (!(await finalizeStream(funnel(noneText), saidSess))) await reply(noneText, saidSess);
+    if (!(await finalizeStream(funnel(noneText), saidSess, completedWork))) {
+      await send(funnel(noneText), saidSess, completionDelivery);
+    }
   } else {
-    if (!(await finalizeStream(body, saidSess))) await send(body, saidSess);
+    if (!(await finalizeStream(body, saidSess, completedWork))) {
+      await send(body, saidSess, completionDelivery);
+    }
   }
   if (unconfirmedClause !== '') await reply(unconfirmedClause.trim(), saidSess);
+  await publishApprovalObservations();
   advanceTo(last);
   settleTurn();
   return 'answered';
@@ -4967,7 +5475,11 @@ function isTerminal(err: unknown): boolean {
  * spool, answer, sleep. fs-event acceleration can join later; a 2-second
  * poll against a local jsonl is imperceptible and has no missed-event
  * mode to debug at 2am. */
-export async function attendLoop(account: string, report: Reporter, io: AttendIo = {}): Promise<never> {
+export async function attendLoop(
+  account: string,
+  report: Reporter,
+  io: AttendIo = {},
+): Promise<never> {
   report.status('attending…');
   for (;;) {
     try {
@@ -4978,7 +5490,7 @@ export async function attendLoop(account: string, report: Reporter, io: AttendIo
       // the cursor guarantees nothing is skipped in the meantime.
       if (isTerminal(err)) throw err;
     }
-    await new Promise(res => setTimeout(res, 2000));
+    await new Promise((res) => setTimeout(res, 2000));
   }
 }
 
@@ -5165,10 +5677,10 @@ export async function realSendReply(
       await sendEncrypted({ stores, auth, to: owner, body, msgId });
     }
   } catch {
-    // The queue keeps it — including a notify:false final edit, whose late
-    // durable delivery still heals the anchor (better rung-late than a
-    // bubble stuck mid-sentence).
-    enqueueNotification(account, owner, body, msgId, sess);
+    // The queue keeps both the body and its explicit notification posture.
+    // A quiet final that retries after recovery still heals its anchor
+    // without ringing as a fresh conversational event.
+    enqueueNotification(account, owner, body, msgId, sess, opts);
     return msgId;
   }
   try {
@@ -5390,9 +5902,11 @@ export function roomCapsFloor(
   operatorCaps: readonly string[] = [],
 ): string[] {
   const floor =
-    host === 'codex' ? ['-s', 'read-only']
-    : host === 'gemini' ? ['--approval-mode', 'plan']
-    : ['--permission-mode', 'plan'];
+    host === 'codex'
+      ? ['-s', 'read-only']
+      : host === 'gemini'
+        ? ['--approval-mode', 'plan']
+        : ['--permission-mode', 'plan'];
   // gemini takes `-m` and `--model`, like codex exec; claude takes `--model`
   // alone (`-m` is not its flag, and carrying it would hand the parser a word
   // this whitelist never inspected).
@@ -5437,7 +5951,7 @@ export function roomCapsFloor(
  * enable's standing rule is refuse rather than coerce.
  */
 export function parseCapsFlag(raw: string): string[] {
-  const caps = raw.split(/\s+/).filter(w => w !== '');
+  const caps = raw.split(/\s+/).filter((w) => w !== '');
   if (caps.length === 0) {
     throw new CliError(
       EXIT.USAGE,
@@ -5468,10 +5982,7 @@ export function parseCapsFlag(raw: string): string[] {
  * the surrounding copy's convention.
  */
 function disclosureReadBack(): string {
-  return (
-    `This account answers as an AI agent on this machine. ` +
-    `${AI_DISCLOSURE_SENTENCE} `
-  );
+  return `This account answers as an AI agent on this machine. ` + `${AI_DISCLOSURE_SENTENCE} `;
 }
 
 /**
@@ -5573,7 +6084,10 @@ export function cmdAttendEnable(
 ): void {
   const profile = loadProfile(account);
   if (!profile.ownerUserId) {
-    throw new CliError(EXIT.ERROR, 'attend requires a PAIRED integration — pair it to your phone first');
+    throw new CliError(
+      EXIT.ERROR,
+      'attend requires a PAIRED integration — pair it to your phone first',
+    );
   }
   // The VALUE is not echoed (and hooks.ts `requireHost` makes the same
   // call for the same reason): a misconfigured line can shift any later
@@ -5584,7 +6098,10 @@ export function cmdAttendEnable(
     throw new CliError(EXIT.USAGE, `--host takes one of: ${ATTEND_HOSTS.join(', ')}`);
   }
   const host = (opts.host ?? 'claude') as AttendConfig['host'];
-  for (const [flag, value] of [['--bin', opts.bin], ['--workdir', opts.workdir]] as const) {
+  for (const [flag, value] of [
+    ['--bin', opts.bin],
+    ['--workdir', opts.workdir],
+  ] as const) {
     if (value !== undefined && value.trim() === '') {
       throw new CliError(EXIT.USAGE, `${flag} needs a non-empty value`);
     }
@@ -5649,8 +6166,9 @@ export function cmdAttendEnable(
         EXIT.ERROR,
         'the sdk driver requires an operator-supplied Anthropic API key, and ' +
           'ANTHROPIC_API_KEY is not set in this shell. A subscription sign-in is not ' +
-          'accepted for this mode — approvals work with claude only under API-key ' +
-          'auth. Export the key and re-run, or enable the default subprocess driver ' +
+          'accepted for this mode. Phone approvals for this SDK answerer require ' +
+          'API-key auth. The interactive Claude Code PermissionRequest bridge is a ' +
+          'separate native-session lane. Export the key and re-run, or enable the default subprocess driver ' +
           'instead. Nothing was saved.',
       );
     }
@@ -5776,7 +6294,7 @@ export function cmdAttendEnable(
   // already refuses.
   if (
     opts.caps !== undefined &&
-    (opts.caps.length === 0 || opts.caps.some(c => c === '' || c.includes('\u0000')))
+    (opts.caps.length === 0 || opts.caps.some((c) => c === '' || c.includes('\u0000')))
   ) {
     throw new CliError(
       EXIT.USAGE,
@@ -5837,7 +6355,10 @@ export function cmdAttendEnable(
     try {
       return execFileSync('/usr/bin/which', [name], { encoding: 'utf8' }).trim();
     } catch {
-      throw new CliError(EXIT.ERROR, `the ${name} binary is not on PATH — install it or pass --bin`);
+      throw new CliError(
+        EXIT.ERROR,
+        `the ${name} binary is not on PATH — install it or pass --bin`,
+      );
     }
   };
   // Captured BEFORE the config is written, so the file never says "enabled"
@@ -5855,9 +6376,11 @@ export function cmdAttendEnable(
     workdir: opts.workdir ?? process.cwd(),
     caps:
       opts.caps ??
-      (host === 'codex' ? ['-s', 'read-only']
-      : host === 'gemini' ? ['--approval-mode', 'plan']
-      : ['--permission-mode', 'plan']),
+      (host === 'codex'
+        ? ['-s', 'read-only']
+        : host === 'gemini'
+          ? ['--approval-mode', 'plan']
+          : ['--permission-mode', 'plan']),
     ...(codexModel === undefined ? {} : { codexModel }),
     ...(geminiModel === undefined ? {} : { geminiModel }),
     // Written only when STATED, all of them: absent has a meaning of its
@@ -5877,12 +6400,8 @@ export function cmdAttendEnable(
     ...(opts.approvalsMinAppBuild === undefined
       ? {}
       : { approvalsMinAppBuild: opts.approvalsMinAppBuild }),
-    ...(opts.streamMinAppBuild === undefined
-      ? {}
-      : { streamMinAppBuild: opts.streamMinAppBuild }),
-    ...(opts.markerMinAppBuild === undefined
-      ? {}
-      : { markerMinAppBuild: opts.markerMinAppBuild }),
+    ...(opts.streamMinAppBuild === undefined ? {} : { streamMinAppBuild: opts.streamMinAppBuild }),
+    ...(opts.markerMinAppBuild === undefined ? {} : { markerMinAppBuild: opts.markerMinAppBuild }),
     // A UUID, so it passes `hostSessionKey` the same way a host's own id does
     // — the own session is not a special case in the argv rules.
     ownSession: randomUUID(),
@@ -6078,9 +6597,7 @@ export function cmdAttendEnable(
       ...(cfg.approvalsMinAppBuild === undefined
         ? {}
         : { approvalsMinAppBuild: cfg.approvalsMinAppBuild }),
-      ...(cfg.markerMinAppBuild === undefined
-        ? {}
-        : { markerMinAppBuild: cfg.markerMinAppBuild }),
+      ...(cfg.markerMinAppBuild === undefined ? {} : { markerMinAppBuild: cfg.markerMinAppBuild }),
     },
     `${account}: attend is configured (${host}, ${profileWord}, ${claudeDriverWord} ` +
       `driver). ` +
@@ -6096,8 +6613,10 @@ export function cmdAttendEnable(
           `runs ONLY on an operator-supplied API key: every turn bills the ` +
           `ANTHROPIC_API_KEY that attend's environment resolves, and a start that ` +
           `resolves a subscription sign-in — or anything not recognisable as a key — ` +
-          `is refused at every turn. Approvals work with codex on any sign-in, and ` +
-          `with claude only when you supply an API key. Left unstated, the SDK picks ` +
+          `is refused at every turn. Phone approvals for this SDK answerer require ` +
+          `the operator-supplied API key. The interactive Claude Code PermissionRequest ` +
+          `bridge is separate: it may use Claude's own sign-in and applies only to ` +
+          `native interactive sessions. Left unstated, the SDK picks ` +
           `its own (most expensive) default model — pin one in caps, e.g. ` +
           `--caps "--permission-mode default --model <name>". ` +
           (cfg.approvalsMinAppBuild === undefined
@@ -6107,7 +6626,9 @@ export function cmdAttendEnable(
               `attend cannot check. On an older build the card is silently dropped ` +
               `and the expiry deny is the only signal; if cards never appear, re-run ` +
               `enable without --approvals. `)
-        : '') +
+        : `Turns use noninteractive claude -p, which does not fire PermissionRequest. ` +
+          `The interactive Claude Code PermissionRequest bridge is separate and applies ` +
+          `only to native interactive sessions. `) +
       // The 5.1.2(i) disclosure — the ONE shared paragraph (see
       // `disclosureReadBack`): the data flow is the same on either host, so
       // the claude branch speaks the same words.
@@ -6547,6 +7068,10 @@ export type AttendState =
       /** claude only: WHICH driver runs the turn — the configured word,
        * verbatim (caps' own read-back rule), `subprocess` when absent. */
       claudeDriver?: string;
+      /** Claude SDK only: source-backed prerequisite presence. These are
+       * booleans rather than package paths or credential values. */
+      claudeSdkInstalled?: boolean;
+      claudeSdkApiKeyPresent?: boolean;
       unit: AttendUnitState;
     };
 
@@ -6555,6 +7080,10 @@ export interface AttendStateIo {
   /** Threaded to `statusOf` (service.ts) so a test never touches the real
    * launchctl/systemctl. `statusOf` is a read of the manager, nothing more. */
   service?: ServiceIo;
+  /** Read-only SDK prerequisite seams. Production resolves the optional
+   * package and checks only whether the environment value is nonblank. */
+  claudeSdkInstalled?: () => boolean;
+  claudeSdkApiKeyPresent?: () => boolean;
 }
 
 /**
@@ -6674,7 +7203,7 @@ export function attendState(account: string, io: AttendStateIo = {}): AttendStat
   // holds a row object it could leak a payload from.
   const approvalFile = loadApprovals(account);
   const inflight = approvalFile.rows.filter(
-    r => r.state === 'asking' || r.state === 'pending' || r.state === 'answering',
+    (r) => r.state === 'asking' || r.state === 'pending' || r.state === 'answering',
   );
   let oldestPendingApprovalAgeMs: number | undefined;
   for (const r of inflight) {
@@ -6690,7 +7219,7 @@ export function attendState(account: string, io: AttendStateIo = {}): AttendStat
   // scheduling artefact — it is a pass that is not running (the field's
   // comment on `AttendState` carries the full argument).
   const approvalsPendingPastTtl = approvalFile.rows.filter(
-    r =>
+    (r) =>
       (r.state === 'asking' || r.state === 'pending') &&
       Number.isFinite(r.askedAt) &&
       Number.isFinite(r.ttlMs) &&
@@ -6699,6 +7228,26 @@ export function attendState(account: string, io: AttendStateIo = {}): AttendStat
 
   const codex = cfg.host === 'codex';
   const codexDriver = typeof cfg.codexDriver === 'string' ? cfg.codexDriver : 'exec';
+  const claudeSdk = cfg.host === 'claude' && cfg.claudeDriver === 'sdk';
+  const observeBoolean = (probe: () => boolean): boolean => {
+    try {
+      return probe() === true;
+    } catch {
+      return false;
+    }
+  };
+  const sdkInstalled = claudeSdk
+    ? observeBoolean(io.claudeSdkInstalled ?? claudeSdkInstalled)
+    : undefined;
+  const sdkApiKeyPresent = claudeSdk
+    ? observeBoolean(
+        io.claudeSdkApiKeyPresent ??
+          (() => {
+            const key = process.env.ANTHROPIC_API_KEY;
+            return typeof key === 'string' && key.trim() !== '';
+          }),
+      )
+    : undefined;
   // The SAME shape test the ask funnel's attestation gate applies (fail
   // closed: malformed reads as un-attested), so status can never claim a
   // form the next ask will not take.
@@ -6758,6 +7307,8 @@ export function attendState(account: string, io: AttendStateIo = {}): AttendStat
     ...(cfg.host === 'claude'
       ? { claudeDriver: typeof cfg.claudeDriver === 'string' ? cfg.claudeDriver : 'subprocess' }
       : {}),
+    ...(sdkInstalled === undefined ? {} : { claudeSdkInstalled: sdkInstalled }),
+    ...(sdkApiKeyPresent === undefined ? {} : { claudeSdkApiKeyPresent: sdkApiKeyPresent }),
     unit: { installed: unitStatus.installed, running: unitStatus.running },
   };
 }
@@ -6834,7 +7385,10 @@ export function cmdAttendStatus(
     }
     for (const name of accounts) {
       const s = attendState(name, io);
-      report.line({ ok: true, action: 'attend-status', account: name, ...s }, attendStateLine(name, s));
+      report.line(
+        { ok: true, action: 'attend-status', account: name, ...s },
+        attendStateLine(name, s),
+      );
     }
     return;
   }
@@ -6947,7 +7501,9 @@ export function cmdAttendStatus(
             `enable ${account} --host codex --driver <exec|app-server>`,
         );
       }
-      lines.push(`  model: ${s.codexModelPinned ? 'pinned at enable time' : "codex's own default"}`);
+      lines.push(
+        `  model: ${s.codexModelPinned ? 'pinned at enable time' : "codex's own default"}`,
+      );
       if (s.codexSignedIn !== true) {
         lines.push(
           '  CODEX_HOME: NOT SIGNED IN — every turn fails with an auth error until it is. ' +
@@ -6987,7 +7543,15 @@ export function cmdAttendStatus(
       if (driver === 'sdk') {
         lines.push(
           '  sdk driver: requires an operator-supplied API key (ANTHROPIC_API_KEY where ' +
-            'attend runs) — a start that resolves a subscription sign-in refuses the turn',
+            'attend runs) — a start that resolves a subscription sign-in refuses the turn. ' +
+            'Phone approvals for this SDK answerer require that key; the interactive ' +
+            'Claude Code PermissionRequest bridge is separate',
+        );
+      } else if (driver === 'subprocess') {
+        lines.push(
+          '  noninteractive claude -p does not fire PermissionRequest; the interactive ' +
+            'Claude Code PermissionRequest bridge is separate and applies only to native ' +
+            'interactive sessions',
         );
       }
     }

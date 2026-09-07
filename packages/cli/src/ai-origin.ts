@@ -41,7 +41,7 @@
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { composeAgentText } from '@tacendum/shared';
+import { composeAgentText, type AiWorkMetadata } from '@tacendum/shared';
 import { clientDir } from './config.js';
 
 /**
@@ -109,7 +109,7 @@ export function markerAttested(account: string): boolean {
  * marked `msg` kind iff `wrapText`. Idempotent, total, and silent: a body
  * this function cannot improve leaves exactly as it came.
  */
-export function markAgentBody(body: string, wrapText: boolean): string {
+export function markAgentBody(body: string, wrapText: boolean, work?: AiWorkMetadata): string {
   if (body.startsWith(ENVELOPE_SENTINEL)) {
     try {
       const parsed = JSON.parse(body) as unknown;
@@ -122,7 +122,12 @@ export function markAgentBody(body: string, wrapText: boolean): string {
         return body;
       }
       const { tcm, ...rest } = parsed as { tcm: string } & Record<string, unknown>;
-      return JSON.stringify({ tcm, ...rest, ai: true });
+      return JSON.stringify({
+        tcm,
+        ...rest,
+        ai: true,
+        ...(work === undefined ? {} : { work }),
+      });
     } catch {
       // Sentinel-shaped but not JSON: not an envelope this build composed —
       // pass it through untouched rather than guess.
@@ -131,7 +136,7 @@ export function markAgentBody(body: string, wrapText: boolean): string {
   }
   if (!wrapText) return body;
   try {
-    return composeAgentText(body);
+    return composeAgentText(body, undefined, work);
   } catch {
     // The strict composer refused (empty, oversized). Nothing upstream of
     // the funnel should produce such a body, but if one arrives the words

@@ -25,6 +25,7 @@ import {
   View,
   type NativeScrollEvent,
   type NativeSyntheticEvent,
+  type ViewToken,
 } from 'react-native';
 import { BLOCK_COPY as BLOCK, disappearLabel } from '../blocking';
 import { CallLogRow } from '../components/CallLogRow';
@@ -146,10 +147,24 @@ import { CALL_CAP_COPY } from './GroupCallScreen';
 // `approvals` table exactly as call chips derive from call_log — never a
 // messages row. The deadline helper is shared so the screen's answer path
 // and the card's grey-out read one clock arithmetic.
-import { ApprovalCard, approvalDeadline } from '../ui/ApprovalCard';
+import {
+  APPROVAL_KIND_COPY,
+  ApprovalCard,
+  approvalDeadline,
+} from '../ui/ApprovalCard';
 import { AgentBadge } from '../ui/AgentBadge';
+import { tileName } from '../ui/CallTile';
 import { DetailDisclosure } from '../ui/DetailDisclosure';
+import {
+  ReactionDetails,
+} from '../ui/ReactionDetails';
 import { AGENT_COPY } from '../machine';
+import {
+  buildSecondOpinionDraft,
+  eligibleSecondOpinionTargetIds,
+  selectedSecondOpinionTargetsAreCurrent,
+  type SecondOpinionAgentFact,
+} from '../secondOpinion';
 // ROUNDS : the join is a PURE function over the built list
 // plus a resolver, so the whole priority order is testable without a screen.
 import {
@@ -207,14 +222,17 @@ import {
 import { sendErrorFor, type SendError } from '../thread/errors';
 import {
   caretAfterEdit,
+  encodeMentionDraft,
   liveMentionChips,
   mentionQueryAt,
   mentionWire,
   namesInSentence,
+  restoreMentionDraft,
   shiftMentionChips,
   type MentionChip,
 } from '../thread/mentions';
 import { roomEventSentence } from '../thread/roomEvents';
+import { groupReactions } from '../thread/reactions';
 import { stylesFor } from '../thread/styles';
 import { FindBar, FindGlyph } from '../thread/FindBar';
 import {
@@ -243,8 +261,13 @@ import {
 // edits .
 export { roomEventSentence };
 
+/** Quote context never carries request bytes or work metadata into a memo. */
+type ApprovalQuote = Pick<db.ApprovalRow, 'peerId' | 'q' | 'kind'>;
+
 interface Props {
   peerId: string;
+  /** A route from the attention inbox lands on this exact durable request. */
+  focusedApprovalQ?: string;
   onBack: () => void;
   onOpenPeerProfile: () => void;
   onOpenPhoto: (msgId: string, direction: 'in' | 'out') => void;
@@ -378,6 +401,8 @@ const COPY = {
   // prevent.
   roomBlocked: `Someone in this room is blocked on this ${DEVICE_NOUN}. You can read, but nothing sends until you unblock them or leave.`,
   roomNotIn: 'You aren’t in this room any more, so nothing sends here.',
+  secondOpinionUnavailable:
+    'The selected agent is no longer available for this room. Review the room’s agent access before sending.',
   /** The outsider tag: a message from someone the roster says is out
    * renders visibly tagged and attributed — never as a member's bubble,
    * never silently dropped. Some of these are honest words from someone who
@@ -752,6 +777,80 @@ function CallLogChip({
   );
 }
 
+/** Facts that can enable a second-opinion target. This deliberately starts
+ * from current structured AI state; machine_peers contributes ownership and
+ * room attribution only after that intersection, because it is historical. */
+async function secondOpinionFactsForFold(
+  fold: ReturnType<typeof foldRoster>,
+  selfId: string,
+  machines: ReadonlySet<string>,
+  markers: ReadonlySet<string>,
+  knownConsents?: ReadonlyMap<string, db.AgentConsentState>,
+): Promise<SecondOpinionAgentFact[]> {
+  // The ordinary room send path is read-only when ANY folded member is
+  // blocked or has an unaccepted identity change. Do not invite a review the
+  // same path is guaranteed to refuse.
+  if (
+    fold.members.some(
+      id =>
+        id !== selfId &&
+        (messaging.isPeerBlocked(id) || messaging.isBlockedLocally(id)),
+    )
+  ) {
+    return [];
+  }
+  const current = new Map(
+    (await db.listAiAgentStates(Date.now())).map(state => [state.peerId, state]),
+  );
+  const possible = fold.members.filter(id => id !== selfId && current.has(id));
+  return Promise.all(
+    possible.map(async peerId => ({
+      peerId,
+      inRoom: true,
+      recognizedInRoom:
+        fold.classes[peerId] === 'integration' ||
+        machines.has(peerId) ||
+        markers.has(peerId),
+      tasksConfigured: current.get(peerId)?.capabilities?.tasks === true,
+      owned: machines.has(peerId),
+      consent: machines.has(peerId)
+        ? ('undecided' as const)
+        : (knownConsents?.get(peerId) ??
+          (await db
+            .getAgentConsent(peerId)
+            .catch(() => 'undecided' as const))),
+    })),
+  );
+}
+
+async function currentSecondOpinionTargetIds(
+  roomId: string,
+  sourceAuthorId: string,
+): Promise<string[]> {
+  const [group, profile] = await Promise.all([db.getGroup(roomId), db.loadProfile()]);
+  if (!group || !profile) return [];
+  const slots = await db.listGroupMemberSlots(roomId);
+  const fold = foldRoster(group.ownerId, slots);
+  if (!fold.members.includes(profile.userId)) return [];
+  const [machineIds, markerIds] = await Promise.all([
+    db.listMachinePeers(),
+    db.listRoomAgentAuthorIds(roomId),
+  ]);
+  const facts = await secondOpinionFactsForFold(
+    fold,
+    profile.userId,
+    new Set(machineIds),
+    new Set(markerIds),
+  );
+  return eligibleSecondOpinionTargetIds(sourceAuthorId, facts);
+}
+
+interface SecondOpinionReviewState {
+  peerId: string;
+  sourceMsgId: string;
+  sourceAuthorId: string;
+}
+
 /**
  * One conversation. Everything that could have been a floating overlay is
  * attached to the thing it belongs to instead: the reaction rail sits under
@@ -760,6 +859,7 @@ function CallLogChip({
  */
 export function ChatThreadScreen({
   peerId,
+  focusedApprovalQ,
   onBack,
   onOpenPeerProfile,
   onOpenPhoto,
@@ -806,6 +906,8 @@ export function ChatThreadScreen({
    * writes — up to the moment of this open. Null until the read answers, or
    * when there is no chat row. */
   const [unreadWindow, setUnreadWindow] = useState<UnreadWindow | null>(null);
+  const [dividerVisible, setDividerVisible] = useState(true);
+  const viewabilityConfig = useRef({ itemVisiblePercentThreshold: 1 }).current;
   /** `${msgId}:${direction}` of the row a tapped quote just revealed, held
    * for QUOTE_FLASH_MS so its bubble washes pine. */
   const [flashKey, setFlashKey] = useState<string | null>(null);
@@ -862,9 +964,24 @@ export function ChatThreadScreen({
    * the same fold the header count and the send path act on, never a
    * slot count and never a guess. Empty for a 1:1. */
   const [roomMembers, setRoomMembers] = useState<string[]>([]);
+  /** Current, source-backed agent facts for the second-opinion composer.
+   * Empty until the room fold, capability snapshots and consent reads agree. */
+  const [secondOpinionFacts, setSecondOpinionFacts] = useState<
+    SecondOpinionAgentFact[]
+  >([]);
+  /** A prepared request remains local/editable until the ordinary Send tap. */
+  const [secondOpinionReview, setSecondOpinionReview] =
+    useState<SecondOpinionReviewState | null>(null);
   /** Mentions the composer is carrying, validated against the draft before
    * every use (see liveMentionChips — the model's own doctrine). */
   const [mentionChips, setMentionChips] = useState<MentionChip[]>([]);
+  /** Mention metadata just read with a saved draft. It stays opaque until
+   * this room's current folded roster and local names have both answered. */
+  const [savedMentionBinding, setSavedMentionBinding] = useState<{
+    peerId: string;
+    text: string;
+    encoded: string;
+  } | null>(null);
   /** Collapsed caret position, for the @-query; null while a range is
    * selected or nothing is known yet. State rather than the selection ref
    * because the PICKER renders from it — but it never feeds a `selection`
@@ -876,6 +993,13 @@ export function ChatThreadScreen({
   const [reactions, setReactions] = useState<Map<string, db.ReactionRow[]>>(
     new Map(),
   );
+  /** The one reaction group whose people are open, bound to the message's
+   * composite identity so colliding sender ids cannot retarget the panel. */
+  const [reactionDetail, setReactionDetail] = useState<{
+    msgId: string;
+    direction: 'in' | 'out';
+    emoji: string;
+  } | null>(null);
   /**
    * The thread's failed fan-outs, keyed by the out-row's own msgId (a
    * device-retest finding). Loaded as ONE batched read per refresh
@@ -947,6 +1071,7 @@ export function ChatThreadScreen({
   // countdown from — a reading, never state: remove the tick and every card
   // stays truthful, just less specific (the CallTile silentMs discipline).
   const [approvals, setApprovals] = useState<db.ApprovalRow[]>([]);
+  const [approvalsLoaded, setApprovalsLoaded] = useState(false);
   const [approvalNow, setApprovalNow] = useState(() => Date.now());
   /** Which approval's answer is in flight (busy buttons), by `q`. */
   const [approvalBusy, setApprovalBusy] = useState<string | null>(null);
@@ -959,7 +1084,10 @@ export function ChatThreadScreen({
   peerIdRef.current = peerId;
   // The previous peer's chips must not survive even one frame of a switch.
   useEffect(() => setCalls([]), [peerId]);
-  useEffect(() => setApprovals([]), [peerId]);
+  useEffect(() => {
+    setApprovals([]);
+    setApprovalsLoaded(false);
+  }, [peerId]);
   // A call that just ended belongs at the bottom of this very thread.
   const liveCall = useCallState();
   const scrollOffset = useRef(0);
@@ -994,14 +1122,19 @@ export function ChatThreadScreen({
   const dividerIndexRef = useRef(-1);
   /** Where the last programmatic scroll wanted to land, for the one retry
    * a far-off, unmeasured index needs (onScrollToIndexFailed). */
-  const scrollWant = useRef<{ index: number; viewPosition: number } | null>(
+  const scrollWant = useRef<{ index: number; viewPosition: number; key: string } | null>(
     null,
   );
   /** The index that retry already ran for, so a row the list cannot measure
    * never loops. */
   const scrollRetried = useRef<number | null>(null);
+  const scrollRetryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** The attention route is a one-shot landing, even when a db notification
+   * requeries the same rows while the person is reading the card. */
+  const focusedApprovalSpent = useRef<string | null>(null);
   const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reactionsRef = useRef<Map<string, db.ReactionRow[]>>(new Map());
+  const rowsRef = useRef<db.MessageRow[]>([]);
   /** The newest inbound row the last requery saw. A COUNT stood here, and a
    * row deleted and a row arrived inside one debounce window left the count
    * unchanged — so the arrival never raised "New messages". Null until the
@@ -1024,12 +1157,21 @@ export function ChatThreadScreen({
   const shelvedDraft = useRef('');
   /** The shelved draft's mention chips, restored with its words. */
   const shelvedChips = useRef<MentionChip[]>([]);
+  const savedMentionBindingRef = useRef(savedMentionBinding);
+  const shelvedMentionBinding = useRef<typeof savedMentionBinding>(null);
+  const reactionDetailRef = useRef(reactionDetail);
   /** Read by callbacks that must not re-arm whenever `pending` changes. */
   const pendingRef = useRef<Pending | null>(null);
   const draftLoaded = useRef(false);
   /** Read by the pick/remove callbacks, which must not re-arm per keystroke. */
   const mentionChipsRef = useRef<MentionChip[]>([]);
   const mentionCaretRef = useRef<number | null>(null);
+  const secondOpinionReviewRef = useRef<SecondOpinionReviewState | null>(null);
+  /** Prevent two same-frame Send taps from passing the async revalidation. */
+  const secondOpinionSending = useRef(false);
+  /** Invalidates a delayed room/capability/consent read on switch or unmount. */
+  const secondOpinionGeneration = useRef(0);
+  const screenLive = useRef(true);
   /** Read by the system-back handler, which is registered once and must see
    * what is open at the moment of the press, not at subscription. */
   const callPickerRef = useRef<'audio' | 'video' | null>(null);
@@ -1042,15 +1184,28 @@ export function ChatThreadScreen({
   const photoReviewRef = useRef<PhotoReview>(NO_PHOTO_REVIEW);
 
   draftRef.current = draft;
+  savedMentionBindingRef.current = savedMentionBinding;
+  reactionDetailRef.current = reactionDetail;
   pendingRef.current = pending;
   mentionChipsRef.current = mentionChips;
   mentionCaretRef.current = mentionCaret;
+  secondOpinionReviewRef.current = secondOpinionReview;
   callPickerRef.current = callPicker;
   safetyOpenRef.current = safetyOpen;
   drawerRef.current = drawer;
   findOpenRef.current = findOpen;
   findQueryRef.current = findQuery;
   photoReviewRef.current = photoReview;
+  rowsRef.current = rows;
+
+  useEffect(() => {
+    screenLive.current = true;
+    secondOpinionGeneration.current += 1;
+    return () => {
+      screenLive.current = false;
+      secondOpinionGeneration.current += 1;
+    };
+  }, [peerId]);
 
   useEffect(() => {
     railForRef.current = railFor;
@@ -1120,6 +1275,7 @@ export function ChatThreadScreen({
         // record. LOCAL reads only; nothing is ever asked of the server.
         let hint: { agentId: string; state: 'undecided' | 'refused' } | null =
           null;
+        let opinionFacts: SecondOpinionAgentFact[] = [];
         if (g && fold) {
           const selfId = (await profile)?.userId;
           const machines = new Set(await db.listMachinePeers().catch(() => []));
@@ -1132,11 +1288,20 @@ export function ChatThreadScreen({
               !machines.has(id) &&
               (fold.classes[id] === 'integration' || markers.has(id)),
           );
+          const consents = new Map<string, db.AgentConsentState>();
+          await Promise.all(
+            candidates.map(async id => {
+              consents.set(
+                id,
+                await db
+                  .getAgentConsent(id)
+                  .catch(() => 'undecided' as const),
+              );
+            }),
+          );
           let refused: string | null = null;
           for (const id of candidates) {
-            const state = await db
-              .getAgentConsent(id)
-              .catch(() => 'undecided' as const);
+            const state = consents.get(id) ?? 'undecided';
             if (state === 'undecided') {
               // The actionable state wins the slot: an unmade choice.
               hint = { agentId: id, state: 'undecided' };
@@ -1147,6 +1312,15 @@ export function ChatThreadScreen({
           if (hint === null && refused !== null) {
             hint = { agentId: refused, state: 'refused' };
           }
+          if (selfId) {
+            opinionFacts = await secondOpinionFactsForFold(
+              fold,
+              selfId,
+              machines,
+              markers,
+              consents,
+            );
+          }
         }
         return {
           g,
@@ -1155,9 +1329,10 @@ export function ChatThreadScreen({
           // roster, the one answer the send path also acts on.
           fold,
           hint,
+          opinionFacts,
         };
       }),
-      ({ g, chats, fold, hint }) => {
+      ({ g, chats, fold, hint, opinionFacts }) => {
         if (peerIdRef.current !== peerId) return;
         setGroup(g);
         setGroupKnown(true);
@@ -1167,6 +1342,7 @@ export function ChatThreadScreen({
         setRoomMembers(fold ? [...fold.members] : []);
         setRoomSkipped(g ? messaging.skippedInRoom(peerId) : []);
         setConsentHint(hint);
+        setSecondOpinionFacts(opinionFacts);
         if (chats) {
           const next = new Map(
             chats.map(c => [
@@ -1213,6 +1389,7 @@ export function ChatThreadScreen({
     quiet(db.listApprovals(peerId, Date.now()), list => {
       if (peerIdRef.current !== peerId) return;
       setApprovals(list);
+      setApprovalsLoaded(true);
       setApprovalNow(Date.now());
     });
     // The machine record, for the AI badge. Same-valued sets keep
@@ -1536,7 +1713,11 @@ export function ChatThreadScreen({
     // And its unread window: the previous thread's stamp says nothing about
     // this one, and this one's divider has not been landed on yet.
     setUnreadWindow(null);
+    setDividerVisible(true);
     dividerScrolled.current = false;
+    scrollWant.current = null;
+    scrollRetried.current = null;
+    if (scrollRetryTimer.current) clearTimeout(scrollRetryTimer.current);
     if (flashTimer.current) clearTimeout(flashTimer.current);
     setFlashKey(null);
     // And every open full answer: the keys are `${msgId}:${direction}` and
@@ -1552,8 +1733,14 @@ export function ChatThreadScreen({
     // The previous room's people must not be offerable in this one, and its
     // chips must not survive into a draft they no longer describe.
     setRoomMembers([]);
+    setSecondOpinionFacts([]);
+    setSecondOpinionReview(null);
+    secondOpinionReviewRef.current = null;
+    secondOpinionSending.current = false;
     setMentionChips([]);
+    setSavedMentionBinding(null);
     setMentionCaret(null);
+    setReactionDetail(null);
     // A half-assembled call belongs to the room it was opened in. Left up, its
     // rows would restock from the NEXT room's fold while the panel still
     // believed it was choosing people for the last one.
@@ -1586,8 +1773,10 @@ export function ChatThreadScreen({
     // exactly the divider's upper bound, so a message that arrives a moment
     // later is on the far side of the line.
     const openedAt = Date.now();
+    let closed = false;
     quiet(
       db.getChat(peerId).then(chatRow => {
+        if (closed) return;
         if (peerIdRef.current === peerId) {
           setUnreadWindow(
             chatRow
@@ -1609,6 +1798,7 @@ export function ChatThreadScreen({
     // the group id for a room, which is the key the chime compares.
     setFocusedConversation(peerId);
     return () => {
+      closed = true;
       clearFocusedConversation(peerId);
       quiet(db.markChatOpened(peerId, Date.now()));
     };
@@ -1616,11 +1806,21 @@ export function ChatThreadScreen({
 
   useEffect(() => {
     draftLoaded.current = false;
-    quiet(db.getDraft(peerId), saved => {
+    let cancelled = false;
+    quiet(db.getComposerDraft(peerId), saved => {
+      if (cancelled || peerIdRef.current !== peerId) return;
       // Never clobber something typed while the read was in flight.
-      setDraft(current => (current === '' ? saved : current));
+      setDraft(current => (current === '' ? saved.text : current));
+      if (draftRef.current === '' && saved.mentionState) {
+        setSavedMentionBinding({
+          peerId,
+          text: saved.text,
+          encoded: saved.mentionState,
+        });
+      }
       draftLoaded.current = true;
     });
+    return () => { cancelled = true; };
   }, [peerId]);
 
   useEffect(() => {
@@ -1630,10 +1830,15 @@ export function ChatThreadScreen({
     if (pending?.kind === 'edit') return;
     if (!draftLoaded.current && draft === '') return;
     const timer = setTimeout(() => {
-      quiet(db.setDraft(peerId, draft));
+      const carried =
+        savedMentionBinding?.peerId === peerId &&
+        savedMentionBinding.text === draft
+          ? savedMentionBinding.encoded
+          : encodeMentionDraft(peerId, draft, mentionChipsRef.current);
+      quiet(db.setDraft(peerId, draft, carried));
     }, DRAFT_SAVE_MS);
     return () => clearTimeout(timer);
-  }, [peerId, draft, pending]);
+  }, [peerId, draft, mentionChips, pending, savedMentionBinding]);
 
   // Separate from the debounce so leaving the screen mid-pause still saves,
   // without writing a row on every keystroke.
@@ -1646,7 +1851,17 @@ export function ChatThreadScreen({
           ? shelvedDraft.current
           : draftRef.current;
       if (!draftLoaded.current && text === '') return;
-      quiet(db.setDraft(peerId, text));
+      const chips =
+        pendingRef.current?.kind === 'edit'
+          ? shelvedChips.current
+          : mentionChipsRef.current;
+      const saved = pendingRef.current?.kind === 'edit'
+        ? shelvedMentionBinding.current
+        : savedMentionBindingRef.current;
+      const encoded = saved?.peerId === peerId && saved.text === text
+        ? saved.encoded
+        : encodeMentionDraft(peerId, text, chips);
+      quiet(db.setDraft(peerId, text, encoded));
     },
     [peerId],
   );
@@ -1699,6 +1914,68 @@ export function ChatThreadScreen({
     },
     [names, me?.userId],
   );
+
+  /** Reaction details may say only a name this phone actually knows for an
+   * authenticated current participant. A missing/former room member is the
+   * plain noun “Someone”; a raw or shortened account id is never copy. */
+  const reactionNameFor = useCallback(
+    (reaction: db.ReactionRow): string => {
+      if (reaction.direction === 'out') return 'You';
+      if (isRoom && (!reaction.reactorId || !roomMembers.includes(reaction.reactorId))) {
+        return 'Someone';
+      }
+      const id = isRoom ? reaction.reactorId : peerId;
+      const entry = isRoom ? names.get(id) : { localName: chat?.localName, displayName: chat?.displayName };
+      const label = tileName(id,
+        sanitizeDisplayName(entry?.localName) || sanitizeDisplayName(entry?.displayName),
+      );
+      // Match nameFor's subject rule: only the local reaction may say You.
+      return /^(you|them)$/i.test(label.trim()) ? 'Someone' : label;
+    },
+    [isRoom, peerId, chat?.localName, chat?.displayName, roomMembers, names],
+  );
+
+  /** Current room identities paired with the exact labels this composer
+   * would draw. Saved mention intent is accepted only against this map. */
+  const eligibleMentionNames = useMemo(
+    () =>
+      new Map(
+        isRoom
+          ? roomMembers
+              .filter(id => id !== me?.userId)
+              .map(id => [id, nameFor(id)] as const)
+          : [],
+      ),
+    [isRoom, roomMembers, me?.userId, nameFor],
+  );
+
+  useEffect(() => {
+    const saved = savedMentionBinding;
+    if (saved === null || !groupKnown || !me?.userId) return;
+    // A person may have typed or picked a fresh mention while the roster read
+    // was in flight. Their live input wins; stale storage never overwrites it.
+    if (mentionChipsRef.current.length === 0) {
+      setMentionChips(
+        isRoom
+          ? restoreMentionDraft(
+              peerId,
+              draft,
+              saved.encoded,
+              eligibleMentionNames,
+            )
+          : [],
+      );
+    }
+    setSavedMentionBinding(null);
+  }, [
+    draft,
+    eligibleMentionNames,
+    groupKnown,
+    isRoom,
+    peerId,
+    savedMentionBinding,
+    me?.userId,
+  ]);
 
   /**
    * Whether an AUTHENTICATED id is a recorded machine. The one
@@ -1791,6 +2068,7 @@ export function ChatThreadScreen({
   const changeDraft = useCallback(
     (next: string) => {
       const prev = draftRef.current;
+      setSavedMentionBinding(null);
       setMentionChips(chips => shiftMentionChips(prev, next, chips));
       setMentionCaret(caretAfterEdit(prev, next));
       setDraft(next);
@@ -1830,8 +2108,20 @@ export function ChatThreadScreen({
     const at = mentionQueryAt(draft, mentionCaret, liveChips);
     if (at === null) return [];
     const needle = at.query.toLowerCase();
+    const reviewTargets = secondOpinionReview
+      ? new Set(
+          eligibleSecondOpinionTargetIds(
+            secondOpinionReview.sourceAuthorId,
+            secondOpinionFacts,
+          ),
+        )
+      : null;
     return roomMembers
-      .filter(id => id !== me?.userId)
+      .filter(
+        id =>
+          id !== me?.userId &&
+          (reviewTargets === null || reviewTargets.has(id)),
+      )
       .map(id => {
         // The disc gets the raw stored name, not nameFor's resolved label:
         // a monogram sliced from the label's id-fragment fallback reads
@@ -1858,6 +2148,8 @@ export function ChatThreadScreen({
     me?.userId,
     names,
     nameFor,
+    secondOpinionReview,
+    secondOpinionFacts,
   ]);
 
   /** Choosing someone replaces the @-query with `@Name ` and records the
@@ -1871,6 +2163,7 @@ export function ChatThreadScreen({
       if (at === null) return;
       const caret = Math.min(mentionCaretRef.current ?? prev.length, prev.length);
       const picked = nameFor(id);
+      setSavedMentionBinding(null);
       const token = `@${picked} `;
       const delta = token.length - (caret - at.at);
       const shifted = live.map(chip =>
@@ -1909,6 +2202,89 @@ export function ChatThreadScreen({
     setDraft(prev.slice(0, chip.start) + prev.slice(end));
     setMentionCaret(chip.start);
   }, []);
+
+  /** Current targets for one agent answer. The source is removed in the
+   * model, so an agent can never be asked to trigger itself. */
+  const secondOpinionTargetsFor = useCallback(
+    (sourceAuthorId: string): string[] =>
+      eligibleSecondOpinionTargetIds(sourceAuthorId, secondOpinionFacts),
+    [secondOpinionFacts],
+  );
+
+  /** Turn an existing agent answer into a local, editable mention draft.
+   * This performs no send; the ordinary composer Send remains confirmation. */
+  const startSecondOpinion = useCallback(
+    (row: db.MessageRow) => {
+      const sourceAuthorId = row.authorId;
+      if (
+        !isRoom ||
+        sourceAuthorId == null ||
+        row.direction !== 'in' ||
+        row.deletedAt != null ||
+        row.sharedBy != null ||
+        row.outsider === 1 ||
+        !roomMembers.includes(sourceAuthorId) ||
+        (row.ai !== 1 && !machinePeers.has(sourceAuthorId)) ||
+        draftRef.current.trim() !== '' ||
+        pendingRef.current !== null ||
+        secondOpinionReviewRef.current !== null ||
+        photoReviewRef.current.kind !== 'none'
+      ) {
+        return;
+      }
+      const ids = secondOpinionTargetsFor(sourceAuthorId);
+      const built = buildSecondOpinionDraft(
+        ids.map(id => ({ peerId: id, name: nameFor(id) })),
+        row.body,
+      );
+      if (built === null) return;
+      const review: SecondOpinionReviewState = {
+        peerId,
+        sourceMsgId: row.msgId,
+        sourceAuthorId,
+      };
+      // Refs move with the state in the same tick, closing rapid-tap seams.
+      secondOpinionReviewRef.current = review;
+      draftRef.current = built.draft;
+      mentionChipsRef.current = built.chips;
+      setSecondOpinionReview(review);
+      setDraft(built.draft);
+      setMentionChips(built.chips);
+      setMentionCaret(built.draft.length);
+      setRailFor(null);
+      setDrawer('none');
+      setSendError(null);
+    },
+    [
+      isRoom,
+      roomMembers,
+      machinePeers,
+      secondOpinionTargetsFor,
+      nameFor,
+      peerId,
+    ],
+  );
+
+  const cancelSecondOpinion = useCallback(() => {
+    const review = secondOpinionReviewRef.current;
+    if (
+      review === null ||
+      review.peerId !== peerIdRef.current ||
+      secondOpinionSending.current
+    ) {
+      return;
+    }
+    typingSignaler.stop();
+    secondOpinionReviewRef.current = null;
+    draftRef.current = '';
+    mentionChipsRef.current = [];
+    setSecondOpinionReview(null);
+    setDraft('');
+    setMentionChips([]);
+    setMentionCaret(null);
+    setSendError(null);
+    quiet(db.setDraft(peerId, ''));
+  }, [peerId, typingSignaler]);
 
   /**
    * The fingerprint is thousands of iterations of native work, so it must not
@@ -1959,6 +2335,26 @@ export function ChatThreadScreen({
     for (const row of rows) map.set(`${row.msgId}:${row.direction}`, row);
     return map;
   }, [rows]);
+
+  // Approval requests live outside messages. Resolve only this peer's
+  // inbound requests, and keep them out of message/round author algebra.
+  const approvalsByWire = useMemo(() => {
+    const map = new Map<string, ApprovalQuote>();
+    if (group === null) {
+      for (const approval of approvals) {
+        if (approval.peerId === peerId) {
+          // A memoized answer may outlive payload redaction on the request.
+          // Give it only the fixed context and navigation identity it needs.
+          map.set(approval.wireMsgId, {
+            peerId: approval.peerId,
+            q: approval.q,
+            kind: approval.kind,
+          });
+        }
+      }
+    }
+    return map;
+  }, [approvals, group, peerId]);
 
   const quotedFor = useCallback(
     // Narrower than ThreadItem on purpose: the round pass asks the SAME
@@ -2039,12 +2435,13 @@ export function ChatThreadScreen({
   useEffect(() => {
     if (!pending) return;
     const live = byKey.get(`${pending.row.msgId}:${pending.row.direction}`);
-    if (!live) return;
-    if (live.deletedAt) {
+    if (!live || live.deletedAt || (live.expiresAt != null && live.expiresAt <= Date.now())) {
       // Same restore as cancelling by hand: an edit borrowed the composer.
       if (pendingRef.current?.kind === 'edit') {
         setDraft(shelvedDraft.current);
         setMentionChips(shelvedChips.current);
+        setSavedMentionBinding(shelvedMentionBinding.current);
+        shelvedMentionBinding.current = null;
         shelvedDraft.current = '';
         shelvedChips.current = [];
       }
@@ -2053,6 +2450,28 @@ export function ChatThreadScreen({
       setPending(current => (current ? { ...current, row: live } : current));
     }
   }, [pending, byKey]);
+
+  // A details surface never outlives its exact message, emoji, or ability to
+  // act. Requeries from deletion, expiry, block and retraction all converge
+  // here, including while the panel itself is already open.
+  useEffect(() => {
+    if (reactionDetail === null) return;
+    const key = `${reactionDetail.msgId}:${reactionDetail.direction}`;
+    const target = byKey.get(key);
+    const groupExists = groupReactions(reactions.get(key) ?? []).some(
+      entry => entry.emoji === reactionDetail.emoji,
+    );
+    if (
+      !target ||
+      target.deletedAt != null ||
+      (target.expiresAt != null && target.expiresAt <= Date.now()) ||
+      !groupExists ||
+      blocked ||
+      peerBlocked
+    ) {
+      setReactionDetail(null);
+    }
+  }, [reactionDetail, byKey, reactions, blocked, peerBlocked]);
 
   /** (msgId:direction) → the body it was parsed from and the result; see the
    * parse-once note inside `items`. */
@@ -2120,6 +2539,13 @@ export function ChatThreadScreen({
     [items],
   );
 
+  const onViewableItemsChanged = useCallback(({ viewableItems }: { viewableItems: ViewToken<ThreadItem>[] }) => {
+    const divider = itemsRef.current[dividerIndexRef.current];
+    if (!divider) return;
+    const key = threadKey(divider);
+    setDividerVisible(viewableItems.some(token => token.isViewable && token.key === key));
+  }, []);
+
   // The landing is a ONE-SHOT for the state the thread opened in. Once the
   // unread window is known and the list has answered, "no divider" is the
   // final answer for this open — spend the flag, so nothing arriving later
@@ -2133,6 +2559,7 @@ export function ChatThreadScreen({
   useEffect(
     () => () => {
       if (flashTimer.current) clearTimeout(flashTimer.current);
+      if (scrollRetryTimer.current) clearTimeout(scrollRetryTimer.current);
     },
     [],
   );
@@ -2141,12 +2568,41 @@ export function ChatThreadScreen({
    * has not measured can be retried once from onScrollToIndexFailed. */
   const scrollToRow = useCallback(
     (index: number, viewPosition: number, animated: boolean) => {
-      scrollWant.current = { index, viewPosition };
+      const item = itemsRef.current[index];
+      if (!item) return;
+      if (scrollRetryTimer.current) clearTimeout(scrollRetryTimer.current);
+      scrollWant.current = { index, viewPosition, key: threadKey(item) };
       scrollRetried.current = null;
       listRef.current?.scrollToIndex({ index, viewPosition, animated });
     },
     [],
   );
+
+  useEffect(() => {
+    if (!focusedApprovalQ) {
+      focusedApprovalSpent.current = null;
+      return;
+    }
+    const focusKey = `${peerId}\u0000${focusedApprovalQ}`;
+    if (focusedApprovalSpent.current === focusKey) return;
+    const index = items.findIndex(
+      item =>
+        item.approval?.peerId === peerId &&
+        item.approval.q === focusedApprovalQ,
+    );
+    // The approvals query answers asynchronously. Leave the request unspent
+    // until its exact row exists so the next render can land on it.
+    if (index < 0) return;
+    focusedApprovalSpent.current = focusKey;
+    // Explicit navigation outranks both ordinary bottom anchoring and the
+    // unread-divider landing; neither may move the requested card away on
+    // the next content-size callback.
+    dividerScrolled.current = true;
+    anchoredToEnd.current = false;
+    atBottom.current = false;
+    setShowJump(true);
+    scrollToRow(index, 0.5, !reduceMotion);
+  }, [focusedApprovalQ, items, peerId, reduceMotion, scrollToRow]);
 
   /**
    * A tapped quote goes to the message it quotes: scroll it to the middle of
@@ -2183,12 +2639,30 @@ export function ChatThreadScreen({
     [reduceMotion, scrollToRow],
   );
 
+  const revealQuotedApproval = useCallback(
+    (target: ApprovalQuote) => {
+      const index = itemsRef.current.findIndex(
+        item =>
+          item.approval?.peerId === target.peerId &&
+          item.approval.q === target.q,
+      );
+      if (index < 0) return;
+      dividerScrolled.current = true;
+      anchoredToEnd.current = false;
+      atBottom.current = false;
+      setShowJump(true);
+      scrollToRow(index, 0.5, !reduceMotion);
+    },
+    [reduceMotion, scrollToRow],
+  );
+
   /** FIND opens. Everything anchored to something else closes with it:
    * the rail is fixed to one row and find is about to move the list out from
    * under it, and the picker and the safety panel hang UNDER the header —
    * which find is replacing, leaving them attached to nothing. */
   const openFind = useCallback(() => {
     setFindOpen(true);
+    setReactionDetail(null);
     setRailFor(null);
     setDrawer('none');
     setCallPicker(null);
@@ -2266,18 +2740,21 @@ export function ChatThreadScreen({
   const onScrollToIndexFailed = useCallback(
     (info: { index: number; averageItemLength: number }) => {
       if (scrollRetried.current === info.index) return;
-      scrollRetried.current = info.index;
       const want = scrollWant.current;
+      if (!want || want.index !== info.index) return;
+      scrollRetried.current = info.index;
+      const requestedPeer = peerIdRef.current;
       listRef.current?.scrollToOffset({
         offset: Math.max(0, info.averageItemLength * info.index),
         animated: false,
       });
-      setTimeout(() => {
-        listRef.current?.scrollToIndex({
-          index: info.index,
-          viewPosition: want?.index === info.index ? want.viewPosition : 0.5,
-          animated: false,
-        });
+      if (scrollRetryTimer.current) clearTimeout(scrollRetryTimer.current);
+      scrollRetryTimer.current = setTimeout(() => {
+        scrollRetryTimer.current = null;
+        if (scrollWant.current !== want || peerIdRef.current !== requestedPeer) return;
+        const index = itemsRef.current.findIndex(item => threadKey(item) === want.key);
+        if (index < 0) return;
+        listRef.current?.scrollToIndex({ index, viewPosition: want.viewPosition, animated: false });
       }, 100);
     },
     [],
@@ -2407,6 +2884,7 @@ export function ChatThreadScreen({
     quiet(db.listApprovals(peerId, Date.now()), list => {
       if (peerIdRef.current !== peerId) return;
       setApprovals(list);
+      setApprovalsLoaded(true);
       setApprovalNow(Date.now());
     });
   }, [peerId]);
@@ -2452,7 +2930,20 @@ export function ChatThreadScreen({
     [peerId, reloadApprovals, showError],
   );
 
+  const jumpToFirstNew = useCallback(() => {
+    const index = dividerIndexRef.current;
+    if (index < 0) return;
+    anchoredToEnd.current = false;
+    atBottom.current = false;
+    dividerScrolled.current = true;
+    setShowJump(true);
+    scrollToRow(index, 0, !reduceMotion);
+  }, [reduceMotion, scrollToRow]);
+
   const jumpToLatest = useCallback(() => {
+    scrollWant.current = null;
+    if (scrollRetryTimer.current) clearTimeout(scrollRetryTimer.current);
+    dividerScrolled.current = true;
     setHasNew(false);
     // Re-anchor: asking for the newest message means asking to STAY there,
     // so anything still loading keeps the view pinned rather than sliding
@@ -2499,6 +2990,8 @@ export function ChatThreadScreen({
   );
 
   const onScrollBeginDrag = useCallback(() => {
+    scrollWant.current = null;
+    if (scrollRetryTimer.current) clearTimeout(scrollRetryTimer.current);
     // The person taking hold of the list is the ONLY thing that hands
     // control over. Everything before this — staged content loads, a
     // keyboard opening, the app's own scrollToEnd — leaves the thread
@@ -2514,7 +3007,7 @@ export function ChatThreadScreen({
   // The keyboard, the error strip and the jump bar all change the list's
   // height; re-anchor instead of pushing the newest message out of view.
   const onListLayout = useCallback(() => {
-    if (atBottom.current && !railOpenRef.current) {
+    if (atBottom.current && !railOpenRef.current && reactionDetailRef.current === null) {
       listRef.current?.scrollToEnd({ animated: false });
     }
   }, []);
@@ -2522,7 +3015,7 @@ export function ChatThreadScreen({
   const onContentSizeChange = useCallback(() => {
     // An open rail is 92pt of content the person is reading: growing the list
     // must not yank it out from under them.
-    if (railOpenRef.current) return;
+    if (railOpenRef.current || reactionDetailRef.current !== null) return;
     // The unread divider's one landing: the first resize that has it on
     // glass opens the thread THERE rather than at the end, and hands the
     // anchor over — from here the person reads down, and the jump bar offers
@@ -2555,11 +3048,22 @@ export function ChatThreadScreen({
   }, [scrollToRow]);
 
   const send = async () => {
+    const review = secondOpinionReviewRef.current;
+    if (review !== null) {
+      if (secondOpinionSending.current) return;
+      secondOpinionSending.current = true;
+    }
+    const releaseSecondOpinionSend = (): void => {
+      if (review !== null) secondOpinionSending.current = false;
+    };
     // Composing ends the moment the person taps send, success or failure —
     // before any await, so the stop precedes the message on the wire.
     typingSignaler.stop();
     const text = draft.trim();
-    if (!text) return;
+    if (!text) {
+      releaseSecondOpinionSend();
+      return;
+    }
     // The chips this send will honour — validated against the draft NOW, so
     // a token the person edited into plain text sends as the plain text they
     // can see, never as a mention of whoever used to stand there.
@@ -2575,7 +3079,53 @@ export function ChatThreadScreen({
         settings: false,
         seq: errorSeq.current,
       });
+      releaseSecondOpinionSend();
       return;
+    }
+    if (review !== null) {
+      const selected = [...new Set(chips.map(chip => chip.id))];
+      const generation = secondOpinionGeneration.current;
+      let source: db.MessageRow | null = null;
+      let eligible: string[] = [];
+      try {
+        [source, eligible] = await Promise.all([
+          db.getMessage(review.sourceMsgId, 'in'),
+          currentSecondOpinionTargetIds(peerId, review.sourceAuthorId),
+        ]);
+      } catch {
+        // The same truthful result as a changed capability/consent fact: this
+        // phone could not confirm the reviewed target, so nothing sends.
+      }
+      const stillHere =
+        screenLive.current &&
+        secondOpinionGeneration.current === generation &&
+        peerIdRef.current === peerId &&
+        secondOpinionReviewRef.current === review;
+      if (!stillHere) {
+        releaseSecondOpinionSend();
+        return;
+      }
+      const now = Date.now();
+      const sourceStillHere =
+        source !== null &&
+        source.peerId === peerId &&
+        source.authorId === review.sourceAuthorId &&
+        source.deletedAt == null &&
+        (source.expiresAt == null || source.expiresAt > now) &&
+        source.sharedBy == null;
+      if (
+        !sourceStillHere ||
+        !selectedSecondOpinionTargetsAreCurrent(selected, eligible)
+      ) {
+        errorSeq.current += 1;
+        setSendError({
+          message: COPY.secondOpinionUnavailable,
+          settings: false,
+          seq: errorSeq.current,
+        });
+        releaseSecondOpinionSend();
+        return;
+      }
     }
     // Your own message is always worth following to.
     anchoredToEnd.current = true;
@@ -2583,6 +3133,15 @@ export function ChatThreadScreen({
     // the person has started typing something new must not act on the wrong
     // message, and the restore-on-failure path needs the original intent.
     const action = pending;
+    if (action && !rowsRef.current.some(row =>
+      row.msgId === action.row.msgId && row.direction === action.row.direction &&
+      row.deletedAt == null && (row.expiresAt == null || row.expiresAt > Date.now())
+    )) {
+      cancelPending();
+      releaseSecondOpinionSend();
+      return;
+    }
+    setSavedMentionBinding(null);
     const rawDraft = draft;
     setDraft('');
     setMentionChips([]);
@@ -2626,6 +3185,10 @@ export function ChatThreadScreen({
       } else {
         await messaging.sendText(peerId, text);
       }
+      if (review !== null) {
+        secondOpinionReviewRef.current = null;
+        setSecondOpinionReview(null);
+      }
       setAcceptedNotice(false);
       refresh();
     } catch (err) {
@@ -2659,6 +3222,8 @@ export function ChatThreadScreen({
       } else {
         showError(err, action?.kind === 'edit' ? 'edit' : 'text');
       }
+    } finally {
+      releaseSecondOpinionSend();
     }
   };
 
@@ -2764,7 +3329,19 @@ export function ChatThreadScreen({
 
   const onReact = useCallback(
     (target: db.MessageRow, emoji: string) => {
+      const live = rowsRef.current.find(
+        row =>
+          row.msgId === target.msgId &&
+          row.direction === target.direction &&
+          row.deletedAt == null &&
+          (row.expiresAt == null || row.expiresAt > Date.now()),
+      );
+      if (!live || blocked || peerBlocked || peerIdRef.current !== peerId) {
+        setReactionDetail(null);
+        return;
+      }
       setRailFor(null);
+      setReactionDetail(null);
       const mine = reactionsRef.current
         .get(`${target.msgId}:${target.direction}`)
         ?.find(r => r.direction === 'out');
@@ -2778,11 +3355,12 @@ export function ChatThreadScreen({
         )
         .catch(err => showError(err, 'reaction'));
     },
-    [peerId, showError],
+    [peerId, blocked, peerBlocked, showError],
   );
 
   const toggleRail = useCallback(
     (row: db.MessageRow, index: number, intent: RailIntent = 'react') => {
+      setReactionDetail(null);
       railScrollOrigin.current = scrollOffset.current;
       const current = railForRef.current;
       const same =
@@ -2806,6 +3384,30 @@ export function ChatThreadScreen({
     },
     [reduceMotion],
   );
+
+  const openReactionDetail = useCallback(
+    (row: db.MessageRow, emoji: string) => {
+      if (blocked || peerBlocked) return;
+      const live = rowsRef.current.some(
+        current =>
+          current.msgId === row.msgId &&
+          current.direction === row.direction &&
+          current.deletedAt == null &&
+          (current.expiresAt == null || current.expiresAt > Date.now()),
+      );
+      if (!live) return;
+      setRailFor(null);
+      anchoredToEnd.current = false;
+      atBottom.current = false;
+      setReactionDetail({
+        msgId: row.msgId,
+        direction: row.direction,
+        emoji,
+      });
+    },
+    [blocked, peerBlocked],
+  );
+  const closeReactionDetail = useCallback(() => setReactionDetail(null), []);
 
   const openPhoto = useCallback(
     (row: db.MessageRow) => onOpenPhoto(row.msgId, row.direction),
@@ -2862,10 +3464,12 @@ export function ChatThreadScreen({
     if (row.direction !== 'out') return;
     // Re-entering an edit must not overwrite the shelf with the previous
     // edit's text; only a genuine compose draft is worth keeping.
-    if (!pendingRef.current) {
+    if (pendingRef.current?.kind !== 'edit') {
+      shelvedMentionBinding.current = savedMentionBindingRef.current;
       shelvedDraft.current = draftRef.current;
       shelvedChips.current = mentionChipsRef.current;
     }
+    setSavedMentionBinding(null);
     setPending({ kind: 'edit', row });
     // A reply's body is its envelope; rewriting starts from the words, and
     // messaging puts the quote back around them.
@@ -2886,6 +3490,8 @@ export function ChatThreadScreen({
       // The chips return WITH their words; liveMentionChips re-validates
       // them against the restored text before anything believes them.
       setMentionChips(shelvedChips.current);
+      setSavedMentionBinding(shelvedMentionBinding.current);
+      shelvedMentionBinding.current = null;
       shelvedDraft.current = '';
       shelvedChips.current = [];
     }
@@ -3379,6 +3985,10 @@ export function ChatThreadScreen({
         setSafetyOpen(false);
         return true;
       }
+      if (reactionDetailRef.current !== null) {
+        setReactionDetail(null);
+        return true;
+      }
       if (railForRef.current !== null) {
         setRailFor(null);
         return true;
@@ -3436,7 +4046,8 @@ export function ChatThreadScreen({
   /** The list's header: one element identity per change of what it shows,
    * so a keystroke in the composer does not hand the list a new header to
    * reconcile. */
-  const threadEmpty = rowsLoaded && rows.length === 0;
+  const threadEmpty =
+    rowsLoaded && approvalsLoaded && rows.length === 0 && approvals.length === 0;
   const meUserId = me?.userId;
   const meDisplayName = me?.displayName;
   const meAvatar = me?.avatarB64;
@@ -3515,6 +4126,15 @@ export function ChatThreadScreen({
   const renderItem = useCallback(
     ({ item, index }: { item: ThreadItem; index: number }) => {
       const quoted = quotedFor(item);
+      // The same `ofs` authorship boundary as quotedFor: an approval arrived
+      // from the peer, so a ref claiming an outgoing message cannot use it.
+      // A real message (including a tombstone) always retains precedence.
+      const quotedApproval =
+        !quoted &&
+        item.envelope?.tcm === 'reply' &&
+        item.envelope.ofs !== (item.row.direction === 'out')
+          ? approvalsByWire.get(item.envelope.ref)
+          : undefined;
       // "You", or my name for them: the quoted ROW's authorship, resolved as
       // every author label is — in a room the authenticated author, in a 1:1
       // the thread's peer — never anything the reply's envelope says.
@@ -3524,7 +4144,33 @@ export function ChatThreadScreen({
           : quoted.authorId
             ? nameFor(quoted.authorId)
             : name
-        : undefined;
+        : quotedApproval
+          ? name
+          : undefined;
+      const sourceAuthorId = item.row.authorId ?? null;
+      const secondOpinionTargets = sourceAuthorId
+        ? secondOpinionTargetsFor(sourceAuthorId)
+        : [];
+      const offerSecondOpinion =
+        group !== null &&
+        sourceAuthorId !== null &&
+        roomMembers.includes(sourceAuthorId) &&
+        item.row.direction === 'in' &&
+        item.row.deletedAt == null &&
+        item.row.sharedBy == null &&
+        item.row.outsider !== 1 &&
+        (item.row.ai === 1 || machinePeers.has(sourceAuthorId)) &&
+        item.lastInGroup &&
+        displayText(item.row.body).trim().length > 0 &&
+        secondOpinionTargets.length > 0 &&
+        secondOpinionReview === null &&
+        draft.trim().length === 0 &&
+        pending === null &&
+        drawer === 'none' &&
+        photoReview.kind === 'none' &&
+        voiceDraft === null &&
+        !recording &&
+        !recordingIntent;
       return (
       <View>
         {item.newDay ? (
@@ -3587,6 +4233,7 @@ export function ChatThreadScreen({
             onRedial={kind => onStartCall?.(kind)}
           />
         ) : (
+        <>
         <MessageRow
           item={item}
           index={index}
@@ -3630,6 +4277,7 @@ export function ChatThreadScreen({
           railIntent={railIntent}
           onLongPress={toggleRail}
           onReact={onReact}
+          onOpenReaction={openReactionDetail}
           onOpenPhoto={openPhoto}
           onRetryPhoto={retryPhotoDownload}
           playingVoice={playingVoice}
@@ -3649,6 +4297,7 @@ export function ChatThreadScreen({
           onReply={startReply}
           onEdit={startEdit}
           quoted={quoted}
+          quotedApproval={quotedApproval}
           quotedAuthor={quotedAuthor}
           // The full answer's open/closed state lives on the SCREEN, so it
           // survives this row's re-memo and the thread's next requery.
@@ -3657,17 +4306,72 @@ export function ChatThreadScreen({
           )}
           onToggleDetail={onToggleDetail}
           onReveal={revealQuoted}
+          onRevealApproval={revealQuotedApproval}
           flashed={flashKey === `${item.row.msgId}:${item.row.direction}`}
           overlay={overlays.get(item.row.msgId)}
         />
+        {reactionDetail?.msgId === item.row.msgId &&
+        reactionDetail.direction === item.row.direction &&
+        !blocked && !peerBlocked && item.row.deletedAt == null &&
+        (item.row.expiresAt == null || item.row.expiresAt > Date.now()) ? (() => {
+          const selected = groupReactions(reactions.get(`${item.row.msgId}:${item.row.direction}`) ?? [])
+            .find(entry => entry.emoji === reactionDetail.emoji);
+          if (!selected) return null;
+          return (
+            <View style={{ alignItems: item.row.direction === 'out' ? 'flex-end' : 'flex-start' }}>
+              <ReactionDetails
+                msgId={item.row.msgId}
+                emoji={selected.emoji}
+                people={selected.reactions.map(reaction => ({
+                  key: `${reaction.direction}:${reaction.reactorId}`,
+                  label: reactionNameFor(reaction),
+                }))}
+                includesMine={selected.includesMine}
+                disabled={blocked || peerBlocked}
+                onClose={closeReactionDetail}
+                onChange={() => toggleRail(item.row, index)}
+                onRemove={() => {
+                  const own = reactionsRef.current.get(`${item.row.msgId}:${item.row.direction}`)
+                    ?.find(reaction => reaction.direction === 'out');
+                  if (own?.emoji === selected.emoji) onReact(item.row, own.emoji);
+                  else closeReactionDetail();
+                }}
+              />
+            </View>
+          );
+        })() : null}
+
+        {offerSecondOpinion ? (
+          <View style={{ alignItems: 'flex-start', paddingLeft: t.space.s4 }}>
+            <Pressable
+              onPress={() => startSecondOpinion(item.row)}
+              accessibilityRole="button"
+              accessibilityLabel="Ask another agent for a second opinion on this answer"
+              testID={`second-opinion-${item.row.msgId}`}
+              style={({ pressed }) => [
+                styles.textAction,
+                { borderRadius: t.radius.button },
+                pressed && { backgroundColor: t.color.pineWash },
+              ]}
+            >
+              <Text style={[t.type.compactStrong, { color: t.color.pine }]}>
+                Ask for a second opinion
+              </Text>
+            </Pressable>
+          </View>
+        ) : null}
+        </>
         )}
       </View>
       );
     },
     [
       t,
+      styles.textAction,
       name,
       revealQuoted,
+      revealQuotedApproval,
+      approvalsByWire,
       flashKey,
       paneWidth,
       reduceMotion,
@@ -3681,6 +4385,10 @@ export function ChatThreadScreen({
       peerBlocked,
       attachments,
       reactions,
+      reactionDetail,
+      reactionNameFor,
+      openReactionDetail,
+      closeReactionDetail,
       fanoutFailures,
       railFor,
       onStartCall,
@@ -3707,6 +4415,18 @@ export function ChatThreadScreen({
       overlays,
       expandedDetails,
       onToggleDetail,
+      secondOpinionTargetsFor,
+      roomMembers,
+      machinePeers,
+      secondOpinionReview,
+      draft,
+      pending,
+      drawer,
+      photoReview.kind,
+      voiceDraft,
+      recording,
+      recordingIntent,
+      startSecondOpinion,
     ],
   );
 
@@ -3990,6 +4710,8 @@ export function ChatThreadScreen({
         data={items}
         keyExtractor={threadKey}
         onScroll={onScroll}
+        onViewableItemsChanged={onViewableItemsChanged}
+        viewabilityConfig={viewabilityConfig}
         onScrollBeginDrag={onScrollBeginDrag}
         onScrollEndDrag={onDragEnd}
         onMomentumScrollEnd={onDragEnd}
@@ -4026,7 +4748,25 @@ export function ChatThreadScreen({
        * selection ends, and `showJump` is untouched underneath — this only
        * decides whether to render it, so nothing about the scroll position
        * has to be recomputed when the rail closes. */}
-      {showJump && railFor === null ? (
+      <View style={{ flexDirection: 'row' }}>
+      {dividerIndexRef.current >= 0 && !dividerVisible && railFor === null && reactionDetail === null ? (
+        <Pressable
+          onPress={jumpToFirstNew}
+          accessibilityRole="button"
+          accessibilityLabel="Return to the first new message"
+          testID="jump-first-new"
+          style={({ pressed }) => [styles.jumpRow, {
+            flex: 1,
+            backgroundColor: pressed ? t.color.pineWash : t.color.paperLayer,
+            borderTopWidth: t.hairline,
+            borderTopColor: t.color.lineSoft,
+            paddingHorizontal: t.layout.gutter,
+          }]}
+        >
+          <Text style={[t.type.compactStrong, { color: t.color.pine }]}>First new</Text>
+        </Pressable>
+      ) : null}
+      {showJump && railFor === null && reactionDetail === null ? (
         <Pressable
           onPress={jumpToLatest}
           accessibilityRole="button"
@@ -4035,6 +4775,7 @@ export function ChatThreadScreen({
           style={({ pressed }) => [
             styles.jumpRow,
             {
+              flex: 1,
               backgroundColor: pressed ? t.color.pineWash : t.color.paperLayer,
               borderTopWidth: t.hairline,
               borderTopColor: t.color.lineSoft,
@@ -4053,6 +4794,7 @@ export function ChatThreadScreen({
           </Text>
         </Pressable>
       ) : null}
+      </View>
 
       {acceptedNotice && !blocked && !peerBlocked ? (
         <InlineNotice
@@ -4485,6 +5227,15 @@ export function ChatThreadScreen({
             onPick: pickMention,
             onRemoveChip: removeMention,
           }}
+          secondOpinion={
+            secondOpinionReview
+              ? {
+                  room: roomName ?? 'This room',
+                  agents: liveChips.map(chip => chip.name),
+                  onCancel: cancelSecondOpinion,
+                }
+              : null
+          }
           onOpenDrawer={openDrawer}
           onFocusInput={focusComposer}
           onSend={() => void send()}
@@ -5019,6 +5770,7 @@ function Composer({
   onChangeDraft,
   onSelectionChange,
   mention,
+  secondOpinion,
   onOpenDrawer,
   onFocusInput,
   onSend,
@@ -5051,6 +5803,13 @@ function Composer({
     onPick: (id: string) => void;
     onRemoveChip: (chip: MentionChip) => void;
   };
+  /** A reviewed second-opinion request. Its full context is the editable
+   * draft below; this header names the room and selected recipients. */
+  secondOpinion: {
+    room: string;
+    agents: string[];
+    onCancel: () => void;
+  } | null;
   onOpenDrawer: (d: Drawer) => void;
   /** The input taking (or being pressed into while holding) focus: the
    * parent closes whatever the keyboard is about to cover. */
@@ -5088,7 +5847,10 @@ function Composer({
   // the mention chip strip is bare pills on the ground, so it does not — a
   // squared corner under nothing solid reads as a glitch.
   const open =
-    drawer !== 'none' || chip !== null || mention.choices.length > 0;
+    drawer !== 'none' ||
+    chip !== null ||
+    secondOpinion !== null ||
+    mention.choices.length > 0;
   // A ref, not state: the input stays uncontrolled with respect to selection,
   // so a programmatic cursor can never fight the person typing.
   const selection = useRef({ start: 0, end: 0 });
@@ -5127,6 +5889,61 @@ function Composer({
         },
       ]}
     >
+      {secondOpinion ? (
+        <View
+          testID="second-opinion-review"
+          style={[
+            styles.chip,
+            {
+              backgroundColor: t.color.paperLayer,
+              borderColor: t.color.lineSoft,
+              borderTopLeftRadius: t.radius.drawer,
+              borderTopRightRadius: t.radius.drawer,
+            },
+          ]}
+        >
+          <View style={[styles.chipBar, { backgroundColor: t.color.pine }]} />
+          <View style={styles.chipBody}>
+            <Text style={[t.type.compactStrong, { color: t.color.inkStrong }]}>
+              Second opinion draft
+            </Text>
+            <Text style={[t.type.timeStatus, { color: t.color.inkMuted }]}>
+              {`Room · ${secondOpinion.room}`}
+            </Text>
+            <Text style={[t.type.timeStatus, { color: t.color.inkMuted }]}>
+              {secondOpinion.agents.length === 0
+                ? 'Selected agent · None'
+                : `Selected agent${
+                    secondOpinion.agents.length === 1 ? '' : 's'
+                  } · ${namesInSentence(secondOpinion.agents)}`}
+            </Text>
+            <Text style={[t.type.compactBody, { color: t.color.inkBody }]}>
+              Edit the request below. Send confirms it.
+            </Text>
+            <Text style={[t.type.timeStatus, { color: t.color.inkMuted }]}>
+              {`Rounds must be enabled on the selected agent${
+                secondOpinion.agents.length === 1 ? '’s computer' : 's’ computers'
+              }. This app cannot confirm that setting.`}
+            </Text>
+          </View>
+          <Pressable
+            onPress={secondOpinion.onCancel}
+            accessibilityRole="button"
+            accessibilityLabel="Cancel second opinion draft"
+            testID="second-opinion-cancel"
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            style={({ pressed }) => [
+              styles.chipCancel,
+              {
+                borderRadius: t.radius.circle,
+                backgroundColor: pressed ? t.color.pineWash : 'transparent',
+              },
+            ]}
+          >
+            <CloseGlyph size={16} color={t.color.inkMuted} />
+          </Pressable>
+        </View>
+      ) : null}
       {/* What this message is about to do to another one, attached to the
           composer so the answer and the thing answered stay together. */}
       {chip ? (
@@ -5147,11 +5964,11 @@ function Composer({
         >
           <View style={[styles.chipBar, { backgroundColor: t.color.pine }]} />
           <View style={styles.chipBody}>
-            <Text style={[t.type.utilityLabel, { color: t.color.pine }]}>
+            <Text style={[t.type.compactStrong, { color: t.color.inkStrong }]}>
               {chip.label}
             </Text>
             <Text
-              numberOfLines={1}
+              numberOfLines={2}
               style={[
                 t.type.compactBody,
                 styles.chipText,
@@ -5175,9 +5992,7 @@ function Composer({
               },
             ]}
           >
-            <Text style={[t.type.iconGlyph, { color: t.color.inkMuted }]}>
-              ✕
-            </Text>
+            <CloseGlyph size={16} color={t.color.inkMuted} />
           </Pressable>
         </View>
       ) : null}
@@ -5757,6 +6572,7 @@ interface MessageRowProps {
   railIntent: RailIntent;
   onLongPress: (row: db.MessageRow, index: number, intent?: RailIntent) => void;
   onReact: (row: db.MessageRow, emoji: string) => void;
+  onOpenReaction: (row: db.MessageRow, emoji: string) => void;
   onOpenPhoto: (row: db.MessageRow) => void;
   onRetryPhoto: (row: db.MessageRow) => void;
   /** `${msgId}:${direction}` of the note currently playing, or null. */
@@ -5775,8 +6591,10 @@ interface MessageRowProps {
   /** The message this one answers, already resolved — undefined when it is
    * not on this device (deleted here, or older than this install). */
   quoted: db.MessageRow | undefined;
-  /** Who wrote `quoted`, resolved by the parent the way every author label
-   * is — "You", or my name for them. Undefined with no `quoted`. */
+  /** An incoming approval request, when no message matches this reply. */
+  quotedApproval: ApprovalQuote | undefined;
+  /** Who wrote the quoted message or request, resolved from its stored
+   * authorship — "You", or my name for them. */
   quotedAuthor: string | undefined;
   /** This row's FULL ANSWER is open . Screen-held, so a
    * requery cannot close it. Always false for a row with no detail. */
@@ -5785,6 +6603,7 @@ interface MessageRowProps {
   onToggleDetail: (row: db.MessageRow) => void;
   /** Tapping the quote: scroll to and flash the quoted row. */
   onReveal: (row: db.MessageRow) => void;
+  onRevealApproval: (approval: ApprovalQuote) => void;
   /** This row was just revealed by a tapped quote: wash it pine. */
   flashed: boolean;
   /** The stream snapshot painted over this inbound bubble while the
@@ -5833,6 +6652,7 @@ function sameRowProps(a: MessageRowProps, b: MessageRowProps): boolean {
   if (
     a.onLongPress !== b.onLongPress ||
     a.onReact !== b.onReact ||
+    a.onOpenReaction !== b.onOpenReaction ||
     a.onOpenPhoto !== b.onOpenPhoto ||
     a.onRetryPhoto !== b.onRetryPhoto ||
     a.onRetrySend !== b.onRetrySend ||
@@ -5853,8 +6673,12 @@ function sameRowProps(a: MessageRowProps, b: MessageRowProps): boolean {
     a.quoted?.msgId !== b.quoted?.msgId ||
     a.quoted?.body !== b.quoted?.body ||
     a.quoted?.deletedAt !== b.quoted?.deletedAt ||
+    a.quotedApproval?.peerId !== b.quotedApproval?.peerId ||
+    a.quotedApproval?.q !== b.quotedApproval?.q ||
+    a.quotedApproval?.kind !== b.quotedApproval?.kind ||
     a.quotedAuthor !== b.quotedAuthor ||
     a.onReveal !== b.onReveal ||
+    a.onRevealApproval !== b.onRevealApproval ||
     a.flashed !== b.flashed ||
     // Without these two the memo goes stale and the disclosure does not open
     //  — the defect this comparator's own header warns
@@ -5901,7 +6725,8 @@ function sameRowProps(a: MessageRowProps, b: MessageRowProps): boolean {
   const q = b.reactions ?? [];
   if (p.length !== q.length) return false;
   for (let i = 0; i < p.length; i++) {
-    if (p[i].direction !== q[i].direction || p[i].emoji !== q[i].emoji) {
+    if (p[i].direction !== q[i].direction || p[i].emoji !== q[i].emoji ||
+      p[i].reactorId !== q[i].reactorId || p[i].ts !== q[i].ts) {
       return false;
     }
   }
@@ -5980,6 +6805,7 @@ function MessageRowInner({
   railIntent,
   onLongPress,
   onReact,
+  onOpenReaction,
   onOpenPhoto,
   onRetryPhoto,
   playingVoice,
@@ -5992,16 +6818,24 @@ function MessageRowInner({
   onReply,
   onEdit,
   quoted,
+  quotedApproval,
   quotedAuthor,
   expanded,
   onToggleDetail,
   onReveal,
+  onRevealApproval,
   flashed,
   overlay,
 }: MessageRowProps) {
   const styles = stylesFor(t);
   const { row, envelope } = item;
   const out = row.direction === 'out';
+  const revealQuote =
+    quoted && !quoted.deletedAt
+      ? () => onReveal(quoted)
+      : quotedApproval
+        ? () => onRevealApproval(quotedApproval)
+        : undefined;
   const inRoom = room !== null;
   /**
    * The AI marker: marker-OR-record (the Art. 50
@@ -6746,7 +7580,7 @@ function MessageRowInner({
         })),
         // The bubble is ONE element to a screen reader, so the quote's own
         // tap is not reachable that way; the rotor offers it instead.
-        ...(quoted && !quoted.deletedAt
+        ...(revealQuote
           ? [{ name: 'reveal', label: 'Go to the quoted message' }]
           : []),
         // The bubble is ONE element, so the disclosure's own tap is not
@@ -6759,7 +7593,7 @@ function MessageRowInner({
   const onA11yAction = (name: string) => {
     if (name === 'react') onLongPress(row, index);
     if (name === 'detail' && detail !== null) onToggleDetail(row);
-    if (name === 'reveal' && quoted && !quoted.deletedAt) onReveal(quoted);
+    if (name === 'reveal') revealQuote?.();
     if (name.startsWith('link:')) {
       const link = bodyLinks[Number(name.slice('link:'.length))];
       // Same rejection discipline as the tap: a scheme this device cannot
@@ -6957,27 +7791,21 @@ function MessageRowInner({
               // than a box.
               <Pressable
                 testID={`quote-${row.msgId}`}
-                onPress={
-                  quoted && !quoted.deletedAt
-                    ? () => onReveal(quoted)
-                    : undefined
-                }
-                disabled={!quoted || !!quoted.deletedAt}
-                accessibilityRole={
-                  quoted && !quoted.deletedAt ? 'button' : undefined
-                }
+                onPress={revealQuote}
+                disabled={!revealQuote}
+                accessibilityRole={revealQuote ? 'button' : undefined}
                 accessibilityLabel={
-                  quoted && !quoted.deletedAt && quotedAuthor
+                  revealQuote && quotedAuthor
                     ? `Go to the quoted message from ${quotedAuthor}`
                     : undefined
                 }
                 style={[
                   styles.quote,
                   {
-                    borderRadius: t.radius.tail,
+                    borderRadius: t.radius.small,
                     backgroundColor: out
                       ? t.color.bubbleOutPressed
-                      : t.color.paperInset,
+                      : t.color.paperLayer,
                     borderLeftColor: out ? t.color.onBubbleOut : t.color.pine,
                   },
                 ]}
@@ -6990,7 +7818,7 @@ function MessageRowInner({
                     testID={`quote-author-${row.msgId}`}
                     numberOfLines={1}
                     style={[
-                      t.type.utilityLabel,
+                      t.type.compactStrong,
                       styles.quoteAuthor,
                       { color: out ? t.color.onBubbleOut : t.color.pine },
                     ]}
@@ -6999,7 +7827,7 @@ function MessageRowInner({
                   </Text>
                 ) : null}
                 <Text
-                  numberOfLines={2}
+                  numberOfLines={1}
                   style={[
                     t.type.compactBody,
                     styles.quoteText,
@@ -7014,7 +7842,9 @@ function MessageRowInner({
                     ? quoted.deletedAt
                       ? COPY.quoteMissing
                       : previewFor(quoted.body, mentionLabelFor)
-                    : COPY.quoteMissing}
+                    : quotedApproval
+                      ? APPROVAL_KIND_COPY[quotedApproval.kind]
+                      : COPY.quoteMissing}
                 </Text>
               </Pressable>
             ) : null}
@@ -7176,16 +8006,17 @@ function MessageRowInner({
           accessibilityRole="button"
           accessibilityLabel={replyArrowLabel}
           testID={`reply-arrow-${row.msgId}`}
-          // 44×44 effective without enlarging the 32×32 box — the reaction
-          // chips' discipline, and the box plus 6 of slop is exactly 44.
-          hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+          // The 28pt disc stays quiet while its touch target reaches 44pt.
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
           style={({ pressed }) => [
             styles.replyArrow,
-            { borderRadius: t.radius.small },
-            pressed && { backgroundColor: t.color.pineWash },
+            {
+              borderRadius: t.radius.circle,
+              backgroundColor: pressed ? t.color.pineWash : t.color.paperLayer,
+            },
           ]}
         >
-          <ReplyGlyph size={17} color={t.color.pine} />
+          <ReplyGlyph size={15} color={t.color.inkMuted} />
         </Pressable>
       ) : null}
       </View>
@@ -7232,51 +8063,29 @@ function MessageRowInner({
             { alignSelf: out ? 'flex-end' : 'flex-start' },
           ]}
         >
-          {reactions.map(r => {
-            const word = REACTION_WORD[r.emoji];
-            const mine = r.direction === 'out';
-            // The reactor is `reactorId` (authenticated) in a room, and the
-            // one possible peer in a 1:1 — never the bubble's author.
-            const reactor =
-              inRoom && r.reactorId ? nameFor(r.reactorId) : peerRef;
-            const label = word
-              ? mine
-                ? `You reacted with ${word}`
-                : `${reactor} reacted with ${word}`
-              : `Reacted with ${r.emoji}`;
+          {groupReactions(reactions).map(group => {
+            const word = REACTION_WORD[group.emoji] ?? group.emoji;
+            const label = `${word.charAt(0).toUpperCase()}${word.slice(1)}, ${group.count} ${group.count === 1 ? 'reaction' : 'reactions'}${group.includesMine ? ', including you' : ''}. Show who reacted`;
             return (
               <Pressable
-                // Two members reacting to one message are two rows sharing a
-                // direction — the reactor completes the key.
-                key={`${r.direction}:${r.reactorId ?? ''}`}
-                // Re-choosing your own reaction retracts it; theirs opens the
-                // rail so you can answer it — in a room exactly as in a 1:1,
-                // through the same room-aware sendReaction.
-                onPress={
-                  interactionsOff
-                    ? undefined
-                    : mine
-                      ? () => onReact(row, r.emoji)
-                      : () => onLongPress(row, index)
-                }
+                key={group.emoji}
+                onPress={interactionsOff ? undefined : () => onOpenReaction(row, group.emoji)}
                 disabled={interactionsOff}
                 accessibilityRole="button"
                 accessibilityLabel={label}
-                // 44 x 44 effective without enlarging the 26 x 30 visual.
-                hitSlop={{ top: 9, bottom: 9, left: 7, right: 7 }}
+                accessibilityState={{ disabled: interactionsOff }}
+                testID={`reaction-group-${row.msgId}-${group.emoji}`}
                 style={[
                   styles.reactionChip,
                   {
                     borderRadius: t.radius.small,
-                    // Ownership cannot rest on a 1.65:1-vs-1.33:1 border alone.
-                    backgroundColor: mine
-                      ? t.color.pineWash
-                      : t.color.paperSheet,
-                    borderColor: mine ? t.color.pineLine : t.color.lineSoft,
+                    backgroundColor: group.includesMine ? t.color.pineWash : t.color.paperSheet,
+                    borderColor: group.includesMine ? t.color.pineLine : t.color.lineSoft,
                   },
                 ]}
               >
-                <Text style={t.type.compactBody}>{r.emoji}</Text>
+                <Text style={t.type.compactBody}>{group.emoji}</Text>
+                <Text style={[t.type.compactStrong, { color: t.color.inkBody }]}>{group.count}</Text>
               </Pressable>
             );
           })}
@@ -7349,7 +8158,7 @@ function MessageRowInner({
           accessibilityElementsHidden
           importantForAccessibility="no-hide-descendants"
           style={[
-            t.type.timeStatus,
+            styles.messageClock,
             out ? styles.metaRight : styles.metaLeft,
             { color: t.color.inkMuted },
           ]}

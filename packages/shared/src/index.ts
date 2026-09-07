@@ -16,6 +16,13 @@ export * from './approval-envelope.js';
 export * from './stream-envelope.js';
 // The Art. 50 AI-origin marker and the `msg` bare-text carrier, through the barrel on the same rule.
 export * from './ai-origin.js';
+// Optional source-backed AI work facts for existing conversational/profile
+// envelopes. The receiver fragment drops malformed metadata without costing
+// the message around it; producers use the strict schema.
+export * from './ai-work.js';
+// Owner→agent routine notification preference and exact agent→owner ack,
+// both optional fields on the existing encrypted profile carrier.
+export * from './ai-notify-preference.js';
 // The pairwise consent edge DTO + cap, through the
 // barrel on the same rule.
 export * from './consent.js';

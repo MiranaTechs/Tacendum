@@ -5,6 +5,7 @@ import * as native from 'tacendum-call';
 import * as calling from '../src/call';
 import * as db from '../src/db';
 import { messaging } from '../src/messaging';
+import { shortId } from '../src/person';
 import { IncomingCallScreen } from '../src/screens/IncomingCallScreen';
 
 /**
@@ -41,16 +42,27 @@ async function ringing(video: boolean): Promise<void> {
   // unknown caller, and this file has no database to hold a chat row.
   jest
     .spyOn(db, 'getChat')
-    .mockResolvedValue({ peerId: PEER, lastMessageAt: Date.now() } as db.ChatRow);
+    .mockResolvedValue({
+      peerId: PEER,
+      lastMessageAt: Date.now(),
+    } as db.ChatRow);
   teardown = await calling.startCalling();
-  const listener = (messaging.onEnvelope as jest.Mock).mock.calls.at(-1)![0] as (
+  const listener = (messaging.onEnvelope as jest.Mock).mock.calls.at(
+    -1,
+  )![0] as (
     peerId: string,
     envelope: unknown,
     meta: { msgId: string; ts: number },
   ) => void;
   listener(
     PEER,
-    { tcm: 'call.offer', cid: CID, sdp: OFFER_SDP, vid: video, exp: Date.now() + 60_000 },
+    {
+      tcm: 'call.offer',
+      cid: CID,
+      sdp: OFFER_SDP,
+      vid: video,
+      exp: Date.now() + 60_000,
+    },
     { msgId: '01HQMSG000000000000000000C', ts: Date.now() },
   );
   await flush();
@@ -61,6 +73,9 @@ async function ringing(video: boolean): Promise<void> {
 beforeEach(() => {
   calling.resetCallingForTests();
   jest.clearAllMocks();
+  (native.cameraPermission as jest.Mock)
+    .mockReset()
+    .mockResolvedValue('granted');
 });
 
 afterEach(() => {
@@ -133,7 +148,11 @@ describe('acceptIncomingCall asks for permissions FIRST', () => {
     expect(result.ok).toBe(false);
     expect(result.reason).toMatch(/Microphone/);
     expect(native.createAnswer).not.toHaveBeenCalled();
-    expect(sent.mock.calls.some(c => c[1]?.tcm === 'call.end' && c[1]?.r === 'decline')).toBe(true);
+    expect(
+      sent.mock.calls.some(
+        c => c[1]?.tcm === 'call.end' && c[1]?.r === 'decline',
+      ),
+    ).toBe(true);
   });
 
   it('does nothing when the ring ended under the prompt', async () => {
@@ -148,7 +167,9 @@ describe('acceptIncomingCall asks for permissions FIRST', () => {
     const accepting = calling.acceptIncomingCall(false);
     await flush();
     // The caller gives up while the prompt is showing.
-    const listener = (messaging.onEnvelope as jest.Mock).mock.calls.at(-1)![0] as (
+    const listener = (messaging.onEnvelope as jest.Mock).mock.calls.at(
+      -1,
+    )![0] as (
       peerId: string,
       envelope: unknown,
       meta: { msgId: string; ts: number },
@@ -184,8 +205,12 @@ describe('the screen reads the camera itself when nobody tells it', () => {
     });
   });
 
-  async function mount(over: Partial<React.ComponentProps<typeof IncomingCallScreen>> = {}) {
+  async function mountScreen(
+    over: Partial<React.ComponentProps<typeof IncomingCallScreen>> = {},
+    settle = true,
+  ) {
     const props = {
+      peerId: '01HQBBBB00000000000000000A',
       peerName: 'Dana',
       withVideo: true,
       onAccept: jest.fn(),
@@ -201,9 +226,11 @@ describe('the screen reads the camera itself when nobody tells it', () => {
         </SafeAreaProvider>,
       );
     });
-    await ReactTestRenderer.act(async () => {
-      await flush();
-    });
+    if (settle) {
+      await ReactTestRenderer.act(async () => {
+        await flush();
+      });
+    }
     mounted.push(tree);
     const byLabel = (label: string) =>
       tree.root.findAll(
@@ -212,10 +239,21 @@ describe('the screen reads the camera itself when nobody tells it', () => {
     const text = () =>
       tree.root
         .findAllByType(require('react-native').Text)
-        .map(n => (Array.isArray(n.props.children) ? n.props.children.join('') : String(n.props.children ?? '')))
+        .map(n =>
+          Array.isArray(n.props.children)
+            ? n.props.children.join('')
+            : String(n.props.children ?? ''),
+        )
         .join('\n');
-    return { byLabel, text, props };
+    return { byLabel, text, props, tree };
   }
+
+  const mount = (
+    over: Partial<React.ComponentProps<typeof IncomingCallScreen>> = {},
+  ) => mountScreen(over, true);
+  const mountWithoutSettling = (
+    over: Partial<React.ComponentProps<typeof IncomingCallScreen>> = {},
+  ) => mountScreen(over, false);
 
   it('stops offering a video answer once the module says the camera was refused', async () => {
     (native.cameraPermission as jest.Mock).mockResolvedValue('denied');
@@ -223,7 +261,38 @@ describe('the screen reads the camera itself when nobody tells it', () => {
     expect(byLabel('Answer with video')).toBeUndefined();
     expect(byLabel('Answer without video')).toBeUndefined();
     expect(byLabel('Answer')).toBeTruthy();
-    expect(text()).toContain('Camera access is off');
+    expect(text()).toContain('Video isn’t available right now');
+  });
+
+  it('keeps video unavailable when the native status read fails', async () => {
+    (native.cameraPermission as jest.Mock).mockRejectedValue(
+      new Error('status unavailable'),
+    );
+    const { byLabel, text } = await mount();
+    expect(byLabel('Answer with video')).toBeUndefined();
+    expect(byLabel('Answer')).toBeTruthy();
+    expect(text()).toContain('Video isn’t available right now');
+  });
+
+  it('keeps decline and audio usable without claiming video while the status read is pending', async () => {
+    let release!: (value: 'denied') => void;
+    (native.cameraPermission as jest.Mock).mockImplementation(
+      () => new Promise(resolve => (release = resolve)),
+    );
+    const mountedNow = await mountWithoutSettling();
+    expect(mountedNow.byLabel('Decline')).toBeTruthy();
+    expect(mountedNow.byLabel('Answer without video')).toBeTruthy();
+    expect(mountedNow.byLabel('Answer with video')).toBeUndefined();
+    const checking = mountedNow.byLabel('Checking camera…');
+    expect(checking).toBeTruthy();
+    expect(checking.props.accessibilityState).toEqual({ disabled: true });
+
+    await ReactTestRenderer.act(async () => {
+      release('denied');
+      await flush();
+    });
+    expect(mountedNow.byLabel('Checking camera…')).toBeUndefined();
+    expect(mountedNow.byLabel('Answer')).toBeTruthy();
   });
 
   it('offers it while the camera is merely not yet asked for — the tap asks', async () => {
@@ -251,19 +320,39 @@ describe('the screen reads the camera itself when nobody tells it', () => {
     expect(props.onAcceptAudioOnly).toHaveBeenCalled();
     expect(props.onAccept).not.toHaveBeenCalled();
   });
+
+  it('renders an unnamed caller as Someone and ?, never as a short account id', async () => {
+    const peerId = '01J0000000000000000000000B';
+    const unsafeName = shortId(peerId);
+    const { text, tree } = await mount({ peerId, peerName: unsafeName });
+    expect(text()).toContain('Someone');
+    expect(text()).toContain('?');
+    expect(text()).not.toContain(unsafeName);
+    const labels = tree.root
+      .findAll(n => typeof n.props.accessibilityLabel === 'string')
+      .map(n => String(n.props.accessibilityLabel));
+    expect(labels).toContain('Incoming video call from Someone');
+    for (const label of labels) expect(label).not.toContain(unsafeName);
+  });
 });
 
 describe('App.tsx wires both buttons through the permission-first accept', () => {
   it('never calls accept() directly from the incoming screen', () => {
-    const fs = jest.requireActual<{ readFileSync(p: string, e: string): string }>('fs');
+    const fs = jest.requireActual<{
+      readFileSync(p: string, e: string): string;
+    }>('fs');
     const testPath = expect.getState().testPath ?? '';
     const appDir = testPath.slice(0, testPath.lastIndexOf('/__tests__/'));
     const src = fs.readFileSync(`${appDir}/App.tsx`, 'utf8');
     const start = src.indexOf('<IncomingCallScreen');
     expect(start).toBeGreaterThan(0);
     const block = src.slice(start, src.indexOf('/>', start));
-    expect(block).toMatch(/onAccept=\{\(\) => void acceptIncomingCall\(true\)\}/);
-    expect(block).toMatch(/onAcceptAudioOnly=\{\(\) => void acceptIncomingCall\(false\)\}/);
+    expect(block).toMatch(
+      /onAccept=\{\(\) => void acceptIncomingCall\(true\)\}/,
+    );
+    expect(block).toMatch(
+      /onAcceptAudioOnly=\{\(\) => void acceptIncomingCall\(false\)\}/,
+    );
     expect(block).not.toMatch(/callController\(\)\.accept\(/);
     // No hand-set `cameraAvailable`: the screen reads the module itself.
     expect(block).not.toMatch(/cameraAvailable=/);

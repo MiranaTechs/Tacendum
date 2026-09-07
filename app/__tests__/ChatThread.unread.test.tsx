@@ -368,3 +368,68 @@ test('an arrival while the thread is open never grows the divider it opened with
   ]);
   await unmount(tree);
 });
+
+
+test('after leaving the divider, First new returns to its live index and hides while visible', async () => {
+  const tree = await renderThread();
+  await resize(tree);
+  const visible = async (key: string) => {
+    await ReactTestRenderer.act(async () => list(tree).props.onViewableItemsChanged({
+      viewableItems: [{ key, isViewable: true }], changed: [],
+    }));
+  };
+  await visible('unread-divider');
+  expect(tree.root.findAllByProps({ testID: 'jump-first-new' })).toHaveLength(0);
+  await visible('01AHEADIN:in');
+  const jump = tree.root.findByProps({ testID: 'jump-first-new' });
+  scrollToIndex.mockClear();
+  await ReactTestRenderer.act(async () => jump.props.onPress());
+  expect(scrollToIndex).toHaveBeenCalledWith(expect.objectContaining({ index: 2, viewPosition: 0 }));
+  await visible('unread-divider');
+  expect(tree.root.findAllByProps({ testID: 'jump-first-new' })).toHaveLength(0);
+  await visible('01AHEADIN:in');
+  rows = [OLD_IN, OLD_OUT, AHEAD_IN];
+  await requery();
+  expect(tree.root.findAllByProps({ testID: 'jump-first-new' })).toHaveLength(0);
+  await unmount(tree);
+});
+
+test('leaving before the previous-open read resolves cannot write an older stamp after close', async () => {
+  let answer!: (value: db.ChatRow | null) => void;
+  jest.spyOn(db, 'getChat').mockImplementation(() => new Promise(resolve => { answer = resolve; }));
+  const mark = jest.spyOn(db, 'markChatOpened').mockResolvedValue();
+  const tree = await renderThread();
+  jest.advanceTimersByTime(5_000);
+  await unmount(tree);
+  const closingTime = Date.now();
+  expect(mark).toHaveBeenLastCalledWith('peer-1', closingTime);
+  await ReactTestRenderer.act(async () => answer({ lastOpenedAt: T0 } as db.ChatRow));
+  expect(mark).toHaveBeenCalledTimes(1);
+});
+
+test.each(['latest', 'drag', 'deleted'])('a delayed first-new retry cannot override %s', async reason => {
+  const tree = await renderThread();
+  await resize(tree);
+  await ReactTestRenderer.act(async () => list(tree).props.onViewableItemsChanged({
+    viewableItems: [{ key: '01AHEADIN:in', isViewable: true }], changed: [],
+  }));
+  await ReactTestRenderer.act(async () => tree.root.findByProps({ testID: 'jump-first-new' }).props.onPress());
+  await ReactTestRenderer.act(async () => list(tree).props.onScrollToIndexFailed({ index: 2, averageItemLength: 100 }));
+  scrollToIndex.mockClear();
+  if (reason === 'latest') {
+    await ReactTestRenderer.act(async () => tree.root.findByProps({ testID: 'jump-latest' }).props.onPress());
+  } else if (reason === 'drag') {
+    await ReactTestRenderer.act(async () => list(tree).props.onScrollBeginDrag());
+  } else {
+    rows = [OLD_IN, OLD_OUT, AHEAD_IN];
+    // Requery before the scheduled retry, so the retained key no longer exists.
+    await ReactTestRenderer.act(async () => {
+      for (const cb of changeListeners) cb();
+      jest.advanceTimersByTime(80);
+    });
+    await ReactTestRenderer.act(async () => {});
+  }
+  await ReactTestRenderer.act(async () => jest.advanceTimersByTime(120));
+  expect(scrollToIndex).not.toHaveBeenCalled();
+  await unmount(tree);
+});

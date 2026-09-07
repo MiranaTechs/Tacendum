@@ -55,50 +55,76 @@ function mount(element: React.JSX.Element) {
   });
   mounted.push(tree);
   const byLabel = (label: string) =>
-    tree.root.findAll(n => n.props.accessibilityLabel === label && typeof n.type !== 'string')[0];
+    tree.root.findAll(
+      n => n.props.accessibilityLabel === label && typeof n.type !== 'string',
+    )[0];
   return { tree, byLabel };
 }
 
 describe('what a call row says', () => {
   it('separates missed from declined — they are different events', () => {
-    expect(callLabel(row({ missed: true, direction: 'in' }))).toBe('Missed audio call');
+    expect(callLabel(row({ missed: true, direction: 'in' }))).toBe(
+      'Missed audio call',
+    );
     expect(callLabel(row({ reason: 'decline' }))).toBe('Audio call declined');
   });
 
   it('says "no answer" for an outgoing call nobody picked up', () => {
     // From the caller's side "missed" would be wrong — they did not miss it.
-    expect(callLabel(row({ missed: true, direction: 'out' }))).toBe('Audio call, no answer');
+    expect(callLabel(row({ missed: true, direction: 'out' }))).toBe(
+      'Audio call, no answer',
+    );
   });
 
   it('says "no answer" and "cancelled" from the CALLER\'s reason, which never carries missed', () => {
     // `missed` is only ever true on the receiving side, so an outgoing call
     // that rang out rendered as a plain "Outgoing audio call" with no
     // duration — the label above was unreachable from the caller's rows.
-    expect(callLabel(row({ direction: 'out', reason: 'timeout', connectedAt: null }))).toBe(
-      'Audio call, no answer',
-    );
-    expect(callLabel(row({ direction: 'out', reason: 'cancelled', connectedAt: null, kind: 'video' }))).toBe(
-      'Video call, cancelled',
-    );
+    expect(
+      callLabel(
+        row({ direction: 'out', reason: 'timeout', connectedAt: null }),
+      ),
+    ).toBe('Audio call, no answer');
+    expect(
+      callLabel(
+        row({
+          direction: 'out',
+          reason: 'cancelled',
+          connectedAt: null,
+          kind: 'video',
+        }),
+      ),
+    ).toBe('Video call, cancelled');
     // A busy refusal on the callee's side is a missed call (the reducer marks
     // it so); the caller's own busy row keeps its word.
-    expect(callLabel(row({ direction: 'in', reason: 'busy', missed: true, connectedAt: null }))).toBe(
-      'Missed audio call',
-    );
-    expect(callLabel(row({ direction: 'out', reason: 'busy', connectedAt: null }))).toBe(
-      'Audio call, busy',
-    );
+    expect(
+      callLabel(
+        row({
+          direction: 'in',
+          reason: 'busy',
+          missed: true,
+          connectedAt: null,
+        }),
+      ),
+    ).toBe('Missed audio call');
+    expect(
+      callLabel(row({ direction: 'out', reason: 'busy', connectedAt: null })),
+    ).toBe('Audio call, busy');
   });
 
   it('distinguishes a failure to connect from a call that happened', () => {
-    expect(callLabel(row({ reason: 'failed_ice' }))).toBe('Audio call failed to connect');
+    expect(callLabel(row({ reason: 'failed_ice' }))).toBe(
+      'Audio call failed to connect',
+    );
     expect(callLabel(row({ reason: 'failed_media', kind: 'video' }))).toBe(
       'Video call failed to connect',
     );
   });
 
   it('names the kind', () => {
-    expect(callLabel(row({ kind: 'video', missed: true }))).toBe('Missed video call');
+    expect(callLabel(row({ kind: 'video', missed: true }))).toBe(
+      'Missed video call',
+    );
   });
 });
 
@@ -109,11 +135,15 @@ describe('duration', () => {
   });
 
   it('measures from connection, not from dialling', () => {
-    expect(callDuration(row({ connectedAt: T - 65_000, endedAt: T }))).toBe('1:05');
+    expect(callDuration(row({ connectedAt: T - 65_000, endedAt: T }))).toBe(
+      '1:05',
+    );
   });
 
   it('grows to hours', () => {
-    expect(callDuration(row({ connectedAt: T - 3_725_000, endedAt: T }))).toBe('1:02:05');
+    expect(callDuration(row({ connectedAt: T - 3_725_000, endedAt: T }))).toBe(
+      '1:02:05',
+    );
   });
 });
 
@@ -121,7 +151,9 @@ describe('the row does not rely on colour alone', () => {
   it('marks missed with a distinct glyph, not just a red tint', () => {
     // Someone who cannot distinguish the colours must still be able to see
     // that a call was missed.
-    expect(callGlyph(row({ missed: true }))).not.toBe(callGlyph(row({ missed: false })));
+    expect(callGlyph(row({ missed: true }))).not.toBe(
+      callGlyph(row({ missed: false })),
+    );
   });
 
   it('points the arrow the way the call went', () => {
@@ -136,7 +168,9 @@ describe('the row does not rely on colour alone', () => {
 
   it('redials the same KIND the original call was', () => {
     const onRedial = jest.fn();
-    const { byLabel } = mount(<CallLogRow row={row({ kind: 'video' })} onRedial={onRedial} />);
+    const { byLabel } = mount(
+      <CallLogRow row={row({ kind: 'video' })} onRedial={onRedial} />,
+    );
     ReactTestRenderer.act(() => {
       byLabel('Incoming video call, 1:05. Call back.').props.onPress();
     });
@@ -145,10 +179,14 @@ describe('the row does not rely on colour alone', () => {
 });
 
 describe('answering a call in the foreground', () => {
-  function incoming(over: Partial<React.ComponentProps<typeof IncomingCallScreen>> = {}) {
+  function incoming(
+    over: Partial<React.ComponentProps<typeof IncomingCallScreen>> = {},
+  ) {
     const props = {
+      peerId: '01HQBBBB00000000000000000A',
       peerName: 'Dana',
       withVideo: true,
+      cameraAvailable: true,
       onAccept: jest.fn(),
       onAcceptAudioOnly: jest.fn(),
       onDecline: jest.fn(),
@@ -174,7 +212,10 @@ describe('answering a call in the foreground', () => {
   it('answers audio when the camera is denied, and says so', () => {
     // Denial is a first-class state, not an error — and it is stated
     // rather than shown by a missing button.
-    const { byLabel, props, tree } = incoming({ withVideo: true, cameraAvailable: false });
+    const { byLabel, props, tree } = incoming({
+      withVideo: true,
+      cameraAvailable: false,
+    });
     expect(byLabel('Answer with video')).toBeUndefined();
     ReactTestRenderer.act(() => {
       byLabel('Answer').props.onPress();
@@ -185,7 +226,7 @@ describe('answering a call in the foreground', () => {
       .map(n => n.props.children)
       .filter((c): c is string => typeof c === 'string')
       .join(' ');
-    expect(text).toContain('Camera access is off');
+    expect(text).toContain('Video isn’t available right now');
   });
 
   it('declines', () => {

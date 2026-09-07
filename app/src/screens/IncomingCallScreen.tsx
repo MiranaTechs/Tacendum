@@ -1,8 +1,17 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Pressable, StatusBar, StyleSheet, Text, View } from 'react-native';
+import {
+  Pressable,
+  ScrollView,
+  StatusBar,
+  StyleSheet,
+  Text,
+  View,
+  useWindowDimensions,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { cameraAvailableForAnswer } from '../call';
 import { Avatar } from '../ui/Avatar';
+import { tileName, UNNAMED } from '../ui/CallTile';
 import { useTheme } from '../theme';
 
 /**
@@ -20,6 +29,7 @@ import { useTheme } from '../theme';
  */
 
 export interface IncomingCallScreenProps {
+  peerId: string;
   peerName: string;
   /** The caller's profile picture, when the database holds one. */
   peerAvatarB64?: string | null;
@@ -38,6 +48,7 @@ export interface IncomingCallScreenProps {
 }
 
 export function IncomingCallScreen({
+  peerId,
   peerName,
   peerAvatarB64,
   withVideo,
@@ -48,89 +59,124 @@ export function IncomingCallScreen({
 }: IncomingCallScreenProps): React.JSX.Element {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
+  const { fontScale } = useWindowDimensions();
   const styles = useMemo(() => makeStyles(theme), [theme]);
   // The module's answer, when the prop leaves it to the screen. Read once
   // per ring and only for a video invite — an audio invite offers no video
-  // answer whatever the camera says. Optimistic until it lands (a status
-  // read, not a prompt) so the buttons do not flicker in from nothing.
+  // answer whatever the camera says. Unknown stays unknown on glass: only a
+  // successful status read may advertise video, while Decline and audio
+  // answer stay usable and the tap remains the only permission request.
   const [cameraRead, setCameraRead] = useState<boolean | null>(null);
   useEffect(() => {
     if (cameraAvailableProp !== undefined || !withVideo) return undefined;
     let live = true;
-    void cameraAvailableForAnswer().then(ok => {
-      if (live) setCameraRead(ok);
-    });
+    void cameraAvailableForAnswer()
+      .then(ok => {
+        if (live) setCameraRead(ok);
+      })
+      .catch(() => {
+        if (live) setCameraRead(false);
+      });
     return () => {
       live = false;
     };
   }, [cameraAvailableProp, withVideo]);
-  const cameraAvailable = cameraAvailableProp ?? cameraRead ?? true;
+  const cameraPending =
+    withVideo && cameraAvailableProp === undefined && cameraRead === null;
+  const cameraAvailable = (cameraAvailableProp ?? cameraRead) === true;
+  const shownName = tileName(peerId, peerName);
+  const unnamed = shownName === UNNAMED;
 
   // Offered only when it adds something: on an audio call it is the same
   // action as Accept, and two buttons that do the same thing is a worse
   // screen, not a more capable one.
-  const offerAudioOnly = withVideo && cameraAvailable;
+  const offerAudioOnly = withVideo && (cameraPending || cameraAvailable);
 
   return (
     <View
-      style={[styles.root, { paddingTop: insets.top + 40, paddingBottom: insets.bottom + 32 }]}
+      style={styles.root}
       accessibilityViewIsModal
-      accessibilityLabel={`Incoming ${withVideo ? 'video' : 'audio'} call from ${peerName}`}
+      accessibilityLabel={`Incoming ${
+        withVideo ? 'video' : 'audio'
+      } call from ${shownName}`}
     >
       <StatusBar barStyle="light-content" />
-
-      <View style={styles.identity}>
-        <View style={styles.avatar}>
-          {peerAvatarB64 ? (
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={[
+          styles.content,
+          { paddingTop: insets.top + 40, paddingBottom: insets.bottom + 32 },
+        ]}
+        contentInsetAdjustmentBehavior="never"
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.identity}>
+          <View style={styles.avatar}>
             <Avatar
-              peerId=""
-              displayName={peerName}
+              peerId={peerId}
+              displayName={shownName}
+              {...(unnamed ? { monogramOverride: '?' } : {})}
               photoB64={peerAvatarB64}
               size={120}
-              accessibilityLabel={`${peerName}'s picture`}
+              accessibilityLabel={`${shownName}'s picture`}
             />
-          ) : (
-            <Text style={styles.avatarLetter}>{peerName.slice(0, 1).toUpperCase()}</Text>
+          </View>
+          <Text
+            style={styles.peer}
+            numberOfLines={1}
+            accessibilityRole="header"
+          >
+            {shownName}
+          </Text>
+          <Text style={styles.kind}>
+            {withVideo ? 'Incoming video call' : 'Incoming call'}
+          </Text>
+          {withVideo && !cameraPending && !cameraAvailable && (
+            // Said plainly rather than by omission: a person who denied camera
+            // access should learn that here, not by wondering why the video
+            // button vanished.
+            <Text style={styles.note}>
+              Video isn’t available right now, so this will connect as audio.
+            </Text>
           )}
         </View>
-        <Text style={styles.peer} numberOfLines={1} accessibilityRole="header">
-          {peerName}
-        </Text>
-        <Text style={styles.kind}>
-          {withVideo ? 'Incoming video call' : 'Incoming call'}
-        </Text>
-        {withVideo && !cameraAvailable && (
-          // Said plainly rather than by omission: a person who denied camera
-          // access should learn that here, not by wondering why the video
-          // button vanished.
-          <Text style={styles.note}>
-            Camera access is off, so this will connect as audio.
-          </Text>
-        )}
-      </View>
 
-      <View style={styles.actions}>
-        <AnswerButton
-          label="Decline"
-          tone="danger"
-          onPress={onDecline}
-          theme={theme}
-        />
-        {offerAudioOnly && (
+        <View style={styles.actions}>
           <AnswerButton
-            label="Answer without video"
-            tone="neutral"
-            onPress={onAcceptAudioOnly}
+            label={
+              cameraPending
+                ? 'Checking camera…'
+                : withVideo && cameraAvailable
+                ? 'Answer with video'
+                : 'Answer'
+            }
+            tone="accept"
+            onPress={
+              withVideo && cameraAvailable ? onAccept : onAcceptAudioOnly
+            }
+            disabled={cameraPending}
             theme={theme}
           />
-        )}
-        <AnswerButton
-          label={withVideo && cameraAvailable ? 'Answer with video' : 'Answer'}
-          tone="accept"
-          onPress={withVideo && cameraAvailable ? onAccept : onAcceptAudioOnly}
-          theme={theme}
-        />
-      </View>
+          <View style={styles.secondaryActions}>
+            <AnswerButton
+              label="Decline"
+              tone="danger"
+              onPress={onDecline}
+              basis={150 * fontScale}
+              theme={theme}
+            />
+            {offerAudioOnly && (
+              <AnswerButton
+                label="Answer without video"
+                tone="neutral"
+                onPress={onAcceptAudioOnly}
+                basis={150 * fontScale}
+                theme={theme}
+              />
+            )}
+          </View>
+        </View>
+      </ScrollView>
     </View>
   );
 }
@@ -139,41 +185,57 @@ function AnswerButton({
   label,
   tone,
   onPress,
+  disabled = false,
+  basis,
   theme,
 }: {
   label: string;
   tone: 'accept' | 'decline' | 'danger' | 'neutral';
   onPress(): void;
+  disabled?: boolean;
+  basis?: number;
   theme: ReturnType<typeof useTheme>;
 }): React.JSX.Element {
   const background =
     tone === 'danger'
       ? theme.color.danger
       : tone === 'accept'
-        ? theme.color.pine
-        : theme.color.mediaLine;
+      ? theme.color.pine
+      : theme.color.mediaLine;
   return (
     <Pressable
       onPress={onPress}
+      disabled={disabled}
       accessibilityRole="button"
       accessibilityLabel={label}
+      accessibilityState={{ disabled }}
       style={({ pressed }) => [
         {
           minHeight: 56,
           minWidth: 44,
-          flex: 1,
+          flexBasis: basis,
+          flexGrow: basis === undefined ? 0 : 1,
+          flexShrink: 0,
           alignItems: 'center',
           justifyContent: 'center',
           borderRadius: 28,
           paddingHorizontal: 12,
+          paddingVertical: 16,
           backgroundColor: background,
-          opacity: pressed ? 0.75 : 1,
+          opacity: disabled ? 0.55 : pressed ? 0.75 : 1,
         },
       ]}
     >
       <Text
-        style={{ color: theme.color.onPine, fontSize: 15, fontWeight: '600' }}
-        numberOfLines={2}
+        style={{
+          color:
+            tone === 'accept' || tone === 'danger'
+              ? theme.color.onPine
+              : theme.color.mediaInk,
+          fontSize: 15,
+          fontWeight: '600',
+          textAlign: 'center',
+        }}
       >
         {label}
       </Text>
@@ -190,8 +252,13 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       right: 0,
       bottom: 0,
       backgroundColor: theme.color.mediaBlack,
+    },
+    scroll: { flex: 1 },
+    content: {
+      flexGrow: 1,
       justifyContent: 'space-between',
       paddingHorizontal: 20,
+      gap: 32,
     },
     identity: { alignItems: 'center', gap: 12 },
     avatar: {
@@ -204,10 +271,19 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       alignItems: 'center',
       justifyContent: 'center',
     },
-    avatarLetter: { color: theme.color.mediaInk, fontSize: 40, fontWeight: '600' },
     peer: { color: theme.color.mediaInk, fontSize: 24, fontWeight: '600' },
     kind: { color: theme.color.mediaInkMuted, fontSize: 15 },
-    note: { color: theme.color.mediaInkMuted, fontSize: 13, textAlign: 'center' },
-    actions: { flexDirection: 'row', gap: 12, alignItems: 'stretch' },
+    note: {
+      color: theme.color.mediaInkMuted,
+      fontSize: 13,
+      textAlign: 'center',
+    },
+    actions: { gap: 12 },
+    secondaryActions: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: 12,
+      alignItems: 'stretch',
+    },
   });
 }

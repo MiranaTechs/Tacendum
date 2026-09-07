@@ -9,12 +9,13 @@ const home = mkdtempSync(join(tmpdir(), 'tacendum-inbound-'));
 process.env.TACENDUM_HOME = home;
 
 const { FileStores } = await import('../src/stores.js');
-const { generateAndStoreKeys, establishSession, encryptText } = await import(
-  '../src/messaging.js'
-);
+const { generateAndStoreKeys, establishSession, encryptText } = await import('../src/messaging.js');
 const { attachInbound, watchQuiet } = await import('../src/inbound.js');
 const { MessageLog } = await import('../src/msglog.js');
+const { readRoutineNotifyPreference } = await import('../src/ai-notify-preference.js');
+const { saveProfile } = await import('../src/profile.js');
 type WsClient = import('../src/wsclient.js').WsClient;
+type InboundOptions = import('../src/inbound.js').InboundOptions;
 type Reporter = import('../src/output.js').Reporter;
 
 const ALICE = '01ALICEALICEALICEALICEALIC';
@@ -51,7 +52,7 @@ class FakeWs {
     for (const h of this.handlers) h(f);
   }
   acked(msgId: string): boolean {
-    return this.sent.some(f => f.type === 'ack' && f.msgId === msgId);
+    return this.sent.some((f) => f.type === 'ack' && f.msgId === msgId);
   }
 }
 
@@ -79,6 +80,16 @@ const bobStores = new FileStores('inb-bob');
 await generateAndStoreKeys(aliceStores);
 const bobUpload = await generateAndStoreKeys(bobStores);
 await establishSession(aliceStores, ALICE, bundleFrom(BOB, bobUpload));
+saveProfile({
+  name: 'inb-bob',
+  identityKey: bobUpload.identityKey,
+  userId: BOB,
+  authToken: 'test-token',
+  registrationId: bobUpload.registrationId,
+  deviceId: 1,
+  accountClass: 'integration',
+  ownerUserId: ALICE,
+});
 
 const log = new MessageLog('inb-bob');
 
@@ -86,7 +97,11 @@ async function deliver(
   body: string,
   ws: FakeWs,
   r: Reporter,
-  opts: { corrupt?: boolean; msgId?: string } = {},
+  opts: {
+    corrupt?: boolean;
+    msgId?: string;
+    notifyPreferenceAck?: InboundOptions['notifyPreferenceAck'];
+  } = {},
 ): Promise<string> {
   const { msgType, payload } = await encryptText(aliceStores, ALICE, BOB, body);
   const msgId = opts.msgId ?? ulid();
@@ -98,6 +113,9 @@ async function deliver(
     report: r,
     log,
     consume: true,
+    ...(opts.notifyPreferenceAck === undefined
+      ? {}
+      : { notifyPreferenceAck: opts.notifyPreferenceAck }),
   });
   ws.deliver({
     type: 'msg',
@@ -149,13 +167,17 @@ describe('the inbound policy writes the log', () => {
       read: false,
     });
     // …and it still rendered to the stream, as listen always has.
-    expect(lines.some(l => l.text === 'hello bob — first contact')).toBe(true);
+    expect(lines.some((l) => l.text === 'hello bob — first contact')).toBe(true);
   });
 
   it('stores the RENDERED form of a reply, never raw envelope JSON', async () => {
     const ws = new FakeWs();
     const { r } = fakeReporter();
-    const msgId = await deliver('{"tcm":"reply","ref":"01ARZ3NDEKTSV4RRFFQ69G5FAV","ofs":false,"text":"on my way"}', ws, r);
+    const msgId = await deliver(
+      '{"tcm":"reply","ref":"01ARZ3NDEKTSV4RRFFQ69G5FAV","ofs":false,"text":"on my way"}',
+      ws,
+      r,
+    );
     const [record] = log.read({ limit: 1 });
     expect(record).toMatchObject({ id: msgId, tcm: 'reply', text: 'on my way' });
     expect(readFileSync(log.path, 'utf8')).not.toContain('{\\"tcm\\"');
@@ -172,7 +194,7 @@ describe('the inbound policy writes the log', () => {
     );
     // Consumed and shown ("store less" is about the DISK, not the stream)…
     expect(ws.acked(msgId)).toBe(true);
-    expect(lines.some(l => l.text === '[vault item saved]')).toBe(true);
+    expect(lines.some((l) => l.text === '[vault item saved]')).toBe(true);
     // …but the spool gained nothing, and the secret is nowhere in it.
     expect(log.read().length).toBe(before);
     const spool = readFileSync(log.path, 'utf8');
@@ -184,7 +206,11 @@ describe('the inbound policy writes the log', () => {
     const ws = new FakeWs();
     const { r } = fakeReporter();
     const before = log.read().length;
-    const msgId = await deliver('{"tcm":"react","ref":"01ARZ3NDEKTSV4RRFFQ69G5FAV","ofs":false,"emoji":"+1"}', ws, r);
+    const msgId = await deliver(
+      '{"tcm":"react","ref":"01ARZ3NDEKTSV4RRFFQ69G5FAV","ofs":false,"emoji":"+1"}',
+      ws,
+      r,
+    );
     expect(ws.acked(msgId)).toBe(true);
     expect(log.read().length).toBe(before);
   });
@@ -206,6 +232,79 @@ describe('the inbound policy writes the log', () => {
     await deliver('{"tcm":"profile","n":"CI — api-server","a":"","v":1}', ws, r);
     expect(bobStores.loadPeerNames()[ALICE]).toBe('CI — api-server');
     // A carrier still: named, acked, not a log record.
+    expect(log.read().length).toBe(before);
+  });
+
+  it('durably applies an owner notification preference before ack and returns an exact quiet ack', async () => {
+    const ws = new FakeWs();
+    const { r, lines } = fakeReporter();
+    const q = ulid();
+    let preferenceAtIncomingAck: unknown;
+    const preferenceAcks: { to: string; body: string; notify: false }[] = [];
+    ws.onAck = () => {
+      preferenceAtIncomingAck = readRoutineNotifyPreference('inb-bob');
+    };
+
+    const msgId = await deliver(
+      JSON.stringify({
+        tcm: 'profile',
+        n: 'Owner',
+        a: '',
+        v: 7,
+        notifyPref: { q, routine: 'quiet' },
+      }),
+      ws,
+      r,
+      { notifyPreferenceAck: async (message) => void preferenceAcks.push(message) },
+    );
+
+    expect(ws.acked(msgId)).toBe(true);
+    expect(preferenceAtIncomingAck).toEqual({ q, routine: 'quiet' });
+    expect(preferenceAcks).toHaveLength(1);
+    expect(preferenceAcks[0]).toMatchObject({ to: ALICE, notify: false });
+    expect(JSON.parse(preferenceAcks[0]!.body)).toEqual({
+      tcm: 'profile',
+      n: '',
+      a: '',
+      v: 0,
+      notifyPrefAck: { q, routine: 'quiet' },
+    });
+    expect(lines.some((line) => line.text === 'profile card: "Owner"')).toBe(true);
+  });
+
+  it('re-acks the exact persisted pair after an ack-send failure without logging it', async () => {
+    const q = ulid();
+    const before = log.read().length;
+    const failedWs = new FakeWs();
+    const failed = fakeReporter();
+    const profile = JSON.stringify({
+      tcm: 'profile',
+      n: '',
+      a: '',
+      v: 0,
+      notifyPref: { q, routine: 'quiet' },
+    });
+
+    await deliver(profile, failedWs, failed.r, {
+      notifyPreferenceAck: async () => {
+        throw new Error('receipt lost');
+      },
+    });
+    expect(readRoutineNotifyPreference('inb-bob')).toEqual({ q, routine: 'quiet' });
+    expect(failed.notes).toContain(
+      '!! notification preference applied; acknowledgement could not be sent — retry from phone',
+    );
+
+    const retryWs = new FakeWs();
+    const retry = fakeReporter();
+    const preferenceAcks: { to: string; body: string; notify: false }[] = [];
+
+    await deliver(profile, retryWs, retry.r, {
+      notifyPreferenceAck: async (message) => void preferenceAcks.push(message),
+    });
+
+    expect(preferenceAcks).toHaveLength(1);
+    expect(JSON.parse(preferenceAcks[0]!.body).notifyPrefAck).toEqual({ q, routine: 'quiet' });
     expect(log.read().length).toBe(before);
   });
 
@@ -241,9 +340,9 @@ describe('the inbound policy writes the log', () => {
       // the strength of a write that did not happen.
       expect(ws.acked(msgId)).toBe(false);
       expect(bobStores.hasSeen(msgId)).toBe(false);
-      expect(notes.some(n => n.includes('NOT acking'))).toBe(true);
+      expect(notes.some((n) => n.includes('NOT acking'))).toBe(true);
       // The plaintext this process holds is shown before it is lost.
-      expect(lines.some(l => l.unlogged === true && l.text === 'must not be silently lost')).toBe(
+      expect(lines.some((l) => l.unlogged === true && l.text === 'must not be silently lost')).toBe(
         true,
       );
     } finally {
@@ -259,7 +358,7 @@ describe('the inbound policy writes the log', () => {
     expect(ws.acked(msgId)).toBe(true); // purge the poison row
     expect(log.read().length).toBe(before);
     expect(readFileSync(log.path, 'utf8')).not.toContain('tamper target sentence');
-    expect(notes.some(n => n.includes('DECRYPT FAILED'))).toBe(true);
+    expect(notes.some((n) => n.includes('DECRYPT FAILED'))).toBe(true);
   });
 });
 
@@ -373,7 +472,7 @@ describe('an earlier revision — plain listen cannot be made to write this prog
     await deliver(body, ws, r);
 
     const lines = out.join('\n').split('\n');
-    const expected = body.split('\n').map(l => `[${ALICE}] ${l}`);
+    const expected = body.split('\n').map((l) => `[${ALICE}] ${l}`);
     const start = lines.indexOf(expected[0]!);
     expect(start, 'the message did not render at all').toBeGreaterThanOrEqual(0);
     expect(lines.slice(start, start + expected.length)).toEqual(expected);
@@ -397,7 +496,14 @@ describe('watchQuiet (the sync drain)', () => {
     for (const delay of [40, 80, 120]) {
       setTimeout(() => {
         lastFrameAt = Date.now();
-        ws.deliver({ type: 'msg', from: ALICE, msgId: ulid(), msgType: 'ciphertext', payload: 'AA', ts: 1 });
+        ws.deliver({
+          type: 'msg',
+          from: ALICE,
+          msgId: ulid(),
+          msgType: 'ciphertext',
+          payload: 'AA',
+          ts: 1,
+        });
       }, delay);
     }
     await quiet.wait(200);

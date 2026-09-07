@@ -97,13 +97,17 @@ import {
   enqueueNotification,
   notifyQueueDir,
   readHookStdin,
+  runNotificationDeliveryTest,
   runNotify,
+  sessionTag,
   takeCursorText,
   type DeliverFn,
 } from '../src/hooks.js';
 import { CliError, EXIT } from '../src/exit.js';
 import { Reporter } from '../src/output.js';
 import { saveProfile } from '../src/profile.js';
+import { AgentTextEnvelope } from '@tacendum/shared';
+import { applyOwnerNotifyPreference } from '../src/ai-notify-preference.js';
 
 /**
  * `tacendum notify --hook <host>` — the one funnel for every agent surface.
@@ -136,15 +140,30 @@ function seedAccount(name: string, ownerUserId?: string): void {
 
 /** A deliver double that records calls and succeeds. */
 function recordingDeliver(): {
-  calls: { to: string; body: string; msgId: string }[];
+  calls: { to: string; body: string; msgId: string; notify?: false }[];
   fn: DeliverFn;
 } {
-  const calls: { to: string; body: string; msgId: string }[] = [];
-  const fn: DeliverFn = async ({ to, body, msgId }) => {
-    calls.push({ to, body, msgId });
+  const calls: { to: string; body: string; msgId: string; notify?: false }[] = [];
+  const fn: DeliverFn = async ({ to, body, msgId, notify }) => {
+    calls.push({ to, body, msgId, ...(notify === false ? { notify: false as const } : {}) });
     return { msgId, state: 'sent' };
   };
   return { calls, fn };
+}
+
+function setQuiet(account = 'ci'): void {
+  applyOwnerNotifyPreference(
+    account,
+    OWNER,
+    OWNER,
+    JSON.stringify({
+      tcm: 'profile',
+      n: '',
+      a: '',
+      v: 0,
+      notifyPref: { q: '01HQXW0000000000000000PREF', routine: 'quiet' },
+    }),
+  );
 }
 
 const stdinOf = (payload: unknown) => () => JSON.stringify(payload);
@@ -155,6 +174,35 @@ const claudeStop = stdinOf({
   hook_event_name: 'Stop',
   cwd: '/w/proj',
   last_assistant_message: 'the build is green',
+});
+
+describe('the explicit setup delivery test', () => {
+  it('uses the durable notify core without inventing a provider completion event', async () => {
+    seedAccount('ci', OWNER);
+    const delivery = recordingDeliver();
+    const outcome = await runNotificationDeliveryTest('ci', 'codex', report, {
+      deliver: delivery.fn,
+    });
+
+    expect(outcome).toEqual({ action: 'notified', state: 'sent' });
+    expect(delivery.calls).toHaveLength(1);
+    expect(delivery.calls[0]?.to).toBe(OWNER);
+    expect(delivery.calls[0]?.body).toContain('Tacendum notification delivery test');
+    expect(delivery.calls[0]?.body).not.toContain('"work"');
+  });
+
+  it('returns queued truth without printing a second command result', async () => {
+    seedAccount('ci', OWNER);
+    const outcome = await runNotificationDeliveryTest('ci', 'claude', report, {
+      deliver: async () => {
+        throw new Error('offline');
+      },
+    });
+    expect(outcome).toEqual({ action: 'queued' });
+    expect(readdirSync(notifyQueueDir('ci')).filter((name) => name.endsWith('.json'))).toHaveLength(
+      1,
+    );
+  });
 });
 
 const queueJsonEntries = (account: string): string[] => {
@@ -181,6 +229,106 @@ afterEach(() => {
 });
 
 describe('host parsers feed one core (field-name shims only)', () => {
+  it('keeps an owner-targeted finished hook quiet after the preference is acknowledged', async () => {
+    setQuiet();
+    const { calls, fn } = recordingDeliver();
+    await runNotify(['--hook', 'claude', '--account', 'ci'], report, {
+      deliver: fn,
+      readStdin: claudeStop,
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.notify).toBe(false);
+  });
+
+  it('persists quiet on a failed finished hook and its later queue retry', async () => {
+    setQuiet();
+    await runNotify(['--hook', 'claude', '--account', 'ci'], report, {
+      deliver: async () => {
+        throw new CliError(EXIT.NETWORK, 'offline');
+      },
+      readStdin: claudeStop,
+    });
+    const queuedName = queueJsonEntries('ci')[0] as string;
+    const queued = JSON.parse(readFileSync(join(notifyQueueDir('ci'), queuedName), 'utf8')) as {
+      notify?: boolean;
+    };
+    expect(queued.notify).toBe(false);
+
+    const { calls, fn } = recordingDeliver();
+    await runNotify(['--hook', 'claude', '--account', 'ci'], report, {
+      deliver: fn,
+      readStdin: claudeStop,
+    });
+    expect(calls[0]?.notify).toBe(false);
+  });
+
+  it('keeps owner attention hooks notifying while routine completion is quiet', async () => {
+    setQuiet();
+    const { calls, fn } = recordingDeliver();
+    await runNotify(['--hook', 'claude', '--account', 'ci'], report, {
+      deliver: fn,
+      readStdin: stdinOf({
+        hook_event_name: 'Notification',
+        cwd: '/w/proj',
+        message: 'Claude needs your permission to use Bash',
+      }),
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.notify).toBeUndefined();
+  });
+
+  it('keeps an explicit non-owner hook delivery notifying', async () => {
+    setQuiet();
+    const { calls, fn } = recordingDeliver();
+    await runNotify(['--hook', 'claude', '--account', 'ci', '--to', OTHER], report, {
+      deliver: fn,
+      readStdin: claudeStop,
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.to).toBe(OTHER);
+    expect(calls[0]?.notify).toBeUndefined();
+  });
+
+  it('emits one canonical, persisted turn-complete event from the Codex final hook', async () => {
+    writeFileSync(join(home, 'ci', 'attend.json'), JSON.stringify({ markerMinAppBuild: 42 }), {
+      mode: 0o600,
+    });
+    const { calls, fn } = recordingDeliver();
+    await runNotify(
+      [
+        '--hook',
+        'codex',
+        '--account',
+        'ci',
+        JSON.stringify({
+          type: 'agent-turn-complete',
+          cwd: '/Users/x/projects/renamer',
+          'thread-id': '019ff79c-6737-7ab2-b66b-1e4ca184c56d',
+          'last-assistant-message': 'Rename complete.',
+        }),
+      ],
+      report,
+      { deliver: fn, readStdin: neverStdin },
+    );
+
+    const sent = calls[0];
+    expect(sent).toBeDefined();
+    const envelope = AgentTextEnvelope.parse(JSON.parse(sent?.body as string));
+    const runTag = sessionTag('019ff79c-6737-7ab2-b66b-1e4ca184c56d');
+    expect(envelope.text).toBe(`renamer · ${runTag}: agent finished\nRename complete.`);
+    expect(envelope.work).toEqual({
+      provider: 'codex',
+      updatedAt: expect.any(Number),
+      event: 'turn-complete',
+      eventId: sent?.msgId,
+      project: 'renamer',
+      runTag,
+    });
+  });
+
   it('claude Stop: stdin JSON, body from last_assistant_message, tag from cwd', async () => {
     const { calls, fn } = recordingDeliver();
     const code = await runNotify(['--hook', 'claude', '--account', 'ci'], report, {
@@ -212,6 +360,34 @@ describe('host parsers feed one core (field-name shims only)', () => {
     );
   });
 
+  it('persists a source-backed waiting-for-input event for a provider attention hook', async () => {
+    writeFileSync(join(home, 'ci', 'attend.json'), JSON.stringify({ markerMinAppBuild: 42 }), {
+      mode: 0o600,
+    });
+    const { calls, fn } = recordingDeliver();
+    await runNotify(['--hook', 'claude', '--account', 'ci'], report, {
+      deliver: fn,
+      now: () => 1_800_000_000_000,
+      readStdin: stdinOf({
+        hook_event_name: 'Notification',
+        cwd: '/w/proj',
+        message: 'Claude needs your permission to use Bash',
+      }),
+    });
+
+    const envelope = AgentTextEnvelope.parse(JSON.parse(calls[0]?.body as string));
+    expect(envelope.text).toBe(
+      'proj: agent needs attention\nClaude needs your permission to use Bash',
+    );
+    expect(envelope.work).toEqual({
+      provider: 'claude',
+      updatedAt: 1_800_000_000_000,
+      event: 'waiting-for-input',
+      eventId: calls[0]?.msgId,
+      project: 'proj',
+    });
+  });
+
   it('claude: an event this command does not notify on is ignored, exit 0', async () => {
     const { calls, fn } = recordingDeliver();
     const code = await runNotify(['--hook', 'claude', '--account', 'ci'], report, {
@@ -231,11 +407,10 @@ describe('host parsers feed one core (field-name shims only)', () => {
       'input-messages': ['Rename foo to bar'],
       'last-assistant-message': 'Rename complete.',
     });
-    const code = await runNotify(
-      ['--hook', 'codex', '--account', 'ci', payload],
-      report,
-      { deliver: fn, readStdin: neverStdin },
-    );
+    const code = await runNotify(['--hook', 'codex', '--account', 'ci', payload], report, {
+      deliver: fn,
+      readStdin: neverStdin,
+    });
     expect(code).toBe(EXIT.OK);
     expect(calls[0]?.body).toBe('renamer: agent finished\nRename complete.');
   });
@@ -286,7 +461,9 @@ describe('cursor: the two-hook dance', () => {
       readStdin: stop(CONV_A),
     });
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.body).toBe('webapp · s-9191: agent finished\nRefactor finished; 3 files changed.');
+    expect(calls[0]?.body).toBe(
+      'webapp · s-9191: agent finished\nRefactor finished; 3 files changed.',
+    );
     // Consumed: the plaintext does not linger once it has been sent — neither
     // the cache entry nor the delivery claim.
     expect(existsSync(cachePath)).toBe(false);
@@ -297,13 +474,16 @@ describe('cursor: the two-hook dance', () => {
     const { calls, fn } = recordingDeliver();
     const opts = { deliver: fn };
     await runNotify(['--hook', 'cursor', '--account', 'ci'], report, {
-      ...opts, readStdin: afterResponse(CONV_A, 'text for session A'),
+      ...opts,
+      readStdin: afterResponse(CONV_A, 'text for session A'),
     });
     await runNotify(['--hook', 'cursor', '--account', 'ci'], report, {
-      ...opts, readStdin: afterResponse(CONV_B, 'text for session B'),
+      ...opts,
+      readStdin: afterResponse(CONV_B, 'text for session B'),
     });
     await runNotify(['--hook', 'cursor', '--account', 'ci'], report, {
-      ...opts, readStdin: stop(CONV_A),
+      ...opts,
+      readStdin: stop(CONV_A),
     });
     expect(calls).toHaveLength(1);
     expect(calls[0]?.body).toContain('text for session A');
@@ -362,10 +542,7 @@ describe('cursor: the two-hook dance', () => {
   it('a crashed run cannot strand plaintext forever: stale cache is swept', async () => {
     const { calls, fn } = recordingDeliver();
     cacheCursorText('ci', CONV_A, 'orphaned plaintext from a crashed session');
-    const cachePath = join(
-      cursorCacheDir('ci'),
-      readdirSync(cursorCacheDir('ci'))[0] as string,
-    );
+    const cachePath = join(cursorCacheDir('ci'), readdirSync(cursorCacheDir('ci'))[0] as string);
     const dayAgo = (Date.now() - 25 * 60 * 60 * 1000) / 1000;
     utimesSync(cachePath, dayAgo, dayAgo);
 
@@ -380,10 +557,7 @@ describe('cursor: the two-hook dance', () => {
 
   it('the sweep does not depend on cursor ever firing again: any host’s notify runs it', async () => {
     cacheCursorText('ci', CONV_A, 'final response of a retired cursor session');
-    const cachePath = join(
-      cursorCacheDir('ci'),
-      readdirSync(cursorCacheDir('ci'))[0] as string,
-    );
+    const cachePath = join(cursorCacheDir('ci'), readdirSync(cursorCacheDir('ci'))[0] as string);
     const dayAgo = (Date.now() - 25 * 60 * 60 * 1000) / 1000;
     utimesSync(cachePath, dayAgo, dayAgo);
 
@@ -556,6 +730,35 @@ describe('never block the agent: queue-and-exit-0 on every failure', () => {
     expect(calls[0]?.msgId).toBe(attempted[0]);
   });
 
+  it('persists the same work eventId through a failed send and queue retry', async () => {
+    writeFileSync(join(home, 'ci', 'attend.json'), JSON.stringify({ markerMinAppBuild: 42 }), {
+      mode: 0o600,
+    });
+    const failing: DeliverFn = async () => {
+      throw new CliError(EXIT.NETWORK, 'down');
+    };
+    await runNotify(['--hook', 'claude', '--account', 'ci'], report, {
+      deliver: failing,
+      readStdin: claudeStop,
+    });
+    const entryName = queueJsonEntries('ci')[0] as string;
+    const queued = JSON.parse(readFileSync(join(notifyQueueDir('ci'), entryName), 'utf8')) as {
+      body: string;
+      msgId: string;
+    };
+    const queuedWork = AgentTextEnvelope.parse(JSON.parse(queued.body)).work;
+    expect(queuedWork?.eventId).toBe(queued.msgId);
+
+    const { calls, fn } = recordingDeliver();
+    await runNotify(['--hook', 'claude', '--account', 'ci'], report, {
+      deliver: fn,
+      readStdin: claudeStop,
+    });
+    const retried = calls[0];
+    expect(retried?.msgId).toBe(queued.msgId);
+    expect(AgentTextEnvelope.parse(JSON.parse(retried?.body as string)).work).toEqual(queuedWork);
+  });
+
   it('a failed flush restores the entry and queues the live event too', async () => {
     enqueueNotification('ci', OWNER, 'still undeliverable');
     const failing: DeliverFn = async () => {
@@ -569,9 +772,15 @@ describe('never block the agent: queue-and-exit-0 on every failure', () => {
     const entries = queueJsonEntries('ci');
     expect(entries).toHaveLength(2); // the restored entry + the new event
     const bodies = entries
-      .map((n) => (JSON.parse(readFileSync(join(notifyQueueDir('ci'), n), 'utf8')) as { body: string }).body)
+      .map(
+        (n) =>
+          (JSON.parse(readFileSync(join(notifyQueueDir('ci'), n), 'utf8')) as { body: string })
+            .body,
+      )
       .sort();
-    expect(bodies).toEqual(['proj: agent finished\nthe build is green', 'still undeliverable'].sort());
+    expect(bodies).toEqual(
+      ['proj: agent finished\nthe build is green', 'still undeliverable'].sort(),
+    );
   });
 
   it('a claim is FRESH at birth: an old entry cannot be judged stale mid-delivery', async () => {
@@ -690,6 +899,33 @@ describe('never block the agent: queue-and-exit-0 on every failure', () => {
 });
 
 describe('transport before ratchet (the real deliver path, protocol mocked)', () => {
+  it('keeps a failed notify:false reply quiet when the hook queue retries it', async () => {
+    const { realSendReply } = await import('../src/attend.js');
+    h.connect = async () => {
+      throw new CliError(EXIT.NETWORK, 'offline');
+    };
+    await realSendReply(
+      'ci',
+      JSON.stringify({ tcm: 'edit', ref: 'anchor', text: 'final answer' }),
+      undefined,
+      { notify: false },
+    );
+
+    const queuedName = queueJsonEntries('ci')[0] as string;
+    const queued = JSON.parse(readFileSync(join(notifyQueueDir('ci'), queuedName), 'utf8')) as {
+      notify?: boolean;
+    };
+    expect(queued.notify).toBe(false);
+
+    h.connect = async () => {};
+    await runNotify(['--hook', 'claude', '--account', 'ci'], report, {
+      readStdin: claudeStop,
+    });
+    expect(h.sentFrames).toHaveLength(2);
+    expect(h.sentFrames[0]?.notify).toBe(false);
+    expect(h.sentFrames[1]?.notify).toBeUndefined();
+  });
+
   it('a refused socket costs ZERO ratchet advances — and still queues, exit 0', async () => {
     // The bricking order was encrypt-then-connect: every failed attempt
     // durably advanced the sender chain, libsignal caps the receiver's

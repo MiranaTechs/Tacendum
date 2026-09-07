@@ -43,7 +43,7 @@ const {
 } = await import('../src/claude-sdk.js');
 const { driverFor } = await import('../src/attend-drivers.js');
 const attend = await import('../src/attend.js');
-const { cmdAttendEnable, loadAttendConfig } = attend;
+const { cmdAttendEnable, cmdAttendStatus, loadAttendConfig } = attend;
 const { hostSessionKey } = await import('../src/hooks.js');
 const { Reporter } = await import('../src/output.js');
 const { CliError, EXIT } = await import('../src/exit.js');
@@ -94,9 +94,7 @@ const RESULT = (text: string): Msg => ({
 
 /** A scripted SDK module: `run` yields the message stream and may drive the
  * captured `canUseTool` mid-stream, exactly as the real CLI does. */
-function fakeSdk(
-  run: (opts: Record<string, unknown>) => AsyncGenerator<unknown>,
-): {
+function fakeSdk(run: (opts: Record<string, unknown>) => AsyncGenerator<unknown>): {
   importSdk: () => Promise<unknown>;
   options: () => Record<string, unknown>;
   closes: () => number;
@@ -149,9 +147,11 @@ describe('translateCapsForSdk — fail-closed, the app-server translation’s sh
       translateCapsForSdk(['--permission-mode', 'plan', '--permission-mode', 'default']),
     ).toEqual({ ok: true, permissionMode: 'default' });
     expect(translateCapsForSdk(['--model', 'haiku'])).toEqual({ ok: true, model: 'haiku' });
-    expect(
-      translateCapsForSdk(['--permission-mode', 'default', '--model=haiku']),
-    ).toEqual({ ok: true, permissionMode: 'default', model: 'haiku' });
+    expect(translateCapsForSdk(['--permission-mode', 'default', '--model=haiku'])).toEqual({
+      ok: true,
+      permissionMode: 'default',
+      model: 'haiku',
+    });
     expect(translateCapsForSdk([])).toEqual({ ok: true });
   });
 
@@ -186,9 +186,7 @@ describe('translateCapsForSdk — fail-closed, the app-server translation’s sh
     expect(res.code).toBe(1);
     expect(res.refusal).toBeNull();
     expect(res.stdout).toContain('position 1 of 2');
-    expect(res.stdout, 'the value is never echoed (enable’s rule)').not.toContain(
-      'secret-value',
-    );
+    expect(res.stdout, 'the value is never echoed (enable’s rule)').not.toContain('secret-value');
     expect(res.stdout).toContain('subprocess');
   });
 });
@@ -240,11 +238,14 @@ describe('the run-time auth gate — system/init.apiKeySource, fail closed (the 
 
   for (const [label, initMsg] of [
     ['"none" (the measured subscription value)', INIT({ apiKeySource: 'none' })],
-    ['an init frame with NO apiKeySource field', (() => {
-      const m = INIT();
-      delete m.apiKeySource;
-      return m;
-    })()],
+    [
+      'an init frame with NO apiKeySource field',
+      (() => {
+        const m = INIT();
+        delete m.apiKeySource;
+        return m;
+      })(),
+    ],
     ['"oauth" (declared in the union, still not a key)', INIT({ apiKeySource: 'oauth' })],
     ['a novel string no build has seen', INIT({ apiKeySource: 'shiny-new-source-2027' })],
   ] as const) {
@@ -383,7 +384,7 @@ describe('canUseTool through the supervisor’s ask seam', () => {
     const input = { command: 'touch approved.txt', description: 'touch' };
     const asks: ApprovalAsk[] = [];
     const { res, result } = await runWithAsk(
-      async a => {
+      async (a) => {
         asks.push(a);
         return 'approve';
       },
@@ -418,7 +419,7 @@ describe('canUseTool through the supervisor’s ask seam', () => {
     // defects shipped under a green suite.
     const before = Date.now();
     const { res, result } = await runWithAsk(
-      () => new Promise(resolve => setTimeout(() => resolve('deny'), 30)),
+      () => new Promise((resolve) => setTimeout(() => resolve('deny'), 30)),
       'Bash',
       { command: 'touch lapsed.txt' },
     );
@@ -599,7 +600,7 @@ describe('the driver split — subprocess untouched, sdk routed, unknown refused
   it('claudeDriver absent stays the subprocess path, byte-for-byte', async () => {
     const calls: string[][] = [];
     const io: DriverIo = {
-      spawn: async argv => {
+      spawn: async (argv) => {
         calls.push(argv);
         return { stdout: 'done', stderr: '', code: 0 };
       },
@@ -665,10 +666,12 @@ describe('attend enable — the configure-time half of the two refusals', () => 
     const human = out[0]!.human;
     expect(human).toContain('sdk driver');
     expect(human).toContain('operator-supplied API key');
-    // the recorded rulings product sentence, un-rounded.
+    // Scope the API-key requirement to this remote answerer. Native
+    // interactive Claude uses a separate PermissionRequest hook lane.
     expect(human).toContain(
-      'Approvals work with codex on any sign-in, and with claude only when you supply an API key',
+      'Phone approvals for this SDK answerer require the operator-supplied API key',
     );
+    expect(human).toContain('interactive Claude Code PermissionRequest bridge is separate');
   });
 
   it('REFUSES when the SDK module is absent, naming the operator’s own install step; nothing is saved', () => {
@@ -683,7 +686,7 @@ describe('attend enable — the configure-time half of the two refusals', () => 
     const { report } = capture();
     for (const env of [{}, { ANTHROPIC_API_KEY: '' }, { ANTHROPIC_API_KEY: '   ' }]) {
       expect(() => cmdAttendEnable('bot', sdkOpts, report, { ...okIo, env })).toThrowError(
-        /operator-supplied Anthropic API key/,
+        /Phone approvals for this SDK answerer require API-key auth/,
       );
     }
     expect(loadAttendConfig('bot')).toBeNull();
@@ -700,7 +703,12 @@ describe('attend enable — the configure-time half of the two refusals', () => 
     ] as const) {
       let code: number | undefined;
       try {
-        cmdAttendEnable('bot', { host, driver, bin: process.execPath, workdir: '/w' }, report, okIo);
+        cmdAttendEnable(
+          'bot',
+          { host, driver, bin: process.execPath, workdir: '/w' },
+          report,
+          okIo,
+        );
       } catch (e) {
         code = e instanceof CliError ? e.exitCode : -1;
       }
@@ -719,6 +727,33 @@ describe('attend enable — the configure-time half of the two refusals', () => 
     );
     expect(loadAttendConfig('bot')?.claudeDriver).toBe('subprocess');
     expect(out[0]!.human).toContain('subprocess driver');
+    expect(out[0]!.human).toContain('noninteractive claude -p');
+    expect(out[0]!.human).toContain('does not fire PermissionRequest');
+  });
+
+  it('status keeps subprocess and SDK approval lanes scoped to their actual Claude modes', () => {
+    const subprocess = capture();
+    cmdAttendEnable(
+      'bot',
+      { host: 'claude', driver: 'subprocess', bin: process.execPath, workdir: '/w' },
+      subprocess.report,
+      { sdkPresent: () => false, env: {} },
+    );
+    cmdAttendStatus('bot', subprocess.report);
+    expect(subprocess.out[1]!.human).toContain('noninteractive claude -p');
+    expect(subprocess.out[1]!.human).toContain('does not fire PermissionRequest');
+    expect(subprocess.out[1]!.human).toContain(
+      'interactive Claude Code PermissionRequest bridge is separate',
+    );
+
+    rmSync(join(home, 'bot', 'attend.json'), { force: true });
+    const sdk = capture();
+    cmdAttendEnable('bot', sdkOpts, sdk.report, okIo);
+    cmdAttendStatus('bot', sdk.report);
+    expect(sdk.out[1]!.human).toContain('Phone approvals for this SDK answerer require');
+    expect(sdk.out[1]!.human).toContain(
+      'interactive Claude Code PermissionRequest bridge is separate',
+    );
   });
 
   it('--approvals now binds to the claude sdk profile too, and still refuses everything surface-less', () => {

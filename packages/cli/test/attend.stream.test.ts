@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { StreamEditEnvelope } from '@tacendum/shared';
+import { AiWorkMetadataSchema, StreamEditEnvelope } from '@tacendum/shared';
 import type { AttendConfig, OutSess, TypingChannel } from '../src/attend.js';
 import type { HostDriver, TurnRequest } from '../src/attend-drivers.js';
 
@@ -53,12 +53,11 @@ const seams = vi.hoisted(() => ({
   driver: null as HostDriver | null,
 }));
 
-vi.mock('../src/attend-drivers.js', async importOriginal => {
+vi.mock('../src/attend-drivers.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../src/attend-drivers.js')>();
   return {
     ...real,
-    driverFor: (host: Parameters<typeof real.driverFor>[0]) =>
-      seams.driver ?? real.driverFor(host),
+    driverFor: (host: Parameters<typeof real.driverFor>[0]) => seams.driver ?? real.driverFor(host),
   };
 });
 
@@ -137,7 +136,7 @@ async function poll(cond: () => boolean, ms = 10_000): Promise<void> {
   const until = Date.now() + ms;
   while (!cond()) {
     if (Date.now() > until) throw new Error('poll timed out');
-    await new Promise(r => setTimeout(r, 5));
+    await new Promise((r) => setTimeout(r, 5));
   }
 }
 
@@ -150,7 +149,7 @@ const clockIo = () => {
     now: () => t,
     sleep: async (ms: number): Promise<void> => {
       t += ms;
-      await new Promise(r => setTimeout(r, 2));
+      await new Promise((r) => setTimeout(r, 2));
     },
   };
 };
@@ -161,12 +160,8 @@ const fakeSend = () => {
   const sends: { body: string; id: string; notify?: false }[] = [];
   return {
     sends,
-    bodies: () => sends.map(s => s.body),
-    sendReply: async (
-      b: string,
-      _sess?: OutSess,
-      opts?: { notify?: boolean },
-    ): Promise<string> => {
+    bodies: () => sends.map((s) => s.body),
+    sendReply: async (b: string, _sess?: OutSess, opts?: { notify?: boolean }): Promise<string> => {
       const id = mid();
       sends.push({ body: b, id, ...(opts?.notify === false ? { notify: false as const } : {}) });
       return id;
@@ -219,16 +214,18 @@ const streamTypingFake = (
  * and the pushes suddenly flow, the anchor appears, and the single-reply
  * assertions fail).
  */
-const streamDriver = (opts: {
-  reply?: string;
-  failWith?: Error;
-  ask?: { payload: string; ttlMs: number; pushBeforeAsk?: string };
-} = {}) => {
+const streamDriver = (
+  opts: {
+    reply?: string;
+    failWith?: Error;
+    ask?: { payload: string; ttlMs: number; pushBeforeAsk?: string };
+  } = {},
+) => {
   let stream: ((s: string) => void) | undefined;
   let offered = false;
   let calls = 0;
   let release: (() => void) | undefined;
-  const released = new Promise<void>(r => {
+  const released = new Promise<void>((r) => {
     release = r;
   });
   const driver: HostDriver = {
@@ -284,9 +281,14 @@ beforeEach(() => {
   seq = 0;
   seams.driver = null;
   saveProfile({
-    name: 'bot', identityKey: 'AAAA', userId: SELF,
-    deviceId: 1, authToken: 'tok', registrationId: 1,
-    accountClass: 'integration', ownerUserId: OWNER,
+    name: 'bot',
+    identityKey: 'AAAA',
+    userId: SELF,
+    deviceId: 1,
+    authToken: 'tok',
+    registrationId: 1,
+    accountClass: 'integration',
+    ownerUserId: OWNER,
   });
   attestedCfg();
 });
@@ -309,7 +311,7 @@ describe('the attestation gate (red-first: never-attested = today, forever)', ()
     // and they mint an anchor, which fails every assertion after them.
     fake.push('half a ');
     fake.push('half a thought');
-    await new Promise(r => setTimeout(r, 60)); // many fake cadence ticks
+    await new Promise((r) => setTimeout(r, 60)); // many fake cadence ticks
     expect(fake.offered(), 'an un-attested turn never learns the seam exists').toBe(false);
     expect(h.sends, 'nothing may leave mid-turn').toEqual([]);
     expect(journalFile().streamAnchor, 'no anchor is ever journalled').toBeUndefined();
@@ -340,8 +342,13 @@ describe('the attestation gate (red-first: never-attested = today, forever)', ()
     // And the host/driver clauses: the field hand-planted on a claude
     // profile is a claim nothing reads — claude cannot stream (v1).
     saveAttendConfig('bot', {
-      host: 'claude', bin: '/opt/agent', workdir: '/w', caps: ['--permission-mode', 'plan'],
-      ownSession: OWN_SESSION, turnsPerHour: 10, streamMinAppBuild: 42,
+      host: 'claude',
+      bin: '/opt/agent',
+      workdir: '/w',
+      caps: ['--permission-mode', 'plan'],
+      ownSession: OWN_SESSION,
+      turnsPerHour: 10,
+      streamMinAppBuild: 42,
     });
     new MessageLog('bot').append(inRow('more work'));
     fake = streamDriver({ reply: 'claude answer' });
@@ -386,11 +393,17 @@ describe('the lifecycle (moving clock): anchor → x.edit intermediates → dura
     const first = StreamEditEnvelope.parse(JSON.parse((typing.edits[0] as { body: string }).body));
     // `ai:true` on every frame — an x.edit is only ever
     // agent-authored, and the marker rides the strict composer.
-    expect(first).toEqual({ tcm: 'x.edit', ref: anchor.id, seq: 1, text: 'The answer is 42', ai: true });
+    expect(first).toEqual({
+      tcm: 'x.edit',
+      ref: anchor.id,
+      seq: 1,
+      text: 'The answer is 42',
+      ai: true,
+    });
 
     // ONLY-IF-CHANGED: the same snapshot again emits nothing.
     fake.push('The answer is 42');
-    await new Promise(r => setTimeout(r, 60)); // many fake cadence ticks
+    await new Promise((r) => setTimeout(r, 60)); // many fake cadence ticks
     expect(typing.edits).toHaveLength(1);
 
     fake.push('The answer is 42, truly');
@@ -407,7 +420,12 @@ describe('the lifecycle (moving clock): anchor → x.edit intermediates → dura
     expect(h.sends).toHaveLength(2);
     const final = h.sends[1] as { body: string; notify?: false };
     expect(final.notify, 'the final must not ring a phone the anchor already rang').toBe(false);
-    expect(JSON.parse(final.body)).toEqual({
+    const parsedFinal = JSON.parse(final.body) as Record<string, unknown>;
+    const { work: rawWork, ...legacyFinal } = parsedFinal;
+    // Keep the original frame contract exact. `work` is supplementary and
+    // gets its own strict source-backed assertions below rather than making
+    // this comparison broadly permissive.
+    expect(legacyFinal).toEqual({
       tcm: 'edit',
       ref: anchor.id,
       text: 'The answer is 42, truly — final.',
@@ -415,6 +433,23 @@ describe('the lifecycle (moving clock): anchor → x.edit intermediates → dura
       // a KNOWN kind's unknown field is invisible to every shipped parser.
       ai: true,
     });
+    const work = AiWorkMetadataSchema.parse(rawWork);
+    expect(work).toMatchObject({
+      provider: 'codex',
+      event: 'turn-complete',
+      usage: [
+        {
+          source: 'local-budget',
+          unit: 'turns',
+          period: 'hour',
+          used: 1,
+          remaining: 9,
+          limit: 10,
+        },
+      ],
+    });
+    expect(work.eventId).toMatch(/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+    expect(work.usage?.[0]?.observedAt).toBe(work.updatedAt);
     expect(final.body.startsWith('{"tcm":'), 'the envelope leads with the routing sentinel').toBe(
       true,
     );
@@ -483,13 +518,13 @@ describe('the lifecycle (moving clock): anchor → x.edit intermediates → dura
 
     // Past the cap: intermediates fall SILENT — no error, no reply — while
     // typing refreshes continue (the indicator is the honest signal left).
-    const typingAtCap = typing.events.filter(e => e.state === 'start').length;
+    const typingAtCap = typing.events.filter((e) => e.state === 'start').length;
     fake.push('over the cap 1');
     fake.push('over the cap 2');
-    await new Promise(r => setTimeout(r, 60)); // many fake refresh windows
+    await new Promise((r) => setTimeout(r, 60)); // many fake refresh windows
     expect(typing.edits).toHaveLength(STREAM_EDITS_PER_TURN_MAX);
     expect(
-      typing.events.filter(e => e.state === 'start').length,
+      typing.events.filter((e) => e.state === 'start').length,
       'typing must continue past the cap',
     ).toBeGreaterThan(typingAtCap);
 
@@ -522,7 +557,7 @@ describe('the fresh gate (red-first: a drained backlog streams nothing)', () => 
     // The mutation trap again: drop the fresh gate in the arming predicate
     // and this push mints an anchor, failing the single-reply assertion.
     fake.push('a bubble nobody is watching');
-    await new Promise(r => setTimeout(r, 60));
+    await new Promise((r) => setTimeout(r, 60));
     expect(fake.offered(), 'a stale trigger never arms the seam').toBe(false);
     fake.finish();
     expect(await run).toBe('answered');
@@ -548,7 +583,7 @@ describe('chatter isolation and suppression', () => {
     await poll(() => h.sends.length >= 1); // the anchor still goes — it is durable
     fake.push('the whole answer in progress');
     fake.push('the whole answer in progress, still');
-    await new Promise(r => setTimeout(r, 60)); // attempts made, all swallowed
+    await new Promise((r) => setTimeout(r, 60)); // attempts made, all swallowed
     expect(typing.edits).toEqual([]);
 
     fake.finish();
@@ -558,7 +593,7 @@ describe('chatter isolation and suppression', () => {
     expect(final.notify).toBe(false);
     expect(JSON.parse(final.body)).toMatchObject({ tcm: 'edit', text: 'the whole answer' });
     expect(
-      h.bodies().some(b => /edit transport|error|fail/i.test(b) && !b.startsWith('{"tcm":')),
+      h.bodies().some((b) => /edit transport|error|fail/i.test(b) && !b.startsWith('{"tcm":')),
       'nothing about the channel failure may reach the phone',
     ).toBe(false);
   }, 30_000);
@@ -577,7 +612,7 @@ describe('chatter isolation and suppression', () => {
     fake.push('the');
     await poll(() => h.sends.length >= 1);
     fake.push('the answer forming');
-    await new Promise(r => setTimeout(r, 60));
+    await new Promise((r) => setTimeout(r, 60));
     expect(typing.edits).toEqual([]);
     fake.finish();
     expect(await run).toBe('answered');
@@ -602,7 +637,7 @@ describe('chatter isolation and suppression', () => {
     // The snapshot existed BEFORE the park (pushBeforeAsk), and the park
     // spins the shared cadence for a long fake while — yet no anchor may
     // leave: a parked turn is the model waiting on the HUMAN.
-    await new Promise(r => setTimeout(r, 60));
+    await new Promise((r) => setTimeout(r, 60));
     expect(h.sends).toHaveLength(1); // the approval prompt, and nothing else
     expect((h.sends[0] as { body: string }).body).toContain('Approval needed');
     expect(journalFile().streamAnchor).toBeUndefined();
@@ -611,12 +646,22 @@ describe('chatter isolation and suppression', () => {
     new MessageLog('bot').append(inRow('approve', { tcm: 'reply', ref: cardMsgId }));
     // The decision unparks the turn; the next cadence tick mints the anchor
     // from the snapshot that waited.
-    await poll(() => h.sends.some(s => s.body === 'early partial'));
+    await poll(() => h.sends.some((s) => s.body === 'early partial'));
     fake.finish();
     expect(await run).toBe('answered');
-    const final = h.sends.at(-1) as { body: string; notify?: false };
+    const final = h.sends.find((s) => {
+      if (!s.body.startsWith('{"tcm":')) return false;
+      return (JSON.parse(s.body) as { tcm?: string }).tcm === 'edit';
+    }) as { body: string; notify?: false };
     expect(final.notify).toBe(false);
     expect(JSON.parse(final.body)).toMatchObject({ tcm: 'edit', text: 'done after approval' });
+    const observation = h.sends.at(-1) as { body: string; notify?: false };
+    expect(observation.notify).toBe(false);
+    expect(JSON.parse(observation.body)).toMatchObject({
+      tcm: 'reply',
+      text: 'Approval decision returned to codex.',
+      work: { approvalObservation: 'decision-returned' },
+    });
   }, 30_000);
 });
 
@@ -643,11 +688,11 @@ describe('the interleaved ask: the final lands at the tail, never hidden above t
     let stream: ((s: string) => void) | undefined;
     let calls = 0;
     let askNow: (() => void) | undefined;
-    const askGate = new Promise<void>(r => {
+    const askGate = new Promise<void>((r) => {
       askNow = r;
     });
     let release: (() => void) | undefined;
-    const released = new Promise<void>(r => {
+    const released = new Promise<void>((r) => {
       release = r;
     });
     let decision: string | undefined;
@@ -710,12 +755,15 @@ describe('the interleaved ask: the final lands at the tail, never hidden above t
     // THE FIX, pinned (red before: the last send was the {tcm:'edit'} onto
     // the anchor, notify:false — invisible at the tail): the final is a NEW
     // plain reply, and it RINGS, because at the tail it is genuinely new.
-    const final = h.sends.at(-1) as { body: string; notify?: false };
+    const final = h.sends.find((s) => s.body === 'Created demo.txt with the demo line.') as {
+      body: string;
+      notify?: false;
+    };
     expect(final.body).toBe('Created demo.txt with the demo line.');
     expect(final.body.startsWith('{"tcm":'), 'the final is prose, not a carrier').toBe(false);
     expect(final.notify, 'a genuinely new tail message rings').toBeUndefined();
     expect(
-      h.bodies().filter(b => b.startsWith('{"tcm":"edit"')),
+      h.bodies().filter((b) => b.startsWith('{"tcm":"edit"')),
       'no durable edit may land on an anchor the turn already wrote past',
     ).toEqual([]);
 
@@ -724,8 +772,17 @@ describe('the interleaved ask: the final lands at the tail, never hidden above t
     // here, so no restart sweep can paint an edit over it.
     expect(anchor.body).toBe('I will create demo.txt with the demo line.');
     expect(journalFile().streamAnchor).toBeUndefined();
-    // Exactly three durable rows: the anchor, the ask, the tail final.
-    expect(h.sends).toHaveLength(3);
+    // The turn lifecycle still owns exactly three durable rows: anchor, ask,
+    // and tail final. A fourth quiet fact follows only after the terminal
+    // reply and records the independently observed decision-returned boundary.
+    expect(h.sends).toHaveLength(4);
+    const observation = h.sends.at(-1) as { body: string; notify?: false };
+    expect(observation.notify).toBe(false);
+    expect(JSON.parse(observation.body)).toMatchObject({
+      tcm: 'reply',
+      text: 'Approval decision returned to codex.',
+      work: { approvalObservation: 'decision-returned' },
+    });
   }, 30_000);
 });
 
@@ -754,7 +811,7 @@ describe('crash → restart (the journal rails)', () => {
     await poll(() => typing.closed() === 1);
     const editsAtDeath = typing.edits.length;
     fake.push('a push after death');
-    await new Promise(r => setTimeout(r, 60));
+    await new Promise((r) => setTimeout(r, 60));
     expect(typing.edits.length).toBe(editsAtDeath);
 
     // THE RESTART SWEEP: the journalled anchor gets the interrupted
@@ -880,11 +937,7 @@ const ledgerSend = () => {
   const sends: { body: string; id: string; sess?: OutSess; notify?: false }[] = [];
   return {
     sends,
-    sendReply: async (
-      b: string,
-      sess?: OutSess,
-      opts?: { notify?: boolean },
-    ): Promise<string> => {
+    sendReply: async (b: string, sess?: OutSess, opts?: { notify?: boolean }): Promise<string> => {
       const id = mid();
       sends.push({
         body: b,
@@ -919,7 +972,7 @@ const steeringStreamDriver = (opts: { reply?: string; threadKey?: string } = {})
   const prompts: string[] = [];
   let calls = 0;
   let release: (() => void) | undefined;
-  const released = new Promise<void>(r => {
+  const released = new Promise<void>((r) => {
     release = r;
   });
   const driver: HostDriver = {
@@ -1057,7 +1110,7 @@ describe('the anchor speaks for the live thread (red-first)', () => {
     // carry:<id> ∉ runningKeys even while the live thread key is in it.
     const replyRow = inRow('follow up on that notification', { tcm: 'reply', ref: notifyId });
     log.append(replyRow);
-    await new Promise(r => setTimeout(r, 60)); // many fake cadence ticks
+    await new Promise((r) => setTimeout(r, 60)); // many fake cadence ticks
     expect(fake.steered, 'a sessionless ref never steers the running turn').toEqual([]);
 
     fake.finish();

@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { Animated, PanResponder, type GestureResponderHandlers } from 'react-native';
+import {
+  Animated,
+  PanResponder,
+  type GestureResponderHandlers,
+} from 'react-native';
 
 /**
  * The draggable, corner-snapping picture-in-picture (lifted out of
@@ -46,7 +50,8 @@ export const PIP_BOTTOM_CLEARANCE = 96;
  * 12pt PhotoViewer's dismiss drag uses to coexist with its taps. */
 export const PIP_DRAG_THRESHOLD = 12;
 
-export type PipCorner = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+export type PipCorner =
+  'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
 export interface PipFrame {
   width: number;
   height: number;
@@ -101,7 +106,8 @@ export function pipAnchor(
   const left = insets.left + PIP_MARGIN;
   const right = frame.width - insets.right - PIP_MARGIN - box.width;
   const top = insets.top + box.topClearance;
-  const bottom = frame.height - insets.bottom - box.bottomClearance - box.height;
+  const bottom =
+    frame.height - insets.bottom - box.bottomClearance - box.height;
   return {
     x:
       right >= left
@@ -232,11 +238,24 @@ export function usePipDrag(opts: {
   reduceMotion: boolean;
   motion: { surface: number; easing: (t: number) => number };
   initialCorner?: PipCorner;
+  /** Reports a settled corner so a parent can retain it across an unmount. */
+  onCornerChange?(corner: PipCorner): void;
 }): PipDrag {
-  const { frame, insets, reduceMotion, motion, initialCorner = 'top-right' } = opts;
+  const {
+    frame,
+    insets,
+    reduceMotion,
+    motion,
+    initialCorner = 'top-right',
+  } = opts;
   const box = opts.box ?? DEFAULT_PIP_BOX;
   const { width: frameW, height: frameH } = frame;
-  const { top: insTop, bottom: insBottom, left: insLeft, right: insRight } = insets;
+  const {
+    top: insTop,
+    bottom: insBottom,
+    left: insLeft,
+    right: insRight,
+  } = insets;
   const {
     width: boxW,
     height: boxH,
@@ -262,17 +281,29 @@ export function usePipDrag(opts: {
   const geomRef = useRef({
     f: { width: frameW, height: frameH },
     ins: { top: insTop, bottom: insBottom, left: insLeft, right: insRight },
-    box: { width: boxW, height: boxH, topClearance: boxTop, bottomClearance: boxBottom },
+    box: {
+      width: boxW,
+      height: boxH,
+      topClearance: boxTop,
+      bottomClearance: boxBottom,
+    },
   });
   geomRef.current = {
     f: { width: frameW, height: frameH },
     ins: { top: insTop, bottom: insBottom, left: insLeft, right: insRight },
-    box: { width: boxW, height: boxH, topClearance: boxTop, bottomClearance: boxBottom },
+    box: {
+      width: boxW,
+      height: boxH,
+      topClearance: boxTop,
+      bottomClearance: boxBottom,
+    },
   };
   const reduceMotionRef = useRef(reduceMotion);
   reduceMotionRef.current = reduceMotion;
   const motionRef = useRef(motion);
   motionRef.current = motion;
+  const onCornerChangeRef = useRef(opts.onCornerChange);
+  onCornerChangeRef.current = opts.onCornerChange;
   /** Whether a finger owns the pip right now (grant → release/terminate). */
   const dragging = useRef(false);
   /**
@@ -289,14 +320,21 @@ export function usePipDrag(opts: {
    * still reads the LIVE geometry, so the pip stays inside the window that
    * exists now, and the settle rebases everything onto the live home.
    */
-  const [dragHome, setDragHome] = useState<{ x: number; y: number } | null>(null);
+  const [dragHome, setDragHome] = useState<{ x: number; y: number } | null>(
+    null,
+  );
   const dragHomeRef = useRef<{ x: number; y: number } | null>(null);
 
   const liveHome = pipAnchor(
-    initialCorner,
+    homeCornerRef.current,
     { width: frameW, height: frameH },
     { top: insTop, bottom: insBottom, left: insLeft, right: insRight },
-    { width: boxW, height: boxH, topClearance: boxTop, bottomClearance: boxBottom },
+    {
+      width: boxW,
+      height: boxH,
+      topClearance: boxTop,
+      bottomClearance: boxBottom,
+    },
   );
   const home = dragHome ?? liveHome;
 
@@ -309,6 +347,7 @@ export function usePipDrag(opts: {
     const a = pipAnchor(next, f, ins, b);
     const to = { x: a.x - h.x, y: a.y - h.y };
     setCorner(next);
+    onCornerChangeRef.current?.(next);
     grab.current = to;
     shift.stopAnimation();
     if (reduceMotionRef.current) {
@@ -341,8 +380,18 @@ export function usePipDrag(opts: {
   useEffect(() => {
     if (dragging.current) return;
     const f = { width: frameW, height: frameH };
-    const ins = { top: insTop, bottom: insBottom, left: insLeft, right: insRight };
-    const b = { width: boxW, height: boxH, topClearance: boxTop, bottomClearance: boxBottom };
+    const ins = {
+      top: insTop,
+      bottom: insBottom,
+      left: insLeft,
+      right: insRight,
+    };
+    const b = {
+      width: boxW,
+      height: boxH,
+      topClearance: boxTop,
+      bottomClearance: boxBottom,
+    };
     const h = pipAnchor(homeCornerRef.current, f, ins, b);
     const a = pipAnchor(cornerRef.current, f, ins, b);
     const to = { x: a.x - h.x, y: a.y - h.y };
@@ -381,7 +430,13 @@ export function usePipDrag(opts: {
     const shiftFor = (dx: number, dy: number) => {
       const { f, ins, box: b } = geomRef.current;
       const h = dragBase();
-      const p = clampPip(h.x + grab.current.x + dx, h.y + grab.current.y + dy, f, ins, b);
+      const p = clampPip(
+        h.x + grab.current.x + dx,
+        h.y + grab.current.y + dy,
+        f,
+        ins,
+        b,
+      );
       return { x: p.x - h.x, y: p.y - h.y };
     };
     const settle = (dx: number, dy: number) => {

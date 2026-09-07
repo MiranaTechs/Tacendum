@@ -7,10 +7,10 @@ const home = mkdtempSync(join(tmpdir(), 'tacendum-tomlkey-'));
 process.env.TACENDUM_HOME = home;
 
 const { saveProfile } = await import('../src/profile.js');
-const { runMcpInstall, mergeJsonConfig, mergeTomlConfig, renderTomlSection } = await import(
-  '../src/mcp-install.js'
-);
+const { runMcpInstall, mergeJsonConfig, mergeTomlConfig, renderTomlSection } =
+  await import('../src/mcp-install.js');
 const { codexNotifyLine, mergeCodexNotify, notifyArgv } = await import('../src/hostconfig.js');
+const { planFromCodexNotifyDispatchArgv } = await import('../src/codex-notify-dispatch.js');
 
 const work = mkdtempSync(join(tmpdir(), 'tacendum-tomlkey-work-'));
 
@@ -143,21 +143,50 @@ describe('mergeTomlConfig: the same key in non-table form cannot take a table â€
 describe('mergeCodexNotify: quoted "notify" is the same top-level key', () => {
   const ARGV = notifyArgv('codex', 'ci', entry);
 
-  it('a foreign notifier spelled "notify" is refused, not silently duplicated past', () => {
+  it('a foreign notifier spelled "notify" is composed once under the same semantic key', () => {
     const existing = '"notify" = ["acme", "notify", "--hook", "slack", "--account", "theirs"]\n';
-    expect(() => mergeCodexNotify(existing, ARGV)).toThrow(/refusing to replace/);
+    const merged = mergeCodexNotify(existing, ARGV);
+    const notifyLines = merged
+      .split('\n')
+      .filter((line) => /^\s*(?:notify|"notify"|'notify')\s*=/.test(line));
+    expect(notifyLines).toHaveLength(1);
+    const line = notifyLines[0] as string;
+    const argv = JSON.parse(line.slice(line.indexOf('['), line.lastIndexOf(']') + 1)) as string[];
+    expect(
+      planFromCodexNotifyDispatchArgv(argv, { nodePath: ARGV[0]!, entryPath: ARGV[1]! }),
+    ).toEqual({
+      v: 1,
+      account: 'ci',
+      previous: [{ argv: ['acme', 'notify', '--hook', 'slack', '--account', 'theirs'] }],
+    });
   });
 
   it("our own line spelled 'notify' is recognised and replaced in place", () => {
-    const oldOurs = codexNotifyLine(['/old-node', '/old-entry', 'notify', '--hook', 'codex', '--account', 'ci']);
+    const oldOurs = codexNotifyLine([
+      ARGV[0]!,
+      ARGV[1]!,
+      'notify',
+      '--hook',
+      'codex',
+      '--account',
+      'old',
+    ]);
     const existing = `${oldOurs.replace(/^notify/, "'notify'")}\n\n[profile]\nname = "keep"\n`;
     const merged = mergeCodexNotify(existing, ARGV);
     const notifyLines = merged
       .split('\n')
       .filter((l) => /^\s*(?:notify|"notify"|'notify')\s*=/.test(l));
     expect(notifyLines).toHaveLength(1);
-    expect(merged).toContain(codexNotifyLine(ARGV));
-    expect(merged).not.toContain('/old-entry');
+    const line = notifyLines[0] as string;
+    const argv = JSON.parse(line.slice(line.indexOf('['), line.lastIndexOf(']') + 1)) as string[];
+    expect(
+      planFromCodexNotifyDispatchArgv(argv, { nodePath: ARGV[0]!, entryPath: ARGV[1]! }),
+    ).toEqual({
+      v: 1,
+      account: 'ci',
+      previous: [],
+    });
+    expect(merged).not.toContain('--account old');
     expect(merged).toContain('name = "keep"');
   });
 

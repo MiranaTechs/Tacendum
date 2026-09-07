@@ -2,6 +2,33 @@ import Foundation
 import UIKit
 import WebRTC
 
+/// A size notification is not a frame. Forward the actual decoded frame to
+/// Metal, then report the first non-empty delivery once for this renderer.
+private final class FrameReadyRenderer: NSObject, RTCVideoRenderer {
+  private let renderer: RTCMTLVideoView
+  private let firstFrame: () -> Void
+  private let lock = NSLock()
+  private var reported = false
+
+  init(renderer: RTCMTLVideoView, firstFrame: @escaping () -> Void) {
+    self.renderer = renderer
+    self.firstFrame = firstFrame
+    super.init()
+  }
+
+  func setSize(_ size: CGSize) { renderer.setSize(size) }
+
+  func renderFrame(_ frame: RTCVideoFrame?) {
+    renderer.renderFrame(frame)
+    guard let frame = frame, frame.width > 0, frame.height > 0 else { return }
+    lock.lock()
+    let shouldReport = !reported
+    reported = true
+    lock.unlock()
+    if shouldReport { firstFrame() }
+  }
+}
+
 /**
  * The UIKit half of the video surface.
  *
@@ -17,6 +44,11 @@ public final class TacendumVideoHost: UIView {
   /// `var`, because detaching REPLACES it. See `detach()`.
   private var renderer = RTCMTLVideoView(frame: .zero)
   private var attached: RTCVideoTrack?
+  private var frameRenderer: FrameReadyRenderer?
+  private var surfaceId = ""
+  private var generation = 0
+  private var ready = false
+  @objc public var onFrameReady: ((String, Int, Bool) -> Void)?
   private var cid = ""
   private var role: VideoTrackRegistry.Role = .remote
   /// Held here rather than read back off the renderer, because the renderer is
@@ -60,7 +92,7 @@ public final class TacendumVideoHost: UIView {
     // view, and the track would keep a renderer attached to a view that is
     // being freed.
     VideoTrackRegistry.shared.stopObserving(owner: self)
-    attached?.remove(renderer)
+    if let frameRenderer = frameRenderer { attached?.remove(frameRenderer) }
   }
 
   // MARK: - props
@@ -83,11 +115,12 @@ public final class TacendumVideoHost: UIView {
    * One call, one subscription, and the binding is a pure function of the
    * arguments — there is no ordering left to get wrong.
    */
-  @objc public func bindCid(_ nextCid: String, role nextRole: String) {
+  @objc public func bindCid(_ nextCid: String, role nextRole: String, surfaceId nextSurfaceId: String) {
     let resolved = VideoTrackRegistry.Role(rawValue: nextRole) ?? .remote
-    guard nextCid != cid || resolved != role else { return }
+    guard nextCid != cid || resolved != role || nextSurfaceId != surfaceId else { return }
     cid = nextCid
     role = resolved
+    surfaceId = nextSurfaceId
     resubscribe()
   }
 
@@ -111,6 +144,7 @@ public final class TacendumVideoHost: UIView {
     // state a fresh view would be in.
     detach()
     cid = ""
+    surfaceId = ""
     role = .remote
     mirrored = false
     fitMode = .fill
@@ -145,8 +179,34 @@ public final class TacendumVideoHost: UIView {
     guard track !== attached else { return }
     detach()
     guard let track = track else { return }
-    track.add(renderer)
     attached = track
+    let epoch = generation
+    let forwarding = FrameReadyRenderer(renderer: renderer) { [weak self] in
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self, self.generation == epoch, self.attached != nil else { return }
+        self.ready = true
+        self.publishReadiness()
+      }
+    }
+    frameRenderer = forwarding
+    track.add(forwarding)
+  }
+
+  /// Fabric can register its emitter after props attach an already-live track.
+  /// Replaying the current state prevents that early first frame being lost.
+  @objc public func publishReadiness() {
+    guard !surfaceId.isEmpty else { return }
+    onFrameReady?(surfaceId, generation, ready)
+  }
+
+  public override func didMoveToWindow() {
+    super.didMoveToWindow()
+    if window == nil {
+      VideoTrackRegistry.shared.stopObserving(owner: self)
+      detach()
+    } else {
+      resubscribe()
+    }
   }
 
   /**
@@ -174,8 +234,12 @@ public final class TacendumVideoHost: UIView {
    * was never there — do not churn a Metal layer for nothing.
    */
   private func detach() {
+    generation += 1
+    ready = false
+    publishReadiness()
     guard let track = attached else { return }
-    track.remove(renderer)
+    if let frameRenderer = frameRenderer { track.remove(frameRenderer) }
+    frameRenderer = nil
     attached = nil
     renderer.removeFromSuperview()
     renderer = RTCMTLVideoView(frame: bounds)

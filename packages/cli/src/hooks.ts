@@ -19,9 +19,11 @@ import { MessageLog } from './msglog.js';
 import type { Reporter } from './output.js';
 import { loadProfile, resolveRecipient } from './profile.js';
 import { sanitizeForTerminal, sanitizeServerField } from './render.js';
-import { sendEncrypted } from './send.js';
+import { sendEncrypted, sendEncryptedAll } from './send.js';
 import { AuthSession } from './session.js';
 import { FileStores, writeFileAtomic } from './stores.js';
+import { AiWorkMetadataSchema, type AiWorkMetadata } from '@tacendum/shared';
+import { readRoutineNotifyPreference } from './ai-notify-preference.js';
 
 /**
  * `tacendum notify --hook <host>` — the ONE code path
@@ -296,7 +298,12 @@ export function parseClaudeHook(stdinText: string): ParsedHook {
   if (eventName === 'Stop') {
     return {
       action: 'send',
-      event: { kind: 'finished', body: str(payload.last_assistant_message) ?? '', projectTag, session },
+      event: {
+        kind: 'finished',
+        body: str(payload.last_assistant_message) ?? '',
+        projectTag,
+        session,
+      },
     };
   }
   if (eventName === 'Notification') {
@@ -619,10 +626,7 @@ export function composeHookBody(event: HookEvent, titleOverride: string | undefi
   // three sessions in one repo apart BEFORE replying; the reply itself
   // routes by ref regardless. An operator-supplied --title is theirs and
   // gains nothing.
-  const where = [
-    event.projectTag,
-    event.session ? sessionTag(event.session) : undefined,
-  ]
+  const where = [event.projectTag, event.session ? sessionTag(event.session) : undefined]
     .filter((part): part is string => Boolean(part))
     .join(' · ');
   const fallback = `${where ? `${where}: ` : ''}${
@@ -674,6 +678,9 @@ interface QueueEntry {
   body: string;
   /** The wire msgId this notification is sent under, on every attempt. */
   msgId: string;
+  /** Explicitly quiet carrier delivery. Missing on old entries means the
+   * historical notifying default. */
+  notify?: false;
   /** Ledger metadata: the host and its session key,
    * carried by the entry so a retry hours later still writes the SAME
    * ledger row a live delivery would have. */
@@ -690,12 +697,7 @@ interface QueueEntry {
  * routing nothing. Best-effort by design: a failed ledger row costs a reply
  * its route (the router says so honestly), never a delivery.
  */
-function ledgerOutRow(
-  account: string,
-  msgId: string,
-  to: string,
-  sess: QueueEntry['sess'],
-): void {
+function ledgerOutRow(account: string, msgId: string, to: string, sess: QueueEntry['sess']): void {
   try {
     new MessageLog(account).append({
       id: msgId,
@@ -722,10 +724,19 @@ export function enqueueNotification(
   body: string,
   msgId: string = ulid(),
   sess?: QueueEntry['sess'],
+  opts: { notify?: boolean } = {},
 ): void {
   const dir = notifyQueueDir(account);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const entry: QueueEntry = { v: 1, ts: Date.now(), to, body, msgId, ...(sess ? { sess } : {}) };
+  const entry: QueueEntry = {
+    v: 1,
+    ts: Date.now(),
+    to,
+    body,
+    msgId,
+    ...(sess ? { sess } : {}),
+    ...(opts.notify === false ? { notify: false as const } : {}),
+  };
   // DURABLE (the default), not crash-consistent: `cmdNotify` hard-exits the
   // process moments after this returns, and the whole point of the write is a
   // "queued" report the operator may act on — a queue entry still in the page
@@ -815,7 +826,9 @@ function pruneQueue(dir: string): void {
 /** Unclaimed entry names, oldest first (ULIDs sort chronologically). */
 function listQueueEntries(dir: string): string[] {
   try {
-    return readdirSync(dir).filter((n) => QUEUE_ENTRY_RE.test(n)).sort();
+    return readdirSync(dir)
+      .filter((n) => QUEUE_ENTRY_RE.test(n))
+      .sort();
   } catch {
     return [];
   }
@@ -996,6 +1009,8 @@ export type DeliverFn = (args: {
   msgId: string;
   report: Reporter;
   budgetMs: number;
+  /** Missing means the historical notifying default. */
+  notify?: boolean;
 }) => Promise<{ msgId: string; state: string }>;
 
 /**
@@ -1024,26 +1039,34 @@ async function deliverNotification(args: {
   msgId: string;
   report: Reporter;
   budgetMs: number;
+  notify?: boolean;
 }): Promise<{ msgId: string; state: string }> {
   const { account, to, body, msgId, report } = args;
   const stores = new FileStores(account);
   const auth = new AuthSession(account, stores);
 
   try {
-    const { receipt } = await sendEncrypted({
-      stores,
-      auth,
-      to,
-      body,
-      msgId,
-      receiptTimeoutMs: Math.max(250, Math.min(args.budgetMs, 10_000)),
-      events: {
-        connecting: () => report.status('connecting…'),
-        fetchingBundle: () =>
-          report.status('no session with the recipient; fetching prekey bundle'),
-        awaitingReceipt: () => report.status('waiting for receipt…'),
-      },
-    });
+    const receiptTimeoutMs = Math.max(250, Math.min(args.budgetMs, 10_000));
+    const events = {
+      connecting: () => report.status('connecting…'),
+      fetchingBundle: () => report.status('no session with the recipient; fetching prekey bundle'),
+      awaitingReceipt: () => report.status('waiting for receipt…'),
+    };
+    const outcome =
+      args.notify === false
+        ? (
+            await sendEncryptedAll({
+              stores,
+              auth,
+              to,
+              messages: [{ body, msgId, notify: false }],
+              receiptTimeoutMs,
+              events,
+            })
+          )[0]
+        : await sendEncrypted({ stores, auth, to, body, msgId, receiptTimeoutMs, events });
+    if (outcome === undefined) throw new Error('notify delivery produced no outcome');
+    const { receipt } = outcome;
     return { msgId, state: receipt.type === 'receipt' ? receipt.state : 'sent' };
   } catch (err) {
     if (isIdentityChange(err)) {
@@ -1071,6 +1094,12 @@ export interface NotifyDeps {
   /** Payload source for the stdin hosts; injectable so tests need no fd 0. */
   readStdin?: () => string | Promise<string>;
   deadlineMs?: number;
+  /** Receipt-side clock for one persisted work event; test seam only. */
+  now?: () => number;
+  /** Already-normalized event used only by setup's explicit delivery test.
+   * It bypasses provider payload parsing, but nothing in the durable
+   * delivery/queue path. No provider parser produces this value. */
+  preparedEvent?: HookEvent;
 }
 
 /**
@@ -1136,32 +1165,40 @@ export async function runNotify(
   const readStdin = deps.readStdin ?? readHookStdin;
 
   let parsed: ParsedHook;
-  try {
-    parsed =
-      host === 'codex'
-        ? // Codex APPENDS the payload, so it is the LAST positional — flags
-          // configured after it in config.toml cannot displace it.
-          parseCodexHook(args.positionals[args.positionals.length - 1])
-        : host === 'claude'
-          ? parseClaudeHook(await readStdin())
-          : host === 'gemini'
-            ? parseGeminiHook(await readStdin())
-            : parseCursorHook(await readStdin());
-  } catch (err) {
-    if (!(err instanceof HookPayloadError)) throw err;
-    // A malformed payload is a host-version drift, not an agent failure.
-    // Exit 0 (nothing to send, nothing to queue), but say so loudly: silence
-    // here is a notifier that stopped notifying with nobody told.
-    result(
-      report,
-      { ok: false, action: 'unparsed', host, error: err.message },
-      `notify --hook ${host}: ${err.message} — nothing sent`,
-    );
-    return EXIT.OK;
+  if (deps.preparedEvent !== undefined) {
+    parsed = { action: 'send', event: deps.preparedEvent };
+  } else {
+    try {
+      parsed =
+        host === 'codex'
+          ? // Codex APPENDS the payload, so it is the LAST positional — flags
+            // configured after it in config.toml cannot displace it.
+            parseCodexHook(args.positionals[args.positionals.length - 1])
+          : host === 'claude'
+            ? parseClaudeHook(await readStdin())
+            : host === 'gemini'
+              ? parseGeminiHook(await readStdin())
+              : parseCursorHook(await readStdin());
+    } catch (err) {
+      if (!(err instanceof HookPayloadError)) throw err;
+      // A malformed payload is a host-version drift, not an agent failure.
+      // Exit 0 (nothing to send, nothing to queue), but say so loudly: silence
+      // here is a notifier that stopped notifying with nobody told.
+      result(
+        report,
+        { ok: false, action: 'unparsed', host, error: err.message },
+        `notify --hook ${host}: ${err.message} — nothing sent`,
+      );
+      return EXIT.OK;
+    }
   }
 
   if (parsed.action === 'ignore') {
-    result(report, { ok: true, action: 'ignored', host, reason: parsed.reason }, `notify: ${parsed.reason}`);
+    result(
+      report,
+      { ok: true, action: 'ignored', host, reason: parsed.reason },
+      `notify: ${parsed.reason}`,
+    );
     return EXIT.OK;
   }
 
@@ -1206,9 +1243,25 @@ export async function runNotify(
   // unknown, and on a pre-`msg` CLI the wrapped body is not degraded but
   // DROPPED whole — renderBody has no `case 'msg'`, `maySpool` refuses the
   // row, and inbound never writes it — so a non-owner send stays byte-bare.
+  // One identity for this source event and its wire message. The queue stores
+  // both the body and msgId, so every retry preserves both identities rather
+  // than re-minting an event from the same provider turn.
+  const liveMsgId = ulid();
+  const work: AiWorkMetadata = AiWorkMetadataSchema.parse({
+    provider: host,
+    updatedAt: (deps.now ?? Date.now)(),
+    // Attention hooks are the provider's explicit evidence that progress is
+    // blocked on a person. Preserve that historical fact as waiting input;
+    // no prose classifier promotes an ordinary notification into this state.
+    event: event.kind === 'finished' ? 'turn-complete' : 'waiting-for-input',
+    eventId: liveMsgId,
+    ...(event.projectTag === undefined ? {} : { project: event.projectTag }),
+    ...(event.session === undefined ? {} : { runTag: sessionTag(event.session) }),
+  });
   const body = markAgentBody(
     composeHookBody(event, title),
     to === profile.ownerUserId && markerAttested(account),
+    work,
   );
   // Ledger metadata, fixed here so the live path and the queue retry write
   // the identical row.
@@ -1217,6 +1270,15 @@ export async function runNotify(
     ...(event.session ? { key: event.session } : {}),
     ...(event.projectTag ? { tag: event.projectTag } : {}),
   };
+  // The owner-authenticated preference governs only the source-backed
+  // routine completion kind. Attention remains push-eligible, and an
+  // explicit non-owner recipient has no authority to inherit the owner's
+  // setting. Persist this bit with the queue entry below so a retry cannot
+  // turn a quiet completion back into a ringing notification.
+  const quietRoutine =
+    to === profile.ownerUserId &&
+    event.kind === 'finished' &&
+    readRoutineNotifyPreference(account).routine === 'quiet';
 
   // -- The never-block core: everything network-shaped below this line is
   //    raced against ONE deadline, and every failure ends in queue + EXIT.OK.
@@ -1285,6 +1347,7 @@ export async function runNotify(
           msgId: entryMsgId,
           report,
           budgetMs: remaining(),
+          ...(entry.notify === false ? { notify: false } : {}),
         }),
       );
       rmSync(claimPath, { force: true });
@@ -1301,17 +1364,18 @@ export async function runNotify(
     }
   }
 
-  // Minted ONCE, here — before the first attempt — and reused by the queue
-  // entry if that attempt fails: a fresh id per attempt turned ordinary
-  // receipt latency into duplicates (frame accepted, receipt after the
-  // deadline, retry re-sent the same plaintext under a NEW id the phone could
-  // not dedupe).
-  const liveMsgId = ulid();
-
   if (sendFailure === null && remaining() >= FLUSH_FLOOR_MS) {
     try {
       const { msgId, state } = await underDeadline(
-        deliver({ account, to, body, msgId: liveMsgId, report, budgetMs: remaining() }),
+        deliver({
+          account,
+          to,
+          body,
+          msgId: liveMsgId,
+          report,
+          budgetMs: remaining(),
+          ...(quietRoutine ? { notify: false } : {}),
+        }),
       );
       commitTakenText();
       ledgerOutRow(account, liveMsgId, to, sess);
@@ -1345,7 +1409,7 @@ export async function runNotify(
     300,
   );
   try {
-    enqueueNotification(account, to, body, liveMsgId, sess);
+    enqueueNotification(account, to, body, liveMsgId, sess, quietRoutine ? { notify: false } : {});
     commitTakenText();
     result(
       report,
@@ -1369,6 +1433,60 @@ export async function runNotify(
     );
   }
   return EXIT.OK;
+}
+
+export type NotificationDeliveryTestOutcome =
+  | { action: 'notified'; state: string; flushed?: number }
+  | { action: 'queued'; flushed?: number }
+  | { action: 'dropped' };
+
+/** Send setup's explicit, plain notification test through the production
+ * notify queue/deadline/delivery path. It is deliberately an attention-kind
+ * normalized event: it tests a notification and does not manufacture a
+ * provider turn-complete fact. The nested Reporter captures runNotify's one
+ * result so `setup --json` still emits exactly one command result; progress
+ * may continue through the caller's Reporter. */
+export async function runNotificationDeliveryTest(
+  account: string,
+  host: HookHost,
+  report: Reporter,
+  deps: NotifyDeps = {},
+): Promise<NotificationDeliveryTestOutcome> {
+  let observed: Record<string, unknown> | undefined;
+  const capture = Object.create(report) as Reporter;
+  Object.defineProperty(capture, 'json', { value: true });
+  capture.emit = (record: Record<string, unknown>): void => {
+    observed = record;
+  };
+  capture.status = (message: string): void => report.status(message);
+
+  await runNotify(
+    ['--hook', host, '--account', account, '--title', 'Tacendum notification test'],
+    capture,
+    {
+      ...deps,
+      preparedEvent: {
+        kind: 'attention',
+        body: 'Tacendum notification delivery test. A relay receipt does not prove the phone displayed it.',
+      },
+    },
+  );
+
+  const action = observed?.action;
+  const flushed =
+    typeof observed?.flushed === 'number' &&
+    Number.isSafeInteger(observed.flushed) &&
+    observed.flushed > 0
+      ? observed.flushed
+      : undefined;
+  if (action === 'notified' && typeof observed?.state === 'string') {
+    return { action, state: observed.state, ...(flushed === undefined ? {} : { flushed }) };
+  }
+  if (action === 'queued') {
+    return { action, ...(flushed === undefined ? {} : { flushed }) };
+  }
+  if (action === 'dropped') return { action };
+  throw new CliError(EXIT.ERROR, 'notification delivery test produced no result');
 }
 
 /** How long a host gets to hand over its stdin payload. Hosts write the JSON

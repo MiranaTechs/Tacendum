@@ -7,8 +7,8 @@ import { Platform, StyleSheet, type TextStyle } from 'react-native';
  * The app is one cool porcelain ground with a faint green cast — the field of
  * a banknote or a passport page — printed in one deep pine ink. Depth is
  * expressed with surface color, outlines, and shared seams — there are no
- * shadows, gradients, blurs, or translucent scrims anywhere in the product,
- * and the only dark surface is the full-screen photo viewer.
+ * shadows, gradients, or blurs. Live-call controls use a translucent media
+ * backing to stay legible over video.
  */
 
 /** Monospace utility face: brand marks, ids, times, state, safety numbers. */
@@ -79,6 +79,8 @@ const color = {
   mediaInk: '#FAFCF7',
   mediaInkMuted: '#95A098',
   mediaLine: 'rgba(250,252,247,0.18)',
+  /** Call controls over live video, including an entirely white frame. */
+  mediaHud: 'rgba(6,8,7,0.88)',
   dangerOnMedia: '#E2726A',
 } as const;
 
@@ -132,6 +134,7 @@ const darkColor: ColorTokens = {
   mediaInk: '#FAFCF7',
   mediaInkMuted: '#95A098',
   mediaLine: 'rgba(250,252,247,0.18)',
+  mediaHud: 'rgba(6,8,7,0.88)',
   dangerOnMedia: '#E2726A',
 };
 

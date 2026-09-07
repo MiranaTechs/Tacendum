@@ -39,6 +39,95 @@ export interface MentionChip {
   end: number;
 }
 
+interface SavedMentionDraft {
+  v: 1;
+  peerId: string;
+  text: string;
+  chips: MentionChip[];
+}
+
+/**
+ * Bind mention intent to the exact local draft and room that produced it.
+ * The duplicated text is intentional: ranges alone can still happen to point
+ * at the same visible `@Name` after unrelated words are replaced. This value
+ * lives in the draft row and is deleted with it; it never crosses the wire.
+ */
+export function encodeMentionDraft(
+  peerId: string,
+  draft: string,
+  chips: MentionChip[],
+): string | null {
+  const live = liveMentionChips(draft, chips);
+  if (live.length === 0) return null;
+  return JSON.stringify({ v: 1, peerId, text: draft, chips: live });
+}
+
+/**
+ * Restore only a mention whose identity, shown name, range, room and complete
+ * draft still agree with the current room fold. Any malformed part drops the
+ * whole recipient set while the caller keeps the ordinary visible text.
+ */
+export function restoreMentionDraft(
+  peerId: string,
+  draft: string,
+  encoded: string | null | undefined,
+  eligibleNames: ReadonlyMap<string, string>,
+): MentionChip[] {
+  if (!encoded) return [];
+  let value: unknown;
+  try {
+    value = JSON.parse(encoded);
+  } catch {
+    return [];
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return [];
+  }
+  const saved = value as Partial<SavedMentionDraft>;
+  if (
+    saved.v !== 1 ||
+    saved.peerId !== peerId ||
+    saved.text !== draft ||
+    !Array.isArray(saved.chips) ||
+    saved.chips.length === 0
+  ) {
+    return [];
+  }
+  const chips: MentionChip[] = [];
+  for (const candidate of saved.chips as unknown[]) {
+    if (
+      candidate === null ||
+      typeof candidate !== 'object' ||
+      Array.isArray(candidate)
+    ) {
+      return [];
+    }
+    const chip = candidate as Partial<MentionChip>;
+    if (
+      typeof chip.id !== 'string' ||
+      typeof chip.name !== 'string' ||
+      chip.name.length === 0 ||
+      !Number.isSafeInteger(chip.start) ||
+      !Number.isSafeInteger(chip.end)
+    ) {
+      return [];
+    }
+    const normalized = chip as MentionChip;
+    if (
+      normalized.start < 0 ||
+      normalized.end <= normalized.start ||
+      normalized.end > draft.length ||
+      eligibleNames.get(normalized.id) !== normalized.name ||
+      draft.slice(normalized.start, normalized.end) !== `@${normalized.name}` ||
+      (chips.length > 0 && normalized.start < chips[chips.length - 1]!.end)
+    ) {
+      return [];
+    }
+    chips.push(normalized);
+  }
+  return chips;
+}
+
 /** The one contiguous span an edit changed: common prefix `p`, common suffix
  * `s`, computed so they never overlap. One text event is one contiguous
  * replacement — typing, deletion, paste and autocorrect all fit it. */

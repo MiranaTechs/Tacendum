@@ -28,6 +28,7 @@
  */
 
 import { z } from 'zod';
+import { AiWorkMetadataSchema, aiWorkMetadata, type AiWorkMetadata } from './ai-work.js';
 // The ROUNDS detail field (§3.1). Imported rather than mirrored:
 // it is a SCHEMA, and a second copy of a schema is a second thing to get
 // wrong. `rounds.ts` is zod-only, so the purity note above still holds.
@@ -108,7 +109,7 @@ export const AgentTextEnvelope = z.object({
     .string()
     .min(1)
     .max(MAX_AGENT_TEXT)
-    .refine(value => !value.startsWith(ENVELOPE_SENTINEL), {
+    .refine((value) => !value.startsWith(ENVELOPE_SENTINEL), {
       message: 'text may not itself be an envelope',
     }),
   /**
@@ -125,6 +126,9 @@ export const AgentTextEnvelope = z.object({
    */
   d: roundDetail,
   ai: aiOrigin,
+  /** Optional sender-observed work facts. A malformed value costs itself,
+   * never the conversational text or AI-origin marker. */
+  work: aiWorkMetadata,
 });
 
 export type AgentTextEnvelope = z.infer<typeof AgentTextEnvelope>;
@@ -140,7 +144,7 @@ export type AgentTextEnvelope = z.infer<typeof AgentTextEnvelope>;
  * LITERAL prefix `{"tcm":` before parsing anything. The key order is pinned
  * by reconstruction here, not left to an upstream object's insertion order.
  */
-export function composeAgentText(text: string, detail?: string): string {
+export function composeAgentText(text: string, detail?: string, work?: AiWorkMetadata): string {
   // THE DETAIL IS CHECKED HERE AND NOT BY THE SCHEMA ABOVE, and the reason is
   // the whole of R24: `d` is `.catch(undefined)` on the receive side, and
   // `.catch` SWALLOWS rather than throws — `AgentTextEnvelope.safeParse` of an
@@ -158,16 +162,22 @@ export function composeAgentText(text: string, detail?: string): string {
       `refusing to compose a msg: detail must be 1..${DETAIL_MAX} characters and not itself an envelope`,
     );
   }
+  // `work` has the same compose-strict/receive-permissive split as `d`.
+  // Parsing only through AgentTextEnvelope would let `.catch(undefined)`
+  // silently erase a producer bug.
+  const parsedWork = work === undefined ? undefined : AiWorkMetadataSchema.safeParse(work);
+  if (parsedWork !== undefined && !parsedWork.success) {
+    throw new Error('refusing to compose a msg: malformed work metadata');
+  }
   const parsed = AgentTextEnvelope.safeParse({
     tcm: AGENT_TEXT_TCM,
     text,
     ...(detail === undefined ? {} : { d: detail }),
     ai: true,
+    ...(parsedWork === undefined ? {} : { work: parsedWork.data }),
   });
   if (!parsed.success) {
-    throw new Error(
-      `refusing to compose a msg: ${parsed.error.issues[0]?.message ?? 'malformed'}`,
-    );
+    throw new Error(`refusing to compose a msg: ${parsed.error.issues[0]?.message ?? 'malformed'}`);
   }
   // `d` is omitted entirely when there is no detail, so a caller that predates
   // rounds gets BYTE-IDENTICAL output to before (pinned in ai-origin.test.ts).
@@ -177,5 +187,6 @@ export function composeAgentText(text: string, detail?: string): string {
     text: parsed.data.text,
     ...(parsed.data.d === undefined ? {} : { d: parsed.data.d }),
     ai: true,
+    ...(parsed.data.work === undefined ? {} : { work: parsed.data.work }),
   });
 }

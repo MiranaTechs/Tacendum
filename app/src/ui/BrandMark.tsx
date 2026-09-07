@@ -4,27 +4,19 @@ import { useTheme } from '../theme';
 import { useReduceMotion } from '../useReduceMotion';
 
 /**
- * The Tacendum mark: two turns of a conversation. The SOLID bar opens (you,
- * upper left) and the OUTLINED bar replies (them, lower right), offset the
- * way a reply sits under a message — the order the site's hero and favicon
- * draw (web/site/index.html `.hmark`), the brand's ruled
- * front door. Re-ordered here deliberately
- * ("the launch screen shows the old logo"); this supersedes the earlier
- * outlined-first order. NOTE: brand/tacendum-mark.svg and the AppIcon
- * rasters still carry the earlier order — regenerating them is a
- * separate rule, flagged, not silently taken here.
- *
- * Every dimension is a ratio of the bar height, matching the site hero's
- * ratios exactly, so the app and the website cannot drift apart.
+ * Two turns of a conversation: the outlined incoming bar opens at upper
+ * left, then the solid reply answers at lower right. This matches the
+ * source brand asset and app icon (build 28 correction).
  */
 const R = {
-  solidWidth: 2.955,
-  replyWidth: 2.795,
-  replyStroke: 0.33,
+  openingWidth: 375 / 127,
+  replyWidth: 396 / 127,
+  replyHeight: 168 / 127,
+  replyStroke: 42 / 127,
   /** Vertical space between the two bars. */
-  gap: 0.227,
+  gap: 8 / 127,
   /** How far the reply sits to the right of the first bar. */
-  offset: 1.545,
+  offset: 175 / 127,
 } as const;
 
 /** The beat between the two turns. A conversation is the pause, not the pair. */
@@ -42,8 +34,7 @@ export function BrandMark({ size = 30, animate = false }: Props) {
   const reduceMotion = useReduceMotion();
   // Start visible unless we are actually going to animate, so the mark can
   // never be left invisible by a setting change or an interrupted mount.
-  // Arrival order IS the conversation: you open, they answer — the same
-  // beat the site hero plays (.you at .08s, .them at .5s).
+  // Incoming first, then your reply.
   const them = useRef(new Animated.Value(animate ? 0 : 1)).current;
   const you = useRef(new Animated.Value(animate ? 0 : 1)).current;
 
@@ -54,13 +45,13 @@ export function BrandMark({ size = 30, animate = false }: Props) {
       return;
     }
     const arrive = Animated.stagger(BEAT_MS, [
-      Animated.timing(you, {
+      Animated.timing(them, {
         toValue: 1,
         duration: t.motion.surface,
         easing: t.motion.easing,
         useNativeDriver: true,
       }),
-      Animated.timing(them, {
+      Animated.timing(you, {
         toValue: 1,
         duration: t.motion.surface,
         easing: t.motion.easing,
@@ -86,7 +77,7 @@ export function BrandMark({ size = 30, animate = false }: Props) {
     <View
       style={{
         width: (R.offset + R.replyWidth) * size,
-        height: (2 + R.gap) * size,
+        height: (1 + R.replyHeight + R.gap) * size,
       }}
       accessibilityElementsHidden
       importantForAccessibility="no-hide-descendants"
@@ -94,27 +85,27 @@ export function BrandMark({ size = 30, animate = false }: Props) {
       <Animated.View
         style={[
           styles.bar,
-          rise(you),
+          rise(them),
           {
-            width: R.solidWidth * size,
+            width: R.openingWidth * size,
             height: size,
             borderRadius: size / 2,
-            backgroundColor: t.color.pine,
+            borderWidth: R.replyStroke * size,
+            borderColor: t.color.pine,
           },
         ]}
       />
       <Animated.View
         style={[
           styles.bar,
-          rise(them),
+          rise(you),
           {
             width: R.replyWidth * size,
-            height: size,
+            height: R.replyHeight * size,
             marginLeft: R.offset * size,
             marginTop: R.gap * size,
-            borderRadius: size / 2,
-            borderWidth: R.replyStroke * size,
-            borderColor: t.color.pine,
+            borderRadius: (R.replyHeight * size) / 2,
+            backgroundColor: t.color.pine,
           },
         ]}
       />
@@ -123,7 +114,7 @@ export function BrandMark({ size = 30, animate = false }: Props) {
 }
 
 /**
- * The horizontal lockup from brand/tacendum-lockup.svg: the mark, then the
+ * The in-app horizontal lockup: the mark, then the
  * wordmark. Because it carries the name, a screen showing this must not also
  * show a separate wordmark — that is the whole point of a lockup.
  *
@@ -149,7 +140,6 @@ export function BrandLockup({
   const t = useTheme();
   const reduceMotion = useReduceMotion();
   const word = useRef(new Animated.Value(animate ? 0 : 1)).current;
-  const cursor = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
     if (!animate || reduceMotion) {
@@ -168,35 +158,6 @@ export function BrandLockup({
     return () => name.stop();
   }, [animate, reduceMotion, word, t.motion]);
 
-  useEffect(() => {
-    // Reduce Motion keeps the cursor lit: it is part of the wordmark, not an
-    // indicator of anything.
-    if (reduceMotion) {
-      cursor.setValue(1);
-      return;
-    }
-    const blink = Animated.loop(
-      Animated.sequence([
-        Animated.timing(cursor, {
-          toValue: 0,
-          duration: 0,
-          delay: 550,
-          easing: t.motion.easing,
-          useNativeDriver: true,
-        }),
-        Animated.timing(cursor, {
-          toValue: 1,
-          duration: 0,
-          delay: 550,
-          easing: t.motion.easing,
-          useNativeDriver: true,
-        }),
-      ]),
-    );
-    blink.start();
-    return () => blink.stop();
-  }, [cursor, reduceMotion, t.motion.easing]);
-
   return (
     <View
       style={styles.lockup}
@@ -207,6 +168,9 @@ export function BrandLockup({
       <BrandMark size={size * BAR_PER_POINT} animate={animate} />
       <Animated.View style={[styles.lockupWord, { opacity: word }]}>
         <Text
+          // A fixed logo drawing, named by the accessible parent. Body copy
+          // still follows Dynamic Type; scaling this wordmark would clip it.
+          allowFontScaling={false}
           style={[
             t.type.brandHero,
             {
@@ -218,19 +182,6 @@ export function BrandLockup({
         >
           TACENDUM
         </Text>
-        <Animated.Text
-          style={[
-            t.type.brandHero,
-            {
-              fontSize: size,
-              lineHeight: size * 1.2,
-              color: t.color.pine,
-              opacity: cursor,
-            },
-          ]}
-        >
-          ▌
-        </Animated.Text>
       </Animated.View>
     </View>
   );

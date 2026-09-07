@@ -13,6 +13,8 @@ import {
   StreamEditEnvelope,
   Ulid,
   aiOrigin,
+  aiNotifyPreference,
+  aiWorkMetadata,
   claimsAiOrigin,
 } from '@tacendum/shared';
 // Room envelopes, canonical in @tacendum/shared for the
@@ -251,6 +253,13 @@ export const ProfileEnvelope = z.object({
   key: z.string().min(1).optional(),
   /** Monotonic version (sender's clock ms) — a late card can't undo a newer one. */
   v: z.number().int().nonnegative(),
+  /** Optional structured integration facts. Malformed/future metadata costs
+   * only itself so the peer's profile card still applies. */
+  work: aiWorkMetadata,
+  /** Owner preference and the agent's exact acknowledgement share the same
+   * bounded pair. Direction plus the authenticated peer gives it meaning. */
+  notifyPref: aiNotifyPreference,
+  notifyPrefAck: aiNotifyPreference,
 });
 export type ProfileEnvelope = z.infer<typeof ProfileEnvelope>;
 
@@ -451,6 +460,9 @@ export const EditEnvelope = z.object({
    * it composes; a human's edit never carries it, and a malformed value
    * collapses to unmarked rather than costing the revision. */
   ai: aiOrigin,
+  /** A durable terminal stream edit may carry its one canonical work event.
+   * Intermediate edits omit it; malformed metadata costs only itself. */
+  work: aiWorkMetadata,
 });
 export type EditEnvelope = z.infer<typeof EditEnvelope>;
 
@@ -548,6 +560,8 @@ export const ReplyEnvelope = z.object({
    *    count in `encodeEnvelope`, which holds the same argument verbatim.
    */
   d: roundDetail,
+  /** Structured work facts use the same fail-soft receive fragment as msg. */
+  work: aiWorkMetadata,
 });
 export type ReplyEnvelope = z.infer<typeof ReplyEnvelope>;
 

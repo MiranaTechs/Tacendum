@@ -186,6 +186,27 @@ export class Reporter {
   }
 
   /**
+   * The awaited form for a protocol boundary whose durable state may advance
+   * only after stdout has accepted the complete record. Ordinary CLI results
+   * do not need this — main keeps the event loop alive while stdout drains —
+   * but a blocking provider hook hard-exits on a deadline, so its approval
+   * journal must not say “returned” while bytes are still buffered or a
+   * write callback has reported failure.
+   */
+  emitRecordAsync(record: Record<string, unknown>, opts: { pretty?: boolean } = {}): Promise<void> {
+    this.clear();
+    const safe = redactValues(record);
+    const text =
+      opts.pretty === true && !this.json ? JSON.stringify(safe, null, 2) : JSON.stringify(safe);
+    return new Promise((resolve, reject) => {
+      process.stdout.write(`${text}\n`, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+  }
+
+  /**
    * Progress. Transient on a terminal, one durable line otherwise, and
    * nothing at all under `--json` — a machine consumer asked for a result,
    * not a narration.

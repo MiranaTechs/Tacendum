@@ -101,8 +101,14 @@ jest.mock('../src/db', () => ({
   loadProfile: jest.fn(),
   chatsMissingMyProfile: jest.fn(),
   peerHasMyProfile: jest.fn(),
+  getAiAgentState: jest.fn(),
+  getAiNotifyPreference: jest.fn(),
+  beginAiNotifyPreference: jest.fn(),
+  clearAiNotifyPreferenceRequest: jest.fn(),
+  applyAiNotifyPreferenceAck: jest.fn(),
   insertMessage: jest.fn(),
   insertApproval: jest.fn(),
+  recordAiWork: jest.fn(),
   enqueueOutgoing: jest.fn(),
   touchChat: jest.fn(),
   upsertChat: jest.fn(),
@@ -207,6 +213,8 @@ beforeEach(async () => {
   db.getMessage!.mockResolvedValue(null);
   db.loadProfile!.mockResolvedValue(null);
   db.peerHasMyProfile!.mockResolvedValue(true);
+  db.beginAiNotifyPreference!.mockResolvedValue(true);
+  db.applyAiNotifyPreferenceAck!.mockResolvedValue(true);
   db.getGroup!.mockResolvedValue(null);
 
   ws.state.open = true;
@@ -312,6 +320,99 @@ describe('a well-formed x.approval — the fixture request, applied', () => {
     expect(listener).toHaveBeenCalled();
   });
 
+  test('stores and records bounded context only when it names the exact request', async () => {
+    const msgId = '01APPROVALFRAME00000000A04';
+    const q = '01J8MEAPPR0VAQ4X2C6TKN9RFV';
+    const work = {
+      provider: 'claude',
+      updatedAt: 1_800_000_000_000,
+      event: 'needs-review',
+      eventId: '01J8MEAPPR0VAQ4X2C6TKN9RFW',
+      requestId: q,
+      project: 'Tacendum',
+      context: {
+        availability: 'captured',
+        capturedAt: 1_799_999_999_000,
+        repository: 'natln/Tacendum',
+        branch: 'feature/chat-review',
+        resultSummary: 'Review the exact command below.',
+      },
+    } as const;
+    db.insertApproval!.mockResolvedValueOnce(true);
+
+    await injectDurable(
+      JSON.stringify({
+        tcm: 'x.approval',
+        q,
+        k: 'exec',
+        p: 'pnpm test',
+        x: 600,
+        a: ['approve', 'deny'],
+        work,
+      }),
+      msgId,
+    );
+
+    expect(db.insertApproval!).toHaveBeenCalledWith(
+      expect.objectContaining({ q, payload: 'pnpm test', work }),
+    );
+    const arrivedAt = db.insertApproval!.mock.calls[0]![0].arrivedAt as number;
+    expect(db.recordAiWork!).toHaveBeenCalledWith(
+      FRIEND,
+      msgId,
+      arrivedAt,
+      work,
+      'approval',
+    );
+    expect(db.recordAiWork!.mock.invocationCallOrder[0]).toBeLessThan(
+      db.markSeen!.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  test('a mismatched or malformed context costs itself, never q/p', async () => {
+    db.insertApproval!.mockResolvedValue(true);
+    const q = '01J8MEAPPR0VAQ4X2C6TKN9RFV';
+    await injectDurable(
+      JSON.stringify({
+        tcm: 'x.approval',
+        q,
+        k: 'exec',
+        p: 'pnpm test',
+        x: 600,
+        a: ['approve', 'deny'],
+        work: {
+          provider: 'claude',
+          updatedAt: 1_800_000_000_000,
+          requestId: '01J8MEAPPR0VAQ4X2C6TKN9RFX',
+        },
+      }),
+      '01APPROVALFRAME00000000A05',
+    );
+    await injectDurable(
+      JSON.stringify({
+        tcm: 'x.approval',
+        q: '01J8MEAPPR0VAQ4X2C6TKN9RFY',
+        k: 'exec',
+        p: 'pnpm lint',
+        x: 600,
+        a: ['approve', 'deny'],
+        work: { provider: 'claude' },
+      }),
+      '01APPROVALFRAME00000000A06',
+    );
+
+    expect(db.insertApproval!).toHaveBeenNthCalledWith(
+      1,
+      expect.not.objectContaining({ work: expect.anything() }),
+    );
+    expect(db.insertApproval!).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ q: '01J8MEAPPR0VAQ4X2C6TKN9RFY', payload: 'pnpm lint' }),
+    );
+    expect(db.insertApproval!.mock.calls[1]![0]).not.toHaveProperty('work');
+    expect(db.recordAiWork!).not.toHaveBeenCalled();
+  });
+
   test('an unknown verb in `a` still lands the row — a verb costs the answer, never the frame', async () => {
     const msgId = '01APPROVALFRAME00000000A02';
     await injectDurable(vector('request-unknown-verb').body, msgId);
@@ -386,14 +487,250 @@ describe('duress', () => {
     session.setMode('duress');
 
     const msgId = '01APPROVALFRAME00000000C01';
-    await injectDurable(vector('request').body, msgId);
+    const request = JSON.parse(vector('request').body) as Record<string, unknown>;
+    await injectDurable(
+      JSON.stringify({
+        ...request,
+        work: {
+          provider: 'claude',
+          updatedAt: 1_800_000_000_000,
+          event: 'needs-review',
+          eventId: '01J8MEAPPR0VAQ4X2C6TKN9RFW',
+          requestId: '01J8MEAPPR0VAQ4X2C6TKN9RFV',
+        },
+      }),
+      msgId,
+    );
     off();
 
     expect(db.insertApproval!).not.toHaveBeenCalled();
     expect(db.insertMessage!).not.toHaveBeenCalled();
     expect(db.upsertChat!).not.toHaveBeenCalled();
+    expect(db.recordAiWork!).not.toHaveBeenCalled();
     expect(db.markSeen!).toHaveBeenCalledWith(msgId, expect.any(Number));
     expect(acksFor(msgId)).toHaveLength(1);
     expect(listener).not.toHaveBeenCalled();
+  });
+});
+
+describe('generation ownership at structured-work awaits', () => {
+  const work = {
+    provider: 'claude',
+    updatedAt: 1_800_000_000_000,
+    event: 'needs-review',
+    eventId: '01J8MEAPPR0VAQ4X2C6TKN9RFW',
+    requestId: '01J8MEAPPR0VAQ4X2C6TKN9RFV',
+  } as const;
+
+  test('a relock while the approval insert waits cannot write work into the next workspace', async () => {
+    let release!: (stored: boolean) => void;
+    db.insertApproval!.mockImplementationOnce(
+      () => new Promise<boolean>(resolve => { release = resolve; }),
+    );
+    const msgId = '01APPROVALFRAME00000000D01';
+    crypto.decryptEnvelope!.mockResolvedValue(
+      JSON.stringify({
+        tcm: 'x.approval',
+        q: work.requestId,
+        k: 'exec',
+        p: 'pnpm test',
+        x: 600,
+        a: ['approve', 'deny'],
+        work,
+      }),
+    );
+    ws.handlers.frame?.({
+      type: 'msg',
+      from: FRIEND,
+      msgId,
+      msgType: 'ciphertext',
+      payload: 'Q0lQSEVS',
+      ts: 5,
+    });
+    await settle(10);
+    messaging.stop();
+    release(true);
+    await settle();
+
+    expect(db.recordAiWork!).not.toHaveBeenCalled();
+    expect(acksFor(msgId)).toHaveLength(0);
+  });
+
+  test('a relock while profile apply waits cannot write its snapshot into the next workspace', async () => {
+    let release!: () => void;
+    db.applyPeerProfile!.mockImplementationOnce(
+      () => new Promise<void>(resolve => { release = resolve; }),
+    );
+    const msgId = '01APPROVALFRAME00000000D02';
+    crypto.decryptEnvelope!.mockResolvedValue(
+      JSON.stringify({
+        tcm: 'profile',
+        n: 'Claude Code',
+        a: '',
+        v: Date.now(),
+        work: {
+          provider: 'claude',
+          updatedAt: Date.now(),
+          capabilities: { notifications: true, approvals: true, tasks: false },
+        },
+        notifyPrefAck: {
+          q: '01J8MEAPPR0VAQ4X2C6TKN9RFW',
+          routine: 'quiet',
+        },
+      }),
+    );
+    ws.handlers.frame?.({
+      type: 'msg',
+      from: FRIEND,
+      msgId,
+      msgType: 'ciphertext',
+      payload: 'Q0lQSEVS',
+      ts: 5,
+    });
+    await settle(10);
+    messaging.stop();
+    release();
+    await settle();
+
+    expect(db.recordAiWork!).not.toHaveBeenCalled();
+    expect(db.applyAiNotifyPreferenceAck!).not.toHaveBeenCalled();
+    expect(acksFor(msgId)).toHaveLength(0);
+  });
+});
+
+describe('owner-controlled AI routine notifications', () => {
+  const preferenceQ = '01J8MEAPPR0VAQ4X2C6TKN9RFW';
+  const profile = {
+    userId: ME,
+    registrationId: 1,
+    displayName: 'Owner',
+    about: 'Available',
+    avatarB64: '',
+    profileVersion: 7,
+  };
+  const agentState = {
+    peerId: FRIEND,
+    provider: 'claude',
+    capabilities: { notifications: true, approvals: true, tasks: false },
+  };
+
+  test('queues an exact profile-carried request while the effective value remains unchanged', async () => {
+    db.loadProfile!.mockResolvedValue(profile);
+    db.getAiAgentState!.mockResolvedValue(agentState);
+
+    const q = await messaging.setAiRoutinePreference(FRIEND, 'quiet');
+
+    expect(q).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+    expect(db.beginAiNotifyPreference!).toHaveBeenCalledWith(
+      FRIEND,
+      q,
+      'quiet',
+      expect.any(Number),
+    );
+    expect(db.beginAiNotifyPreference!.mock.invocationCallOrder[0]).toBeLessThan(
+      db.enqueueOutgoing!.mock.invocationCallOrder[0]!,
+    );
+    const plaintext = crypto.encryptText!.mock.calls.at(-1)?.[2] as string;
+    expect(JSON.parse(plaintext)).toEqual({
+      tcm: 'profile',
+      n: '',
+      a: '',
+      v: 0,
+      notifyPref: { q, routine: 'quiet' },
+    });
+    expect(db.enqueueOutgoing!.mock.calls.at(-1)?.[1]).toMatchObject({
+      notify: false,
+    });
+    expect(db.markMyProfileSent!).not.toHaveBeenCalled();
+  });
+
+  test('refuses a request without a current source-backed notification capability', async () => {
+    db.loadProfile!.mockResolvedValue(profile);
+    db.getAiAgentState!.mockResolvedValue({
+      ...agentState,
+      capabilities: { notifications: false, approvals: true, tasks: false },
+    });
+
+    await expect(
+      messaging.setAiRoutinePreference(FRIEND, 'quiet'),
+    ).rejects.toThrow('not configured');
+    expect(db.beginAiNotifyPreference!).not.toHaveBeenCalled();
+    expect(crypto.encryptText!).not.toHaveBeenCalled();
+  });
+
+  test('a manual retry reuses the durable pending q instead of inventing a new request', async () => {
+    db.loadProfile!.mockResolvedValue(profile);
+    db.getAiAgentState!.mockResolvedValue(agentState);
+    db.getAiNotifyPreference!.mockResolvedValue({
+      peerId: FRIEND,
+      effectiveRoutine: 'all',
+      pendingQ: preferenceQ,
+      requestedRoutine: 'quiet',
+      requestedAt: 1,
+      acknowledgedAt: null,
+    });
+
+    await expect(
+      messaging.retryAiRoutinePreference(FRIEND),
+    ).resolves.toBe(preferenceQ);
+
+    expect(db.beginAiNotifyPreference!).not.toHaveBeenCalled();
+    const plaintext = crypto.encryptText!.mock.calls.at(-1)?.[2] as string;
+    expect(JSON.parse(plaintext).notifyPref).toEqual({
+      q: preferenceQ,
+      routine: 'quiet',
+    });
+  });
+
+  test('a storage refusal leaves no preference carrier to flush', async () => {
+    db.loadProfile!.mockResolvedValue(profile);
+    db.getAiAgentState!.mockResolvedValue(agentState);
+    db.beginAiNotifyPreference!.mockResolvedValueOnce(false);
+
+    await expect(
+      messaging.setAiRoutinePreference(FRIEND, 'quiet'),
+    ).rejects.toThrow('not available');
+    expect(crypto.encryptText!).not.toHaveBeenCalled();
+    expect(db.enqueueOutgoing!).not.toHaveBeenCalled();
+  });
+
+  test('an authenticated exact ack is applied even when its profile version is old', async () => {
+    await injectDurable(
+      JSON.stringify({
+        tcm: 'profile',
+        n: 'Claude Code',
+        a: '',
+        v: 1,
+        notifyPrefAck: { q: preferenceQ, routine: 'quiet' },
+      }),
+      '01APPROVALFRAME00000000E01',
+    );
+
+    expect(db.applyAiNotifyPreferenceAck!).toHaveBeenCalledWith(
+      FRIEND,
+      preferenceQ,
+      'quiet',
+      expect.any(Number),
+    );
+    expect(db.applyPeerProfile!).toHaveBeenCalled();
+  });
+
+  test('malformed preference metadata costs only itself and the profile still applies', async () => {
+    await injectDurable(
+      JSON.stringify({
+        tcm: 'profile',
+        n: 'Claude Code',
+        a: '',
+        v: 2,
+        notifyPrefAck: { q: 'wrong', routine: 'silent' },
+      }),
+      '01APPROVALFRAME00000000E02',
+    );
+
+    expect(db.applyPeerProfile!).toHaveBeenCalledWith(
+      FRIEND,
+      expect.objectContaining({ displayName: 'Claude Code', version: 2 }),
+    );
+    expect(db.applyAiNotifyPreferenceAck!).not.toHaveBeenCalled();
   });
 });

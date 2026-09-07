@@ -21,8 +21,25 @@ import { WsClient } from './wsclient.js';
 // The ONE reader of attend's state. Imported rather than re-derived — see
 // the attend check below for why this file, of all files, does not get to
 // have its own opinion about what attend.json says.
-import { attendState } from './attend.js';
-import type { ServiceIo } from './service.js';
+import { attendCodexBin, attendState } from './attend.js';
+import {
+  aiAttendCapabilityFact,
+  readAiCapabilities,
+  observeCodexVersion,
+  type AiProvider,
+} from './ai-capabilities.js';
+import {
+  inspectHostConfig,
+  SETUP_SURFACES,
+  type HostConfigInspection,
+  type SetupSurface,
+} from './hostconfig.js';
+import {
+  readCodexNotifyDiagnostic,
+  type CodexNotifyDiagnosticRead,
+} from './codex-notify-dispatch.js';
+import { statusOf, type ServiceIo } from './service.js';
+import { CLAUDE_SDK_INSTALL_STEP } from './claude-sdk.js';
 
 /**
  * `tacendum doctor`.
@@ -51,7 +68,7 @@ import type { ServiceIo } from './service.js';
 
 export interface CheckResult {
   /** Stable slug:
-   * home | identity | credential | attend | api | clock | session | ws. */
+   * home | identity | credential | attend | ai | api | clock | session | ws. */
   check: string;
   ok: boolean;
   detail: string;
@@ -116,6 +133,22 @@ export interface DoctorIo {
    * test never queries the real launchctl/systemd. Absent means the real
    * manager — which is the observation the check exists to make. */
   attendUnit?: ServiceIo;
+  /** One grouped seam for host files, process version output and the listen
+   * unit. A custom DoctorIo that omits it makes no machine-global AI probes;
+   * production's default supplies the real read-only observers. */
+  ai?: DoctorAiIo;
+}
+
+export interface DoctorAiIo {
+  inspectHost(surface: SetupSurface, account: string): HostConfigInspection;
+  listenerStatus(account: string): { installed: boolean; running: boolean };
+  codexVersion(bin: string): string | null;
+  codexDiagnostic(account: string): CodexNotifyDiagnosticRead;
+  /** Optional test seams for attendState's read-only SDK prerequisites.
+   * Production omits them and uses the reader's local package/environment
+   * probes. No credential value crosses this interface. */
+  claudeSdkInstalled?: () => boolean;
+  claudeSdkApiKeyPresent?: () => boolean;
 }
 
 function defaultIo(): DoctorIo {
@@ -155,6 +188,15 @@ function defaultIo(): DoctorIo {
       }
     },
     now: () => Date.now(),
+    ai: {
+      inspectHost: (surface, account) => inspectHostConfig(surface, account),
+      listenerStatus: account => {
+        const status = statusOf(account, {}, 'listen');
+        return { installed: status.installed, running: status.running };
+      },
+      codexVersion: bin => observeCodexVersion(bin),
+      codexDiagnostic: account => readCodexNotifyDiagnostic(account),
+    },
   };
 }
 
@@ -656,6 +698,81 @@ function identityLoads(blob: string): boolean {
   return true;
 }
 
+const AI_SURFACE_PROVIDER: Readonly<Record<SetupSurface, AiProvider>> = {
+  'claude-code': 'claude',
+  codex: 'codex',
+  gemini: 'gemini',
+  cursor: 'cursor',
+};
+
+const absentHostInspection = (): HostConfigInspection => ({
+  state: 'absent',
+  notificationConfigured: false,
+  approvalsConfigured: false,
+});
+
+function capabilityClass(capabilities: {
+  notifications: boolean;
+  approvals: boolean;
+  tasks: boolean;
+}): string {
+  if (capabilities.tasks) return 'task-capable';
+  if (capabilities.approvals) return 'native-approval-only';
+  if (capabilities.notifications) return 'notification-only';
+  return 'configured without an available capability';
+}
+
+const CODEX_NOTIFICATION_TEST =
+  'run: tacendum setup codex --name "<display name>" --test-notification; ' +
+  'a relay receipt does not prove phone display';
+
+function codexDispatchDetail(read: CodexNotifyDiagnosticRead): {
+  detail: string;
+  failed: boolean;
+} {
+  if (read.kind === 'missing') {
+    return { detail: 'no Codex dispatch recorded yet', failed: false };
+  }
+  if (read.kind === 'unreadable') {
+    return { detail: 'the payload-free Codex dispatch status is unreadable', failed: true };
+  }
+  const tacendum: Record<typeof read.diagnostic.tacendum, { text: string; failed: boolean }> = {
+    'not-run': { text: 'Tacendum child did not run', failed: true },
+    notified: {
+      text: 'relay accepted the Tacendum notification; this receipt does not prove phone display',
+      failed: false,
+    },
+    queued: { text: 'Tacendum notification is durably queued for retry', failed: false },
+    dropped: { text: 'Tacendum notification delivery was dropped', failed: true },
+    'never-started': { text: 'Tacendum child never started', failed: true },
+    'failed-after-start': {
+      text: 'Tacendum child started but delivery failed',
+      failed: true,
+    },
+  };
+  const parts = [`last Codex dispatch: ${tacendum[read.diagnostic.tacendum].text}`];
+  let failed = tacendum[read.diagnostic.tacendum].failed;
+  for (const previous of read.diagnostic.previous) {
+    switch (previous.state) {
+      case 'completed':
+        parts.push('foreign notifier completed');
+        break;
+      case 'started':
+        parts.push('foreign notifier started (completion was not observed)');
+        break;
+      case 'never-started':
+        parts.push('foreign notifier never started');
+        failed = true;
+        break;
+      case 'failed-after-start':
+        parts.push('foreign notifier started but delivery failed');
+        failed = true;
+        break;
+    }
+  }
+  return { detail: parts.join(', '), failed };
+}
+
 export async function runDoctor(name: string, io: DoctorIo = defaultIo()): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
   const home = tacendumHome();
@@ -915,11 +1032,17 @@ export async function runDoctor(name: string, io: DoctorIo = defaultIo()): Promi
   //   - unpaired: `attendOnce` refuses to run at all;
   //   - a unit installed but not running — supervision that is not
   //     supervising (not-installed stays a PASS: hand-run loops are legal).
+  const attend = attendState(name, {
+    now: () => io.now(),
+    ...(io.attendUnit === undefined ? {} : { service: io.attendUnit }),
+    ...(io.ai?.claudeSdkInstalled === undefined
+      ? {}
+      : { claudeSdkInstalled: io.ai.claudeSdkInstalled }),
+    ...(io.ai?.claudeSdkApiKeyPresent === undefined
+      ? {}
+      : { claudeSdkApiKeyPresent: io.ai.claudeSdkApiKeyPresent }),
+  });
   {
-    const attend = attendState(name, {
-      now: () => io.now(),
-      ...(io.attendUnit === undefined ? {} : { service: io.attendUnit }),
-    });
     if (attend.state === 'absent' || attend.state === 'disabled') {
       results.push({
         check: 'attend',
@@ -957,6 +1080,24 @@ export async function runDoctor(name: string, io: DoctorIo = defaultIo()): Promi
       if (!attend.workdirIsDirectory) {
         faults.push('the workdir is not a directory — turns cannot run there');
         remedies.push(`re-point it: tacendum attend enable ${shown} --workdir <dir>`);
+      }
+      if (attend.host === 'claude' && attend.claudeDriver === 'sdk') {
+        if (attend.claudeSdkInstalled !== true) {
+          faults.push(
+            'the Claude Agent SDK is not installed where this CLI runs — every SDK turn refuses',
+          );
+          remedies.push(`install the SDK where this CLI runs: ${CLAUDE_SDK_INSTALL_STEP}`);
+        }
+        if (attend.claudeSdkApiKeyPresent !== true) {
+          faults.push(
+            'ANTHROPIC_API_KEY is not available to this process — every SDK turn refuses',
+          );
+          remedies.push(
+            'provide ANTHROPIC_API_KEY to the attend process and restart it, or re-enable ' +
+              `the default driver: tacendum attend enable ${shown} --host claude ` +
+              '--driver subprocess',
+          );
+        }
       }
       if (attend.unit.installed && !attend.unit.running) {
         faults.push('the attend unit is installed but NOT running');
@@ -1014,6 +1155,240 @@ export async function runDoctor(name: string, io: DoctorIo = defaultIo()): Promi
             },
       );
     }
+  }
+
+  // --- ai: maintained host handlers, answerer capabilities and launch truth --
+  // Host notification/approval hooks and attend are independent lanes. In
+  // particular, an existing Claude notification surface may coexist with a
+  // Codex answerer on the same account; deriving one aggregate from the
+  // account name would hide that working answerer and advertise capabilities
+  // no single provider has. Assess every explicit provider separately, using
+  // the one attend fact only when its provider matches.
+  {
+    const inspections = new Map<SetupSurface, HostConfigInspection>();
+    for (const surface of SETUP_SURFACES) {
+      if (io.ai === undefined) {
+        inspections.set(surface, absentHostInspection());
+        continue;
+      }
+      try {
+        inspections.set(surface, io.ai.inspectHost(surface, name));
+      } catch {
+        inspections.set(surface, {
+          state: 'unreadable',
+          notificationConfigured: false,
+          approvalsConfigured: false,
+        });
+      }
+    }
+
+    const claudeInspection = inspections.get('claude-code') ?? absentHostInspection();
+    const notificationHandlerConfigured = [...inspections.values()].some(
+      inspection => inspection.notificationConfigured,
+    );
+    let listener: { installed: boolean; running: boolean } | null = null;
+    if (
+      (claudeInspection.approvalsConfigured ||
+        notificationHandlerConfigured ||
+        attend.state === 'enabled') &&
+      io.ai !== undefined
+    ) {
+      try {
+        const observed = io.ai.listenerStatus(name);
+        listener = {
+          installed: observed.installed === true,
+          running: observed.running === true,
+        };
+      } catch {
+        listener = null;
+      }
+    }
+
+    const attendFact = aiAttendCapabilityFact(
+      attend.state === 'enabled'
+        ? {
+            configured: true,
+            host: attend.host,
+            paired: attend.paired,
+            binRunnable: attend.binRunnable,
+            workdirIsDirectory: attend.workdirIsDirectory,
+            codexSignedIn: attend.codexSignedIn,
+            codexDriver: attend.codexDriver,
+            codexApprovalPolicy: attend.codexApprovalPolicy,
+            claudeDriver: attend.claudeDriver,
+            claudeSdkInstalled: attend.claudeSdkInstalled,
+            claudeSdkApiKeyPresent: attend.claudeSdkApiKeyPresent,
+          }
+        : { configured: false },
+    );
+    const codexInspection = inspections.get('codex') ?? absentHostInspection();
+    const codexRelevant =
+      codexInspection.notificationConfigured ||
+      (attendFact.configured && attendFact.provider === 'codex');
+    let installedCodexVersion: string | null | undefined;
+    if (codexRelevant && io.ai !== undefined) {
+      try {
+        const configuredBin =
+          attendFact.configured && attendFact.provider === 'codex'
+            ? attendCodexBin(name)
+            : 'codex';
+        installedCodexVersion =
+          configuredBin === undefined ? null : io.ai.codexVersion(configuredBin);
+      } catch {
+        installedCodexVersion = null;
+      }
+    }
+
+    const detail: string[] = [];
+    const issues: string[] = [];
+    const remedies: string[] = [];
+    let preferenceControlReported = false;
+    for (const surface of SETUP_SURFACES) {
+      const inspection = inspections.get(surface) ?? absentHostInspection();
+      if (inspection.state === 'unreadable') {
+        issues.push(`${surface} host configuration is unreadable`);
+        remedies.push(`run: tacendum setup ${surface} --name "<display name>"`);
+      }
+      const provider = AI_SURFACE_PROVIDER[surface];
+      const sameProviderAttend = attendFact.configured && attendFact.provider === provider;
+      const active =
+        inspection.notificationConfigured ||
+        inspection.approvalsConfigured ||
+        sameProviderAttend;
+      if (!active) continue;
+      const assessment = readAiCapabilities({
+        provider,
+        notificationConfigured: inspection.notificationConfigured,
+        nativeClaudePermissionConfigured:
+          provider === 'claude' && inspection.approvalsConfigured,
+        listenerConfigured: listener?.installed === true,
+        ...(listener === null ? {} : { listenerRunning: listener.running }),
+        attend: attendFact,
+        ...(provider === 'codex' && installedCodexVersion !== undefined
+          ? { codexInstalledVersion: installedCodexVersion }
+          : {}),
+      });
+      const caps = assessment.capabilities;
+      if (caps.notifications) preferenceControlReported = true;
+      detail.push(
+        `${provider}: ${capabilityClass(caps)} ` +
+          `(notifications ${caps.notifications ? 'yes' : 'no'}, approvals ${
+            caps.approvals ? 'yes' : 'no'
+          }, tasks ${caps.tasks ? 'yes' : 'no'})`,
+      );
+      if (provider === 'claude' && inspection.approvalsConfigured) {
+        detail.push(
+          'native interactive Claude PermissionRequest approvals apply to interactive sessions only',
+        );
+      }
+      if (provider === 'claude' && attend.state === 'enabled' && attend.host === 'claude') {
+        if ((attend.claudeDriver ?? 'subprocess') === 'subprocess') {
+          detail.push(
+            'claude -p subprocess tasks do not invoke PermissionRequest and have no phone tool-approval lane',
+          );
+        } else if (attend.claudeDriver === 'sdk') {
+          detail.push(
+            'Claude SDK answerer approvals are API-key-only and separate from interactive hook approvals',
+          );
+        }
+      }
+      if (assessment.codexVersion !== undefined) {
+        const version = assessment.codexVersion;
+        if (version.status === 'validated') {
+          detail.push(
+            `Codex installed ${version.installed}; validated target ${version.validatedTarget}`,
+          );
+        } else if (version.status === 'unvalidated') {
+          detail.push(
+            `Codex installed ${version.installed}; validated target ${version.validatedTarget}; ` +
+              'the installed dialect is unvalidated',
+          );
+        } else {
+          detail.push(
+            `Codex installed version unavailable; validated target ${version.validatedTarget}; ` +
+              'the approval dialect is unvalidated',
+          );
+        }
+      }
+    }
+
+    if (preferenceControlReported) {
+      if (listener === null) {
+        issues.push(
+          'routine notification preference listener status could not be read',
+        );
+        remedies.push(`run: tacendum service status ${shown}`);
+      } else if (!listener.installed) {
+        issues.push(
+          'routine notification preference requests have no installed receiving listener',
+        );
+        remedies.push(`run: tacendum service install ${shown}`);
+      } else if (!listener.running) {
+        issues.push(
+          'routine notification preference requests will stay queued while the receiving listener is installed but not running',
+        );
+        remedies.push(
+          `run: tacendum service status ${shown}; restart it with: tacendum service install ${shown}`,
+        );
+      } else {
+        detail.push('routine notification preference listener installed and running');
+      }
+    }
+
+    if (claudeInspection.approvalsConfigured) {
+      if (listener === null) {
+        issues.push(
+          'the interactive Claude PermissionRequest bridge is configured but listener status could not be read',
+        );
+        remedies.push(`run: tacendum service status ${shown}`);
+      } else if (!listener.installed) {
+        issues.push(
+          'the interactive Claude PermissionRequest bridge is configured but the listener is not installed',
+        );
+        remedies.push(`run: tacendum service install ${shown}`);
+      } else if (!listener.running) {
+        issues.push(
+          'the interactive Claude PermissionRequest bridge is configured; the listener is installed but not running',
+        );
+        remedies.push(`run: tacendum service install ${shown}`);
+      } else {
+        detail.push('Claude approval listener installed and running');
+      }
+    }
+
+    if (codexInspection.notificationConfigured) {
+      let dispatch: CodexNotifyDiagnosticRead;
+      try {
+        dispatch = io.ai?.codexDiagnostic(name) ?? { kind: 'missing' };
+      } catch {
+        dispatch = { kind: 'unreadable' };
+      }
+      const status = codexDispatchDetail(dispatch);
+      detail.push(status.detail);
+      if (status.failed) {
+        issues.push('the last Codex notification dispatch did not complete cleanly');
+        remedies.push(CODEX_NOTIFICATION_TEST);
+      }
+    }
+
+    const allDetail = [...detail, ...issues];
+    results.push(
+      issues.length === 0
+        ? {
+            check: 'ai',
+            ok: true,
+            detail:
+              allDetail.length === 0
+                ? 'no maintained AI host handler or attend answerer configured'
+                : allDetail.join('; '),
+          }
+        : {
+            check: 'ai',
+            ok: false,
+            detail: allDetail.join('; '),
+            remedy: [...new Set(remedies)].join(' — and '),
+          },
+    );
   }
 
   // --- api + clock: one round trip answers both ------------------------------

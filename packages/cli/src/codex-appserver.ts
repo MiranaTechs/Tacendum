@@ -5,7 +5,8 @@
  * approval surface at all, and an off-the-shelf JSON-RPC 2.0 library would
  * reject or mis-emit the frames this server actually speaks.
  *
- * THE DIALECT, measured on codex-cli 0.144.0 — three quirks, each of which fails
+ * THE DIALECT, measured on codex-cli 0.144.0 and compatibility-revalidated
+ * against 0.153.4 on 2026-09-06 — three quirks, each of which fails
  * SILENTLY if assumed away:
  *
  *  1. Framing is newline-delimited bare `{id,method,params}` JSON with NO
@@ -38,7 +39,7 @@
  */
 
 // ---------------------------------------------------------------------------
-// VENDORED PROTOCOL TYPES — keyed to codex-cli 0.144.0. Regenerate on every
+// VENDORED PROTOCOL TYPES — keyed to codex-cli 0.153.4. Regenerate on every
 // binary bump and re-run the live gate (gate.codex-appserver.test.ts pins the
 // installed version to this constant, so a bump FAILS the suite until someone
 // does):
@@ -56,7 +57,7 @@
  * installed `codex --version` against this and fails on mismatch — version
  * skew is proven-live and silent, so the canary must be
  * a test, not a comment. */
-export const CODEX_APPSERVER_VERSION = '0.144.0';
+export const CODEX_APPSERVER_VERSION = '0.153.4';
 
 /** v2/SandboxMode.ts, verbatim. */
 export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
@@ -337,14 +338,10 @@ class WireFailure extends Error {
  * have to police.
  */
 export function runAppServerTurn(req: AppServerTurnRequest): Promise<AppServerTurnOutcome> {
-  return new Promise(resolve => {
+  return new Promise((resolve) => {
     let session: SessionHandle;
     try {
-      session = req.session(
-        [...APP_SERVER_ARGV],
-        req.workdir,
-        { CODEX_HOME: req.codexHome },
-      );
+      session = req.session([...APP_SERVER_ARGV], req.workdir, { CODEX_HOME: req.codexHome });
     } catch {
       // Nothing launched. 127 is the code that already means exactly that
       // (realRunTurn's sync-throw arm makes the same call for the same
@@ -426,7 +423,7 @@ export function runAppServerTurn(req: AppServerTurnRequest): Promise<AppServerTu
       session.kill();
     };
 
-    session.onExit(code => {
+    session.onExit((code) => {
       exited = true;
       if (afterExit !== null) {
         resolve(afterExit);
@@ -493,12 +490,7 @@ export function runAppServerTurn(req: AppServerTurnRequest): Promise<AppServerTu
      * touching the wire: nothing sent is provably nothing delivered.
      */
     const steer = async (text: string): Promise<SteerResult> => {
-      if (
-        settled ||
-        threadId === undefined ||
-        liveTurnId === undefined ||
-        asksOutstanding > 0
-      ) {
+      if (settled || threadId === undefined || liveTurnId === undefined || asksOutstanding > 0) {
         return 'not-delivered';
       }
       try {
@@ -560,7 +552,10 @@ export function runAppServerTurn(req: AppServerTurnRequest): Promise<AppServerTu
 
     const serveRequest = async (method: string, id: unknown, params: Frame | undefined) => {
       if (method === 'item/commandExecution/requestApproval') {
-        send({ id, result: { decision: await decide(commandPayload(params), 'commandExecution') } });
+        send({
+          id,
+          result: { decision: await decide(commandPayload(params), 'commandExecution') },
+        });
         return;
       }
       if (method === 'item/fileChange/requestApproval') {
@@ -660,7 +655,7 @@ export function runAppServerTurn(req: AppServerTurnRequest): Promise<AppServerTu
       }
     };
 
-    session.onLine(line => {
+    session.onLine((line) => {
       let parsed: unknown;
       try {
         parsed = JSON.parse(line);
@@ -714,6 +709,19 @@ export function runAppServerTurn(req: AppServerTurnRequest): Promise<AppServerTu
        * unrecognised, never a silent new default).
        */
       approvalPolicy: req.approvalPolicy ?? 'untrusted',
+      /**
+       * ThreadStartParams/ThreadResumeParams in the generated 0.153.4 stable
+       * schema expose `approvalsReviewer?: 'user' | 'auto_review' |
+       * 'guardian_subagent' | null`. Tacendum's approval seam asks the paired
+       * OWNER and nobody else, so state that reviewer explicitly. Relying on
+       * the server default would let a future/default config select an
+       * automated reviewer while this client still presented itself as the
+       * phone approval path. The 0.153.4 build target was live-validated with
+       * this field on both allow and deny; this is not a per-turn installed-
+       * version probe, so setup/doctor must diagnose a different binary as an
+       * unvalidated dialect rather than claiming it is approval-ready.
+       */
+      approvalsReviewer: 'user',
       ...(req.sandbox !== undefined ? { sandbox: req.sandbox } : {}),
       // The model pin, typed (ThreadStartParams.model) — the same
       // isolation-must-not-change-the-model-silently rule the exec driver

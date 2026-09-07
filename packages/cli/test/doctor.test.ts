@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,10 +17,12 @@ const { FileStores } = await import('../src/stores.js');
 const { generateAndStoreKeys } = await import('../src/messaging.js');
 const { saveProfile } = await import('../src/profile.js');
 const { clientDir } = await import('../src/config.js');
+const { codexHomeDir } = await import('../src/attend-drivers.js');
 const { runDoctor, CLOCK_SKEW_TOLERANCE_MS } = await import('../src/doctor.js');
 const { CliError, EXIT } = await import('../src/exit.js');
 type CheckResult = import('../src/doctor.js').CheckResult;
 type DoctorIo = import('../src/doctor.js').DoctorIo;
+type DoctorAiIo = import('../src/doctor.js').DoctorAiIo;
 
 const NAME = 'doc';
 const USER_ID = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
@@ -47,7 +49,20 @@ interface IoOptions {
   me?: number | 'down';
   meUserId?: string;
   dial?: 'ok' | 'auth' | 'down' | 'refused' | 'answered';
+  ai?: DoctorAiIo;
 }
+
+const quietAi = (overrides: Partial<DoctorAiIo> = {}): DoctorAiIo => ({
+  inspectHost: () => ({
+    state: 'absent',
+    notificationConfigured: false,
+    approvalsConfigured: false,
+  }),
+  listenerStatus: () => ({ installed: false, running: false }),
+  codexVersion: () => null,
+  codexDiagnostic: () => ({ kind: 'missing' }),
+  ...overrides,
+});
 
 function io(opts: IoOptions = {}): DoctorIo {
   const fetchImpl = (async (input: RequestInfo | URL) => {
@@ -94,6 +109,7 @@ function io(opts: IoOptions = {}): DoctorIo {
       }
     },
     now: () => Date.now(),
+    ai: opts.ai ?? quietAi(),
   };
 }
 
@@ -119,6 +135,7 @@ describe('doctor', () => {
       'identity',
       'credential',
       'attend',
+      'ai',
       'api',
       'clock',
       'session',
@@ -365,6 +382,67 @@ describe('doctor: the attend check', () => {
     }
   });
 
+  it('fails closed when a configured Claude SDK answerer has lost a current prerequisite', async () => {
+    enable({ claudeDriver: 'sdk' });
+    pair();
+    try {
+      const missingBoth = await runDoctor(
+        NAME,
+        io({
+          ai: quietAi({
+            listenerStatus: () => ({ installed: true, running: true }),
+            claudeSdkInstalled: () => false,
+            claudeSdkApiKeyPresent: () => false,
+          }),
+        }),
+      );
+      const brokenAttend = byCheck(missingBoth, 'attend');
+      expect(brokenAttend.ok).toBe(false);
+      expect(brokenAttend.detail).toContain('Claude Agent SDK is not installed');
+      expect(brokenAttend.detail).toContain('ANTHROPIC_API_KEY is not available');
+      expect(brokenAttend.remedy).toContain(
+        'npm install @anthropic-ai/claude-agent-sdk@0.3.228',
+      );
+      expect(brokenAttend.remedy).toContain('ANTHROPIC_API_KEY');
+      expect(byCheck(missingBoth, 'ai').detail).toContain(
+        'claude: configured without an available capability',
+      );
+
+      const missingKey = byCheck(
+        await runDoctor(
+          NAME,
+          io({
+            ai: quietAi({
+              listenerStatus: () => ({ installed: true, running: true }),
+              claudeSdkInstalled: () => true,
+              claudeSdkApiKeyPresent: () => false,
+            }),
+          }),
+        ),
+        'attend',
+      );
+      expect(missingKey.ok).toBe(false);
+      expect(missingKey.detail).not.toContain('Claude Agent SDK is not installed');
+      expect(missingKey.detail).toContain('ANTHROPIC_API_KEY is not available');
+
+      const ready = await runDoctor(
+        NAME,
+        io({
+          ai: quietAi({
+            listenerStatus: () => ({ installed: true, running: true }),
+            claudeSdkInstalled: () => true,
+            claudeSdkApiKeyPresent: () => true,
+          }),
+        }),
+      );
+      expect(byCheck(ready, 'attend').ok).toBe(true);
+      expect(byCheck(ready, 'ai').detail).toContain('claude: task-capable');
+      expect(byCheck(ready, 'ai').detail).toContain('approvals yes');
+    } finally {
+      restore();
+    }
+  });
+
   it('an approval still pending past its own deadline FAILS — the sweep that would lapse it is not running', async () => {
     enable();
     pair();
@@ -440,5 +518,236 @@ describe('doctor: the attend check', () => {
       restore();
       rmSync(unitDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('doctor: AI configuration and launch diagnostics', () => {
+  const inspectOnly = (
+    surface: 'claude-code' | 'codex' | 'cursor' | 'gemini',
+    facts: { notificationConfigured: boolean; approvalsConfigured: boolean },
+  ): DoctorAiIo['inspectHost'] => candidate =>
+    candidate === surface
+      ? { state: 'configured', ...facts }
+      : {
+          state: 'absent',
+          notificationConfigured: false,
+          approvalsConfigured: false,
+        };
+
+  it('scopes native Claude approvals to interactive sessions and requires the listener', async () => {
+    const inspectHost = inspectOnly('claude-code', {
+      notificationConfigured: false,
+      approvalsConfigured: true,
+    });
+    const missing = byCheck(
+      await runDoctor(NAME, io({ ai: quietAi({ inspectHost }) })),
+      'ai',
+    );
+    expect(missing.ok).toBe(false);
+    expect(missing.detail).toContain('interactive Claude PermissionRequest');
+    expect(missing.detail).toContain('listener is not installed');
+    expect(missing.remedy).toContain('tacendum service install <name>');
+
+    const running = byCheck(
+      await runDoctor(
+        NAME,
+        io({
+          ai: quietAi({
+            inspectHost,
+            listenerStatus: () => ({ installed: true, running: true }),
+          }),
+        }),
+      ),
+      'ai',
+    );
+    expect(running.ok).toBe(true);
+    expect(running.detail).toContain('native-approval-only');
+    expect(running.detail).toContain('interactive sessions only');
+  });
+
+  it('diagnoses the receiving listener required by routine notification preferences', async () => {
+    const inspectHost = inspectOnly('cursor', {
+      notificationConfigured: true,
+      approvalsConfigured: false,
+    });
+    const missing = byCheck(
+      await runDoctor(NAME, io({ ai: quietAi({ inspectHost }) })),
+      'ai',
+    );
+    expect(missing.ok).toBe(false);
+    expect(missing.detail).toContain('cursor: notification-only');
+    expect(missing.detail).toContain(
+      'routine notification preference requests have no installed receiving listener',
+    );
+    expect(missing.remedy).toContain('tacendum service install <name>');
+
+    const stopped = byCheck(
+      await runDoctor(
+        NAME,
+        io({
+          ai: quietAi({
+            inspectHost,
+            listenerStatus: () => ({ installed: true, running: false }),
+          }),
+        }),
+      ),
+      'ai',
+    );
+    expect(stopped.ok).toBe(false);
+    expect(stopped.detail).toContain(
+      'routine notification preference requests will stay queued while the receiving listener is installed but not running',
+    );
+    expect(stopped.detail).not.toContain('no installed receiving listener');
+    expect(stopped.remedy).toContain('tacendum service status <name>');
+    expect(stopped.remedy).toContain('tacendum service install <name>');
+
+    const running = byCheck(
+      await runDoctor(
+        NAME,
+        io({
+          ai: quietAi({
+            inspectHost,
+            listenerStatus: () => ({ installed: true, running: true }),
+          }),
+        }),
+      ),
+      'ai',
+    );
+    expect(running.ok).toBe(true);
+    expect(running.detail).toContain(
+      'routine notification preference listener installed and running',
+    );
+  });
+
+  it('lists a notification surface and a different answerer as separate provider facts', async () => {
+    const attendJson = join(clientDir(NAME), 'attend.json');
+    const codexHome = codexHomeDir(NAME);
+    writeFileSync(
+      attendJson,
+      JSON.stringify({
+        host: 'codex',
+        bin: process.execPath,
+        workdir: home,
+        caps: [],
+        ownSession: 'ffffffff-9999-4999-8999-999999999999',
+        turnsPerHour: 5,
+        codexDriver: 'app-server',
+        codexApprovalPolicy: 'on-request',
+      }),
+    );
+    mkdirSync(codexHome, { recursive: true });
+    writeFileSync(join(codexHome, 'auth.json'), '{}');
+    saveProfile({ ...DOC_PROFILE, ownerUserId: USER_ID });
+    try {
+      const inspectHost: DoctorAiIo['inspectHost'] = surface =>
+        surface === 'claude-code'
+          ? {
+              state: 'configured',
+              notificationConfigured: true,
+              approvalsConfigured: false,
+            }
+          : {
+              state: 'absent',
+              notificationConfigured: false,
+              approvalsConfigured: false,
+            };
+      const codexVersion = vi.fn((bin: string) =>
+        bin === process.execPath ? '0.154.0' : '0.153.4',
+      );
+      const ai = byCheck(
+        await runDoctor(
+          NAME,
+          io({
+            ai: quietAi({
+              inspectHost,
+              codexVersion,
+              listenerStatus: () => ({ installed: true, running: true }),
+            }),
+          }),
+        ),
+        'ai',
+      );
+      expect(ai.ok).toBe(true);
+      expect(ai.detail).toContain('claude: notification-only');
+      expect(ai.detail).toContain('codex: task-capable');
+      expect(ai.detail).toContain('installed 0.154.0');
+      expect(ai.detail).toContain('validated target 0.153.4');
+      expect(ai.detail).toContain('unvalidated');
+      expect(ai.detail).not.toMatch(/blocked|broken/i);
+      expect(codexVersion).toHaveBeenCalledWith(process.execPath);
+    } finally {
+      rmSync(attendJson, { force: true });
+      rmSync(codexHome, { recursive: true, force: true });
+      saveProfile(DOC_PROFILE);
+    }
+  });
+
+  it('distinguishes a child that never started from a child delivery failure', async () => {
+    const inspectHost = inspectOnly('codex', {
+      notificationConfigured: true,
+      approvalsConfigured: false,
+    });
+    const ai = byCheck(
+      await runDoctor(
+        NAME,
+        io({
+          ai: quietAi({
+            inspectHost,
+            listenerStatus: () => ({ installed: true, running: true }),
+            codexVersion: () => '0.153.4',
+            codexDiagnostic: () => ({
+              kind: 'ok',
+              diagnostic: {
+                v: 1,
+                recordedAt: '2026-09-06T12:00:00.000Z',
+                tacendum: 'never-started',
+                previous: [{ index: 0, state: 'failed-after-start' }],
+              },
+            }),
+          }),
+        }),
+      ),
+      'ai',
+    );
+    expect(ai.ok).toBe(false);
+    expect(ai.detail).toContain('Tacendum child never started');
+    expect(ai.detail).toContain('foreign notifier started but delivery failed');
+    expect(ai.remedy).toContain(
+      'tacendum setup codex --name "<display name>" --test-notification',
+    );
+    expect(`${ai.detail} ${ai.remedy}`).not.toContain(NAME);
+  });
+
+  it('calls a relay acknowledgement a receipt, never proof of phone display', async () => {
+    const inspectHost = inspectOnly('codex', {
+      notificationConfigured: true,
+      approvalsConfigured: false,
+    });
+    const ai = byCheck(
+      await runDoctor(
+        NAME,
+        io({
+          ai: quietAi({
+            inspectHost,
+            listenerStatus: () => ({ installed: true, running: true }),
+            codexVersion: () => '0.153.4',
+            codexDiagnostic: () => ({
+              kind: 'ok',
+              diagnostic: {
+                v: 1,
+                recordedAt: '2026-09-06T12:00:00.000Z',
+                tacendum: 'notified',
+                previous: [{ index: 0, state: 'started' }],
+              },
+            }),
+          }),
+        }),
+      ),
+      'ai',
+    );
+    expect(ai.ok).toBe(true);
+    expect(ai.detail).toContain('relay accepted');
+    expect(ai.detail).toContain('does not prove phone display');
+    expect(ai.detail).toContain('foreign notifier started');
   });
 });

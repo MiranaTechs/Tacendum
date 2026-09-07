@@ -1,0 +1,50 @@
+import type { AiAgentStateRow } from './db';
+
+export const AI_TASK_PROMPT_MAX = 2_000;
+
+export const AI_QUICK_TASKS = [
+  {
+    id: 'review-changes',
+    label: 'Review changes',
+    prompt:
+      'Review the current changes. Explain significant risks and cite the files or evidence you used. Do not change files.',
+  },
+  {
+    id: 'explain-failure',
+    label: 'Explain a failing check',
+    prompt:
+      'Explain the current failing check. Identify the root cause and suggest the smallest fix. Do not change files.',
+  },
+  {
+    id: 'summarize-changes',
+    label: 'Summarize changes',
+    prompt:
+      'Summarize the current changes, grouped by user-visible behavior, and cite the files you inspected. Do not change files.',
+  },
+] as const;
+
+export type AiQuickTaskId = (typeof AI_QUICK_TASKS)[number]['id'];
+
+export function canStartAiTask(state: AiAgentStateRow | null): boolean {
+  return state?.capabilities?.tasks === true;
+}
+
+/**
+ * The confirmation belongs to the peer/provider/project shown when it was
+ * opened. Re-reading before send prevents an async capability or project
+ * change from turning a reviewed request into one addressed under different
+ * facts. Project remains display context; it is never sent as an authority
+ * over the host's working directory.
+ */
+export function sameAiTaskTarget(
+  reviewed: AiAgentStateRow,
+  current: AiAgentStateRow | null,
+): boolean {
+  return (
+    current !== null &&
+    current.peerId === reviewed.peerId &&
+    current.provider === reviewed.provider &&
+    current.project === reviewed.project &&
+    current.capabilities?.tasks === true
+  );
+}

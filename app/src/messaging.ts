@@ -895,6 +895,16 @@ class MessagingService {
   }
 
   /**
+   * Repaint after a debug fixture writes through db APIs. Production callers
+   * cannot use this as a second mutation path: release builds refuse it, and
+   * the dev hook separately requires the local target and real workspace.
+   */
+  debugNotifyForFixtures(): void {
+    if (!__DEV__) return;
+    this.notify();
+  }
+
+  /**
    * Receive decrypted envelopes as they arrive. Returns an unsubscribe.
    * Subscribers are advisory: a throwing one must never break delivery,
    * persistence, or the ack for everyone else.
@@ -2989,6 +2999,159 @@ class MessagingService {
     } catch {
       // Best-effort — retried on the next send or app start.
     }
+  }
+
+  /**
+   * Ask one configured agent to change how it pushes routine turn-complete
+   * reports. The request is a silent profile carrier so older peers harmlessly
+   * treat it as an ordinary profile refresh instead of feeding control text to
+   * an answerer. The database keeps the previous effective mode until that
+   * authenticated peer echoes this exact q+value.
+   */
+  async setAiRoutinePreference(
+    peerUserId: string,
+    routine: db.AiRoutineNotificationMode,
+  ): Promise<string> {
+    if (session.mode === 'duress') {
+      throw new Error('AI notification settings are unavailable while locked');
+    }
+    if (!maySendTo('profileCard', this.blockStateFor(peerUserId))) {
+      throw new BlockedPeerError('blocked');
+    }
+    const gen = this.generation;
+    const requireCurrent = (): void => {
+      if (this.stale(gen)) throw new Error('messaging not started');
+    };
+    const firstState = await db.getAiAgentState(peerUserId);
+    requireCurrent();
+    if (
+      firstState?.peerId !== peerUserId ||
+      firstState.capabilities?.notifications !== true
+    ) {
+      throw new Error('routine notifications are not configured for this agent');
+    }
+
+    // Re-read before allocating the request. Capability snapshots are
+    // configured support, not liveness, but a removed capability must not be
+    // ignored merely because this method began against an older snapshot.
+    const currentState = await db.getAiAgentState(peerUserId);
+    requireCurrent();
+    if (
+      currentState?.peerId !== peerUserId ||
+      currentState.provider !== firstState.provider ||
+      currentState.capabilities?.notifications !== true
+    ) {
+      throw new Error('routine notifications are not configured for this agent');
+    }
+
+    const q = await nextMsgId();
+    requireCurrent();
+    const requestedAt = Date.now();
+    const recorded = await db.beginAiNotifyPreference(
+      peerUserId,
+      q,
+      routine,
+      requestedAt,
+    );
+    requireCurrent();
+    if (!recorded) {
+      throw new Error('AI notification setting is not available');
+    }
+
+    const envelope = encodeEnvelope({
+      tcm: 'profile',
+      // A preference is control metadata, independent of whether this phone
+      // has ever published a profile. Inert v0 fields let older clients treat
+      // the carrier as a harmless profile refresh without leaking a name or
+      // coupling the control path to an avatar upload.
+      n: '',
+      a: '',
+      v: 0,
+      notifyPref: { q, routine },
+    });
+    let durable = false;
+    try {
+      await this.encryptAndEnqueue(peerUserId, envelope, {
+        preview: null,
+        onWire: () => {
+          durable = true;
+        },
+      });
+      return q;
+    } catch (error) {
+      // Once enqueueOutgoing commits, retry machinery owns the carrier and
+      // “waiting for the agent” is truthful even if the immediate flush
+      // failed. Before that point, retire only our own q; a newer choice wins.
+      if (durable) return q;
+      if (!this.stale(gen)) {
+        await db.clearAiNotifyPreferenceRequest(peerUserId, q);
+      }
+      throw error;
+    }
+  }
+
+  /** Re-send the exact still-pending request after an owner asks to retry. */
+  async retryAiRoutinePreference(peerUserId: string): Promise<string> {
+    if (session.mode === 'duress') {
+      throw new Error('AI notification settings are unavailable while locked');
+    }
+    if (!maySendTo('profileCard', this.blockStateFor(peerUserId))) {
+      throw new BlockedPeerError('blocked');
+    }
+    const gen = this.generation;
+    const requireCurrent = (): void => {
+      if (this.stale(gen)) throw new Error('messaging not started');
+    };
+    const pending = await db.getAiNotifyPreference(peerUserId);
+    requireCurrent();
+    if (pending.pendingQ === null || pending.requestedRoutine === null) {
+      throw new Error('there is no AI notification setting waiting to retry');
+    }
+
+    const firstState = await db.getAiAgentState(peerUserId);
+    requireCurrent();
+    if (
+      firstState?.peerId !== peerUserId ||
+      firstState.capabilities?.notifications !== true
+    ) {
+      throw new Error('routine notifications are not configured for this agent');
+    }
+    const currentState = await db.getAiAgentState(peerUserId);
+    requireCurrent();
+    const currentPending = await db.getAiNotifyPreference(peerUserId);
+    requireCurrent();
+    if (
+      currentState?.peerId !== peerUserId ||
+      currentState.provider !== firstState.provider ||
+      currentState.capabilities?.notifications !== true ||
+      currentPending.pendingQ !== pending.pendingQ ||
+      currentPending.requestedRoutine !== pending.requestedRoutine
+    ) {
+      throw new Error('the AI notification setting changed before retry');
+    }
+
+    const envelope = encodeEnvelope({
+      tcm: 'profile',
+      n: '',
+      a: '',
+      v: 0,
+      notifyPref: {
+        q: pending.pendingQ,
+        routine: pending.requestedRoutine,
+      },
+    });
+    let durable = false;
+    try {
+      await this.encryptAndEnqueue(peerUserId, envelope, {
+        preview: null,
+        onWire: () => {
+          durable = true;
+        },
+      });
+    } catch (error) {
+      if (!durable) throw error;
+    }
+    return pending.pendingQ;
   }
 
   /**
@@ -5630,7 +5793,13 @@ class MessagingService {
         // only. `frame.ts` keeps the row's place in the timeline. The
         // deadline itself lives on the CLI's clock (deny via:'ttl'); the
         // card's local grey-out claims only what this phone did — nothing.
-        await db.insertApproval({
+        const arrivedAt = Date.now();
+        // Context is supplementary and belongs only to the q carried by this
+        // immutable approval envelope. A mismatched requestId costs the work
+        // facts, never the exact q/p request itself.
+        const approvalWork =
+          envelope.work?.requestId === envelope.q ? envelope.work : undefined;
+        const stored = await db.insertApproval({
           peerId: frame.from,
           q: envelope.q,
           wireMsgId: frame.msgId,
@@ -5640,8 +5809,22 @@ class MessagingService {
           sessionTag: envelope.s ?? null,
           verbs: envelope.a,
           ts: frame.ts,
-          arrivedAt: Date.now(),
+          arrivedAt,
+          ...(approvalWork === undefined ? {} : { work: approvalWork }),
         });
+        if (this.stale(gen)) return;
+        // Replays and hostile q re-binds cannot smuggle a fresh event/state
+        // snapshot beside the append-once request. Only the frame that won
+        // the approval insert may contribute its structured facts.
+        if (stored && approvalWork !== undefined) {
+          await db.recordAiWork(
+            frame.from,
+            frame.msgId,
+            arrivedAt,
+            approvalWork,
+            'approval',
+          );
+        }
         // A relock crossed the write: leave WITHOUT acking, exactly as the
         // vault branch does — acking would purge the server's copy of a
         // frame this phone never persisted, and redelivery is the only
@@ -5764,6 +5947,27 @@ class MessagingService {
           hasAvatar: Boolean(envelope.att && envelope.key),
           version: envelope.v,
         });
+        if (this.stale(gen)) return;
+        const receivedAt = Date.now();
+        if (envelope.work !== undefined) {
+          await db.recordAiWork(
+            frame.from,
+            frame.msgId,
+            receivedAt,
+            envelope.work,
+            'profile',
+          );
+          if (this.stale(gen)) return;
+        }
+        if (envelope.notifyPrefAck !== undefined) {
+          await db.applyAiNotifyPreferenceAck(
+            frame.from,
+            envelope.notifyPrefAck.q,
+            envelope.notifyPrefAck.routine,
+            receivedAt,
+          );
+          if (this.stale(gen)) return;
+        }
         await this.noteSeen(frame.msgId);
         this.ws.send({ type: 'ack', msgId: frame.msgId });
         if (envelope.att && envelope.key) {
@@ -6959,6 +7163,7 @@ class MessagingService {
    */
   private async applyContent(ctx: ContentContext): Promise<void> {
     const { gen, envelope, text } = ctx;
+    const arrivedAt = Date.now();
     if (envelope?.tcm === 'x.edit') {
       // A relay-only intermediate arriving as a DURABLE send. The
       // 1:1 stored case never reaches here — the x.* namespace floor in
@@ -7019,6 +7224,32 @@ class MessagingService {
               stamp,
             );
       if (this.stale(gen)) return;
+      if (
+        envelope.tcm === 'edit' &&
+        envelope.work !== undefined &&
+        ctx.authorId === null &&
+        ctx.convId === ctx.senderId
+      ) {
+        // A duplicate terminal edit may already have applied before a crash.
+        // The anchor's presence is enough to record its idempotent event. An
+        // edit that raced ahead of the anchor stays parked and contributes no
+        // workspace-wide fact until redelivery can see that source row.
+        const sourceExists =
+          applied ||
+          (await db.getMessage(target.msgId, target.direction)) !== null;
+        if (this.stale(gen)) return;
+        if (sourceExists) {
+          await db.recordAiWork(
+            ctx.convId,
+            ctx.wireMsgId,
+            arrivedAt,
+            envelope.work,
+            'message',
+            target.msgId,
+          );
+          if (this.stale(gen)) return;
+        }
+      }
       if (!applied) {
         // The message being revised is not here yet — frames are handled
         // concurrently, so a carrier can overtake the prekey message it
@@ -7092,7 +7323,7 @@ class MessagingService {
       // The relayed-history insert stamps it too — arrival is arrival — and
       // `sharedBy` is what keeps those rows out of the unread count. Our
       // clock, never `ctx.ts`, which the sender chose.
-      arrivedAt: Date.now(),
+      arrivedAt,
     });
     if (this.stale(gen)) return;
     // A revision may have arrived before the message it revises; applying it
@@ -7111,6 +7342,25 @@ class MessagingService {
       if (this.stale(gen)) return;
     }
     await db.upsertChat(ctx.convId);
+    if (this.stale(gen)) return;
+    // Work metadata is a source-backed fact from an authenticated 1:1 agent.
+    // Rooms have their own consent boundary and device wrappers have a
+    // separate anchor identity, so neither is silently widened here.
+    const work =
+      ctx.authorId === null &&
+      ctx.convId === ctx.senderId &&
+      (envelope?.tcm === 'msg' || envelope?.tcm === 'reply')
+        ? envelope.work
+        : undefined;
+    if (work !== undefined) {
+      await db.recordAiWork(
+        ctx.convId,
+        ctx.wireMsgId,
+        arrivedAt,
+        work,
+        'message',
+      );
+    }
     // WITH the resolver: this is the single seam all INBOUND conversation
     // content crosses. Its outbound twin is fanOut's preview default,
     // which resolves the same way for the one caller that hands it a bare

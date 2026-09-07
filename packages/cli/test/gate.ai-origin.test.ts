@@ -1,8 +1,9 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
  * THE ART. 50 AI-ORIGIN FUNNEL — one module, one rule: every agent-authored body
@@ -101,12 +102,31 @@ const { applyGroupNew, ownerOnlyPolicy } = await import('@tacendum/shared/group-
 const { clientDir } = await import('../src/config.js');
 const { Reporter } = await import('../src/output.js');
 const { CliError, EXIT } = await import('../src/exit.js');
+const { applyOwnerNotifyPreference } = await import('../src/ai-notify-preference.js');
 
 const OWNER = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
 const SELF = '01HQXW0000000000000000TEST';
 const OWN_SESSION = 'ffffffff-9999-4999-8999-999999999999';
 const THREAD = 'f1f1f1f1-0000-4000-8000-000000000001';
 const GID = '01GGGGGGGGGGGGGGGGGGGGGGGG';
+const REPO_WORKDIR = join(home, 'context-fixture');
+
+// Exercise real Git discovery without depending on the checkout's directory
+// name, current branch, or even the presence of its .git metadata.
+beforeAll(() => {
+  mkdirSync(REPO_WORKDIR);
+  const options = {
+    cwd: REPO_WORKDIR,
+    env: { HOME: home, PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1' },
+    stdio: 'ignore' as const,
+  };
+  execFileSync('git', ['init', '--quiet', '--template='], options);
+  execFileSync('git', ['symbolic-ref', 'HEAD', 'refs/heads/test/ai-origin'], options);
+});
+
+afterAll(() => {
+  rmSync(home, { recursive: true, force: true });
+});
 
 let seq = 0;
 const mid = (): string => `01HQXS00000000000000${String(++seq).padStart(6, '0')}`.slice(0, 26);
@@ -190,6 +210,7 @@ const typingFake = () => {
 const streamDriver = (
   opts: {
     reply?: string;
+    code?: number;
     ask?: { payload: string; ttlMs: number; pushBeforeAsk?: string };
   } = {},
 ) => {
@@ -210,7 +231,12 @@ const streamDriver = (
         await req.ask({ payload: opts.ask.payload, ttlMs: opts.ask.ttlMs });
       }
       await released;
-      return { stdout: opts.reply ?? 'final answer', stderr: '', code: 0, refusal: null };
+      return {
+        stdout: opts.reply ?? 'final answer',
+        stderr: '',
+        code: opts.code ?? 0,
+        refusal: null,
+      };
     },
   };
   return {
@@ -309,8 +335,257 @@ describe('markerAttested — one attestation file, every sender lane', () => {
 });
 
 describe('the one way out of attend is marked (the coverage pin)', () => {
+  it('quiet mode suppresses only the successful 1:1 turn-complete push', async () => {
+    cfg({ markerMinAppBuild: 11 });
+    applyOwnerNotifyPreference(
+      'bot',
+      OWNER,
+      OWNER,
+      JSON.stringify({
+        tcm: 'profile',
+        n: '',
+        a: '',
+        v: 0,
+        notifyPref: { q: '01HQXW0000000000000000PREF', routine: 'quiet' },
+      }),
+    );
+    new MessageLog('bot').append(inRow('do the work'));
+    seams.driver = {
+      host: 'codex',
+      async runTurn() {
+        return { stdout: 'completed normally', stderr: '', code: 0, refusal: null };
+      },
+    };
+    const h = fakeSend();
+
+    expect(await attendOnce('bot', { ...clockIo(), sendReply: h.sendReply })).toBe('answered');
+    expect(h.sends).toHaveLength(1);
+    expect(h.sends[0]?.notify).toBe(false);
+    expect(asEnvelope(h.sends[0]?.body as string)?.work).toMatchObject({
+      event: 'turn-complete',
+    });
+  });
+
+  it('quiet mode keeps a failed 1:1 turn push-enabled', async () => {
+    cfg({ markerMinAppBuild: 11 });
+    applyOwnerNotifyPreference(
+      'bot',
+      OWNER,
+      OWNER,
+      JSON.stringify({
+        tcm: 'profile',
+        n: '',
+        a: '',
+        v: 0,
+        notifyPref: { q: '01HQXW0000000000000000PREF', routine: 'quiet' },
+      }),
+    );
+    new MessageLog('bot').append(inRow('do the work'));
+    seams.driver = {
+      host: 'codex',
+      async runTurn() {
+        return { stdout: '', stderr: 'failed', code: 7, refusal: null };
+      },
+    };
+    const h = fakeSend();
+
+    expect(await attendOnce('bot', { ...clockIo(), sendReply: h.sendReply })).toBe('failed');
+    expect(h.sends).toHaveLength(1);
+    expect(h.sends[0]?.notify).toBeUndefined();
+    expect(asEnvelope(h.sends[0]?.body as string)?.work).toMatchObject({ event: 'turn-failed' });
+  });
+
+  it('quiet mode suppresses the provisional stream and sends one quiet successful final', async () => {
+    cfg({ markerMinAppBuild: 11, streamMinAppBuild: 11 });
+    applyOwnerNotifyPreference(
+      'bot',
+      OWNER,
+      OWNER,
+      JSON.stringify({
+        tcm: 'profile',
+        n: '',
+        a: '',
+        v: 0,
+        notifyPref: { q: '01HQXW0000000000000000PREF', routine: 'quiet' },
+      }),
+    );
+    new MessageLog('bot').append(inRow('stream the work'));
+    const fake = streamDriver({ reply: 'completed normally' });
+    seams.driver = fake.driver;
+    const h = fakeSend();
+    const clock = clockIo();
+    const typing = typingFake();
+    const run = attendOnce('bot', {
+      ...clock,
+      sendReply: h.sendReply,
+      typing: typing.factory,
+    });
+
+    await poll(() => fake.calls() === 1);
+    fake.push('early routine progress');
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(h.sends, 'Quiet must not mint a notifying provisional anchor').toHaveLength(0);
+    expect(typing.edits).toHaveLength(0);
+
+    // The stream made its one delivery choice when the first snapshot was
+    // ready. A later preference applies to later turns; it cannot turn this
+    // quiet turn's deferred final into a fresh interruption.
+    applyOwnerNotifyPreference(
+      'bot',
+      OWNER,
+      OWNER,
+      JSON.stringify({
+        tcm: 'profile',
+        n: '',
+        a: '',
+        v: 0,
+        notifyPref: { q: '01HQXZ0000000000000000PREF', routine: 'all' },
+      }),
+    );
+
+    fake.finish();
+    expect(await run).toBe('answered');
+    expect(h.sends).toHaveLength(1);
+    expect(h.sends[0]?.notify).toBe(false);
+    const terminal = asEnvelope(h.sends[0]?.body as string)?.work as
+      { event?: string; eventId?: string } | undefined;
+    expect(terminal).toMatchObject({ event: 'turn-complete' });
+    expect(terminal?.eventId).toMatch(/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+  });
+
+  it('quiet mode suppresses the provisional stream but keeps one failed final notifying', async () => {
+    cfg({ markerMinAppBuild: 11, streamMinAppBuild: 11 });
+    applyOwnerNotifyPreference(
+      'bot',
+      OWNER,
+      OWNER,
+      JSON.stringify({
+        tcm: 'profile',
+        n: '',
+        a: '',
+        v: 0,
+        notifyPref: { q: '01HQXW0000000000000000PREF', routine: 'quiet' },
+      }),
+    );
+    new MessageLog('bot').append(inRow('stream the risky work'));
+    const fake = streamDriver({ reply: 'provider stopped', code: 7 });
+    seams.driver = fake.driver;
+    const h = fakeSend();
+    const clock = clockIo();
+    const typing = typingFake();
+    const run = attendOnce('bot', {
+      ...clock,
+      sendReply: h.sendReply,
+      typing: typing.factory,
+    });
+
+    await poll(() => fake.calls() === 1);
+    fake.push('early routine progress');
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(h.sends, 'Quiet must not mint a notifying provisional anchor').toHaveLength(0);
+    expect(typing.edits).toHaveLength(0);
+
+    fake.finish();
+    expect(await run).toBe('failed');
+    expect(h.sends).toHaveLength(1);
+    expect(
+      h.sends[0]?.notify,
+      'failure keeps the transport default that wakes the owner',
+    ).toBeUndefined();
+    const terminal = asEnvelope(h.sends[0]?.body as string)?.work as
+      { event?: string; eventId?: string } | undefined;
+    expect(terminal).toMatchObject({ event: 'turn-failed' });
+    expect(terminal?.eventId).toMatch(/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+  });
+
+  it('a terminal answer combines captured context, runnable tasks and exact native-hook support', async () => {
+    cfg({
+      host: 'claude',
+      bin: process.execPath,
+      workdir: REPO_WORKDIR,
+      caps: ['--permission-mode', 'plan'],
+      claudeDriver: 'subprocess',
+      markerMinAppBuild: 11,
+    });
+    new MessageLog('bot').append(inRow('inspect this project'));
+    seams.driver = {
+      host: 'claude',
+      async runTurn() {
+        return { stdout: 'inspection complete', stderr: '', code: 0, refusal: null };
+      },
+    };
+    const h = fakeSend();
+
+    expect(
+      await attendOnce('bot', {
+        ...clockIo(),
+        sendReply: h.sendReply,
+        aiCapability: {
+          inspectHost: () => ({ notificationConfigured: false, approvalsConfigured: true }),
+          listenerStatus: () => ({ installed: true, running: true }),
+        },
+      }),
+    ).toBe('answered');
+    expect(h.sends).toHaveLength(1);
+    const work = asEnvelope(h.sends[0]?.body as string)?.work as
+      Record<string, unknown> | undefined;
+    expect(work).toMatchObject({
+      provider: 'claude',
+      event: 'turn-complete',
+      project: 'context-fixture',
+      context: {
+        availability: 'captured',
+        repository: 'context-fixture',
+        branch: 'test/ai-origin',
+        capturedAt: expect.any(Number),
+      },
+      capabilities: { notifications: true, approvals: true, tasks: true },
+    });
+  });
+
+  it('a terminal Claude SDK snapshot requires current package and API-key presence', async () => {
+    cfg({
+      host: 'claude',
+      bin: process.execPath,
+      workdir: REPO_WORKDIR,
+      caps: ['--permission-mode', 'default'],
+      claudeDriver: 'sdk',
+      markerMinAppBuild: 11,
+    });
+    new MessageLog('bot').append(inRow('review this project'));
+    seams.driver = {
+      host: 'claude',
+      async runTurn() {
+        return { stdout: 'review complete', stderr: '', code: 0, refusal: null };
+      },
+    };
+    const h = fakeSend();
+
+    expect(
+      await attendOnce('bot', {
+        ...clockIo(),
+        sendReply: h.sendReply,
+        aiCapability: {
+          inspectHost: () => ({ notificationConfigured: false, approvalsConfigured: false }),
+          listenerStatus: () => ({ installed: true, running: true }),
+          claudeSdkInstalled: () => true,
+          claudeSdkApiKeyPresent: () => true,
+        },
+      }),
+    ).toBe('answered');
+    expect(asEnvelope(h.sends[0]?.body as string)?.work).toMatchObject({
+      provider: 'claude',
+      capabilities: { notifications: true, approvals: true, tasks: true },
+    });
+  });
+
   it('attested: card, anchor, intermediates and final ALL leave marked — no compose path escapes', async () => {
-    cfg({ markerMinAppBuild: 11, streamMinAppBuild: 11, approvalsMinAppBuild: 11 });
+    cfg({
+      markerMinAppBuild: 11,
+      streamMinAppBuild: 11,
+      approvalsMinAppBuild: 11,
+      workdir: REPO_WORKDIR,
+    });
     new MessageLog('bot').append(inRow('deploy it'));
     const fake = streamDriver({
       reply: 'done after approval',
@@ -346,16 +621,152 @@ describe('the one way out of attend is marked (the coverage pin)', () => {
     expect(kinds).toContain('x.approval');
     expect(kinds).toContain('msg');
     expect(kinds).toContain('edit');
+    const approval = h.sends
+      .map((s) => asEnvelope(s.body))
+      .find((e) => e?.tcm === 'x.approval') as {
+      work?: { context?: Record<string, unknown> };
+    };
+    expect(approval.work?.context).toMatchObject({
+      availability: 'captured',
+      repository: 'context-fixture',
+      branch: 'test/ai-origin',
+      capturedAt: expect.any(Number),
+    });
+    const approvalRequestId = approval.work?.requestId as string;
+    const observationSend = h.sends.find((s) => {
+      const work = asEnvelope(s.body)?.work as { approvalObservation?: string } | undefined;
+      return work?.approvalObservation === 'decision-returned';
+    });
+    expect(observationSend?.notify).toBe(false);
+    const observation = asEnvelope(observationSend?.body as string) as {
+      text?: string;
+      work?: Record<string, unknown>;
+    };
+    expect(observation.text).toBe('Approval decision returned to codex.');
+    expect(observation.work).toMatchObject({
+      provider: 'codex',
+      requestId: approvalRequestId,
+      approvalObservation: 'decision-returned',
+      updatedAt: expect.any(Number),
+    });
+    expect(observation.work?.event).toBeUndefined();
+    expect(
+      h.sends.some(
+        (s) =>
+          (asEnvelope(s.body)?.work as { approvalObservation?: string } | undefined)
+            ?.approvalObservation === 'provider-received',
+      ),
+    ).toBe(false);
     // The anchor's words ride inside the msg wrapper, funneled and intact.
     const anchor = h.sends.map((s) => asEnvelope(s.body)).find((e) => e?.tcm === 'msg') as {
       text: string;
     };
     expect(anchor.text).toBe('early partial');
+    const terminal = h.sends.map((s) => asEnvelope(s.body)).find((e) => e?.tcm === 'edit') as {
+      work?: {
+        provider?: string;
+        event?: string;
+        eventId?: string;
+        updatedAt?: number;
+        usage?: Array<Record<string, unknown>>;
+      };
+    };
+    expect(terminal.work).toMatchObject({
+      provider: 'codex',
+      event: 'turn-complete',
+      usage: [
+        {
+          source: 'local-budget',
+          unit: 'turns',
+          period: 'hour',
+          used: 1,
+          remaining: 9,
+          limit: 10,
+        },
+      ],
+    });
+    expect(terminal.work?.eventId).toMatch(/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+    expect(terminal.work?.usage?.[0]?.observedAt).toBe(terminal.work?.updatedAt);
     // Every stream intermediate is marked too.
     expect(typing.edits.length).toBeGreaterThanOrEqual(1);
     for (const frame of typing.edits) {
       expect((JSON.parse(frame) as { ai?: boolean }).ai).toBe(true);
     }
+  }, 30_000);
+
+  it('a failed 1:1 turn emits one source-backed turn-failed event on its terminal reply', async () => {
+    cfg({ markerMinAppBuild: 11 });
+    new MessageLog('bot').append(inRow('do the work'));
+    seams.driver = {
+      host: 'codex',
+      async runTurn() {
+        return { stdout: '', stderr: '', code: 7, refusal: null, sessionKey: THREAD };
+      },
+    };
+    const h = fakeSend();
+    const clock = clockIo();
+    expect(await attendOnce('bot', { ...clock, sendReply: h.sendReply })).toBe('failed');
+
+    expect(h.sends).toHaveLength(1);
+    const terminal = asEnvelope(h.sends[0]?.body as string) as {
+      text?: string;
+      work?: {
+        provider?: string;
+        event?: string;
+        eventId?: string;
+        runTag?: string;
+        usage?: Array<Record<string, unknown>>;
+      };
+    };
+    expect(terminal.text).toContain('The turn failed (exit 7)');
+    expect(terminal.work).toMatchObject({
+      provider: 'codex',
+      event: 'turn-failed',
+      runTag: expect.stringMatching(/^s-[0-9a-f]{4}$/),
+      usage: [
+        {
+          source: 'local-budget',
+          unit: 'turns',
+          period: 'hour',
+          used: 1,
+          remaining: 9,
+          limit: 10,
+        },
+      ],
+    });
+    expect(terminal.work?.eventId).toMatch(/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+  });
+
+  it('an error returned immediately after an approval callback claims only decision-returned', async () => {
+    cfg({ markerMinAppBuild: 11, approvalsMinAppBuild: 11 });
+    new MessageLog('bot').append(inRow('try the work'));
+    seams.driver = {
+      host: 'codex',
+      async runTurn(req) {
+        await req.ask?.({ payload: 'touch result.txt', kind: 'commandExecution' });
+        return { stdout: '', stderr: 'host stopped', code: 7, refusal: null };
+      },
+    };
+    const h = fakeSend();
+    const run = attendOnce('bot', { ...clockIo(), sendReply: h.sendReply });
+    await poll(() => approvalRows()[0]?.state === 'pending');
+    const approval = approvalRows()[0] as { msgId?: string };
+    new MessageLog('bot').append(inRow('approve', { tcm: 'reply', ref: approval.msgId }));
+
+    expect(await run).toBe('failed');
+    const observations = h.sends
+      .map((s) => ({ send: s, envelope: asEnvelope(s.body) }))
+      .filter(
+        (item) =>
+          (item.envelope?.work as { approvalObservation?: string } | undefined)
+            ?.approvalObservation !== undefined,
+      );
+    expect(observations).toHaveLength(1);
+    expect(observations[0]?.send.notify).toBe(false);
+    expect(observations[0]?.envelope?.work).toMatchObject({
+      approvalObservation: 'decision-returned',
+    });
+    expect(JSON.stringify(h.sends)).not.toContain('provider-received');
   }, 30_000);
 
   it('un-attested marker: bare text is byte-identical to today, while envelope bodies still carry ai', async () => {
@@ -805,32 +1216,34 @@ describe('the approval-card cap guard sees the FINAL marked bytes (boundary band
     return h.sends;
   }
 
-  it('a card in the band composes null → the graceful overcap deny, never a body past MAX_BODY_BYTES', async () => {
-    // MEASURE: a small ask lands a real card; the envelope's overhead is its
-    // byte length minus the payload's (q is fixed-width, k/x/a identical
-    // across both accounts' asks, and the ungated marker is INSIDE it).
+  it('supplementary work yields at the frame boundary before an exact approval payload is refused', async () => {
+    // MEASURE: a small ask lands a real card. q/eventId are fixed-width and
+    // the fixture clock keeps every timestamp at the same digit width, so
+    // removing `work` from these parsed bytes gives the legacy card overhead
+    // for a second account without guessing at JSON escaping.
     const probe = 'measure me';
     const sends1 = await turnWithAsk('band-measure', probe);
     const card = sends1.map((s) => asEnvelope(s.body)).find((e) => e?.tcm === 'x.approval');
     expect(card, 'the measuring ask must land a card').toBeDefined();
-    const cardBytes = Buffer.byteLength(
-      sends1.find((s) => asEnvelope(s.body)?.tcm === 'x.approval')?.body as string,
-      'utf8',
-    );
-    const overhead = cardBytes - probe.length;
     expect(card?.ai, 'the measured card carries the marker inside the cap').toBe(true);
+    expect(card?.work, 'small cards carry the supplementary work fact').toBeDefined();
+    const legacy = { ...card };
+    delete legacy.work;
+    const legacyOverhead = Buffer.byteLength(JSON.stringify(legacy), 'utf8') - probe.length;
 
-    // THE BAND: pre-marker bytes ≤ MAX_BODY_BYTES < marked bytes. The old
-    // guard passed this card; assertBodyWithinCap then threw INSIDE
-    // sendEncrypted — past the graceful deny, with the ratchet question
-    // already asked. The honest guard refuses it at compose time.
-    const payload = 'p'.repeat(MAX_BODY_BYTES - overhead + 5);
+    // THE BAND: the legacy, marked card fits exactly; adding optional work
+    // does not. The immutable approval payload outranks its supplementary
+    // activity decoration, so the card must still leave with p byte-exact.
+    const payload = 'p'.repeat(MAX_BODY_BYTES - legacyOverhead);
     const sends2 = await turnWithAsk('band-over', payload);
     const after = approvalsFile('band-over');
-    expect(after.rows[0]).toMatchObject({ decision: 'deny', via: 'overcap' });
-    expect(after.overCapRefusals).toBe(1);
-    // The deny is SAID, and nothing this pass sent can out-size the wire cap.
-    expect(sends2.some((s) => s.body.includes('does not fit'))).toBe(true);
+    expect(after.overCapRefusals).toBe(0);
+    const boundaryBody = sends2.find((s) => asEnvelope(s.body)?.tcm === 'x.approval')?.body;
+    expect(boundaryBody, 'the approval card still leaves').toBeDefined();
+    const boundary = JSON.parse(boundaryBody as string) as Record<string, unknown>;
+    expect(boundary.p).toBe(payload);
+    expect(boundary.work, 'supplementary work is the field that yields').toBeUndefined();
+    expect(Buffer.byteLength(boundaryBody as string, 'utf8')).toBe(MAX_BODY_BYTES);
     for (const s of sends2) {
       expect(Buffer.byteLength(s.body, 'utf8')).toBeLessThanOrEqual(MAX_BODY_BYTES);
     }

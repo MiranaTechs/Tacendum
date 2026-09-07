@@ -45,6 +45,7 @@ type Cell = string | number | null;
 type Row = Record<string, Cell>;
 
 let table: Row[] = [];
+let revokedPeers = new Set<string>();
 
 /** Bind `?` placeholders into the text positionally — one cursor over the
  * whole statement, which is what the driver does. The evaluator resolves
@@ -159,6 +160,12 @@ function runApprovalSql(
   params: readonly unknown[],
 ): { rows: Row[]; rowsAffected?: number } | null {
   const flat = rawSql.replace(/\s+/g, ' ').trim();
+  if (/^INSERT INTO revoked_machine_peers\b/i.test(flat)) {
+    const peerId = String(params[0]);
+    const added = !revokedPeers.has(peerId);
+    revokedPeers.add(peerId);
+    return { rows: [], rowsAffected: added ? 1 : 0 };
+  }
   if (!/\bapprovals\b/i.test(flat)) return null;
   if (/^CREATE TABLE/i.test(flat)) return { rows: [] };
   const sql = bind(flat);
@@ -169,7 +176,7 @@ function runApprovalSql(
   // literal read off the statement), so a stripped condition or a changed
   // number changes what the model admits.
   const insert =
-    /^INSERT INTO approvals \(([^)]*)\) (?:VALUES \((.*)\)|SELECT (.*?) WHERE \(SELECT COUNT\(\*\) FROM approvals WHERE (.*)\) < (\d+)) ON CONFLICT\(([^)]*)\) DO NOTHING$/i.exec(
+    /^INSERT INTO approvals \(([^)]*)\) (?:VALUES \((.*)\)|SELECT (.*?) WHERE \(SELECT COUNT\(\*\) FROM approvals WHERE (.*)\) < (\d+)(?: AND NOT EXISTS \( SELECT 1 FROM revoked_machine_peers WHERE peerId = (§\d+§) \))?) ON CONFLICT\(([^)]*)\) DO NOTHING$/i.exec(
       sql,
     );
   if (insert) {
@@ -179,6 +186,12 @@ function runApprovalSql(
       const live = table.filter(row => evalCond(insert[4]!, row, params)).length;
       if (!(live < Number(insert[5]))) return { rows: [], rowsAffected: 0 };
     }
+    if (
+      insert[6] !== undefined &&
+      revokedPeers.has(String(evalExpr(insert[6], null, params)))
+    ) {
+      return { rows: [], rowsAffected: 0 };
+    }
     const values = splitTop(valueList, ',').map(v => evalExpr(v, null, params));
     if (cols.length !== values.length) {
       throw new Error('approvals model: column/value count mismatch');
@@ -187,7 +200,7 @@ function runApprovalSql(
     cols.forEach((col, i) => {
       row[col] = values[i] === undefined ? null : values[i]!;
     });
-    const target = insert[6]!.split(',').map(x => x.trim());
+    const target = insert[7]!.split(',').map(x => x.trim());
     const clash = table.some(r => target.every(col => r[col] === row[col]));
     // DO NOTHING is the single-use rule at rest: the model inserts ONLY
     // when the conflict target finds no existing row.
@@ -266,6 +279,7 @@ beforeEach(async () => {
   await db.close();
   sqlite.reset();
   table = [];
+  revokedPeers = new Set();
   db.setWorkspace('real');
   await db.initDb();
   const instance = sqlite.instances.get(REAL)!;
@@ -343,6 +357,17 @@ describe('insert — single-use under (peerId, q)', () => {
     expect(await db.listApprovals(PEER, T0 + 1)).toHaveLength(1);
     expect(await db.listApprovals(OTHER_PEER, T0 + 1)).toHaveLength(1);
     expect((await db.listApprovals(PEER, T0 + 1))[0]!.payload).toBe(ASK.payload);
+  });
+
+  test('a successfully revoked machine rejects late and replayed approval inserts', async () => {
+    await db.insertApproval(ASK);
+    await db.recordMachineRevoked(PEER, T0 + 1);
+
+    expect(await db.listApprovals(PEER, T0 + 2)).toHaveLength(0);
+    expect(
+      await db.insertApproval({ ...ASK, q: Q2, arrivedAt: T0 + 3, ts: T0 + 3 }),
+    ).toBe(false);
+    expect(await db.listApprovals(PEER, T0 + 4)).toHaveLength(0);
   });
 });
 

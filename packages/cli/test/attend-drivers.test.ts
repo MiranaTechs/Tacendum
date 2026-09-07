@@ -50,12 +50,22 @@ const REFUSAL = {
 };
 
 const claudeCfg = (over: Partial<AttendConfig> = {}): AttendConfig => ({
-  host: 'claude', bin: '/opt/agent', workdir: '/w', caps: ['--permission-mode', 'plan'],
-  ownSession: OWN_SESSION, turnsPerHour: 10, ...over,
+  host: 'claude',
+  bin: '/opt/agent',
+  workdir: '/w',
+  caps: ['--permission-mode', 'plan'],
+  ownSession: OWN_SESSION,
+  turnsPerHour: 10,
+  ...over,
 });
 const codexCfg = (over: Partial<AttendConfig> = {}): AttendConfig => ({
-  host: 'codex', bin: '/opt/codex', workdir: '/w', caps: ['-s', 'read-only'],
-  ownSession: OWN_SESSION, turnsPerHour: 10, ...over,
+  host: 'codex',
+  bin: '/opt/codex',
+  workdir: '/w',
+  caps: ['-s', 'read-only'],
+  ownSession: OWN_SESSION,
+  turnsPerHour: 10,
+  ...over,
 });
 
 type Answer = { stdout: string; stderr: string; code: number };
@@ -95,11 +105,20 @@ describe('the claude driver', () => {
   it('argv per route: a routed session resumes; own-fresh creates; own-started resumes', async () => {
     const a = seam(ok);
     await driverFor('claude').runTurn(
-      { cfg: claudeCfg(), route: { kind: 'session', host: 'claude', key: SESSION_A }, prompt: 'p', account: 'bot' },
+      {
+        cfg: claudeCfg(),
+        route: { kind: 'session', host: 'claude', key: SESSION_A },
+        prompt: 'p',
+        account: 'bot',
+      },
       a.io,
     );
     expect(a.calls[0]!.argv).toEqual([
-      '-p', `--resume=${SESSION_A}`, '--permission-mode', 'plan', ...CLAUDE_ISOLATION,
+      '-p',
+      `--resume=${SESSION_A}`,
+      '--permission-mode',
+      'plan',
+      ...CLAUDE_ISOLATION,
     ]);
     expect(a.calls[0]!.cwd, 'the turn runs in the configured workdir').toBe('/w');
     expect(a.calls[0]!.prompt, 'the prompt rides the spawn seam, never argv').toBe('p');
@@ -110,16 +129,29 @@ describe('the claude driver', () => {
       b.io,
     );
     expect(b.calls[0]!.argv).toEqual([
-      '-p', `--session-id=${OWN_SESSION}`, '--permission-mode', 'plan', ...CLAUDE_ISOLATION,
+      '-p',
+      `--session-id=${OWN_SESSION}`,
+      '--permission-mode',
+      'plan',
+      ...CLAUDE_ISOLATION,
     ]);
 
     const c = seam(ok);
     await driverFor('claude').runTurn(
-      { cfg: claudeCfg({ ownSessionStarted: true }), route: { kind: 'own' }, prompt: 'p', account: 'bot' },
+      {
+        cfg: claudeCfg({ ownSessionStarted: true }),
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
+      },
       c.io,
     );
     expect(c.calls[0]!.argv).toEqual([
-      '-p', `--resume=${OWN_SESSION}`, '--permission-mode', 'plan', ...CLAUDE_ISOLATION,
+      '-p',
+      `--resume=${OWN_SESSION}`,
+      '--permission-mode',
+      'plan',
+      ...CLAUDE_ISOLATION,
     ]);
   });
 
@@ -129,17 +161,30 @@ describe('the claude driver', () => {
       { ...ok, stdout: 'beside it: fine' },
     );
     const res = await driverFor('claude').runTurn(
-      { cfg: claudeCfg(), route: { kind: 'session', host: 'claude', key: SESSION_A }, prompt: 'p', account: 'bot' },
+      {
+        cfg: claudeCfg(),
+        route: { kind: 'session', host: 'claude', key: SESSION_A },
+        prompt: 'p',
+        account: 'bot',
+      },
       s.io,
     );
     expect(s.calls).toHaveLength(2);
     // The same command plus --fork-session — with the isolation tail riding
     // BOTH spawns, because it is applied at the spawn funnel, not per site.
     expect(s.calls[0]!.argv).toEqual([
-      '-p', `--resume=${SESSION_A}`, '--permission-mode', 'plan', ...CLAUDE_ISOLATION,
+      '-p',
+      `--resume=${SESSION_A}`,
+      '--permission-mode',
+      'plan',
+      ...CLAUDE_ISOLATION,
     ]);
     expect(s.calls[1]!.argv).toEqual([
-      '-p', `--resume=${SESSION_A}`, '--permission-mode', 'plan', '--fork-session',
+      '-p',
+      `--resume=${SESSION_A}`,
+      '--permission-mode',
+      'plan',
+      '--fork-session',
       ...CLAUDE_ISOLATION,
     ]);
     expect(res.code).toBe(0);
@@ -168,20 +213,31 @@ describe('the claude driver', () => {
       { ...ok, stdout: 'created instead' },
     );
     const res = await driverFor('claude').runTurn(
-      { cfg: claudeCfg({ ownSessionStarted: true }), route: { kind: 'own' }, prompt: 'p', account: 'bot' },
+      {
+        cfg: claudeCfg({ ownSessionStarted: true }),
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
+      },
       s.io,
     );
     expect(s.calls[0]!.argv.slice(0, 2)).toEqual(['-p', `--resume=${OWN_SESSION}`]);
     expect(s.calls[1]!.argv.slice(0, 2)).toEqual(['-p', `--session-id=${OWN_SESSION}`]);
-    expect(res.ownExists, 'the recovery spawn reached the host, which writes at session start').toBe(
-      true,
-    );
+    expect(
+      res.ownExists,
+      'the recovery spawn reached the host, which writes at session start',
+    ).toBe(true);
   });
 
   it("a ROUTED session that answers no-conversation is not attend's to re-create: one spawn", async () => {
     const s = seam({ stdout: '', stderr: REFUSAL.noConversation(SESSION_A), code: 1 });
     const res = await driverFor('claude').runTurn(
-      { cfg: claudeCfg(), route: { kind: 'session', host: 'claude', key: SESSION_A }, prompt: 'p', account: 'bot' },
+      {
+        cfg: claudeCfg(),
+        route: { kind: 'session', host: 'claude', key: SESSION_A },
+        prompt: 'p',
+        account: 'bot',
+      },
       s.io,
     );
     expect(
@@ -210,7 +266,12 @@ describe('the claude driver', () => {
   it('a refusal sentence from a turn that SUCCEEDED is an agent talking, not a host refusing', async () => {
     const s = seam({ stdout: 'quoting the host at you', stderr: REFUSAL.live(SESSION_A), code: 0 });
     const res = await driverFor('claude').runTurn(
-      { cfg: claudeCfg(), route: { kind: 'session', host: 'claude', key: SESSION_A }, prompt: 'p', account: 'bot' },
+      {
+        cfg: claudeCfg(),
+        route: { kind: 'session', host: 'claude', key: SESSION_A },
+        prompt: 'p',
+        account: 'bot',
+      },
       s.io,
     );
     expect(res.refusal, 'only a FAILED turn can be a refusal').toBeNull();
@@ -221,7 +282,12 @@ describe('the claude driver', () => {
     // A successful own turn: the transcript exists.
     const a = seam(ok);
     const ra = await driverFor('claude').runTurn(
-      { cfg: claudeCfg({ ownSessionStarted: true }), route: { kind: 'own' }, prompt: 'p', account: 'bot' },
+      {
+        cfg: claudeCfg({ ownSessionStarted: true }),
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
+      },
       a.io,
     );
     expect(ra.ownExists).toBe(true);
@@ -251,7 +317,12 @@ describe('the claude driver', () => {
       { stdout: '', stderr: '', code: 127 },
     );
     const rd = await driverFor('claude').runTurn(
-      { cfg: claudeCfg({ ownSessionStarted: true }), route: { kind: 'own' }, prompt: 'p', account: 'bot' },
+      {
+        cfg: claudeCfg({ ownSessionStarted: true }),
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
+      },
       d.io,
     );
     expect(rd.ownExists, 'the flag records what was OBSERVED, not what was hoped').toBe(false);
@@ -259,7 +330,12 @@ describe('the claude driver', () => {
     // A routed turn observes nothing about the own transcript.
     const e = seam(ok);
     const re = await driverFor('claude').runTurn(
-      { cfg: claudeCfg(), route: { kind: 'session', host: 'claude', key: SESSION_A }, prompt: 'p', account: 'bot' },
+      {
+        cfg: claudeCfg(),
+        route: { kind: 'session', host: 'claude', key: SESSION_A },
+        prompt: 'p',
+        account: 'bot',
+      },
       e.io,
     );
     expect(re.ownExists).toBeUndefined();
@@ -278,7 +354,12 @@ describe('the claude driver', () => {
       { ...ok, stdout: 'beside it: fine' },
     );
     await driverFor('claude').runTurn(
-      { cfg: claudeCfg(), route: { kind: 'session', host: 'claude', key: SESSION_A }, prompt: 'p', account: 'bot' },
+      {
+        cfg: claudeCfg(),
+        route: { kind: 'session', host: 'claude', key: SESSION_A },
+        prompt: 'p',
+        account: 'bot',
+      },
       s.io,
     );
     expect(s.calls).toHaveLength(2);
@@ -330,7 +411,13 @@ describe('the ask seam', () => {
 
     const x = seam(ok);
     const codex = await driverFor('codex').runTurn(
-      { cfg: codexCfg(), route: { kind: 'session', host: 'codex', key: 'K1' }, prompt: 'p', account: 'bot', ask },
+      {
+        cfg: codexCfg(),
+        route: { kind: 'session', host: 'codex', key: 'K1' },
+        prompt: 'p',
+        account: 'bot',
+        ask,
+      },
       x.io,
     );
     expect(codex.code).toBe(0);
@@ -344,11 +431,22 @@ describe('the codex driver', () => {
   it('argv: exec with caps first, and `resume -- <key>` only when a key is routed', async () => {
     const a = seam(ok);
     await driverFor('codex').runTurn(
-      { cfg: codexCfg(), route: { kind: 'session', host: 'codex', key: 'K1' }, prompt: 'p', account: 'bot' },
+      {
+        cfg: codexCfg(),
+        route: { kind: 'session', host: 'codex', key: 'K1' },
+        prompt: 'p',
+        account: 'bot',
+      },
       a.io,
     );
     expect(a.calls[0]!.argv).toEqual([
-      'exec', '--ignore-user-config', '-s', 'read-only', 'resume', '--', 'K1',
+      'exec',
+      '--ignore-user-config',
+      '-s',
+      'read-only',
+      'resume',
+      '--',
+      'K1',
     ]);
 
     const b = seam(ok);
@@ -388,13 +486,21 @@ describe('the codex driver', () => {
       {
         cfg: codexCfg({ codexModel: 'gpt-5-codex' }),
         route: { kind: 'session', host: 'codex', key: 'K1' },
-        prompt: 'p', account: 'bot',
+        prompt: 'p',
+        account: 'bot',
       },
       pinned.io,
     );
     expect(pinned.calls[0]!.argv).toEqual([
-      'exec', '--ignore-user-config', '-c', 'model=gpt-5-codex', '-s', 'read-only',
-      'resume', '--', 'K1',
+      'exec',
+      '--ignore-user-config',
+      '-c',
+      'model=gpt-5-codex',
+      '-s',
+      'read-only',
+      'resume',
+      '--',
+      'K1',
     ]);
     // Unpinned: NOTHING is passed — codex's built-in default is the
     // behaviour an operator with no config.toml model already had, and an
@@ -410,7 +516,12 @@ describe('the codex driver', () => {
   it('one spawn is the whole turn — a failure buys codex no recovery and no observation', async () => {
     const s = seam({ stdout: '', stderr: "error: unexpected argument '-s' found\n", code: 2 });
     const res = await driverFor('codex').runTurn(
-      { cfg: codexCfg(), route: { kind: 'session', host: 'codex', key: 'K1' }, prompt: 'p', account: 'bot' },
+      {
+        cfg: codexCfg(),
+        route: { kind: 'session', host: 'codex', key: 'K1' },
+        prompt: 'p',
+        account: 'bot',
+      },
       s.io,
     );
     expect(s.calls, 'codex has no recovery: a second spawn must not exist').toHaveLength(1);
@@ -433,7 +544,12 @@ describe('the codex driver', () => {
   it("claude's refusal sentence in CODEX stderr is no refusal at all", async () => {
     const s = seam({ stdout: '', stderr: REFUSAL.noConversation(SESSION_A), code: 1 });
     const res = await driverFor('codex').runTurn(
-      { cfg: codexCfg(), route: { kind: 'session', host: 'codex', key: 'K1' }, prompt: 'p', account: 'bot' },
+      {
+        cfg: codexCfg(),
+        route: { kind: 'session', host: 'codex', key: 'K1' },
+        prompt: 'p',
+        account: 'bot',
+      },
       s.io,
     );
     expect(res.refusal, "claude's refusal table must not classify codex stderr").toBeNull();
@@ -450,7 +566,7 @@ describe('the codex driver', () => {
  * ---------------------------------------------------------------------------
  * THE CODEX APP-SERVER DRIVER — the opt-in duplex half, against a
  * FAKED session driving the REAL client. The fake speaks the measured
- * 0.144.0 dialect: bare `{id,method,params}` frames, server→client requests
+ * 0.153.4 dialect: bare `{id,method,params}` frames, server→client requests
  * in their OWN id space starting at 0, `initialize` answering no capability
  * list, the fileChange approval params carrying NO diff. Frame shapes are
  * lifted from the captured transcripts, not invented.
@@ -489,19 +605,25 @@ interface FakeApproval {
  * turn. Everything the client writes is recorded, raw and parsed, so tests
  * assert the WIRE, not the client's self-report.
  */
-const appServer = (opts: {
-  threadId?: string;
-  reply?: string;
-  approvals?: FakeApproval[];
-  turnStatus?: 'completed' | 'failed';
-  turnError?: string;
-} = {}) => {
+const appServer = (
+  opts: {
+    threadId?: string;
+    reply?: string;
+    approvals?: FakeApproval[];
+    turnStatus?: 'completed' | 'failed';
+    turnError?: string;
+  } = {},
+) => {
   const threadId = opts.threadId ?? THREAD_ID;
   const rawLines: string[] = [];
   const wrote: Frame[] = [];
   /** Frames the client sent as ANSWERS to server→client requests. */
   const decisions: Frame[] = [];
-  const spawned: { argv: string[]; cwd: string; env: Readonly<Record<string, string>> | undefined }[] = [];
+  const spawned: {
+    argv: string[];
+    cwd: string;
+    env: Readonly<Record<string, string>> | undefined;
+  }[] = [];
   let lineCb: ((line: string) => void) | undefined;
   let exitCb: ((code: number | null) => void) | undefined;
   const emit = (obj: Frame): void => queueMicrotask(() => lineCb?.(JSON.stringify(obj)));
@@ -514,8 +636,16 @@ const appServer = (opts: {
         emit({
           method: 'item/completed',
           params: {
-            item: { type: 'agentMessage', id: 'msg_1', text: opts.reply, phase: 'commentary', memoryCitation: null },
-            threadId, turnId: TURN_ID, completedAtMs: 2,
+            item: {
+              type: 'agentMessage',
+              id: 'msg_1',
+              text: opts.reply,
+              phase: 'commentary',
+              memoryCitation: null,
+            },
+            threadId,
+            turnId: TURN_ID,
+            completedAtMs: 2,
           },
         });
       }
@@ -524,19 +654,28 @@ const appServer = (opts: {
         params: {
           threadId,
           turn: {
-            id: TURN_ID, items: [], itemsView: 'notLoaded',
+            id: TURN_ID,
+            items: [],
+            itemsView: 'notLoaded',
             status: opts.turnStatus ?? 'completed',
-            error: opts.turnError === undefined
-              ? null
-              : { message: opts.turnError, codexErrorInfo: null, additionalDetails: null },
-            startedAt: 1, completedAt: 2, durationMs: 1000,
+            error:
+              opts.turnError === undefined
+                ? null
+                : { message: opts.turnError, codexErrorInfo: null, additionalDetails: null },
+            startedAt: 1,
+            completedAt: 2,
+            durationMs: 1000,
           },
         },
       });
       return;
     }
     if (a.kind === 'request') {
-      emit({ method: a.method ?? 'item/tool/requestUserInput', id: a.id ?? 0, params: a.params ?? {} });
+      emit({
+        method: a.method ?? 'item/tool/requestUserInput',
+        id: a.id ?? 0,
+        params: a.params ?? {},
+      });
       return;
     }
     if (a.kind === 'fileChange') {
@@ -546,14 +685,20 @@ const appServer = (opts: {
           method: 'item/started',
           params: {
             item: {
-              type: 'fileChange', id: itemId, status: 'inProgress',
-              changes: [{
-                path: a.path ?? 'src/app.ts',
-                kind: { type: 'update', move_path: null },
-                diff: a.diff ?? '@@ -1 +1 @@\n-old line\n+new line',
-              }],
+              type: 'fileChange',
+              id: itemId,
+              status: 'inProgress',
+              changes: [
+                {
+                  path: a.path ?? 'src/app.ts',
+                  kind: { type: 'update', move_path: null },
+                  diff: a.diff ?? '@@ -1 +1 @@\n-old line\n+new line',
+                },
+              ],
             },
-            threadId, turnId: TURN_ID, startedAtMs: 1,
+            threadId,
+            turnId: TURN_ID,
+            startedAtMs: 1,
           },
         });
       }
@@ -562,7 +707,15 @@ const appServer = (opts: {
       emit({
         method: 'item/fileChange/requestApproval',
         id: a.id ?? 0,
-        params: { threadId, turnId: TURN_ID, itemId, startedAtMs: 1, reason: null },
+        params: {
+          kind: 'fileChange',
+          threadId,
+          turnId: TURN_ID,
+          itemId,
+          startedAtMs: 1,
+          reason: null,
+          grantRoot: null,
+        },
       });
       return;
     }
@@ -570,7 +723,12 @@ const appServer = (opts: {
       method: 'item/commandExecution/requestApproval',
       id: a.id ?? 0,
       params: {
-        threadId, turnId: TURN_ID, itemId: 'exec-1', startedAtMs: 1, environmentId: 'local',
+        kind: 'command',
+        threadId,
+        turnId: TURN_ID,
+        itemId: 'exec-1',
+        startedAtMs: 1,
+        environmentId: 'local',
         command: a.command ?? "/bin/zsh -lc 'touch approved.txt'",
         cwd: a.cwd ?? '/w',
         commandActions: [{ type: 'unknown', command: 'touch approved.txt' }],
@@ -585,7 +743,15 @@ const appServer = (opts: {
     if (typeof method === 'string' && id !== undefined) {
       if (method === 'initialize') {
         // The measured response, whole: NO capability list (dialect quirk 3).
-        emit({ id, result: { userAgent: 'codex/0.144.0', codexHome: '/isolated', platformFamily: 'unix', platformOs: 'macos' } });
+        emit({
+          id,
+          result: {
+            userAgent: 'codex/0.153.4',
+            codexHome: '/isolated',
+            platformFamily: 'unix',
+            platformOs: 'macos',
+          },
+        });
       } else if (method === 'thread/start') {
         emit({ id, result: { thread: { id: threadId } } });
       } else if (method === 'thread/resume') {
@@ -613,9 +779,15 @@ const appServer = (opts: {
       wrote.push(f);
       queueMicrotask(() => handle(f));
     },
-    onLine(cb) { lineCb = cb; },
-    onExit(cb) { exitCb = cb; },
-    kill() { queueMicrotask(() => exitCb?.(0)); },
+    onLine(cb) {
+      lineCb = cb;
+    },
+    onExit(cb) {
+      exitCb = cb;
+    },
+    kill() {
+      queueMicrotask(() => exitCb?.(0));
+    },
   };
   const factory: SessionFactory = (argv, cwd, env) => {
     spawned.push({ argv, cwd, env });
@@ -629,7 +801,7 @@ const appServer = (opts: {
 const appServerIo = (factory: SessionFactory) => {
   const spawns: string[][] = [];
   const io: DriverIo = {
-    spawn: async argv => {
+    spawn: async (argv) => {
       spawns.push(argv);
       return { stdout: 'exec ran', stderr: '', code: 0 };
     },
@@ -662,7 +834,9 @@ describe('the codex app-server driver', () => {
         // A config written by a future build (or a typo): the union does not
         // admit it, which is exactly the situation under test.
         cfg: { ...codexCfg(), codexDriver: 'daemon' as unknown as 'exec' },
-        route: { kind: 'own' }, prompt: 'p', account: 'bot',
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
       },
       io,
     );
@@ -684,27 +858,39 @@ describe('the codex app-server driver', () => {
     expect(s.spawned).toHaveLength(1);
     expect(s.spawned[0]!.argv).toEqual(['app-server', '--strict-config']);
     expect(s.spawned[0]!.cwd).toBe('/w');
-    expect(s.spawned[0]!.env, 'the isolated home rides the session spawn too').toEqual({ CODEX_HOME });
+    expect(s.spawned[0]!.env, 'the isolated home rides the session spawn too').toEqual({
+      CODEX_HOME,
+    });
     expect(statSync(CODEX_HOME).mode & 0o777).toBe(0o700);
 
     // THE WIRE, not the client's self-report. Bare frames: no jsonrpc member
     // anywhere (measured: zero occurrences in any capture), one line each.
     for (const line of s.rawLines) expect(line).not.toContain('\n');
-    for (const f of s.wrote) expect(Object.keys(f), 'no jsonrpc member — the 0.144.0 dialect').not.toContain('jsonrpc');
+    for (const f of s.wrote)
+      expect(Object.keys(f), 'no jsonrpc member — the 0.153.4 dialect').not.toContain('jsonrpc');
 
-    const methods = s.wrote.map(f => f.method);
+    const methods = s.wrote.map((f) => f.method);
     expect(methods.slice(0, 2), 'initialize, then the initialized notification').toEqual([
-      'initialize', 'initialized',
+      'initialize',
+      'initialized',
     ]);
-    const start = s.wrote.find(f => f.method === 'thread/start');
+    const start = s.wrote.find((f) => f.method === 'thread/start');
     expect(start, 'an own route starts a fresh thread').toBeDefined();
     const params = start!.params as Frame;
     expect(params.cwd).toBe('/w');
-    expect(params.sandbox, "caps ['-s','read-only'] became a TYPED thread setting").toBe('read-only');
+    expect(params.sandbox, "caps ['-s','read-only'] became a TYPED thread setting").toBe(
+      'read-only',
+    );
     expect(params.approvalPolicy).toBe('untrusted');
-    expect(Object.keys(params), 'no model pin captured means NO model member — never invented')
-      .not.toContain('model');
-    const turnStart = s.wrote.find(f => f.method === 'turn/start');
+    expect(
+      params.approvalsReviewer,
+      'the current stable dialect names the user as the approval reviewer explicitly',
+    ).toBe('user');
+    expect(
+      Object.keys(params),
+      'no model pin captured means NO model member — never invented',
+    ).not.toContain('model');
+    const turnStart = s.wrote.find((f) => f.method === 'turn/start');
     expect((turnStart!.params as Frame).threadId).toBe(THREAD_ID);
     expect((turnStart!.params as Frame).input).toEqual([
       { type: 'text', text: 'hello there', text_elements: [] },
@@ -723,33 +909,59 @@ describe('the codex app-server driver', () => {
   it('the model pin rides thread settings only when enable captured one', async () => {
     const s = appServer({ reply: 'ok' });
     await driverFor('codex').runTurn(
-      { cfg: appCfg({ codexModel: 'gpt-5-codex' }), route: { kind: 'own' }, prompt: 'p', account: 'bot' },
+      {
+        cfg: appCfg({ codexModel: 'gpt-5-codex' }),
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
+      },
       appServerIo(s.factory).io,
     );
-    expect((s.wrote.find(f => f.method === 'thread/start')!.params as Frame).model).toBe('gpt-5-codex');
+    expect((s.wrote.find((f) => f.method === 'thread/start')!.params as Frame).model).toBe(
+      'gpt-5-codex',
+    );
   });
 
   it('a routed session resumes via thread/resume, and the resumed id is the session key', async () => {
     const s = appServer({ reply: 'resumed fine' });
     const res = await driverFor('codex').runTurn(
-      { cfg: appCfg(), route: { kind: 'session', host: 'codex', key: THREAD_ID }, prompt: 'p', account: 'bot' },
+      {
+        cfg: appCfg(),
+        route: { kind: 'session', host: 'codex', key: THREAD_ID },
+        prompt: 'p',
+        account: 'bot',
+      },
       appServerIo(s.factory).io,
     );
-    expect(s.wrote.some(f => f.method === 'thread/start'), 'a routed turn must not mint a fresh thread').toBe(false);
-    const resume = s.wrote.find(f => f.method === 'thread/resume');
+    expect(
+      s.wrote.some((f) => f.method === 'thread/start'),
+      'a routed turn must not mint a fresh thread',
+    ).toBe(false);
+    const resume = s.wrote.find((f) => f.method === 'thread/resume');
     expect((resume!.params as Frame).threadId).toBe(THREAD_ID);
-    expect((resume!.params as Frame).sandbox, 'the typed settings ride the resume too').toBe('read-only');
+    expect((resume!.params as Frame).sandbox, 'the typed settings ride the resume too').toBe(
+      'read-only',
+    );
     expect(res.code).toBe(0);
     expect(res.sessionKey).toBe(THREAD_ID);
   });
 
   it('a commandExecution approval asks with the EXACT protocol payload and answers accept on the wire', async () => {
-    const s = appServer({ reply: 'created it', approvals: [{ kind: 'command', command: "/bin/zsh -lc 'touch approved.txt'", cwd: '/w' }] });
+    const s = appServer({
+      reply: 'created it',
+      approvals: [{ kind: 'command', command: "/bin/zsh -lc 'touch approved.txt'", cwd: '/w' }],
+    });
     const payloads: string[] = [];
     const res = await driverFor('codex').runTurn(
       {
-        cfg: appCfg(), route: { kind: 'own' }, prompt: 'p', account: 'bot',
-        ask: async a => { payloads.push(a.payload); return 'approve'; },
+        cfg: appCfg(),
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
+        ask: async (a) => {
+          payloads.push(a.payload);
+          return 'approve';
+        },
       },
       appServerIo(s.factory).io,
     );
@@ -766,9 +978,18 @@ describe('the codex app-server driver', () => {
   });
 
   it('a deny becomes decline, and a decline is NOT an error path (measured: the turn completes)', async () => {
-    const s = appServer({ reply: 'declined, so I did not run it', approvals: [{ kind: 'command' }] });
+    const s = appServer({
+      reply: 'declined, so I did not run it',
+      approvals: [{ kind: 'command' }],
+    });
     const res = await driverFor('codex').runTurn(
-      { cfg: appCfg(), route: { kind: 'own' }, prompt: 'p', account: 'bot', ask: async () => 'deny' },
+      {
+        cfg: appCfg(),
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
+        ask: async () => 'deny',
+      },
       appServerIo(s.factory).io,
     );
     expect(s.decisions[0]).toEqual({ id: 0, result: { decision: 'decline' } });
@@ -779,13 +1000,26 @@ describe('the codex app-server driver', () => {
   it('a fileChange approval JOINS the diff by itemId — the 211-byte params carry none', async () => {
     const s = appServer({
       reply: 'edited',
-      approvals: [{ kind: 'fileChange', itemId: 'fc_9', path: 'src/send.ts', diff: '@@ -10 +10 @@\n-cap = 0\n+cap = 16384' }],
+      approvals: [
+        {
+          kind: 'fileChange',
+          itemId: 'fc_9',
+          path: 'src/send.ts',
+          diff: '@@ -10 +10 @@\n-cap = 0\n+cap = 16384',
+        },
+      ],
     });
     const payloads: string[] = [];
     const res = await driverFor('codex').runTurn(
       {
-        cfg: appCfg(), route: { kind: 'own' }, prompt: 'p', account: 'bot',
-        ask: async a => { payloads.push(a.payload); return 'approve'; },
+        cfg: appCfg(),
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
+        ask: async (a) => {
+          payloads.push(a.payload);
+          return 'approve';
+        },
       },
       appServerIo(s.factory).io,
     );
@@ -799,21 +1033,33 @@ describe('the codex app-server driver', () => {
   });
 
   it('a fileChange approval whose item never arrived is DECLINED unasked — an empty change under approval buttons is worse than nothing', async () => {
-    const s = appServer({ reply: 'nothing applied', approvals: [{ kind: 'fileChange', emitItem: false }] });
+    const s = appServer({
+      reply: 'nothing applied',
+      approvals: [{ kind: 'fileChange', emitItem: false }],
+    });
     let asked = 0;
     const res = await driverFor('codex').runTurn(
       {
-        cfg: appCfg(), route: { kind: 'own' }, prompt: 'p', account: 'bot',
-        ask: async () => { asked += 1; return 'approve'; },
+        cfg: appCfg(),
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
+        ask: async () => {
+          asked += 1;
+          return 'approve';
+        },
       },
       appServerIo(s.factory).io,
     );
-    expect(asked, 'unshown is unapprovable — the operator is never asked to approve bytes nobody can render').toBe(0);
+    expect(
+      asked,
+      'unshown is unapprovable — the operator is never asked to approve bytes nobody can render',
+    ).toBe(0);
     expect(s.decisions[0]).toEqual({ id: 0, result: { decision: 'decline' } });
     expect(res.code, 'fail-closed, not fail-broken: the turn completes').toBe(0);
   });
 
-  it("server→client requests live in their OWN id space — a server id colliding with a client id still surfaces the approval", async () => {
+  it('server→client requests live in their OWN id space — a server id colliding with a client id still surfaces the approval', async () => {
     // The server's counter starts at 0; ours starts at 1. Force the overlap:
     // the server asks with id 1, an id our client has ALREADY used for
     // initialize. A client keying one shared map on the id reads this frame
@@ -824,14 +1070,21 @@ describe('the codex app-server driver', () => {
     let asked = 0;
     const res = await driverFor('codex').runTurn(
       {
-        cfg: appCfg(), route: { kind: 'own' }, prompt: 'p', account: 'bot',
-        ask: async () => { asked += 1; return 'approve'; },
+        cfg: appCfg(),
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
+        ask: async () => {
+          asked += 1;
+          return 'approve';
+        },
       },
       appServerIo(s.factory).io,
     );
     expect(asked).toBe(1);
     expect(s.decisions[0], "the answer rides the SERVER's id, untranslated").toEqual({
-      id: 1, result: { decision: 'accept' },
+      id: 1,
+      result: { decision: 'accept' },
     });
     expect(res.code).toBe(0);
   });
@@ -839,21 +1092,29 @@ describe('the codex app-server driver', () => {
   it('an unrecognised cap REFUSES the turn before anything spawns — never dropped', async () => {
     for (const caps of [
       ['-s', 'read-only', '--profile', 'x'], // an exec cap app-server cannot state
-      ['-s', 'read-write'],                  // a sandbox word codex does not have
-      ['--ignore-user-config'],              // exec's belt — gone on this surface
+      ['-s', 'read-write'], // a sandbox word codex does not have
+      ['--ignore-user-config'], // exec's belt — gone on this surface
     ]) {
       const s = appServer({ reply: 'ok' });
       let asked = 0;
       const res = await driverFor('codex').runTurn(
         {
-          cfg: appCfg({ caps }), route: { kind: 'own' }, prompt: 'p', account: 'bot',
-          ask: async () => { asked += 1; return 'approve'; },
+          cfg: appCfg({ caps }),
+          route: { kind: 'own' },
+          prompt: 'p',
+          account: 'bot',
+          ask: async () => {
+            asked += 1;
+            return 'approve';
+          },
         },
         appServerIo(s.factory).io,
       );
       expect(res.code, `caps ${JSON.stringify(caps)} must refuse`).toBe(1);
       expect(res.stdout).toContain('does not recognise');
-      expect(res.stdout, 'the cap VALUE is named by position, never echoed').not.toContain('--profile');
+      expect(res.stdout, 'the cap VALUE is named by position, never echoed').not.toContain(
+        '--profile',
+      );
       expect(res.stdout).not.toContain('read-write');
       expect(s.spawned, 'the refusal must cost no process').toHaveLength(0);
       expect(asked).toBe(0);
@@ -866,15 +1127,23 @@ describe('the codex app-server driver', () => {
     await driverFor('codex').runTurn(
       {
         cfg: appCfg({ caps: ['--sandbox', 'read-only', '--sandbox=workspace-write'] }),
-        route: { kind: 'own' }, prompt: 'p', account: 'bot',
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
       },
       appServerIo(s.factory).io,
     );
-    expect((s.wrote.find(f => f.method === 'thread/start')!.params as Frame).sandbox).toBe('workspace-write');
+    expect((s.wrote.find((f) => f.method === 'thread/start')!.params as Frame).sandbox).toBe(
+      'workspace-write',
+    );
   });
 
   it('a turn/completed carrying an error maps to a non-zero code, and the error text reaches nobody', async () => {
-    const s = appServer({ reply: 'partial words', turnStatus: 'failed', turnError: 'stream error: ANTHROPIC_API_KEY=sk-ant-x' });
+    const s = appServer({
+      reply: 'partial words',
+      turnStatus: 'failed',
+      turnError: 'stream error: ANTHROPIC_API_KEY=sk-ant-x',
+    });
     const res = await driverFor('codex').runTurn(
       { cfg: appCfg(), route: { kind: 'own' }, prompt: 'p', account: 'bot' },
       appServerIo(s.factory).io,
@@ -898,18 +1167,20 @@ describe('the codex app-server driver', () => {
   it('the ask names its family and the thread key — edit needs the first, respond routes home by the second', async () => {
     const s = appServer({
       reply: 'ok',
-      approvals: [
-        { kind: 'command' },
-        { kind: 'fileChange', itemId: 'fc_1' },
-      ],
+      approvals: [{ kind: 'command' }, { kind: 'fileChange', itemId: 'fc_1' }],
     });
     const asks: { kind?: string; sessionKey?: string }[] = [];
     await driverFor('codex').runTurn(
       {
-        cfg: appCfg(), route: { kind: 'own' }, prompt: 'p', account: 'bot',
-        ask: async a => {
-          asks.push({ ...(a.kind !== undefined ? { kind: a.kind } : {}),
-            ...(a.sessionKey !== undefined ? { sessionKey: a.sessionKey } : {}) });
+        cfg: appCfg(),
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
+        ask: async (a) => {
+          asks.push({
+            ...(a.kind !== undefined ? { kind: a.kind } : {}),
+            ...(a.sessionKey !== undefined ? { sessionKey: a.sessionKey } : {}),
+          });
           return 'deny';
         },
       },
@@ -926,11 +1197,13 @@ describe('the codex app-server driver', () => {
     await driverFor('codex').runTurn(
       {
         cfg: appCfg({ codexApprovalPolicy: 'on-request' }),
-        route: { kind: 'own' }, prompt: 'p', account: 'bot',
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
       },
       appServerIo(s.factory).io,
     );
-    expect((s.wrote.find(f => f.method === 'thread/start')!.params as Frame).approvalPolicy).toBe(
+    expect((s.wrote.find((f) => f.method === 'thread/start')!.params as Frame).approvalPolicy).toBe(
       'on-request',
     );
     // Absent stays the measured default — the dialect test above already
@@ -944,7 +1217,9 @@ describe('the codex app-server driver', () => {
         // A config hand-edited past the enable-time check: the second line
         // of defence is the driver's.
         cfg: appCfg({ codexApprovalPolicy: 'always' as unknown as 'untrusted' }),
-        route: { kind: 'own' }, prompt: 'p', account: 'bot',
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
       },
       appServerIo(s.factory).io,
     );
@@ -963,18 +1238,37 @@ describe('the codex app-server driver', () => {
       reply: 'moved on without them',
       approvals: [
         {
-          kind: 'request', method: 'item/tool/requestUserInput',
+          kind: 'request',
+          method: 'item/tool/requestUserInput',
           params: {
-            threadId: THREAD_ID, turnId: TURN_ID, itemId: 'q_1',
-            questions: [{ id: 'q1', header: 'h', question: 'which env?', isOther: false, isSecret: false, options: null }],
+            threadId: THREAD_ID,
+            turnId: TURN_ID,
+            itemId: 'q_1',
+            questions: [
+              {
+                id: 'q1',
+                header: 'h',
+                question: 'which env?',
+                isOther: false,
+                isSecret: false,
+                options: null,
+              },
+            ],
             autoResolutionMs: null,
           },
         },
         {
-          kind: 'request', method: 'item/permissions/requestApproval', id: 1,
+          kind: 'request',
+          method: 'item/permissions/requestApproval',
+          id: 1,
           params: {
-            threadId: THREAD_ID, turnId: TURN_ID, itemId: 'perm_1', environmentId: null,
-            startedAtMs: 1, cwd: '/w', reason: 'needs network',
+            threadId: THREAD_ID,
+            turnId: TURN_ID,
+            itemId: 'perm_1',
+            environmentId: null,
+            startedAtMs: 1,
+            cwd: '/w',
+            reason: 'needs network',
             permissions: { network: { enabled: true }, fileSystem: null },
           },
         },
@@ -983,8 +1277,14 @@ describe('the codex app-server driver', () => {
     let asked = 0;
     const res = await driverFor('codex').runTurn(
       {
-        cfg: appCfg(), route: { kind: 'own' }, prompt: 'p', account: 'bot',
-        ask: async () => { asked += 1; return 'approve'; },
+        cfg: appCfg(),
+        route: { kind: 'own' },
+        prompt: 'p',
+        account: 'bot',
+        ask: async () => {
+          asked += 1;
+          return 'approve';
+        },
       },
       appServerIo(s.factory).io,
     );

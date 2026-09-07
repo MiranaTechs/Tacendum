@@ -535,3 +535,14 @@ describe('chat list — the App Lock nudge', () => {
     await unmount(tree);
   });
 });
+
+
+test('opening a conversation leaves the prior unread stamp for the thread to capture', async () => {
+  const mark = jest.spyOn(db, 'markChatOpened').mockResolvedValue();
+  const sync = jest.spyOn(messaging, 'syncThreadRead').mockResolvedValue();
+  const tree = await renderList();
+  await press(tree, `chat-${SAM}`);
+  expect(mark).not.toHaveBeenCalled();
+  expect(sync).not.toHaveBeenCalled();
+  await unmount(tree);
+});

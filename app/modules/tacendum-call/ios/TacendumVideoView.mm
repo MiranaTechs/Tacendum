@@ -51,6 +51,13 @@ using namespace facebook::react;
     static const auto defaultProps = std::make_shared<const TacendumVideoViewProps>();
     _props = defaultProps;
     _host = [[TacendumVideoHost alloc] initWithFrame:frame];
+    __weak TacendumVideoView *weakSelf = self;
+    _host.onFrameReady = ^(NSString *surfaceId, NSInteger generation, BOOL ready) {
+      TacendumVideoView *strongSelf = weakSelf;
+      if (!strongSelf || !strongSelf->_eventEmitter) return;
+      auto emitter = std::static_pointer_cast<const TacendumVideoViewEventEmitter>(strongSelf->_eventEmitter);
+      emitter->onFrameReady({std::string(surfaceId.UTF8String), static_cast<int>(generation), static_cast<bool>(ready)});
+    };
     self.contentView = _host;
   }
   return self;
@@ -87,9 +94,10 @@ using namespace facebook::react;
   // Guarded together because they are ONE binding: re-binding tears down and
   // re-attaches a renderer, which drops a frame, and Fabric calls this on
   // every commit.
-  if (!prev || next.cid != prev->cid || next.track != prev->track) {
+  if (!prev || next.cid != prev->cid || next.track != prev->track || next.surfaceId != prev->surfaceId) {
     [_host bindCid:[NSString stringWithUTF8String:next.cid.c_str()]
-              role:next.track == TacendumVideoViewTrack::Local ? @"local" : @"remote"];
+              role:next.track == TacendumVideoViewTrack::Local ? @"local" : @"remote"
+         surfaceId:[NSString stringWithUTF8String:next.surfaceId.c_str()]];
   }
   if (!prev || next.mirror != prev->mirror) {
     [_host setMirror:next.mirror];
@@ -100,6 +108,12 @@ using namespace facebook::react;
   }
 
   [super updateProps:props oldProps:oldProps];
+}
+
+- (void)updateEventEmitter:(const EventEmitter::Shared &)eventEmitter
+{
+  [super updateEventEmitter:eventEmitter];
+  [_host publishReadiness];
 }
 
 /**

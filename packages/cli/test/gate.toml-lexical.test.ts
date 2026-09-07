@@ -24,7 +24,10 @@ saveProfile({
 
 const entry = join(work, 'main.js');
 writeFileSync(entry, '#!/usr/bin/env node\n');
-const SECTION = renderTomlSection({ command: process.execPath, args: [entry, 'mcp', '--account', 'installer'] });
+const SECTION = renderTomlSection({
+  command: process.execPath,
+  args: [entry, 'mcp', '--account', 'installer'],
+});
 const ARGV = notifyArgv('codex', 'ci', entry);
 
 /** All-CRLF: every \n is preceded by \r, and no \r stands alone. */
@@ -83,10 +86,18 @@ describe('defect 1: CRLF files — recognised, merged once, ending preserved', (
   });
 
   it('recognises our own CRLF notify line and replaces it in place', () => {
-    const stale = codexNotifyLine(['/old', '/old-entry', 'notify', '--hook', 'codex', '--account', 'ci']);
+    const stale = codexNotifyLine([
+      ARGV[0]!,
+      ARGV[1]!,
+      'notify',
+      '--hook',
+      'codex',
+      '--account',
+      'old',
+    ]);
     const merged = mergeCodexNotify(`${stale}\r\n`, ARGV);
     expect(merged.match(/notify = \[/g)).toHaveLength(1);
-    expect(merged).not.toContain('/old-entry');
+    expect(merged).not.toContain('--account old');
     expect(uniformlyCrlf(merged)).toBe(true);
   });
 
@@ -174,17 +185,17 @@ describe('defect 2: multiline strings and arrays are content, never syntax', () 
     ].join('\n');
     const merged = mergeCodexNotify(existing, ARGV); // used to throw "another notifier"
     expect(merged).toContain('doc = """');
-    expect(merged).toContain('"--account", "ci"');
+    expect(merged).toContain('"codex-notify-dispatch", "--plan-v1"');
   });
 
-  it("our own notify reflowed across lines is replaced with its WHOLE extent", () => {
+  it('our own notify reflowed across lines is replaced with its WHOLE extent', () => {
     const existing = [
-      'notify = ["/n", "/e", "notify", "--hook", "codex", "--account",',
-      '  "ci"]',
+      `notify = [${JSON.stringify(ARGV[0])}, ${JSON.stringify(ARGV[1])}, "notify", "--hook", "codex", "--account",`,
+      '  "old"]',
       '',
     ].join('\n');
     const merged = mergeCodexNotify(existing, ARGV);
-    expect(merged).not.toContain('  "ci"]'); // the old value's tail went with it
+    expect(merged).not.toContain('  "old"]'); // the old value's tail went with it
     expect(merged.match(/notify = \[/g)).toHaveLength(1);
   });
 
@@ -199,7 +210,9 @@ describe('defect 2: multiline strings and arrays are content, never syntax', () 
     // opens no comment that could swallow a real delimiter.
     const existing = 'x = "a\\"# not a comment [mcp_servers.tacendum]"\ny = 1\n';
     const merged = mergeTomlConfig(existing, SECTION);
-    expect(merged.startsWith('x = "a\\"# not a comment [mcp_servers.tacendum]"\ny = 1\n')).toBe(true);
+    expect(merged.startsWith('x = "a\\"# not a comment [mcp_servers.tacendum]"\ny = 1\n')).toBe(
+      true,
+    );
     expect(merged.match(/^\[mcp_servers\.tacendum\]$/m)).toHaveLength(1);
   });
 });

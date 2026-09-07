@@ -292,14 +292,21 @@ describe('blocking makes itself true in the same transaction', () => {
     const later = since();
     await db.blockPeer(PEER, AT);
     const sql = later().filter(s => !s.startsWith('SELECT'));
-    // Order matters: any statement between the row and the purge is a window
-    // in which the block is recorded but a queued envelope is still flushable.
+    // Every removal must commit with the block. No intermediate COMMIT may
+    // expose a blocked peer with queued envelopes or actionable AI state.
     expect(sql[0]).toBe('BEGIN IMMEDIATE');
     expect(sql[1]).toContain('INSERT INTO blocked_peers');
-    expect(sql[2]).toContain('DELETE FROM outbox');
-    expect(sql[3]).toContain("UPDATE messages SET status = 'error'");
-    expect(sql[4]).toBe('COMMIT');
-    expect(sql).toHaveLength(5);
+    expect(sql[2]).toBe('DELETE FROM approvals WHERE peerId = ?');
+    expect(sql[3]).toBe('DELETE FROM ai_work_events WHERE peerId = ?');
+    expect(sql[4]).toBe('DELETE FROM ai_agent_state WHERE peerId = ?');
+    expect(sql[5]).toBe('DELETE FROM ai_notify_preferences WHERE peerId = ?');
+    for (const table of ['approvals', 'ai_work_events', 'ai_agent_state', 'ai_notify_preferences']) {
+      expect(callsOf(`DELETE FROM ${table} WHERE peerId = ?`).at(-1)?.[1]).toEqual([PEER]);
+    }
+    expect(sql[6]).toContain('DELETE FROM outbox');
+    expect(sql[7]).toContain("UPDATE messages SET status = 'error'");
+    expect(sql[8]).toBe('COMMIT');
+    expect(sql).toHaveLength(9);
   });
 
   it('purges only that person’s queued envelopes', async () => {

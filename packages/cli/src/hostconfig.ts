@@ -13,6 +13,12 @@ import {
 } from './mcp-install.js';
 import { parseAssignmentKeyLine } from './toml-keys.js';
 import { writeFileAtomic } from './stores.js';
+import {
+  codexNotifyDispatchArgv,
+  planFromCodexNotifyDispatchArgv,
+  type CodexNotifyPlanV1,
+  type CodexPreviousNotifier,
+} from './codex-notify-dispatch.js';
 
 /**
  * Host hook configuration for `tacendum setup <surface>`: the file each assistant host reads to learn that finishing a
@@ -84,6 +90,29 @@ function shellWord(word: string): string {
 
 function notifyCommand(surface: SetupSurface, account: string, entry: string): string {
   return notifyArgv(surface, account, entry).map(shellWord).join(' ');
+}
+
+/** Claude's command-hook schema accepts one shell command string.  Keep the
+ * semantic command as argv until this final formatting boundary so paths
+ * with spaces and quotes cannot change argument boundaries. */
+export function claudePermissionArgv(
+  account: string,
+  minimumAppBuild: number,
+  entry: string,
+): string[] {
+  return [
+    process.execPath,
+    entry,
+    'claude-permission',
+    '--account',
+    account,
+    '--approvals',
+    String(minimumAppBuild),
+  ];
+}
+
+function claudePermissionCommand(account: string, minimumAppBuild: number, entry: string): string {
+  return claudePermissionArgv(account, minimumAppBuild, entry).map(shellWord).join(' ');
 }
 
 /**
@@ -164,14 +193,389 @@ function isOurNotifyCommand(command: unknown): boolean {
   );
 }
 
-/** Same test for the codex TOML argv form, where the words are separate
- * strings rather than one shell line. Requires OUR tag and the `--account`
- * flag, not merely the words `"notify", "--hook"` — a foreign
- * `notify = ["acme", "notify", "--hook", "slack"]` is another notifier's
- * line, and matching it here would silently REPLACE it (the refusal branch
- * in `mergeCodexNotify` only protects lines this predicate rejects). */
-function isOurNotifyToml(line: string): boolean {
-  return /"notify",\s*"--hook",\s*"(claude|codex|gemini|cursor)",\s*"--account"/.test(line);
+interface ParsedClaudePermissionCommand {
+  nodePath: string;
+  entryPath: string;
+  account: string;
+  minimumAppBuild: number;
+}
+
+/** The exact private subcommand shape, independent of ownership. Ownership
+ * additionally requires the executable and entry path this setup intends. */
+function parseClaudePermissionCommand(command: unknown): ParsedClaudePermissionCommand | null {
+  if (typeof command !== 'string') return null;
+  const words = splitShellWords(command);
+  if (
+    words === null ||
+    words.length !== 7 ||
+    words[2] !== 'claude-permission' ||
+    words[3] !== '--account' ||
+    words[4] === undefined ||
+    words[5] !== '--approvals' ||
+    !/^\d+$/.test(words[6] ?? '')
+  ) {
+    return null;
+  }
+  const minimumAppBuild = Number(words[6]);
+  if (!Number.isSafeInteger(minimumAppBuild) || minimumAppBuild < 1) return null;
+  return {
+    nodePath: words[0] as string,
+    entryPath: words[1] as string,
+    account: words[4],
+    minimumAppBuild,
+  };
+}
+
+function isOwnedClaudePermissionCommand(
+  command: unknown,
+  nodePath: string,
+  entryPath: string,
+): boolean {
+  const parsed = parseClaudePermissionCommand(command);
+  return parsed?.nodePath === nodePath && parsed.entryPath === entryPath;
+}
+
+function directCodexAccount(argv: readonly string[]): string | null {
+  const at = argv.indexOf('notify');
+  if (
+    at < 1 ||
+    at > 2 ||
+    argv.length !== at + 5 ||
+    argv[at + 1] !== '--hook' ||
+    argv[at + 2] !== 'codex' ||
+    argv[at + 3] !== '--account'
+  ) {
+    return null;
+  }
+  return argv[at + 4] ?? null;
+}
+
+/** Parse the one value Codex accepts here: an array of TOML strings.  This is
+ * deliberately not a general TOML value parser; numbers, inline tables and
+ * nested arrays cannot be argv and are refusals.  Comments and reflowed
+ * arrays are supported because they are ordinary operator formatting. */
+function parseCodexNotifyArgv(assignment: string): string[] | null {
+  const equals = assignment.indexOf('=');
+  if (equals === -1) return null;
+  const value = assignment.slice(equals + 1);
+  let i = 0;
+  const skip = (): void => {
+    for (;;) {
+      while (/\s/.test(value[i] ?? '')) i += 1;
+      if (value[i] !== '#') return;
+      const newline = value.indexOf('\n', i);
+      i = newline === -1 ? value.length : newline + 1;
+    }
+  };
+  const basicEscapes: Record<string, string> = {
+    b: '\b',
+    t: '\t',
+    n: '\n',
+    f: '\f',
+    r: '\r',
+    '"': '"',
+    '\\': '\\',
+  };
+  const oneString = (): string | null => {
+    const quote = value[i];
+    if (quote !== '"' && quote !== "'") return null;
+    // A multiline string is valid TOML but not needed for executable argv;
+    // refusing it is safer than implementing a second general TOML parser.
+    if (value[i + 1] === quote && value[i + 2] === quote) return null;
+    i += 1;
+    let out = '';
+    while (i < value.length) {
+      const ch = value[i] as string;
+      if (ch === quote) {
+        i += 1;
+        return out;
+      }
+      if (ch === '\n' || ch === '\r' || ch === '\0' || (ch < ' ' && ch !== '\t')) return null;
+      if (quote === '"' && ch === '\\') {
+        const esc = value[i + 1];
+        if (esc !== undefined && esc in basicEscapes) {
+          out += basicEscapes[esc] as string;
+          i += 2;
+          continue;
+        }
+        if (esc === 'u' || esc === 'U') {
+          const count = esc === 'u' ? 4 : 8;
+          const hex = value.slice(i + 2, i + 2 + count);
+          if (!new RegExp(`^[0-9A-Fa-f]{${count}}$`).test(hex)) return null;
+          const codePoint = Number.parseInt(hex, 16);
+          if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return null;
+          out += String.fromCodePoint(codePoint);
+          i += 2 + count;
+          continue;
+        }
+        return null;
+      }
+      out += ch;
+      i += 1;
+    }
+    return null;
+  };
+
+  skip();
+  if (value[i] !== '[') return null;
+  i += 1;
+  const argv: string[] = [];
+  for (;;) {
+    skip();
+    if (value[i] === ']') {
+      i += 1;
+      break;
+    }
+    const item = oneString();
+    if (item === null) return null;
+    argv.push(item);
+    skip();
+    if (value[i] === ',') {
+      i += 1;
+      continue;
+    }
+    if (value[i] === ']') {
+      i += 1;
+      break;
+    }
+    return null;
+  }
+  skip();
+  return i === value.length ? argv : null;
+}
+
+type PythonLiteral = string | PythonLiteral[] | { [key: string]: PythonLiteral };
+
+/** Parse the deliberately tiny Python-literal subset used by the one
+ * pre-product dispatcher.  This never executes or imports that file.  The
+ * caller first verifies its exact recorded digest, so this parser is only a
+ * structured way to recover the static COMMANDS value from known bytes. */
+function parsePythonLiteral(text: string): PythonLiteral | null {
+  let i = 0;
+  const ws = (): void => {
+    while (/\s/.test(text[i] ?? '')) i += 1;
+  };
+  const string = (): string | null => {
+    const quote = text[i];
+    if (quote !== "'" && quote !== '"') return null;
+    if (text[i + 1] === quote && text[i + 2] === quote) return null;
+    i += 1;
+    let out = '';
+    const escapes: Record<string, string> = {
+      a: '\x07',
+      b: '\b',
+      f: '\f',
+      n: '\n',
+      r: '\r',
+      t: '\t',
+      v: '\v',
+      '\\': '\\',
+      "'": "'",
+      '"': '"',
+    };
+    while (i < text.length) {
+      const ch = text[i] as string;
+      if (ch === quote) {
+        i += 1;
+        return out;
+      }
+      if (ch === '\n' || ch === '\r' || ch === '\0') return null;
+      if (ch !== '\\') {
+        out += ch;
+        i += 1;
+        continue;
+      }
+      const esc = text[i + 1];
+      if (esc !== undefined && esc in escapes) {
+        out += escapes[esc] as string;
+        i += 2;
+        continue;
+      }
+      const widths: Record<string, number> = { x: 2, u: 4, U: 8 };
+      const width = esc === undefined ? undefined : widths[esc];
+      if (width === undefined) return null;
+      const hex = text.slice(i + 2, i + 2 + width);
+      if (!new RegExp(`^[0-9A-Fa-f]{${width}}$`).test(hex)) return null;
+      const codePoint = Number.parseInt(hex, 16);
+      if (codePoint === 0 || codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
+        return null;
+      }
+      out += String.fromCodePoint(codePoint);
+      i += 2 + width;
+    }
+    return null;
+  };
+  const value = (): PythonLiteral | null => {
+    ws();
+    const ch = text[i];
+    if (ch === "'" || ch === '"') return string();
+    if (ch === '[' || ch === '(') {
+      const close = ch === '[' ? ']' : ')';
+      i += 1;
+      const items: PythonLiteral[] = [];
+      for (;;) {
+        ws();
+        if (text[i] === close) {
+          i += 1;
+          return items;
+        }
+        const item = value();
+        if (item === null) return null;
+        items.push(item);
+        ws();
+        if (text[i] === ',') {
+          i += 1;
+          continue;
+        }
+        if (text[i] !== close) return null;
+        i += 1;
+        return items;
+      }
+    }
+    if (ch === '{') {
+      i += 1;
+      const object: { [key: string]: PythonLiteral } = Object.create(null) as {
+        [key: string]: PythonLiteral;
+      };
+      for (;;) {
+        ws();
+        if (text[i] === '}') {
+          i += 1;
+          return object;
+        }
+        const key = string();
+        if (key === null) return null;
+        ws();
+        if (text[i] !== ':') return null;
+        i += 1;
+        const item = value();
+        if (item === null) return null;
+        object[key] = item;
+        ws();
+        if (text[i] === ',') {
+          i += 1;
+          continue;
+        }
+        if (text[i] !== '}') return null;
+        i += 1;
+        return object;
+      }
+    }
+    return null;
+  };
+  const parsed = value();
+  ws();
+  return parsed !== null && i === text.length ? parsed : null;
+}
+
+function literalArgv(value: PythonLiteral | undefined): string[] | null {
+  if (!Array.isArray(value) || value.length === 0 || !value.every(item => typeof item === 'string')) {
+    return null;
+  }
+  return [...value] as string[];
+}
+
+function literalEnv(value: PythonLiteral | undefined): Record<string, string> | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  const entries = Object.entries(value);
+  if (!entries.every(([, item]) => typeof item === 'string')) return null;
+  return Object.fromEntries(entries) as Record<string, string>;
+}
+
+interface LegacyCodexMigration {
+  previous: CodexPreviousNotifier[];
+  tacendumEnv: Record<string, string>;
+}
+
+const LEGACY_CODEX_DISPATCHER_SHA256 =
+  'cc1f37e1c9ef051ae56696b1310bc8ae756ffae72c928c0ae651225a74399b9d';
+
+function legacyCodexDispatcherArgv(): readonly [string, string] {
+  return [
+    '/Library/Frameworks/Python.framework/Versions/3.14/bin/python3',
+    join(homedir(), '.codex', 'hooks', 'tacendum-notify.py'),
+  ];
+}
+
+function migrateLegacyCodexDispatcher(
+  argv: readonly string[],
+  io: HostConfigIo,
+): LegacyCodexMigration | null {
+  const expected = io.legacyCodexDispatcherArgv ?? legacyCodexDispatcherArgv();
+  // This exact path is the only ambiguous case: the known script already
+  // sends through Tacendum, so treating changed bytes/argv as an unrelated
+  // notifier could add a second delivery.  Refuse instead of guessing.
+  if (argv[1] !== expected[1]) return null;
+  if (argv.length !== expected.length || argv.some((item, index) => item !== expected[index])) {
+    throw new CliError(
+      EXIT.ERROR,
+      'the legacy Codex dispatcher command has changed — refusing to add a second Tacendum delivery',
+    );
+  }
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(expected[1]);
+  } catch {
+    throw new CliError(
+      EXIT.ERROR,
+      'the legacy Codex dispatcher cannot be read — refusing to add a second Tacendum delivery',
+    );
+  }
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  if (digest !== (io.legacyCodexDispatcherSha256 ?? LEGACY_CODEX_DISPATCHER_SHA256)) {
+    throw new CliError(
+      EXIT.ERROR,
+      'the legacy Codex dispatcher file has changed — refusing to add a second Tacendum delivery',
+    );
+  }
+  const commandLines = bytes
+    .toString('utf8')
+    .split('\n')
+    .filter(line => line.startsWith('COMMANDS = '));
+  if (commandLines.length !== 1) {
+    throw new CliError(EXIT.ERROR, 'the validated legacy Codex dispatcher has an unreadable command plan');
+  }
+  const literal = parsePythonLiteral((commandLines[0] as string).slice('COMMANDS = '.length));
+  if (!Array.isArray(literal) || literal.length !== 2) {
+    throw new CliError(EXIT.ERROR, 'the validated legacy Codex dispatcher has an unreadable command plan');
+  }
+  const previousPair = literal[0];
+  const tacendumPair = literal[1];
+  if (!Array.isArray(previousPair) || previousPair.length !== 2 || !Array.isArray(tacendumPair) || tacendumPair.length !== 2) {
+    throw new CliError(EXIT.ERROR, 'the validated legacy Codex dispatcher has an unreadable command plan');
+  }
+  const previousArgv = literalArgv(previousPair[0]);
+  const previousEnv = literalEnv(previousPair[1]);
+  const oldTacendumArgv = literalArgv(tacendumPair[0]);
+  const tacendumEnv = literalEnv(tacendumPair[1]);
+  if (
+    previousArgv === null ||
+    previousEnv === null ||
+    oldTacendumArgv === null ||
+    directCodexAccount(oldTacendumArgv) === null ||
+    tacendumEnv === null
+  ) {
+    throw new CliError(EXIT.ERROR, 'the validated legacy Codex dispatcher has an unreadable command plan');
+  }
+  return { previous: [{ argv: previousArgv, env: previousEnv }], tacendumEnv };
+}
+
+function managedCodexLine(
+  directArgv: string[],
+  previous: CodexPreviousNotifier[],
+  tacendumEnv?: Record<string, string>,
+): string {
+  const account = directCodexAccount(directArgv);
+  if (account === null || directArgv[0] === undefined || directArgv[1] === undefined) {
+    throw new CliError(EXIT.ERROR, 'internal: invalid tacendum Codex notifier argv');
+  }
+  const plan: CodexNotifyPlanV1 = {
+    v: 1,
+    account,
+    previous,
+    ...(tacendumEnv !== undefined ? { tacendumEnv } : {}),
+  };
+  return codexNotifyLine(codexNotifyDispatchArgv(directArgv[0], directArgv[1], plan));
 }
 
 export function hostConfigPathFor(surface: SetupSurface): string {
@@ -283,14 +687,21 @@ function parseJsonConfig(existing: string | null): Record<string, unknown> {
  * A list that exists but is not an array is a REFUSAL, not an overwrite:
  * whatever put it there, replacing it destroys data this tool cannot read.
  */
-function withOurEntry(list: unknown, key: string, entry: Record<string, unknown>): unknown[] {
+type HookCommandOwner = (command: unknown) => boolean;
+
+function withOurEntry(
+  list: unknown,
+  key: string,
+  entry: Record<string, unknown>,
+  owns: HookCommandOwner = isOurNotifyCommand,
+): unknown[] {
   if (list !== undefined && !Array.isArray(list)) {
     throw new CliError(
       EXIT.ERROR,
       `the existing config's ${key} is not a list — refusing to overwrite it`,
     );
   }
-  const kept = withoutOurEntries((list as unknown[] | undefined) ?? []);
+  const kept = withoutOurEntries((list as unknown[] | undefined) ?? [], owns);
   kept.push(entry);
   return kept;
 }
@@ -298,7 +709,10 @@ function withOurEntry(list: unknown, key: string, entry: Record<string, unknown>
 /** The filter half of `withOurEntry`, alone — for a list we used to write
  * into and no longer do (gemini's `Stop`), where ours must go and nothing
  * may be appended. */
-function withoutOurEntries(list: unknown[]): unknown[] {
+function withoutOurEntries(
+  list: unknown[],
+  owns: HookCommandOwner = isOurNotifyCommand,
+): unknown[] {
   const kept: unknown[] = [];
   for (const item of list) {
     if (!isRecord(item)) {
@@ -306,11 +720,11 @@ function withoutOurEntries(list: unknown[]): unknown[] {
       continue;
     }
     // Flat shape: the command sits on the item itself.
-    if (isOurNotifyCommand(item.command)) continue;
+    if (owns(item.command)) continue;
     // Group shape: the commands sit one level down. Filter only ours out of
     // the group; a group that held ONLY ours disappears with them.
     if (Array.isArray(item.hooks)) {
-      const hooks = item.hooks.filter(h => !(isRecord(h) && isOurNotifyCommand(h.command)));
+      const hooks = item.hooks.filter(h => !(isRecord(h) && owns(h.command)));
       if (hooks.length === 0 && item.hooks.length > 0) continue;
       kept.push(hooks.length === item.hooks.length ? item : { ...item, hooks });
       continue;
@@ -318,6 +732,47 @@ function withoutOurEntries(list: unknown[]): unknown[] {
     kept.push(item);
   }
   return kept;
+}
+
+function hookCommandValues(list: unknown): unknown[] {
+  if (!Array.isArray(list)) return [];
+  const commands: unknown[] = [];
+  for (const item of list) {
+    if (!isRecord(item)) continue;
+    if (item.command !== undefined) commands.push(item.command);
+    if (Array.isArray(item.hooks)) {
+      for (const hook of item.hooks) {
+        if (isRecord(hook) && hook.command !== undefined) commands.push(hook.command);
+      }
+    }
+  }
+  return commands;
+}
+
+function claudePermissionOwner(command: string): { nodePath: string; entryPath: string } {
+  const parsed = parseClaudePermissionCommand(command);
+  if (parsed === null) {
+    throw new CliError(EXIT.ERROR, 'internal: invalid Claude permission hook command');
+  }
+  return { nodePath: parsed.nodePath, entryPath: parsed.entryPath };
+}
+
+function refuseUnownedClaudePermissionClaims(
+  list: unknown,
+  owner: { nodePath: string; entryPath: string },
+): void {
+  for (const command of hookCommandValues(list)) {
+    const parsed = parseClaudePermissionCommand(command);
+    if (
+      parsed !== null &&
+      (parsed.nodePath !== owner.nodePath || parsed.entryPath !== owner.entryPath)
+    ) {
+      throw new CliError(
+        EXIT.ERROR,
+        'the existing PermissionRequest list claims Tacendum\'s private approval command, but its executable ownership cannot be established — refusing to replace or compose it',
+      );
+    }
+  }
 }
 
 /** One Claude-style hook command. `async: true` is row 6's requirement: the
@@ -328,6 +783,101 @@ function claudeHookGroup(command: string, matcher?: string): Record<string, unkn
     ...(matcher !== undefined ? { matcher } : {}),
     hooks: [{ type: 'command', command, async: true, timeout: 10 }],
   };
+}
+
+function claudePermissionHookGroup(command: string): Record<string, unknown> {
+  return { hooks: [{ type: 'command', command, timeout: 600 }] };
+}
+
+function hasOnlyKeys(record: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(record);
+  return actual.length === keys.length && actual.every(key => keys.includes(key));
+}
+
+/** Match the complete hook objects this release writes. Capability reporting
+ * cannot treat a familiar command string as proof: `async` and timeout are
+ * execution semantics, and a command nested under a malformed group never
+ * runs at all. Foreign groups may coexist, but the maintained group itself
+ * must retain its exact shape. */
+function hasExactGroupedHook(
+  list: unknown,
+  command: string,
+  kind:
+    | { host: 'claude'; matcher?: string }
+    | { host: 'gemini' },
+): boolean {
+  if (!Array.isArray(list)) return false;
+  if (hookCommandValues(list).filter(candidate => candidate === command).length !== 1) return false;
+  return list.some(item => {
+    if (!isRecord(item) || !Array.isArray(item.hooks) || item.hooks.length !== 1) return false;
+    const hook = item.hooks[0];
+    if (!isRecord(hook) || hook.type !== 'command' || hook.command !== command) return false;
+    if (kind.host === 'claude') {
+      const groupKeys = kind.matcher === undefined ? ['hooks'] : ['matcher', 'hooks'];
+      return (
+        hasOnlyKeys(item, groupKeys) &&
+        item.matcher === kind.matcher &&
+        hasOnlyKeys(hook, ['type', 'command', 'async', 'timeout']) &&
+        hook.async === true &&
+        hook.timeout === 10
+      );
+    }
+    return (
+      hasOnlyKeys(item, ['hooks']) &&
+      hasOnlyKeys(hook, ['type', 'command', 'timeout']) &&
+      hook.timeout === 10_000
+    );
+  });
+}
+
+function hasExactCursorHook(list: unknown, command: string): boolean {
+  if (!Array.isArray(list)) return false;
+  if (hookCommandValues(list).filter(candidate => candidate === command).length !== 1) return false;
+  return list.some(
+    item => isRecord(item) && hasOnlyKeys(item, ['command']) && item.command === command,
+  );
+}
+
+function hasExactClaudePermission(
+  list: unknown,
+  account: string,
+  entryPath: string,
+): boolean {
+  if (!Array.isArray(list)) return false;
+  const owned = hookCommandValues(list).filter(command => {
+    const parsed = parseClaudePermissionCommand(command);
+    return (
+      parsed?.nodePath === process.execPath &&
+      parsed.entryPath === entryPath &&
+      parsed.account === account
+    );
+  });
+  if (owned.length !== 1) return false;
+  return list.some(item => {
+    if (
+      !isRecord(item) ||
+      !hasOnlyKeys(item, ['hooks']) ||
+      !Array.isArray(item.hooks) ||
+      item.hooks.length !== 1
+    ) {
+      return false;
+    }
+    const hook = item.hooks[0];
+    if (
+      !isRecord(hook) ||
+      !hasOnlyKeys(hook, ['type', 'command', 'timeout']) ||
+      hook.type !== 'command' ||
+      hook.timeout !== 600
+    ) {
+      return false;
+    }
+    const parsed = parseClaudePermissionCommand(hook.command);
+    return (
+      parsed?.nodePath === process.execPath &&
+      parsed.entryPath === entryPath &&
+      parsed.account === account
+    );
+  });
 }
 
 /** The root's `hooks` table, or a refusal — never an overwrite of a shape
@@ -348,7 +898,11 @@ function hooksTable(root: Record<string, unknown>): Record<string, unknown> {
  * on a finished turn, `Notification` (matched to the three needs-a-human
  * events) fires when the agent is blocked waiting.
  */
-export function mergeClaudeSettings(existing: string | null, command: string): string {
+export function mergeClaudeSettings(
+  existing: string | null,
+  command: string,
+  permissionCommand?: string,
+): string {
   const root = parseJsonConfig(existing);
   const hooks = hooksTable(root);
   hooks.Stop = withOurEntry(hooks.Stop, 'hooks.Stop', claudeHookGroup(command));
@@ -357,8 +911,28 @@ export function mergeClaudeSettings(existing: string | null, command: string): s
     'hooks.Notification',
     claudeHookGroup(command, CLAUDE_NOTIFICATION_MATCHER),
   );
+  if (permissionCommand !== undefined) {
+    const owner = claudePermissionOwner(permissionCommand);
+    refuseUnownedClaudePermissionClaims(hooks.PermissionRequest, owner);
+    hooks.PermissionRequest = withOurEntry(
+      hooks.PermissionRequest,
+      'hooks.PermissionRequest',
+      claudePermissionHookGroup(permissionCommand),
+      candidate => isOwnedClaudePermissionCommand(candidate, owner.nodePath, owner.entryPath),
+    );
+  }
   root.hooks = hooks;
   return `${JSON.stringify(root, null, 2)}\n`;
+}
+
+function hasConfiguredClaudePermission(
+  rendered: string,
+  account: string,
+  entryPath: string,
+): boolean {
+  const root = JSON.parse(rendered) as Record<string, unknown>;
+  if (!isRecord(root.hooks)) return false;
+  return hasExactClaudePermission(root.hooks.PermissionRequest, account, entryPath);
 }
 
 /** One Gemini-style hook entry. Gemini's hook schema
@@ -435,14 +1009,19 @@ export function codexNotifyLine(argv: string[]): string {
  * that table and Codex never sees it. So ours is inserted BEFORE the first
  * table header, and only the top-level region is scanned for an existing one.
  *
- * A foreign `notify` is a REFUSAL, not a replacement: Codex has exactly one
- * notify slot, and overwriting it silently disconnects whatever notifier the
- * operator already trusts. The refusal names the line to add by hand; the
- * existing value is never echoed (it is argv the operator wrote — the same
- * reason args.ts never echoes an unknown token).
+ * A readable foreign `notify` is retained as a child of Tacendum's bounded
+ * dispatcher because Codex has exactly one notify slot. Its argv boundaries
+ * are preserved and Codex's JSON payload is appended once at runtime. Values
+ * that cannot be parsed as string argv, duplicate keys, and commands that
+ * imitate Tacendum's private formats without current executable ownership
+ * are refused rather than guessed at or echoed.
  */
-export function mergeCodexNotify(existing: string | null, argv: string[]): string {
-  const ourLine = codexNotifyLine(argv);
+export function mergeCodexNotify(
+  existing: string | null,
+  argv: string[],
+  io: HostConfigIo = {},
+): string {
+  let ourLine = managedCodexLine(argv, []);
   const raw = existing ?? '';
   if (raw.trim() === '') return `${ourLine}\n`;
 
@@ -484,25 +1063,63 @@ export function mergeCodexNotify(existing: string | null, argv: string[]): strin
   }
 
   if (notifyAts.length > 0) {
-    if (notifyAts.some(at => !isOurNotifyToml(lines[at] ?? ''))) {
-      throw new CliError(
-        EXIT.ERROR,
-        'config.toml already sets a top-level `notify` for another notifier — refusing to ' +
-          `replace it. To switch to tacendum, change that line yourself to:\n${ourLine}`,
-      );
-    }
-    // Every notify line is provably ours, and each is replaced or dropped
-    // WITH ITS WHOLE EXTENT: a value reflowed across lines continues until
-    // the next structural line, and swapping only its first line used to
-    // leave the tail of the old array dangling — invalid TOML. The first
-    // becomes the fresh line; any later one is the duplicate the old text
-    // match appended — dropped, which repairs the file without touching
-    // anything that is not ours.
     const extentEnd = (at: number): number => {
       let e = at + 1;
       while (e < lines.length && !structural[e]) e += 1;
       return e;
     };
+    if (notifyAts.length !== 1) {
+      throw new CliError(
+        EXIT.ERROR,
+        'config.toml defines top-level `notify` more than once — refusing to guess which value Codex uses',
+      );
+    }
+    const at = notifyAts[0] as number;
+    const existingArgv = parseCodexNotifyArgv(lines.slice(at, extentEnd(at)).join('\n'));
+    if (existingArgv === null) {
+      throw new CliError(
+        EXIT.ERROR,
+        'config.toml has a top-level `notify` value this setup cannot safely read as argv — ' +
+          'refusing to overwrite it',
+      );
+    }
+    let managed: CodexNotifyPlanV1 | null;
+    try {
+      managed = planFromCodexNotifyDispatchArgv(existingArgv, {
+        nodePath: argv[0] ?? '',
+        entryPath: argv[1] ?? '',
+      });
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('ownership cannot be established')) {
+        throw new CliError(
+          EXIT.ERROR,
+          'config.toml claims the managed Codex notifier command, but its executable ownership cannot be established — refusing to replace or compose it',
+        );
+      }
+      throw new CliError(
+        EXIT.ERROR,
+        'config.toml contains a malformed managed Codex notifier — refusing to guess at its handlers',
+      );
+    }
+    if (managed !== null) {
+      ourLine = managedCodexLine(argv, managed.previous, managed.tacendumEnv);
+    } else if (directCodexAccount(existingArgv) !== null) {
+      if (existingArgv[0] !== argv[0] || existingArgv[1] !== argv[1]) {
+        throw new CliError(
+          EXIT.ERROR,
+          'config.toml contains an ambiguous Codex notifier that resembles Tacendum but is not owned by the current executable — refusing to replace or compose it',
+        );
+      }
+    } else {
+      const legacy = migrateLegacyCodexDispatcher(existingArgv, io);
+      ourLine =
+        legacy === null
+          ? managedCodexLine(argv, [{ argv: existingArgv }])
+          : managedCodexLine(argv, legacy.previous, legacy.tacendumEnv);
+    }
+    // Replace the single notify assignment WITH ITS WHOLE EXTENT: a value
+    // reflowed across lines continues until the next structural line, and
+    // swapping only its first line leaves the old array tail as invalid TOML.
     const keep = notifyAts[0] as number;
     const out: string[] = [];
     let i = 0;
@@ -558,6 +1175,20 @@ function assertOneTopLevelNotify(merged: string): string {
 export interface HostConfigIo {
   entryPath?: string;
   targetPath?: string;
+  /** Test seam for the one exact pre-product dispatcher migration. */
+  legacyCodexDispatcherArgv?: readonly [string, string];
+  /** Test seam; production uses the digest recorded in the installation note. */
+  legacyCodexDispatcherSha256?: string;
+}
+
+/** Behavioral setup options are separate from HostConfigIo's filesystem
+ * seams.  Native Claude approvals are opt-in because PermissionRequest is a
+ * synchronous policy boundary; ordinary notification setup must not install
+ * or remove it implicitly. */
+export interface HostConfigOptions {
+  claudePermission?: {
+    minimumAppBuild: number;
+  };
 }
 
 export interface HostConfigOutcome {
@@ -565,6 +1196,170 @@ export interface HostConfigOutcome {
   /** False when the file already said exactly this — the idempotent re-run. */
   changed: boolean;
   backup: string | null;
+  /** The requested native Claude PermissionRequest hook is present in the
+   * rendered config. This says configuration only, never connectivity. */
+  approvalsConfigured: boolean;
+}
+
+export interface HostConfigInspection {
+  /** `configured` means at least one complete current handler is present.
+   * `readable` is a valid, inspectable file without one; it is distinct from
+   * an absent file and from bytes whose structure cannot be trusted. */
+  state: 'absent' | 'configured' | 'readable' | 'unreadable';
+  notificationConfigured: boolean;
+  approvalsConfigured: boolean;
+}
+
+function inspectJsonHostConfig(
+  surface: Exclude<SetupSurface, 'codex'>,
+  existing: string,
+  account: string,
+  entry: string,
+): Pick<HostConfigInspection, 'notificationConfigured' | 'approvalsConfigured'> {
+  const root = parseJsonConfig(existing);
+  if (root.hooks !== undefined && !isRecord(root.hooks)) {
+    throw new Error('invalid hooks table');
+  }
+  const hooks = isRecord(root.hooks) ? root.hooks : {};
+  const command = notifyCommand(surface, account, entry);
+  let notificationConfigured = false;
+  let approvalsConfigured = false;
+  switch (surface) {
+    case 'claude-code':
+      for (const key of ['Stop', 'Notification', 'PermissionRequest']) {
+        if (hooks[key] !== undefined && !Array.isArray(hooks[key])) {
+          throw new Error('invalid Claude hook list');
+        }
+      }
+      notificationConfigured =
+        hasExactGroupedHook(hooks.Stop, command, { host: 'claude' }) &&
+        hasExactGroupedHook(hooks.Notification, command, {
+          host: 'claude',
+          matcher: CLAUDE_NOTIFICATION_MATCHER,
+        });
+      approvalsConfigured = hasExactClaudePermission(
+        hooks.PermissionRequest,
+        account,
+        entry,
+      );
+      break;
+    case 'gemini':
+      if (hooks.AfterAgent !== undefined && !Array.isArray(hooks.AfterAgent)) {
+        throw new Error('invalid Gemini hook list');
+      }
+      notificationConfigured = hasExactGroupedHook(hooks.AfterAgent, command, {
+        host: 'gemini',
+      });
+      break;
+    case 'cursor':
+      for (const key of ['afterAgentResponse', 'stop']) {
+        if (hooks[key] !== undefined && !Array.isArray(hooks[key])) {
+          throw new Error('invalid Cursor hook list');
+        }
+      }
+      notificationConfigured =
+        hasExactCursorHook(hooks.afterAgentResponse, command) &&
+        hasExactCursorHook(hooks.stop, command);
+      break;
+  }
+  return { notificationConfigured, approvalsConfigured };
+}
+
+function inspectCodexHostConfig(
+  existing: string,
+  account: string,
+  entry: string,
+): boolean {
+  const { lines } = splitTomlOrRefuse(existing);
+  const structural = structuralTomlLines(lines);
+  const firstTable = lines.findIndex((line, index) =>
+    (structural[index] ?? false) && /^\s*\[/.test(line),
+  );
+  const topLevel = firstTable === -1 ? lines.length : firstTable;
+  const notifyAts: number[] = [];
+  for (let index = 0; index < topLevel; index += 1) {
+    if (!structural[index]) continue;
+    const path = parseAssignmentKeyLine(lines[index] ?? '');
+    if (path !== null && path[0] === 'notify') notifyAts.push(index);
+  }
+  if (notifyAts.length === 0) return false;
+  if (notifyAts.length !== 1) throw new Error('duplicate Codex notify keys');
+  const at = notifyAts[0] as number;
+  const path = parseAssignmentKeyLine(lines[at] ?? '');
+  if (path === null || path.length !== 1) return false;
+  let end = at + 1;
+  while (end < lines.length && !structural[end]) end += 1;
+  const argv = parseCodexNotifyArgv(lines.slice(at, end).join('\n'));
+  if (argv === null) throw new Error('unreadable Codex notify argv');
+  let plan: CodexNotifyPlanV1 | null;
+  try {
+    plan = planFromCodexNotifyDispatchArgv(argv, {
+      nodePath: process.execPath,
+      entryPath: entry,
+    });
+  } catch {
+    return false;
+  }
+  return plan?.account === account;
+}
+
+/** Observe a host file without merging or writing it. This reader recognizes
+ * only the complete current executable/entry/account registration, so setup
+ * and doctor never advertise a capability from a lookalike command or a
+ * partly edited hook. */
+export function inspectHostConfig(
+  surface: SetupSurface,
+  account: string,
+  io: HostConfigIo = {},
+): HostConfigInspection {
+  const target = io.targetPath ?? hostConfigPathFor(surface);
+  let existing: string | null;
+  try {
+    ({ existing } = readConfigForEdit(target));
+  } catch {
+    return {
+      state: 'unreadable',
+      notificationConfigured: false,
+      approvalsConfigured: false,
+    };
+  }
+  if (existing === null) {
+    return {
+      state: 'absent',
+      notificationConfigured: false,
+      approvalsConfigured: false,
+    };
+  }
+  const entry = io.entryPath ?? builtEntryPath();
+  let notificationConfigured = false;
+  let approvalsConfigured = false;
+  try {
+    if (surface === 'codex') {
+      notificationConfigured = inspectCodexHostConfig(existing, account, entry);
+    } else {
+      ({ notificationConfigured, approvalsConfigured } = inspectJsonHostConfig(
+        surface,
+        existing,
+        account,
+        entry,
+      ));
+    }
+  } catch {
+    return {
+      state: 'unreadable',
+      notificationConfigured: false,
+      approvalsConfigured: false,
+    };
+  }
+  if (!existsSync(entry)) {
+    notificationConfigured = false;
+    approvalsConfigured = false;
+  }
+  return {
+    state: notificationConfigured || approvalsConfigured ? 'configured' : 'readable',
+    notificationConfigured,
+    approvalsConfigured,
+  };
 }
 
 /** Everything `writeHostConfig` needs, computed without writing: the merge
@@ -577,12 +1372,14 @@ interface RenderedHostConfig {
    * never a third resolution of the path); 0o644 for a fresh file. */
   mode: number;
   merged: string;
+  approvalsConfigured: boolean;
 }
 
 function renderHostConfig(
   surface: SetupSurface,
   account: string,
   io: HostConfigIo = {},
+  options: HostConfigOptions = {},
 ): RenderedHostConfig {
   const entry = io.entryPath ?? builtEntryPath();
   if (!existsSync(entry)) {
@@ -601,10 +1398,32 @@ function renderHostConfig(
   // symlinked target had its link silently replaced by a regular file.
   const { existing, mode } = readConfigForEdit(target);
 
+  const approval = options.claudePermission;
+  if (approval !== undefined && surface !== 'claude-code') {
+    throw new CliError(
+      EXIT.USAGE,
+      'the native Claude approval hook can only be configured for claude-code',
+    );
+  }
+  if (
+    approval !== undefined &&
+    (!Number.isSafeInteger(approval.minimumAppBuild) || approval.minimumAppBuild < 1)
+  ) {
+    throw new CliError(
+      EXIT.USAGE,
+      'the native Claude approval app build must be a positive whole number',
+    );
+  }
   let merged: string;
   switch (surface) {
     case 'claude-code':
-      merged = mergeClaudeSettings(existing, notifyCommand(surface, account, entry));
+      merged = mergeClaudeSettings(
+        existing,
+        notifyCommand(surface, account, entry),
+        approval === undefined
+          ? undefined
+          : claudePermissionCommand(account, approval.minimumAppBuild, entry),
+      );
       break;
     case 'gemini':
       merged = mergeGeminiSettings(existing, notifyCommand(surface, account, entry));
@@ -613,10 +1432,12 @@ function renderHostConfig(
       merged = mergeCursorHooks(existing, notifyCommand(surface, account, entry));
       break;
     case 'codex':
-      merged = mergeCodexNotify(existing, notifyArgv(surface, account, entry));
+      merged = mergeCodexNotify(existing, notifyArgv(surface, account, entry), io);
       break;
   }
-  return { entry, target, existing, mode, merged };
+  const approvalsConfigured =
+    surface === 'claude-code' && hasConfiguredClaudePermission(merged, account, entry);
+  return { entry, target, existing, mode, merged, approvalsConfigured };
 }
 
 /**
@@ -634,9 +1455,10 @@ export function preflightHostConfig(
   surface: SetupSurface,
   account: string,
   io: HostConfigIo = {},
-): { entry: string; target: string } {
-  const { entry, target } = renderHostConfig(surface, account, io);
-  return { entry, target };
+  options: HostConfigOptions = {},
+): { entry: string; target: string; approvalsConfigured: boolean } {
+  const { entry, target, approvalsConfigured } = renderHostConfig(surface, account, io, options);
+  return { entry, target, approvalsConfigured };
 }
 
 /** One lock per TARGET file, under tacendum's own home — never inside the
@@ -667,11 +1489,19 @@ export function writeHostConfig(
   surface: SetupSurface,
   account: string,
   io: HostConfigIo = {},
+  options: HostConfigOptions = {},
 ): HostConfigOutcome {
   const preTarget = io.targetPath ?? hostConfigPathFor(surface);
   return withFileLock(hostConfigLockPath(preTarget), () => {
-    const { target, existing, mode, merged } = renderHostConfig(surface, account, io);
-    if (existing === merged) return { path: target, changed: false, backup: null };
+    const { target, existing, mode, merged, approvalsConfigured } = renderHostConfig(
+      surface,
+      account,
+      io,
+      options,
+    );
+    if (existing === merged) {
+      return { path: target, changed: false, backup: null, approvalsConfigured };
+    }
 
     mkdirSync(dirname(target), { recursive: true });
     let backup: string | null = null;
@@ -691,6 +1521,6 @@ export function writeHostConfig(
     // what survives the rename, and forcing our key-material 0600 onto
     // another tool's config would be a silent permissions change.
     writeFileAtomic(target, merged, { mode: existing !== null ? mode : 0o644 });
-    return { path: target, changed: true, backup };
+    return { path: target, changed: true, backup, approvalsConfigured };
   });
 }

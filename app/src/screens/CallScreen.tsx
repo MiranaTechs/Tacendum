@@ -9,8 +9,11 @@ import {
   Text,
   View,
 } from 'react-native';
-import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context';
-import type { CallState } from '@tacendum/shared';
+import {
+  useSafeAreaFrame,
+  useSafeAreaInsets,
+} from 'react-native-safe-area-context';
+import { RINGING_ACK_GRACE_MS, type CallState } from '@tacendum/shared';
 import { TacendumVideoView } from 'tacendum-call';
 import { EARPIECE_KNOWN_ABSENT } from '../audioRoute';
 // Moved out so the small-group screen reuses them rather than growing
@@ -40,9 +43,11 @@ import {
   PIP_HEIGHT,
   PIP_WIDTH,
   pipCornerForAction,
+  type PipCorner,
   usePipDrag,
 } from '../ui/pipDrag';
 import { useOutgoingRingback } from '../ui/ringback';
+import { useVideoReadiness } from '../ui/videoReadiness';
 import { useTheme } from '../theme';
 import { useReduceMotion } from '../useReduceMotion';
 
@@ -119,6 +124,11 @@ export interface CallScreenProps {
   onFlipCamera(): void;
   onToggleSpeaker(): void;
   onHangup(): void;
+  /** Presentation-only state retained by App for this call's remount. */
+  initialSwapped?: boolean;
+  initialPipCorner?: PipCorner;
+  onSwappedChange?(swapped: boolean): void;
+  onPipCornerChange?(corner: PipCorner): void;
   /**
    * Put the call away and keep it going ("go
    * back to the chat from a video call while the video call is on"). When
@@ -161,6 +171,23 @@ export function statusLabel(state: CallState): string {
     default:
       return '';
   }
+}
+
+/** A local-clock qualification for an offer nobody has acknowledged yet. */
+export function statusLabelAt(state: CallState, now: number): string {
+  if (
+    state.name === 'outgoing_connecting' &&
+    state.call.direction === 'out' &&
+    !state.call.remoteReady &&
+    now >= state.call.startedAt + RINGING_ACK_GRACE_MS
+  ) {
+    return 'Calling… They may be offline.';
+  }
+  return statusLabel(state);
+}
+
+function spokenStatusLabel(visible: string): string {
+  return visible.replace('… ', '. ').replace(/…$/, '');
 }
 
 /**
@@ -244,7 +271,10 @@ function PeerFace({
   const shown = tileName(peerId, peerName);
   const unnamed = shown === UNNAMED;
   return (
-    <View style={ground ? styles.avatarGround : styles.avatarWrap} pointerEvents="none">
+    <View
+      style={ground ? styles.avatarGround : styles.avatarWrap}
+      pointerEvents="none"
+    >
       <Avatar
         peerId={peerId}
         displayName={shown}
@@ -277,6 +307,10 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
     onFlipCamera,
     onToggleSpeaker,
     onHangup,
+    initialSwapped = false,
+    initialPipCorner = 'top-right',
+    onSwappedChange,
+    onPipCornerChange,
     onMinimize,
     now = Date.now,
   } = props;
@@ -299,7 +333,7 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
    * Local state, not global: it is a preference about this screen right now,
    * and it should not survive the call it belongs to.
    */
-  const [swapped, setSwapped] = useState(false);
+  const [swapped, setSwapped] = useState(initialSwapped);
 
   /**
    * Where the corner preview is parked (the
@@ -324,38 +358,24 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
   const frame = useSafeAreaFrame();
   const pip = usePipDrag({
     frame: { width: frame.width, height: frame.height },
-    insets: { top: insets.top, bottom: insets.bottom, left: insets.left, right: insets.right },
+    insets: {
+      top: insets.top,
+      bottom: insets.bottom,
+      left: insets.left,
+      right: insets.right,
+    },
     reduceMotion,
     motion: theme.motion,
+    initialCorner: initialPipCorner,
+    onCornerChange: onPipCornerChange,
   });
 
   const call = state.call;
   const isVideo = call?.video === true || call?.peerVideo === true;
-  /**
-   * Whether the surface carrying the REMOTE track can have anything in it.
-   *
-   * A `TacendumVideoView` with no track is an opaque black rectangle — the
-   * native host paints `.black` behind an empty `RTCMTLVideoView`, which is
-   * the honest thing for a surface to do and the wrong thing for a SCREEN to
-   * stop at. That rectangle covered the whole display for every second of
-   * ringing and connecting, and for every second the far end's camera was
-   * off: "person B is all dark screen" (hardware).
-   *
-   * TWO FACTS, BOTH ALREADY KNOWN HERE, and neither of them a guess:
-   *  - `connected` is the machine's word for media actually flowing. Before
-   *    it there is no remote track at all — the answer has not been applied —
-   *    so there is nothing a renderer could be showing.
-   *  - `peerVideo` is the far end's own report of its camera: the answer's
-   *    `vid`, then every `call.media` after it. False means they are sending
-   *    no video, not that we are waiting for some.
-   *
-   * Deliberately NOT "has a frame arrived" — nothing publishes that. The
-   * remaining gap is the moment between `connected` and the first decoded
-   * keyframe, where this still shows black; closing it needs a first-frame
-   * event out of the host, and the codegen spec that would carry it belongs
-   * to another lane.
-   */
-  const remoteVideoLive = state.name === 'connected' && call?.peerVideo === true;
+  const remoteExpected = state.name === 'connected' && call?.peerVideo === true;
+  const fullVideo = useVideoReadiness(call?.cid ?? '', swapped ? 'local' : 'remote', swapped ? videoEnabled : remoteExpected);
+  const previewVideo = useVideoReadiness(call?.cid ?? '', swapped ? 'remote' : 'local', swapped ? remoteExpected : videoEnabled);
+  const remoteVideoLive = swapped ? previewVideo.ready : fullVideo.ready;
 
   /**
    * Whether there is a remote track for the peer's PHOTO to stand in for.
@@ -384,7 +404,9 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
    * scrims out of the product outright.
    */
   const mediaEstablished =
-    state.name === 'connected' || state.name === 'reconnecting' || call?.connectedAt != null;
+    state.name === 'connected' ||
+    state.name === 'reconnecting' ||
+    call?.connectedAt != null;
 
   // One timer, once per second, only while there is something to count.
   useEffect(() => {
@@ -393,8 +415,42 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
     return () => clearInterval(id);
   }, [call?.connectedAt, now]);
 
+  // The caller gets one qualified hint when an offer has produced neither a
+  // ringing acknowledgement nor an answer. This is presentation time only:
+  // no reducer state, signaling frame or delivery fact is manufactured.
+  useEffect(() => {
+    if (
+      state.name !== 'outgoing_connecting' ||
+      call?.direction !== 'out' ||
+      call.remoteReady
+    ) {
+      return undefined;
+    }
+    const remaining = call.startedAt + RINGING_ACK_GRACE_MS - now();
+    if (remaining <= 0) {
+      setTick(now());
+      return undefined;
+    }
+    const id = setTimeout(() => setTick(now()), remaining);
+    return () => clearTimeout(id);
+  }, [
+    state.name,
+    call?.cid,
+    call?.direction,
+    call?.remoteReady,
+    call?.startedAt,
+    now,
+  ]);
+
   const duration = useMemo(() => durationLabel(state, tick), [state, tick]);
-  const announcement = useMemo(() => durationAnnouncement(state, tick), [state, tick]);
+  const announcement = useMemo(
+    () => durationAnnouncement(state, tick),
+    [state, tick],
+  );
+  const visibleStatus = useMemo(
+    () => statusLabelAt(state, tick),
+    [state, tick],
+  );
   const styles = useMemo(() => makeStyles(theme), [theme]);
 
   // The notice, spoken. `accessibilityLiveRegion` is an ANDROID prop —
@@ -407,7 +463,9 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
   useEffect(() => {
     if (Platform.OS !== 'ios' || pressureNotice === null) return;
     AccessibilityInfo.announceForAccessibility(
-      pressureRestorable ? `${pressureNotice} · Tap to restore` : pressureNotice,
+      pressureRestorable
+        ? `${pressureNotice} · Tap to restore`
+        : pressureNotice,
     );
   }, [pressureNotice, pressureRestorable]);
 
@@ -422,27 +480,7 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
   const shownName = tileName(call.peerId, peerName);
 
   return (
-    <View
-      style={styles.root}
-      accessibilityViewIsModal
-      // A video call announces as one: the camera being on is
-      // exactly the fact a blind person cannot check for themselves.
-      // IncomingCallScreen already names the kind; this screen did not.
-      //
-      // OWED, A DEVICE READING. This label sits on a View with no
-      // `accessible`, which RN defaults to FALSE — the same rule that made
-      // QualityBars' 'Connection poor' unreachable a few files over. The
-      // difference is that a modal CONTAINER's label may be spoken as the
-      // window's name on focus rather than as an element, which is why
-      // IncomingCallScreen.tsx:76-79 has always been written this way and why
-      // `accessible` must NOT be added here: it would collapse the whole call
-      // screen — every control, the peer, the status — into one element.
-      // Until VoiceOver on a device settles whether the container label is
-      // spoken at all, this is a label that may be reaching nobody. If it is
-      // not spoken, the kind belongs on a real element instead: appended to
-      // the status line below, which is already a live region.
-      accessibilityLabel={isVideo ? 'Video call' : 'Call'}
-    >
+    <View style={styles.root} accessibilityViewIsModal>
       <StatusBar barStyle="light-content" />
 
       {/* The remote video fills the screen. It renders nothing until a track
@@ -453,15 +491,24 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
       {isVideo && (
         <Pressable
           style={styles.remoteVideo}
-          onPress={() => setSwapped(v => !v)}
+          onPress={() => {
+            const next = !swapped;
+            setSwapped(next);
+            onSwappedChange?.(next);
+          }}
           accessibilityRole="button"
           accessibilityLabel={
-            swapped ? 'Your video, full screen' : `${shownName}'s video, full screen`
+            swapped
+              ? 'Your video, full screen'
+              : `${shownName}'s video, full screen`
           }
           accessibilityHint="Tap to swap the two videos"
         >
           <TacendumVideoView
+            key={fullVideo.surfaceId}
             style={styles.fill}
+            surfaceId={fullVideo.surfaceId}
+            onFrameReady={fullVideo.onFrameReady}
             cid={call.cid}
             track={swapped ? 'local' : 'remote'}
             mirror={swapped ? frontCamera : false}
@@ -529,7 +576,11 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
         >
           <Pressable
             style={styles.pipPress}
-            onPress={() => setSwapped(v => !v)}
+            onPress={() => {
+              const next = !swapped;
+              setSwapped(next);
+              onSwappedChange?.(next);
+            }}
             accessibilityRole="button"
             accessibilityLabel={
               swapped ? `${shownName}'s video, small` : 'Your video, small'
@@ -545,7 +596,10 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
             }}
           >
             <TacendumVideoView
+              key={previewVideo.surfaceId}
               style={styles.pipVideo}
+              surfaceId={previewVideo.surfaceId}
+              onFrameReady={previewVideo.onFrameReady}
               cid={call.cid}
               track={swapped ? 'remote' : 'local'}
               mirror={swapped ? false : frontCamera}
@@ -593,7 +647,10 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
             a call screen could be read as ending it. */}
         {onMinimize && (
           <Pressable
-            style={({ pressed }) => [styles.minimize, pressed && styles.minimizePressed]}
+            style={({ pressed }) => [
+              styles.minimize,
+              pressed && styles.minimizePressed,
+            ]}
             onPress={onMinimize}
             accessibilityRole="button"
             accessibilityLabel="Minimize call"
@@ -617,8 +674,9 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
             // stopped being told when their call went Ringing → Connected →
             // Reconnecting, which is the one thing this line exists to say.
             accessibilityLiveRegion="polite"
+            accessibilityLabel={`${isVideo ? 'Video call' : 'Call'}, ${spokenStatusLabel(visibleStatus)}`}
           >
-            {statusLabel(state)}
+            {visibleStatus}
           </Text>
           {duration !== null && (
             <Text
@@ -630,7 +688,12 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
             </Text>
           )}
         </View>
-        {state.name === 'connected' && <QualityBars level={quality} theme={theme} />}
+        {remoteExpected && !remoteVideoLive && (
+          <Text style={styles.status} accessibilityLiveRegion="polite">Video starting…</Text>
+        )}
+        {state.name === 'connected' && (
+          <QualityBars level={quality} theme={theme} />
+        )}
 
         {/* The design. The video changing under you without explanation is the
             thing this exists to prevent, and a screen reader user gets no
@@ -656,7 +719,9 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
               onPress={() => {
                 // The tap's only visible result is this text disappearing —
                 // silence, to someone not looking at the screen. Say so.
-                AccessibilityInfo.announceForAccessibility('Restoring full video quality');
+                AccessibilityInfo.announceForAccessibility(
+                  'Restoring full video quality',
+                );
                 onRestoreQuality();
               }}
             >
@@ -675,7 +740,9 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
             accessibilityLabel="Switch to voice to save battery"
             style={styles.switchVoice}
           >
-            <Text style={styles.switchVoiceLabel}>Low battery · Switch to voice</Text>
+            <Text style={styles.switchVoiceLabel}>
+              Low battery · Switch to voice
+            </Text>
           </Pressable>
         )}
       </View>
@@ -753,7 +820,11 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       backgroundColor: theme.color.mediaBlack,
       justifyContent: 'space-between',
     },
-    header: { paddingHorizontal: 20 },
+    header: {
+      paddingHorizontal: 20,
+      paddingBottom: 12,
+      backgroundColor: theme.color.mediaHud,
+    },
     /** 44×44 (HIG minimum), pulled 11pt into the gutter so the 22pt glyph's
      * left edge lines up with the name under it. */
     minimize: {
@@ -767,9 +838,18 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
     },
     minimizePressed: { backgroundColor: theme.color.mediaLine },
     peer: { color: theme.color.mediaInk, fontSize: 22, fontWeight: '600' },
-    statusRow: { flexDirection: 'row', alignItems: 'baseline', gap: 10, marginTop: 4 },
+    statusRow: {
+      flexDirection: 'row',
+      alignItems: 'baseline',
+      gap: 10,
+      marginTop: 4,
+    },
     status: { color: theme.color.mediaInkMuted, fontSize: 15 },
-    duration: { color: theme.color.mediaInkMuted, fontSize: 15, fontVariant: ['tabular-nums'] },
+    duration: {
+      color: theme.color.mediaInkMuted,
+      fontSize: 15,
+      fontVariant: ['tabular-nums'],
+    },
     // Quiet, not alarming: the phone being warm is normal and the call is
     // still working. A red banner would read as a failure.
     fill: { width: '100%', height: '100%' },
@@ -804,6 +884,7 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       alignItems: 'center',
       paddingHorizontal: 16,
       paddingTop: 16,
+      backgroundColor: theme.color.mediaHud,
     },
     remoteVideo: {
       position: 'absolute',
@@ -817,6 +898,8 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
      * maths above measures with. */
     pip: {
       position: 'absolute',
+      // The preview remains above the header's contrast backing.
+      zIndex: 1,
       width: PIP_WIDTH,
       // 16:9.
       height: PIP_HEIGHT,

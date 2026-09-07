@@ -6,7 +6,12 @@ jest.mock('../src/ui/pipDrag', () => {
 });
 
 import React from 'react';
-import { AccessibilityInfo, Dimensions, Keyboard, StyleSheet } from 'react-native';
+import {
+  AccessibilityInfo,
+  Dimensions,
+  Keyboard,
+  StyleSheet,
+} from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import type { CallState } from '@tacendum/shared';
@@ -51,7 +56,9 @@ import { Avatar } from '../src/ui/Avatar';
 const T = 1_800_000_000_000;
 
 function state(
-  over: Partial<NonNullable<CallState['call']>> & { name?: CallState['name'] } = {},
+  over: Partial<NonNullable<CallState['call']>> & {
+    name?: CallState['name'];
+  } = {},
 ): CallState {
   const { name = 'connected', ...call } = over;
   if (name === 'idle') return { name: 'idle', call: null };
@@ -105,17 +112,23 @@ function render(over: Partial<React.ComponentProps<typeof CallOverlay>> = {}) {
   });
   mounted.push(tree);
   const byTestID = (testID: string) =>
-    tree.root.findAll(n => n.props.testID === testID && typeof n.type !== 'string')[0];
+    tree.root.findAll(
+      n => n.props.testID === testID && typeof n.type !== 'string',
+    )[0];
   const texts = () =>
     tree.root
       .findAll(n => String(n.type) === 'Text')
       .map(n => [n.props.children].flat().join(''));
   const videoViews = () =>
-    tree.root.findAll(n => (n.type as unknown as string) === 'TacendumVideoView');
+    tree.root.findAll(
+      n => (n.type as unknown as string) === 'TacendumVideoView',
+    );
   /** The draggable wrapper: the HOST view the panHandlers landed on. */
   const wrapper = () =>
     tree.root.findAll(
-      n => typeof n.type === 'string' && typeof n.props.onMoveShouldSetResponder === 'function',
+      n =>
+        typeof n.type === 'string' &&
+        typeof n.props.onMoveShouldSetResponder === 'function',
     )[0];
   return { tree, props, byTestID, texts, videoViews, wrapper };
 }
@@ -123,27 +136,33 @@ function render(over: Partial<React.ComponentProps<typeof CallOverlay>> = {}) {
 describe('the line under the name', () => {
   it('is the running time once media flows, from connectedAt', () => {
     expect(overlayLine(state({ connectedAt: T - 65_000 }), T)).toBe('1:05');
-    expect(overlayLine(state({ connectedAt: T - 3_725_000 }), T)).toBe('1:02:05');
+    expect(overlayLine(state({ connectedAt: T - 3_725_000 }), T)).toBe(
+      '1:02:05',
+    );
   });
 
   it('is the state’s own word while reconnecting or ending — never a frozen time', () => {
-    expect(overlayLine(state({ name: 'reconnecting' }), T)).toBe('Reconnecting…');
+    expect(overlayLine(state({ name: 'reconnecting' }), T)).toBe(
+      'Reconnecting…',
+    );
     expect(overlayLine(state({ name: 'ending' }), T)).toBe('Ending…');
   });
 
   it('speaks the person then the state, at minute granularity', () => {
-    expect(overlayAccessibilityLabel(state({ connectedAt: T - 30_000 }), 'Dana', T)).toBe(
-      'Dana, Connected',
-    );
-    expect(overlayAccessibilityLabel(state({ connectedAt: T - 185_000 }), 'Dana', T)).toBe(
-      'Dana, 3 minutes',
-    );
-    expect(overlayAccessibilityLabel(state({ name: 'reconnecting' }), 'Dana', T)).toBe(
-      'Dana, Reconnecting',
-    );
+    expect(
+      overlayAccessibilityLabel(state({ connectedAt: T - 30_000 }), 'Dana', T),
+    ).toBe('Dana, Connected');
+    expect(
+      overlayAccessibilityLabel(state({ connectedAt: T - 185_000 }), 'Dana', T),
+    ).toBe('Dana, 3 minutes');
+    expect(
+      overlayAccessibilityLabel(state({ name: 'reconnecting' }), 'Dana', T),
+    ).toBe('Dana, Reconnecting');
     // The id-refusal rule: a "name" that is the peer's id speaks as the
     // placeholder, never as id characters.
-    expect(overlayAccessibilityLabel(state(), 'P1', T)).toBe('Someone, 1 minute');
+    expect(overlayAccessibilityLabel(state(), 'P1', T)).toBe(
+      'Someone, 1 minute',
+    );
   });
 });
 
@@ -173,9 +192,13 @@ describe('an audio call is a pill', () => {
     const end = byTestID('call-overlay-end');
     expect(end.props.accessibilityLabel).toBe('End call');
     const restore = byTestID('call-overlay');
-    expect(restore.findAll(n => n.props.testID === 'call-overlay-end')).toHaveLength(0);
+    expect(
+      restore.findAll(n => n.props.testID === 'call-overlay-end'),
+    ).toHaveLength(0);
     const flat = StyleSheet.flatten(
-      typeof end.props.style === 'function' ? end.props.style({ pressed: false }) : end.props.style,
+      typeof end.props.style === 'function'
+        ? end.props.style({ pressed: false })
+        : end.props.style,
     );
     expect(flat.width).toBe(44);
     expect(flat.height).toBe(44);
@@ -213,13 +236,37 @@ describe('a video call is the peer’s video in the self-view’s box', () => {
     const flat = StyleSheet.flatten(wrapper()!.props.style);
     expect(flat.width).toBe(OVERLAY_VIDEO_BOX.width);
     expect(flat.height).toBe(OVERLAY_VIDEO_BOX.height);
-    expect(flat.overflow).toBe('hidden');
+    expect(flat.width).toBeGreaterThan(PIP_WIDTH);
+  });
+
+  it('carries a separate 44pt End control beside Restore', () => {
+    const { byTestID, props } = render({
+      state: state({ video: true, peerVideo: true }),
+    });
+    const restore = byTestID('call-overlay');
+    const end = byTestID('call-overlay-end');
+    expect(
+      restore.findAll(n => n.props.testID === 'call-overlay-end'),
+    ).toHaveLength(0);
+    expect(end.props.accessibilityLabel).toBe('End call');
+    const flat = StyleSheet.flatten(
+      typeof end.props.style === 'function'
+        ? end.props.style({ pressed: false })
+        : end.props.style,
+    );
+    expect(flat.width).toBe(44);
+    expect(flat.height).toBe(44);
+    ReactTestRenderer.act(() => end.props.onPress());
+    expect(props.onHangup).toHaveBeenCalledTimes(1);
+    expect(props.onRestore).not.toHaveBeenCalled();
   });
 
   it('shows their face while their video is not flowing, and gets out of the way when it is', () => {
     const photoUri = `data:image/jpeg;base64,${PHOTO}`;
     const photos = (tree: ReactTestRenderer.ReactTestRenderer) =>
-      tree.root.findAll(n => typeof n.type === 'string' && n.props?.source?.uri === photoUri);
+      tree.root.findAll(
+        n => typeof n.type === 'string' && n.props?.source?.uri === photoUri,
+      );
     // Camera off at the far end: the same PeerBackdrop the full screen uses.
     const off = render({
       state: state({ video: true, peerVideo: false }),
@@ -232,6 +279,9 @@ describe('a video call is the peer’s video in the self-view’s box', () => {
       state: state({ video: true, peerVideo: true }),
       peerAvatarB64: PHOTO,
     });
+    expect(photos(live.tree)).toHaveLength(1);
+    const remote = live.tree.root.findAll(n => (n.type as unknown as string) === 'TacendumVideoView')[0]!;
+    ReactTestRenderer.act(() => remote.props.onFrameReady({ nativeEvent: { surfaceId: remote.props.surfaceId, generation: 1, ready: true } }));
     expect(photos(live.tree)).toHaveLength(0);
     // Reconnecting: their video is not flowing, so the face is back.
     const re = render({
@@ -249,7 +299,9 @@ describe('a video call is the peer’s video in the self-view’s box', () => {
     // letters stay, so the window is never bare black either.
     const photoUri = `data:image/jpeg;base64,${PHOTO}`;
     const photos = (tree: ReactTestRenderer.ReactTestRenderer) =>
-      tree.root.findAll(n => typeof n.type === 'string' && n.props?.source?.uri === photoUri);
+      tree.root.findAll(
+        n => typeof n.type === 'string' && n.props?.source?.uri === photoUri,
+      );
     const ringing = render({
       state: state({
         name: 'outgoing_ringing',
@@ -277,7 +329,9 @@ describe('a video call is the peer’s video in the self-view’s box', () => {
     // is to keep showing who is on the call.
     const photoUri = `data:image/jpeg;base64,${PHOTO}`;
     const photos = (tree: ReactTestRenderer.ReactTestRenderer) =>
-      tree.root.findAll(n => typeof n.type === 'string' && n.props?.source?.uri === photoUri);
+      tree.root.findAll(
+        n => typeof n.type === 'string' && n.props?.source?.uri === photoUri,
+      );
     const ending = render({
       state: state({
         name: 'ending',
@@ -304,12 +358,17 @@ describe('a video call is the peer’s video in the self-view’s box', () => {
   });
 
   it('letters a photo-less peer from their name at the corner size, never the id', () => {
-    const { tree, texts } = render({ state: state({ video: true }), peerName: 'P1' });
+    const { tree, texts } = render({
+      state: state({ video: true }),
+      peerName: 'P1',
+    });
     expect(texts()).toContain('?');
     expect(texts()).not.toContain('P1');
     const named = render({ state: state({ video: true }), peerName: 'Dana' });
     const letters = named.tree.root.findAll(
-      n => String(n.type) === 'Text' && [n.props.children].flat().join('') === 'DA',
+      n =>
+        String(n.type) === 'Text' &&
+        [n.props.children].flat().join('') === 'DA',
     )[0]!;
     expect(StyleSheet.flatten(letters.props.style).fontSize).toBe(32);
     expect(tree).toBeTruthy();
@@ -317,14 +376,20 @@ describe('a video call is the peer’s video in the self-view’s box', () => {
 
   it('is a video window the moment EITHER side has video', () => {
     // The peer's camera on with mine off is still their video to show.
-    expect(render({ state: state({ video: false, peerVideo: true }) }).videoViews()).toHaveLength(1);
-    expect(render({ state: state({ video: true, peerVideo: false }) }).videoViews()).toHaveLength(1);
+    expect(
+      render({ state: state({ video: false, peerVideo: true }) }).videoViews(),
+    ).toHaveLength(1);
+    expect(
+      render({ state: state({ video: true, peerVideo: false }) }).videoViews(),
+    ).toHaveLength(1);
   });
 });
 
 describe('tap restores, drag moves, VoiceOver can do both', () => {
   it('a tap on the window brings the full call back', () => {
-    const { byTestID, props } = render({ state: state({ video: true, peerVideo: true }) });
+    const { byTestID, props } = render({
+      state: state({ video: true, peerVideo: true }),
+    });
     const surface = byTestID('call-overlay');
     expect(surface.props.accessibilityRole).toBe('button');
     expect(surface.props.accessibilityLabel).toBe('Dana, 1 minute');
@@ -339,7 +404,9 @@ describe('tap restores, drag moves, VoiceOver can do both', () => {
       const w = wrapper()!;
       expect(w).toBeTruthy();
       // The restore surface lives inside the draggable wrapper.
-      expect(w.findAll(n => n.props?.testID === 'call-overlay').length).toBeGreaterThan(0);
+      expect(
+        w.findAll(n => n.props?.testID === 'call-overlay').length,
+      ).toBeGreaterThan(0);
       // Never claims on touch DOWN — a tap must reach the Pressable — and
       // does not surrender mid-drag. (Safe to drive directly: neither
       // handler reads touch history.)
@@ -350,10 +417,12 @@ describe('tap restores, drag moves, VoiceOver can do both', () => {
   });
 
   it('parks top-right by default: 16 in from the edge, under the thread header', () => {
-    const { wrapper } = render({ state: state({ video: true, peerVideo: true }) });
+    const { wrapper } = render({
+      state: state({ video: true, peerVideo: true }),
+    });
     const flat = StyleSheet.flatten(wrapper()!.props.style);
     expect(flat.position).toBe('absolute');
-    expect(flat.left).toBe(390 - PIP_MARGIN - PIP_WIDTH);
+    expect(flat.left).toBe(390 - PIP_MARGIN - OVERLAY_VIDEO_BOX.width);
     expect(flat.top).toBe(47 + OVERLAY_TOP_CLEARANCE);
     // The drag rides an animated translation, not a re-render per move.
     expect(flat.transform).toHaveLength(2);
@@ -372,7 +441,9 @@ describe('tap restores, drag moves, VoiceOver can do both', () => {
       const { byTestID, wrapper } = render();
       await ReactTestRenderer.act(async () => {});
       const surface = byTestID('call-overlay');
-      expect(surface.props.accessibilityActions).toBe(PIP_ACCESSIBILITY_ACTIONS);
+      expect(surface.props.accessibilityActions).toBe(
+        PIP_ACCESSIBILITY_ACTIONS,
+      );
       const FRAME = { width: 390, height: 844 };
       const INSETS = { top: 47, bottom: 34, left: 0, right: 0 };
       const home = pipAnchor('top-right', FRAME, INSETS, OVERLAY_AUDIO_BOX);
@@ -385,7 +456,9 @@ describe('tap restores, drag moves, VoiceOver can do both', () => {
       expect(translate()).toEqual({ x: 0, y: 0 });
 
       ReactTestRenderer.act(() => {
-        surface.props.onAccessibilityAction({ nativeEvent: { actionName: 'move-bottom-left' } });
+        surface.props.onAccessibilityAction({
+          nativeEvent: { actionName: 'move-bottom-left' },
+        });
       });
       // Parked bottom-left: the base stays home, the translation carries it.
       const bl = pipAnchor('bottom-left', FRAME, INSETS, OVERLAY_AUDIO_BOX);
@@ -397,7 +470,9 @@ describe('tap restores, drag moves, VoiceOver can do both', () => {
 
       // A system action it does not own is ignored, not a teleport.
       ReactTestRenderer.act(() => {
-        surface.props.onAccessibilityAction({ nativeEvent: { actionName: 'magicTap' } });
+        surface.props.onAccessibilityAction({
+          nativeEvent: { actionName: 'magicTap' },
+        });
       });
       expect(translate().x).toBeCloseTo(bl.x - home.x);
       expect(translate().y).toBeCloseTo(bl.y - home.y);
@@ -408,7 +483,9 @@ describe('tap restores, drag moves, VoiceOver can do both', () => {
 
   it('is NOT a modal: the app underneath must stay usable with VoiceOver', () => {
     const { tree } = render();
-    expect(tree.root.findAll(n => n.props.accessibilityViewIsModal === true)).toHaveLength(0);
+    expect(
+      tree.root.findAll(n => n.props.accessibilityViewIsModal === true),
+    ).toHaveLength(0);
   });
 });
 
@@ -421,8 +498,33 @@ describe('the keyboard', () => {
       ...OVERLAY_AUDIO_BOX,
       bottomClearance: OVERLAY_BOTTOM_CLEARANCE + 302,
     });
-    expect(overlayBox('video', 302).bottomClearance).toBe(OVERLAY_BOTTOM_CLEARANCE + 302);
-    expect(overlayBox('video', 302).width).toBe(PIP_WIDTH);
+    expect(overlayBox('video', 302).bottomClearance).toBe(
+      OVERLAY_BOTTOM_CLEARANCE + 302,
+    );
+    expect(overlayBox('video', 302).width).toBe(OVERLAY_VIDEO_BOX.width);
+  });
+
+  it('keeps the whole video-and-End row inside every corner on a narrow landscape frame', () => {
+    const frame = { width: 320, height: 390 };
+    const insets = { top: 0, bottom: 21, left: 0, right: 0 };
+    for (const corner of [
+      'top-left',
+      'top-right',
+      'bottom-left',
+      'bottom-right',
+    ] as const) {
+      const anchor = pipAnchor(corner, frame, insets, OVERLAY_VIDEO_BOX);
+      expect(anchor.x).toBeGreaterThanOrEqual(PIP_MARGIN);
+      expect(anchor.x + OVERLAY_VIDEO_BOX.width).toBeLessThanOrEqual(
+        frame.width - PIP_MARGIN,
+      );
+      expect(anchor.y).toBeGreaterThanOrEqual(
+        insets.top + OVERLAY_TOP_CLEARANCE,
+      );
+      expect(anchor.y + OVERLAY_VIDEO_BOX.height).toBeLessThanOrEqual(
+        frame.height - insets.bottom - OVERLAY_BOTTOM_CLEARANCE,
+      );
+    }
   });
 
   it('a docked keyboard lifts the bottom band the pill must clear — End is never under the keys', () => {
@@ -432,12 +534,21 @@ describe('the keyboard', () => {
     const addListener = jest.spyOn(Keyboard, 'addListener');
     try {
       render();
-      const boxes = (usePipDrag as jest.Mock).mock.calls as Array<[{ box: PipBox }]>;
-      expect(boxes[boxes.length - 1]![0].box.bottomClearance).toBe(OVERLAY_BOTTOM_CLEARANCE);
+      const boxes = (usePipDrag as jest.Mock).mock.calls as Array<
+        [{ box: PipBox }]
+      >;
+      expect(boxes[boxes.length - 1]![0].box.bottomClearance).toBe(
+        OVERLAY_BOTTOM_CLEARANCE,
+      );
 
       const { width, height } = Dimensions.get('window');
       const cover = 336;
-      const frame = { screenX: 0, screenY: height - cover, width, height: cover };
+      const frame = {
+        screenX: 0,
+        screenY: height - cover,
+        width,
+        height: cover,
+      };
       ReactTestRenderer.act(() => {
         for (const [name, handler] of addListener.mock.calls) {
           if (name === 'keyboardWillChangeFrame') {
@@ -453,14 +564,18 @@ describe('the keyboard', () => {
         OVERLAY_BOTTOM_CLEARANCE + inset,
       );
       // And the top band did not move: a window parked top-right stays put.
-      expect(boxes[boxes.length - 1]![0].box.topClearance).toBe(OVERLAY_TOP_CLEARANCE);
+      expect(boxes[boxes.length - 1]![0].box.topClearance).toBe(
+        OVERLAY_TOP_CLEARANCE,
+      );
 
       ReactTestRenderer.act(() => {
         for (const [name, handler] of addListener.mock.calls) {
           if (name === 'keyboardWillHide') (handler as () => void)();
         }
       });
-      expect(boxes[boxes.length - 1]![0].box.bottomClearance).toBe(OVERLAY_BOTTOM_CLEARANCE);
+      expect(boxes[boxes.length - 1]![0].box.bottomClearance).toBe(
+        OVERLAY_BOTTOM_CLEARANCE,
+      );
     } finally {
       addListener.mockRestore();
     }
@@ -470,6 +585,8 @@ describe('the keyboard', () => {
 describe('lifecycle', () => {
   it('renders nothing at all when idle', () => {
     const { tree } = render({ state: { name: 'idle', call: null } });
-    expect(tree.root.findAll(n => n.props.testID === 'call-overlay')).toHaveLength(0);
+    expect(
+      tree.root.findAll(n => n.props.testID === 'call-overlay'),
+    ).toHaveLength(0);
   });
 });

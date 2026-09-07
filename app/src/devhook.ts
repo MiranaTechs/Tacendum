@@ -8,6 +8,7 @@ import * as config from './config';
 import * as nativeCall from 'tacendum-call';
 import * as db from './db';
 import * as decoy from './decoy';
+import { encodeEnvelope } from './envelope';
 import * as lock from './lock';
 import { messaging } from './messaging';
 import * as registration from './registration';
@@ -110,6 +111,42 @@ if (__DEV__) {
 }
 
 if (__DEV__) {
+  const fixtureTargetIsLocal =
+    config.DEV_TARGET === 'local' &&
+    /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/.test(
+      config.API_BASE,
+    );
+  const requireLocalFixtureTarget = (): void => {
+    if (!fixtureTargetIsLocal || session.mode !== 'real') {
+      throw new Error(
+        'AI fixtures require a real workspace on the local debug target',
+      );
+    }
+  };
+  // Fixed synthetic ids. They name no real account and are only ever written
+  // after the local-target guard above succeeds.
+  const attentionFixture = {
+    peerId: '01HATTN0000000000000000000',
+    execQ: '01HATTNREQ0000000000000001',
+    fileQ: '01HATTNREQ0000000000000002',
+  } as const;
+  const workFixture = {
+    peerId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+    completionMessageId: '01J8MEAPPR0VAQ4X2C6TKN9RFW',
+    completionEventId: '01J8MEAPPR0VAQ4X2C6TKN9RFX',
+    failureMessageId: '01J8MEAPPR0VAQ4X2C6TKN9RFY',
+    failureEventId: '01J8MEAPPR0VAQ4X2C6TKN9RFZ',
+    preferenceQ: '01J8MEAPPR0VAQ4X2C6TKN9RFP',
+  } as const;
+  const secondOpinionFixture = {
+    roomId: '01J8MEAPPR0VAQ4X2C6TKN9RFQ',
+    claudeId: '01J8MEAPPR0VAQ4X2C6TKN9RFA',
+    codexId: '01J8MEAPPR0VAQ4X2C6TKN9RFB',
+    answerId: '01J8MEAPPR0VAQ4X2C6TKN9RFC',
+    claudeProfileOrigin: '01J8MEAPPR0VAQ4X2C6TKN9RFD',
+    codexProfileOrigin: '01J8MEAPPR0VAQ4X2C6TKN9RFE',
+  } as const;
+
   (globalThis as unknown as Record<string, unknown>).TacendumDev = {
     registration,
     db,
@@ -175,6 +212,414 @@ if (__DEV__) {
     lock,
     decoy,
     session,
+    /**
+     * B1 AI-attention simulator scene. This writes through the real database
+     * APIs and renders through the ordinary subscription/router paths. The
+     * target and session guards keep synthetic rows away from AWS, release
+     * builds, and the decoy workspace.
+     */
+    aiAttention: {
+      setup: async (): Promise<string> => {
+        requireLocalFixtureTarget();
+        const now = Date.now();
+        await db.deleteChat(attentionFixture.peerId);
+        await db.upsertChat(attentionFixture.peerId, 'Claude Code · local demo');
+        const capturedWork = {
+          provider: 'claude' as const,
+          updatedAt: now,
+          requestId: attentionFixture.execQ,
+          project: 'Tacendum',
+          runTag: 's-b1a1',
+          context: {
+            availability: 'captured' as const,
+            capturedAt: now,
+            repository: 'natln/Tacendum',
+            branch: 'feature/chat-review',
+            resultSummary: 'The agent reported that the requested review is ready.',
+          },
+        };
+        const staleWork = {
+          provider: 'claude' as const,
+          updatedAt: now - 10 * 60_000,
+          requestId: attentionFixture.fileQ,
+          project: 'Tacendum',
+          runTag: 's-b1a2',
+          context: {
+            availability: 'stale' as const,
+            capturedAt: now - 10 * 60_000,
+            repository: 'natln/Tacendum',
+            branch: 'feature/chat-review',
+            resultSummary: 'This context was captured earlier and may have changed.',
+          },
+        };
+        const exec = await db.insertApproval({
+          peerId: attentionFixture.peerId,
+          q: attentionFixture.execQ,
+          wireMsgId: '01HATTNWIRE000000000000001',
+          kind: 'exec',
+          payload: 'pnpm --filter @tacendum/app test',
+          ttlSec: 15 * 60,
+          sessionTag: 's-b1a1',
+          verbs: ['approve', 'deny'],
+          ts: now,
+          arrivedAt: now,
+          work: capturedWork,
+        });
+        const file = await db.insertApproval({
+          peerId: attentionFixture.peerId,
+          q: attentionFixture.fileQ,
+          wireMsgId: '01HATTNWIRE000000000000002',
+          kind: 'file',
+          payload: 'app/src/screens/AttentionScreen.tsx',
+          ttlSec: 20 * 60,
+          sessionTag: 's-b1a2',
+          verbs: ['approve', 'deny'],
+          ts: now + 1,
+          arrivedAt: now,
+          work: staleWork,
+        });
+        if (!exec || !file) {
+          throw new Error('AI attention fixture rows were not stored');
+        }
+        messaging.debugNotifyForFixtures();
+        return JSON.stringify(attentionFixture);
+      },
+      observe: async (
+        q: string,
+        observation:
+          | 'answer-received'
+          | 'decision-returned'
+          | 'provider-received'
+          | 'expired' = 'decision-returned',
+      ): Promise<void> => {
+        requireLocalFixtureTarget();
+        if (q !== attentionFixture.execQ && q !== attentionFixture.fileQ) {
+          throw new Error('Unknown AI attention fixture request');
+        }
+        const now = Date.now();
+        await db.recordAiWork(attentionFixture.peerId, `fixture-observation-${now}`, now, {
+          provider: 'claude',
+          updatedAt: now,
+          requestId: q,
+          approvalObservation: observation,
+        });
+        messaging.debugNotifyForFixtures();
+      },
+      clear: async (): Promise<void> => {
+        requireLocalFixtureTarget();
+        await db.deleteChat(attentionFixture.peerId);
+        messaging.debugNotifyForFixtures();
+      },
+    },
+    /**
+     * A3/B3–B5 source-backed scenes. Every variant reaches the same database
+     * APIs as an authenticated profile/message carrier; none inserts a UI
+     * object or bypasses retention. The fixed peer is synthetic and the
+     * debug/local/real-workspace guard above applies to every entrypoint.
+     */
+    aiWork: {
+      setup: async (
+        scenario:
+          | 'reports'
+          | 'notifications-only'
+          | 'tasks'
+          | 'preference-pending'
+          | 'preference-quiet'
+          | 'usage-exhausted'
+          | 'usage-stale'
+          | 'usage-unavailable' = 'reports',
+      ): Promise<string> => {
+        requireLocalFixtureTarget();
+        if (
+          ![
+            'reports',
+            'notifications-only',
+            'tasks',
+            'preference-pending',
+            'preference-quiet',
+            'usage-exhausted',
+            'usage-stale',
+            'usage-unavailable',
+          ].includes(scenario)
+        ) {
+          throw new Error('Unknown AI work fixture scenario');
+        }
+        const now = Date.now();
+        const receivedAt = scenario === 'usage-stale' ? now - 10 * 60_000 : now;
+        await db.deleteChat(workFixture.peerId);
+        await db.upsertChat(workFixture.peerId, 'Codex · local demo');
+        await db.recordAiWork(
+          workFixture.peerId,
+          `fixture-profile-${scenario}`,
+          receivedAt,
+          {
+            provider: 'codex',
+            updatedAt: receivedAt,
+            project: 'Tacendum',
+            capabilities:
+              scenario === 'notifications-only'
+                ? { notifications: true, approvals: false, tasks: false }
+                : { notifications: true, approvals: true, tasks: true },
+            context: {
+              availability: 'captured',
+              capturedAt: receivedAt,
+              repository: 'natln/Tacendum',
+              branch: 'feature/chat-review',
+            },
+            ...(scenario === 'usage-exhausted'
+              ? {
+                  usage: [
+                    {
+                      source: 'local-budget' as const,
+                      unit: 'turns' as const,
+                      period: 'session' as const,
+                      observedAt: receivedAt,
+                      remaining: 0,
+                      limit: 12,
+                    },
+                  ],
+                }
+              : scenario === 'usage-stale' || scenario === 'tasks'
+                ? {
+                    usage: [
+                      {
+                        source: 'local-budget' as const,
+                        unit: 'turns' as const,
+                        period: 'session' as const,
+                        observedAt: receivedAt,
+                        remaining: 4,
+                        limit: 12,
+                      },
+                    ],
+                  }
+                : {}),
+          },
+          'profile',
+        );
+
+        if (
+          scenario === 'preference-pending' ||
+          scenario === 'preference-quiet'
+        ) {
+          const stored = await db.beginAiNotifyPreference(
+            workFixture.peerId,
+            workFixture.preferenceQ,
+            'quiet',
+            now,
+          );
+          if (!stored) {
+            throw new Error('AI notification preference fixture was not stored');
+          }
+          if (scenario === 'preference-quiet') {
+            const applied = await db.applyAiNotifyPreferenceAck(
+              workFixture.peerId,
+              workFixture.preferenceQ,
+              'quiet',
+              now + 1,
+            );
+            if (!applied) {
+              throw new Error('AI notification preference fixture ack was not applied');
+            }
+          }
+        }
+
+        if (scenario === 'reports') {
+          await db.insertMessage({
+            msgId: workFixture.completionMessageId,
+            peerId: workFixture.peerId,
+            direction: 'in',
+            body: 'I finished the requested review. Open this conversation for the details.',
+            ts: now - 2_000,
+            status: 'received',
+          });
+          await db.recordAiWork(
+            workFixture.peerId,
+            workFixture.completionMessageId,
+            now - 2_000,
+            {
+              provider: 'codex',
+              updatedAt: now - 2_000,
+              event: 'turn-complete',
+              eventId: workFixture.completionEventId,
+              project: 'Tacendum',
+              runTag: 's-7c2e',
+              context: {
+                availability: 'captured',
+                capturedAt: now - 2_000,
+                resultSummary: 'The agent reported that its review turn finished.',
+              },
+            },
+            'message',
+          );
+          await db.insertMessage({
+            msgId: workFixture.failureMessageId,
+            peerId: workFixture.peerId,
+            direction: 'in',
+            body: 'The check could not complete. Open this conversation for the reported failure.',
+            ts: now - 1_000,
+            status: 'received',
+          });
+          await db.recordAiWork(
+            workFixture.peerId,
+            workFixture.failureMessageId,
+            now - 1_000,
+            {
+              provider: 'codex',
+              updatedAt: now - 1_000,
+              event: 'turn-failed',
+              eventId: workFixture.failureEventId,
+              project: 'Tacendum',
+              runTag: 's-91af',
+              context: {
+                availability: 'captured',
+                capturedAt: now - 1_000,
+                resultSummary: 'The agent reported that a check failed.',
+              },
+            },
+            'message',
+          );
+        }
+        messaging.debugNotifyForFixtures();
+        return JSON.stringify({ ...workFixture, scenario });
+      },
+      ackPreference: async (): Promise<void> => {
+        requireLocalFixtureTarget();
+        const applied = await db.applyAiNotifyPreferenceAck(
+          workFixture.peerId,
+          workFixture.preferenceQ,
+          'quiet',
+          Date.now(),
+        );
+        if (!applied) {
+          throw new Error('No matching AI notification preference is waiting');
+        }
+        messaging.debugNotifyForFixtures();
+      },
+      clear: async (): Promise<void> => {
+        requireLocalFixtureTarget();
+        await db.deleteChat(workFixture.peerId);
+        messaging.debugNotifyForFixtures();
+      },
+    },
+    /**
+     * B4 room scene. It creates an ordinary owner-authored roster, two
+     * server-recorded machine peers with current task capability snapshots,
+     * and one first-hand AI-marked room answer. The screen still has to fold
+     * the roster, recognize eligible agents, prepare a mention, and use the
+     * ordinary reviewed Send path; this hook never calls that action itself.
+     */
+    secondOpinion: {
+      setup: async (): Promise<string> => {
+        requireLocalFixtureTarget();
+        const me = await db.loadProfile();
+        if (!me) throw new Error('A local profile is required for this fixture');
+        const now = Date.now();
+        const oldStore = await db.loadGroupStore(secondOpinionFixture.roomId);
+        oldStore.clear();
+        await oldStore.persist();
+        await db.deleteChat(secondOpinionFixture.claudeId);
+        await db.deleteChat(secondOpinionFixture.codexId);
+
+        const store = await db.loadGroupStore(secondOpinionFixture.roomId);
+        store.anchorName = 'Second opinion demo';
+        store.setOwner(me.userId);
+        store.putSlot({
+          memberId: me.userId,
+          writerId: me.userId,
+          seq: 1,
+          state: 'in',
+        });
+        for (const memberId of [
+          secondOpinionFixture.claudeId,
+          secondOpinionFixture.codexId,
+        ]) {
+          store.putSlot({
+            memberId,
+            writerId: me.userId,
+            seq: 1,
+            state: 'in',
+            class: 'integration',
+          });
+        }
+        store.setPresent(true);
+        await store.persist();
+        await db.setLocalName(secondOpinionFixture.roomId, 'Second opinion demo');
+        await db.upsertChat(secondOpinionFixture.claudeId, 'Claude · fixture');
+        await db.upsertChat(secondOpinionFixture.codexId, 'Codex · fixture');
+        await db.recordMachinePeer(secondOpinionFixture.claudeId, now);
+        await db.recordMachinePeer(secondOpinionFixture.codexId, now);
+        await db.recordAiWork(
+          secondOpinionFixture.claudeId,
+          secondOpinionFixture.claudeProfileOrigin,
+          now,
+          {
+            provider: 'claude',
+            updatedAt: now,
+            project: 'Tacendum',
+            capabilities: {
+              notifications: true,
+              approvals: true,
+              tasks: true,
+            },
+          },
+          'profile',
+        );
+        await db.recordAiWork(
+          secondOpinionFixture.codexId,
+          secondOpinionFixture.codexProfileOrigin,
+          now,
+          {
+            provider: 'codex',
+            updatedAt: now,
+            project: 'Tacendum',
+            capabilities: {
+              notifications: true,
+              approvals: true,
+              tasks: true,
+            },
+          },
+          'profile',
+        );
+        const roomMessageId = `${secondOpinionFixture.claudeId}.${secondOpinionFixture.answerId}`;
+        await db.insertMessage({
+          msgId: roomMessageId,
+          peerId: secondOpinionFixture.roomId,
+          direction: 'in',
+          body: encodeEnvelope({
+            tcm: 'msg',
+            text: 'The approval cleanup now shares one maintenance path.',
+            d: 'Deletion, expiration, and revocation all remove the request and its supplementary context in the same database boundary.',
+            ai: true,
+          }),
+          ts: now,
+          arrivedAt: now,
+          status: 'received',
+          authorId: secondOpinionFixture.claudeId,
+          sq: 1,
+          ai: 1,
+        });
+        await db.touchChat(
+          secondOpinionFixture.roomId,
+          'The approval cleanup now shares one maintenance path.',
+          now,
+        );
+        messaging.debugNotifyForFixtures();
+        return JSON.stringify({
+          ...secondOpinionFixture,
+          ownerId: me.userId,
+          roomMessageId,
+        });
+      },
+      clear: async (): Promise<void> => {
+        requireLocalFixtureTarget();
+        const store = await db.loadGroupStore(secondOpinionFixture.roomId);
+        store.clear();
+        await store.persist();
+        await db.deleteChat(secondOpinionFixture.claudeId);
+        await db.deleteChat(secondOpinionFixture.codexId);
+        messaging.debugNotifyForFixtures();
+      },
+    },
     /**
      * Calling, for a scripted media run.
      *

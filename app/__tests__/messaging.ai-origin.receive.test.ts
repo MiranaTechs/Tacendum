@@ -348,6 +348,137 @@ describe('the 1:1 msg envelope persists verbatim, marked', () => {
   });
 });
 
+describe('structured AI work stays source-backed and 1:1', () => {
+  const EVENT = '01J8MEAPPR0VAQ4X2C6TKN9RFW';
+
+  test('a valid msg event persists after its source row and keeps the original body', async () => {
+    const work = {
+      provider: 'claude',
+      updatedAt: Date.now(),
+      event: 'turn-complete',
+      eventId: EVENT,
+      project: 'Tacendum',
+      context: {
+        availability: 'captured',
+        capturedAt: Date.now(),
+        resultSummary: 'Reported completion, with no claim about checks.',
+      },
+    } as const;
+    const body = JSON.stringify({
+      tcm: 'msg',
+      text: 'The turn finished.',
+      ai: true,
+      work,
+    });
+    const wireId = await deliver(body, CLAUDE);
+
+    expect(q(`SELECT body FROM messages WHERE peerId = ?`, CLAUDE)).toEqual([
+      { body },
+    ]);
+    const events = await db.listRecentAiWorkEvents(Date.now());
+    expect(events).toEqual([
+      expect.objectContaining({
+        peerId: CLAUDE,
+        eventId: EVENT,
+        wireMsgId: wireId,
+        sourceRef: wireId,
+        event: 'turn-complete',
+        project: 'Tacendum',
+      }),
+    ]);
+  });
+
+  test('malformed work costs itself while conversational words still land', async () => {
+    const body = JSON.stringify({
+      tcm: 'msg',
+      text: 'The answer remains visible.',
+      ai: true,
+      work: { provider: 'claude' },
+    });
+    await deliver(body, CLAUDE);
+
+    expect(q(`SELECT body FROM messages WHERE peerId = ?`, CLAUDE)).toEqual([
+      { body },
+    ]);
+    await expect(db.listRecentAiWorkEvents(Date.now())).resolves.toEqual([]);
+  });
+
+  test('a terminal edit records one event against the edited anchor', async () => {
+    const anchor = await deliver('streaming…', CLAUDE);
+    const work = {
+      provider: 'codex',
+      updatedAt: Date.now(),
+      event: 'turn-complete',
+      eventId: EVENT,
+      project: 'Tacendum',
+    } as const;
+    const editWire = await deliver(
+      JSON.stringify({
+        tcm: 'edit',
+        ref: anchor,
+        text: 'The final answer.',
+        ai: true,
+        work,
+      }),
+      CLAUDE,
+    );
+
+    expect(q(`SELECT body FROM messages WHERE peerId = ? AND msgId = ?`, CLAUDE, anchor)).toEqual([
+      { body: 'The final answer.' },
+    ]);
+    await expect(db.listRecentAiWorkEvents(Date.now())).resolves.toEqual([
+      expect.objectContaining({
+        eventId: EVENT,
+        wireMsgId: editWire,
+        sourceRef: anchor,
+        provider: 'codex',
+      }),
+    ]);
+  });
+
+  test('a profile snapshot updates capabilities without inventing an event', async () => {
+    const now = Date.now();
+    await deliver(
+      JSON.stringify({
+        tcm: 'profile',
+        n: 'Claude Code',
+        a: '',
+        v: now,
+        work: {
+          provider: 'claude',
+          updatedAt: now,
+          capabilities: { notifications: true, approvals: true, tasks: false },
+        },
+      }),
+      CLAUDE,
+    );
+
+    await expect(db.getAiAgentState(CLAUDE)).resolves.toMatchObject({
+      provider: 'claude',
+      capabilities: { notifications: true, approvals: true, tasks: false },
+    });
+    await expect(db.listRecentAiWorkEvents(Date.now())).resolves.toEqual([]);
+  });
+
+  test('room-contained work never enters the personal attention store', async () => {
+    await deliver(gNew(ROOM, [ANA, ME]), ANA);
+    const inner = JSON.stringify({
+      tcm: 'msg',
+      text: 'Room answer',
+      ai: true,
+      work: {
+        provider: 'claude',
+        updatedAt: Date.now(),
+        event: 'turn-complete',
+        eventId: EVENT,
+      },
+    });
+    await deliver(gMsg(ROOM, mid('W1'), inner, { ai: true }), ANA);
+
+    await expect(db.listRecentAiWorkEvents(Date.now())).resolves.toEqual([]);
+  });
+});
+
 describe('the edit arm stamps the marker, raise-only', () => {
   const rowOf = (wireId: string): Row[] =>
     q(

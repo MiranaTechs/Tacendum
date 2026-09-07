@@ -10,17 +10,24 @@ import {
   writeHostConfig,
   type HostConfigIo,
   type HostConfigOutcome,
+  type HostConfigOptions,
   type SetupSurface,
 } from './hostconfig.js';
-import { preflightCrewVoice, writeCrewVoice, type VoiceIo, type VoiceOutcome } from './crewvoice.js';
+import {
+  runNotificationDeliveryTest,
+  type HookHost,
+  type NotificationDeliveryTestOutcome,
+  type NotifyDeps,
+} from './hooks.js';
+import {
+  preflightCrewVoice,
+  writeCrewVoice,
+  type VoiceIo,
+  type VoiceOutcome,
+} from './crewvoice.js';
 import { attachInbound, type Inbound } from './inbound.js';
 import { withFileLockAsync } from './lock.js';
-import {
-  DEVICE_ID,
-  isIdentityChange,
-  loadOrGenerateKeys,
-  signAuthChallenge,
-} from './messaging.js';
+import { DEVICE_ID, isIdentityChange, loadOrGenerateKeys, signAuthChallenge } from './messaging.js';
 import { MessageLog } from './msglog.js';
 import type { Reporter } from './output.js';
 import {
@@ -36,7 +43,17 @@ import { sanitizeForTerminal, sanitizeServerField } from './render.js';
 import { sendEncryptedAll, type OutboundMessage } from './send.js';
 import { AuthSession } from './session.js';
 import { FileStores, writeFileAtomic } from './stores.js';
+import { statusOf, type ServiceIo } from './service.js';
 import { WsClient } from './wsclient.js';
+import { AiWorkMetadataSchema, type AiWorkMetadata } from '@tacendum/shared';
+import { attendState, loadAttendConfig } from './attend.js';
+import {
+  aiAttendCapabilityFact,
+  observeCodexVersion,
+  readAiCapabilities,
+  type AiProvider,
+  type CodexVersionProbeIo,
+} from './ai-capabilities.js';
 
 /**
  * `tacendum setup <surface> --name "<display name>"` — the onboarding flow:
@@ -68,7 +85,8 @@ import { WsClient } from './wsclient.js';
 
 export const SETUP_USAGE =
   'tacendum setup claude-code|codex|cursor|gemini --name "<display name>" ' +
-  '[--owner <id>] [--account <name>] [--seconds N]';
+  '[--owner <id>] [--account <name>] [--seconds N] ' +
+  '[--approvals <min-app-build>] [--test-notification]';
 
 /** How long the QR flow waits for the phone's first message. Long, because a
  * human is installing an app and scanning; bounded, because an ATTENDED
@@ -83,7 +101,7 @@ const QR_WAIT_DEFAULT_SECONDS = 600;
  * phone, so the name would silently never land. Refused here instead. */
 const MAX_DISPLAY_NAME = 40;
 
-const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Test seams, doctor.ts-style: the flow is worth driving end-to-end against
  * a stub server and a scripted socket, and a test must never touch the real
@@ -91,6 +109,13 @@ const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(r
 export interface SetupIo {
   hostConfig?: HostConfigIo;
   voice?: VoiceIo;
+  service?: ServiceIo;
+  notification?: NotifyDeps;
+  codexVersion?: CodexVersionProbeIo;
+  /** Current Claude SDK prerequisite observations. Only booleans leave these
+   * seams; the API-key value and package resolution path never do. */
+  claudeSdkInstalled?: () => boolean;
+  claudeSdkApiKeyPresent?: () => boolean;
   /** The QR flow needs a terminal to show the code on. */
   stderrIsTty?: boolean;
   /** Poll cadence for the QR wait. */
@@ -142,8 +167,104 @@ export function qrPayload(userId: string): string {
  * emits keys in insertion order. The type belongs in packages/shared next
  * to the call envelopes; that lift is deliberately deferred, so the shape is constructed here and checked by test.
  */
-export function profileCardBody(displayName: string): string {
-  return JSON.stringify({ tcm: 'profile', n: displayName, a: '', v: Date.now() });
+export function profileCardBody(displayName: string, work?: AiWorkMetadata): string {
+  const checked = work === undefined ? undefined : AiWorkMetadataSchema.parse(work);
+  return JSON.stringify({
+    tcm: 'profile',
+    n: displayName,
+    a: '',
+    v: Date.now(),
+    ...(checked === undefined ? {} : { work: checked }),
+  });
+}
+
+function providerForSurface(surface: SetupSurface): AiProvider {
+  return surface === 'claude-code' ? 'claude' : surface;
+}
+
+function capabilitySnapshot(
+  account: string,
+  surface: SetupSurface,
+  outcome: HostConfigOutcome,
+  io: SetupIo,
+): {
+  work: AiWorkMetadata;
+  listener: { installed: boolean; running: boolean };
+  assessment: ReturnType<typeof readAiCapabilities>;
+  answererProvider?: AiProvider;
+} {
+  const provider = providerForSurface(surface);
+  const listener = statusOf(account, io.service);
+  const state = attendState(account, {
+    ...(io.service === undefined ? {} : { service: io.service }),
+    ...(io.claudeSdkInstalled === undefined ? {} : { claudeSdkInstalled: io.claudeSdkInstalled }),
+    ...(io.claudeSdkApiKeyPresent === undefined
+      ? {}
+      : { claudeSdkApiKeyPresent: io.claudeSdkApiKeyPresent }),
+  });
+  let attend = aiAttendCapabilityFact({ configured: false });
+  let answererProvider: AiProvider | undefined;
+  if (state.state === 'enabled') {
+    answererProvider = state.host;
+    attend = aiAttendCapabilityFact({
+      configured: true,
+      host: state.host,
+      paired: state.paired,
+      binRunnable: state.binRunnable,
+      workdirIsDirectory: state.workdirIsDirectory,
+      codexSignedIn: state.codexSignedIn,
+      codexDriver: state.codexDriver,
+      codexApprovalPolicy: state.codexApprovalPolicy,
+      claudeDriver: state.claudeDriver,
+      claudeSdkInstalled: state.claudeSdkInstalled,
+      claudeSdkApiKeyPresent: state.claudeSdkApiKeyPresent,
+    });
+  }
+  const attendConfig = loadAttendConfig(account);
+  const codexInstalledVersion =
+    provider === 'codex' && attendConfig?.host === 'codex'
+      ? observeCodexVersion(attendConfig.bin, io.codexVersion)
+      : undefined;
+  const assessment = readAiCapabilities({
+    provider,
+    notificationConfigured: true,
+    nativeClaudePermissionConfigured: outcome.approvalsConfigured,
+    listenerConfigured: listener.installed,
+    listenerRunning: listener.running,
+    attend,
+    ...(codexInstalledVersion === undefined ? {} : { codexInstalledVersion }),
+  });
+  const updatedAt = Date.now();
+  const usage =
+    state.state === 'enabled' &&
+    state.host === provider &&
+    Number.isSafeInteger(state.turnsPerHour) &&
+    state.turnsPerHour > 0 &&
+    Number.isSafeInteger(state.turnsUsed) &&
+    state.turnsUsed >= 0
+      ? [
+          {
+            source: 'local-budget' as const,
+            unit: 'turns' as const,
+            period: 'hour' as const,
+            observedAt: updatedAt,
+            used: state.turnsUsed,
+            remaining: Math.max(0, state.turnsPerHour - state.turnsUsed),
+            limit: state.turnsPerHour,
+          },
+        ]
+      : undefined;
+  return {
+    work: AiWorkMetadataSchema.parse({
+      provider,
+      updatedAt,
+      capabilities: assessment.capabilities,
+      ...(usage === undefined ? {} : { usage }),
+    }),
+    listener: { installed: listener.installed, running: listener.running },
+    assessment,
+    ...(answererProvider === undefined ? {} : { answererProvider }),
+  };
 }
 
 /** The pairing QR as terminal text. Block characters render in the terminal
@@ -155,7 +276,10 @@ export function renderPairingQr(userId: string): string {
 }
 
 export async function cmdSetup(argv: string[], report: Reporter, io: SetupIo = {}): Promise<void> {
-  const args = parseArgs(argv, { value: ['--name', '--owner', '--account', '--seconds'] });
+  const args = parseArgs(argv, {
+    value: ['--name', '--owner', '--account', '--seconds', '--approvals'],
+    boolean: ['--test-notification'],
+  });
   if (flagBool(args, '--help')) {
     console.log(`usage: ${SETUP_USAGE}`);
     return;
@@ -204,10 +328,16 @@ export async function cmdSetup(argv: string[], report: Reporter, io: SetupIo = {
   try {
     profilePath(account); // shape check; throws a plain Error on an illegal name
   } catch (err) {
-    throw new CliError(EXIT.USAGE, `--account: ${err instanceof Error ? err.message : 'invalid name'}`);
+    throw new CliError(
+      EXIT.USAGE,
+      `--account: ${err instanceof Error ? err.message : 'invalid name'}`,
+    );
   }
 
   const waitSeconds = flagCount(args, '--seconds', QR_WAIT_DEFAULT_SECONDS);
+  const hostConfigOptions: HostConfigOptions = args.flags.has('--approvals')
+    ? { claudePermission: { minimumAppBuild: flagCount(args, '--approvals', 0) } }
+    : {};
 
   // PREFLIGHT BEFORE ANY NETWORK OR STATE: every refusal the config write
   // can make — a missing built artifact, an existing config that does not
@@ -217,7 +347,7 @@ export async function cmdSetup(argv: string[], report: Reporter, io: SetupIo = {
   // already paired. A failure that DEVELOPS between here and the final
   // write (the host rewriting its file, the disk filling) is still
   // possible; the state notes below are the honest answer to those.
-  preflightHostConfig(surface, account, io.hostConfig);
+  preflightHostConfig(surface, account, io.hostConfig, hostConfigOptions);
   // And the voice target, under the same argument: a refusably-malformed
   // instructions file (markers quoted in the operator's prose, a hand-made
   // skill under our name) must refuse a setup that has not started — the
@@ -303,9 +433,23 @@ export async function cmdSetup(argv: string[], report: Reporter, io: SetupIo = {
   // whose snapshot includes the owner re-saves the truth.
   const sendAuth = new AuthSession(account, stores);
 
-  // From here on the pairing EXISTS, so every failure must say so — the
-  // remaining steps are retryable by re-running setup, which skips straight
-  // back here.
+  let outcome: HostConfigOutcome;
+  try {
+    outcome = writeHostConfig(surface, account, io.hostConfig, hostConfigOptions);
+  } catch (err) {
+    report.note(
+      `state: ${account} is registered and PAIRED, but the ${surface} hook config was ` +
+        `NOT written and the name card was not sent. Re-run setup to retry; the pairing is kept.`,
+    );
+    throw err;
+  }
+
+  // The profile snapshot is sent only AFTER the exact maintained hook is on
+  // disk. Its notifications capability therefore describes a fact that is
+  // already true; sending it first would leave a false positive whenever the
+  // later config write failed. Pairing still precedes every host write, so a
+  // late failure cannot redirect an unbound integration.
+  const snapshot = capabilitySnapshot(account, surface, outcome, io);
   try {
     await sendPairingMessages({
       account,
@@ -315,6 +459,7 @@ export async function cmdSetup(argv: string[], report: Reporter, io: SetupIo = {
       displayName,
       surface,
       report,
+      work: snapshot.work,
       // F5: the hello belongs to the FIRST pairing. A re-run resends only
       // the name card (the documented rename path) — re-greeting the owner
       // on every re-run is a duplicate message, not idempotence.
@@ -322,21 +467,9 @@ export async function cmdSetup(argv: string[], report: Reporter, io: SetupIo = {
     });
   } catch (err) {
     report.note(
-      `state: ${account} is registered and PAIRED, but the name card did not go out — ` +
-        'the chat may show a raw id instead of the name. Re-run setup to retry; the ' +
-        'pairing is kept.',
-    );
-    throw err;
-  }
-
-  let outcome: HostConfigOutcome;
-  try {
-    outcome = writeHostConfig(surface, account, io.hostConfig);
-  } catch (err) {
-    report.note(
-      `state: ${account} is registered and PAIRED and the name card was delivered, but ` +
-        `the ${surface} hook config was NOT written. Re-run setup to retry; nothing ` +
-        'else needs to be redone.',
+      `state: ${account} is registered and PAIRED and the ${surface} hook config is written, ` +
+        'but the name/capability card did not go out — the chat may show a raw id or stale ' +
+        'capabilities. Re-run setup to retry; the pairing and hook are kept.',
     );
     throw err;
   }
@@ -365,6 +498,50 @@ export async function cmdSetup(argv: string[], report: Reporter, io: SetupIo = {
     );
   }
 
+  // Outbound notification support and inbound control reachability are two
+  // different facts. The profile truthfully advertises the former after the
+  // maintained hook is written; Quiet requests (and native Claude approval
+  // decisions, when configured) still need the ordinary receiving listener.
+  // Keep that dependency explicit instead of changing the capability bit's
+  // meaning or leaving an owner request pending with no local consumer.
+  const listenerFeatures = outcome.approvalsConfigured
+    ? 'native Claude approvals and phone notification preferences'
+    : 'phone notification preferences';
+  if (!snapshot.listener.installed) {
+    report.note(
+      `${listenerFeatures} need the receiving listener. Install it with: ` +
+        `tacendum service install ${account}`,
+    );
+  } else if (!snapshot.listener.running) {
+    report.note(
+      `${listenerFeatures} need the installed listener to be running. Check it with: ` +
+        `tacendum service status ${account}`,
+    );
+  }
+
+  let notificationTest: NotificationDeliveryTestOutcome | undefined;
+  if (flagBool(args, '--test-notification')) {
+    const provider: HookHost = surface === 'claude-code' ? 'claude' : surface;
+    notificationTest = await runNotificationDeliveryTest(
+      account,
+      provider,
+      report,
+      io.notification,
+    );
+    if (notificationTest.action === 'notified') {
+      report.note(
+        `notification test received a ${sanitizeServerField(notificationTest.state)} relay ` +
+          'receipt; that confirms transport acknowledgement, not that the phone displayed an alert.',
+      );
+    } else if (notificationTest.action === 'queued') {
+      report.note(
+        'notification test is queued; the next notification from this account will retry it.',
+      );
+    } else {
+      report.note('notification test could not be sent or queued.');
+    }
+  }
+
   // What setup may print (F12): the operator's own typed inputs (`account`
   // is shape-checked by profilePath above, `name` refused control bytes
   // above), paths this module chose, and the two ids — which are
@@ -383,6 +560,16 @@ export async function cmdSetup(argv: string[], report: Reporter, io: SetupIo = {
       name: displayName,
       config: outcome.path,
       configChanged: outcome.changed,
+      approvalsConfigured: outcome.approvalsConfigured,
+      capabilities: snapshot.assessment.capabilities,
+      ...(snapshot.assessment.codexVersion === undefined
+        ? {}
+        : { codexVersion: snapshot.assessment.codexVersion }),
+      ...(snapshot.answererProvider === undefined ||
+      snapshot.answererProvider === snapshot.work.provider
+        ? {}
+        : { separateAnswererProvider: snapshot.answererProvider }),
+      ...(notificationTest === undefined ? {} : { notificationTest }),
       voice: voice.path,
       voiceChanged: voice.changed,
     },
@@ -490,7 +677,9 @@ async function ensureIntegrationAccount(account: string, report: Reporter): Prom
 
   report.status('registering integration account…');
   const minted = await withFileLockAsync(join(stores.root, 'register.lock'), async () => {
-    const keys = await withFileLockAsync(stores.ratchetLockPath(), () => loadOrGenerateKeys(stores));
+    const keys = await withFileLockAsync(stores.ratchetLockPath(), () =>
+      loadOrGenerateKeys(stores),
+    );
     // Durable (the default) and BEFORE the auth block that saves the
     // profile: a crash anywhere between the profile save and the upload
     // must leave the marker behind, or the early return above re-adopts a
@@ -678,7 +867,7 @@ async function qrPairingFlow(opts: {
       await inbound.settled();
       if (inbound.consumed > 0) {
         const pinned = stores.identity.pinnedPeers().filter(isUserId);
-        const fresh = pinned.filter(p => !before.has(p));
+        const fresh = pinned.filter((p) => !before.has(p));
         const candidates = fresh.length > 0 ? fresh : pinned;
         if (candidates.length === 1) {
           report.note(
@@ -777,11 +966,12 @@ async function sendPairingMessages(opts: {
   surface: SetupSurface;
   report: Reporter;
   includeHello: boolean;
+  work: AiWorkMetadata;
 }): Promise<void> {
   const { account, stores, auth, owner, report } = opts;
 
   const messages: OutboundMessage[] = [
-    { body: profileCardBody(opts.displayName), notify: false },
+    { body: profileCardBody(opts.displayName, opts.work), notify: false },
   ];
   if (opts.includeHello) {
     messages.push({
@@ -799,7 +989,7 @@ async function sendPairingMessages(opts: {
       to: owner,
       messages,
       events: {
-        onSocket: ws => {
+        onSocket: (ws) => {
           inbound = attachInbound({
             name: account,
             userId: auth.userId,

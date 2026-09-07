@@ -1,12 +1,14 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { apiAuth, apiAuthChallenge, apiIntegrationBind, apiUploadKeys } from './api.js';
 import {
-  apiAuth,
-  apiAuthChallenge,
-  apiIntegrationBind,
-  apiUploadKeys,
-} from './api.js';
-import { flagBool, flagCount, flagString, parseArgs, scanGlobals, type ParsedArgs } from './args.js';
+  flagBool,
+  flagCount,
+  flagString,
+  parseArgs,
+  scanGlobals,
+  type ParsedArgs,
+} from './args.js';
 import { listContacts } from './contacts.js';
 import { registerForecast, runDoctor } from './doctor.js';
 import { CliError, EXIT, exitCodeFor, slugOf, type ExitCode } from './exit.js';
@@ -47,6 +49,8 @@ import { WsClient } from './wsclient.js';
 import { CallSession, readCallLog } from './call-session.js';
 import { groupCallStatePath, readGroupCallState } from './group-call.js';
 import { cmdNotify } from './hooks.js';
+import { cmdClaudePermission } from './claude-permission.js';
+import { CODEX_NOTIFY_DISPATCH_COMMAND, runCodexNotifyDispatch } from './codex-notify-dispatch.js';
 import { cmdRoom } from './room-commands.js';
 import { cmdRun } from './run.js';
 import { cmdSend } from './send.js';
@@ -140,11 +144,7 @@ function testExpOffsetMs(): number {
  * first — same client name, new `userId`, and every peer still pinning the old
  * key. There is no phone number left to recover it with.
  */
-async function cmdRegister(
-  name: string,
-  report: Reporter,
-  asIntegration = false,
-): Promise<void> {
+async function cmdRegister(name: string, report: Reporter, asIntegration = false): Promise<void> {
   const stores = new FileStores(name);
   const returning = stores.identity.exists();
   /**
@@ -499,7 +499,7 @@ async function cmdPair(name: string, rawOwner: string, report: Reporter): Promis
       throw new CliError(
         EXIT.USAGE,
         `no account with id ${owner}. That is the owner's own id — it is on the ` +
-          'my-code screen in the app, not the integration\'s id from `whoami`.',
+          "my-code screen in the app, not the integration's id from `whoami`.",
       );
     }
     if (err instanceof CliError && err.code === 'not_integration') {
@@ -624,8 +624,7 @@ async function runTimed(
   leaveAfter: number,
   addAfter: readonly { at: number; peerId: string }[] = [],
 ): Promise<void> {
-  const sleep = (ms: number): Promise<void> =>
-    new Promise(resolve => setTimeout(resolve, ms));
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
   const schedule: { at: number; run: () => Promise<void> }[] = [];
   for (const add of addAfter) {
     // Same bound `--leave-after` has always carried: an action scheduled at
@@ -820,7 +819,9 @@ function cmdInbox(
     // any other — sanitized AGAIN on the way to the terminal, so a log
     // written by anything else cannot smuggle control bytes through us.
     const peer = sanitizeServerField(r.peer);
-    const text = r.red ? `[body purged after read${r.bytes ? `, ${r.bytes} bytes` : ''}]` : sanitizeForTerminal(r.text);
+    const text = r.red
+      ? `[body purged after read${r.bytes ? `, ${r.bytes} bytes` : ''}]`
+      : sanitizeForTerminal(r.text);
     // §3.7. Sanitized AGAIN on the way out for `text`'s exact
     // reason — the spool is a file and a file is an input — and gated on the
     // flag so today's listing and today's `--json` object are byte-identical
@@ -999,12 +1000,15 @@ async function cmdDoctor(name: string, report: Reporter): Promise<ExitCode> {
     // the treatment. Unbounded on purpose: a remedy carries a path and a
     // command the operator must copy verbatim, and truncating that is how a
     // diagnostic starts lying (the hostconfig lesson, see the top-level catch).
-    report.line({}, prefixLines(`${r.ok ? 'PASS' : 'FAIL'} ${r.check} — `, sanitizeForTerminal(r.detail)));
+    report.line(
+      {},
+      prefixLines(`${r.ok ? 'PASS' : 'FAIL'} ${r.check} — `, sanitizeForTerminal(r.detail)),
+    );
     if (!r.ok && r.remedy) {
       report.line({}, prefixLines('       remedy: ', sanitizeForTerminal(r.remedy)));
     }
   }
-  const failed = results.filter(r => !r.ok).length;
+  const failed = results.filter((r) => !r.ok).length;
   report.note(failed === 0 ? 'all checks passed' : `${failed} of ${results.length} checks failed`);
   return failed === 0 ? EXIT.OK : EXIT.ERROR;
 }
@@ -1023,7 +1027,6 @@ function cmdVersion(report: Reporter): void {
       `${LICENSE} — source: ${SOURCE_URL}`,
   );
 }
-
 
 /**
  * Place a call and stay connected.
@@ -1054,7 +1057,7 @@ async function cmdCall(
       // the peer connection exists, not before it.
       await session.trickle(opts.ice);
     }
-    await new Promise(resolve => setTimeout(resolve, opts.seconds * 1000));
+    await new Promise((resolve) => setTimeout(resolve, opts.seconds * 1000));
   } finally {
     session.close();
   }
@@ -1239,9 +1242,7 @@ function cmdWhoami(name: string, report: Reporter): void {
   // a 403, and "unbound" is a diagnosis where "it doesn't work" is not.
   const kind = profile.accountClass === 'integration' ? 'integration' : 'human';
   const binding =
-    profile.accountClass === 'integration'
-      ? { boundTo: profile.ownerUserId ?? null }
-      : {};
+    profile.accountClass === 'integration' ? { boundTo: profile.ownerUserId ?? null } : {};
 
   // THROUGH THE REPORTER, and this was a DISCLOSURE rather than a tidy-up.
   // Both arms used to call `console.log(JSON.stringify(…))` directly, which is
@@ -1451,8 +1452,10 @@ usage:
   tacendum safety <name> <peer>
   tacendum trust <name> <peer>
   tacendum setup <surface> --name "<display name>" [--owner <id>]
+      [--approvals <min-app-build>] [--test-notification]
   tacendum run <from> [<to>] [--name <label>] -- <command> [args...]
   tacendum notify --hook claude|codex|gemini|cursor --account <name> [--to <id>] [--title T]
+  tacendum claude-permission --account <name> [--approvals <min-app-build>]
   tacendum credential <name> [--migrate [--remove-file]]
   tacendum crew voice
   tacendum crew adopt <account> <member-id>
@@ -1460,7 +1463,8 @@ usage:
   tacendum consent list <account>
   tacendum service install|uninstall|status <account>
   tacendum attend enable|disable|run <account> [--host claude|codex|gemini] [--bin P] [--workdir D]
-      [--turns N] [--caps "<args>"] [--driver exec|app-server] [--approval-policy untrusted|on-request|never]
+      [--turns N] [--caps "<args>"] [--driver exec|app-server|subprocess|sdk]
+      [--approval-policy untrusted|on-request|never]
       [--approvals <min-app-build>] [--stream <min-app-build>] [--marker <min-app-build>]
   tacendum attend status [<account>]
   tacendum attend triggers <account> [<room-gid> on|off]
@@ -1483,6 +1487,13 @@ integrations: an account a tool or agent sends from is registered with
   A paired integration may message that one person and nobody else, cannot
   ring a phone, and can be revoked from the phone at any time. Registering
   without --integration makes an ordinary account with none of those bounds.
+
+Claude approval modes:
+  setup claude-code --approvals <build> installs a blocking PermissionRequest
+  bridge for native INTERACTIVE Claude Code and needs \`service install\` on the
+  same account to receive the owner's decision. Noninteractive \`claude -p\`
+  attend turns do not fire PermissionRequest. The separate attend \`sdk\` driver
+  can relay its own tool asks, and requires an operator-supplied API key.
 
 crews: an owner running a fleet of agents can adopt their paired
   integrations into one crew ("tacendum crew adopt"); crew-mates may then
@@ -1633,7 +1644,7 @@ async function main(): Promise<ExitCode | number> {
       // `unknown option --integration` before cmdRegister ever ran, and every
       // account this product created was human-class.
       const args = parseArgs(argv, { boolean: ['--integration'] });
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       await cmdRegister(
         requireAccount(args, 0, 'tacendum register <name> [--integration]'),
         report,
@@ -1643,18 +1654,14 @@ async function main(): Promise<ExitCode | number> {
     }
     case 'pair': {
       const args = parseArgs(argv);
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       const usage = 'tacendum pair <name> <owner-ulid>';
-      await cmdPair(
-        requireAccount(args, 0, usage),
-        requirePositional(args, 1, usage),
-        report,
-      );
+      await cmdPair(requireAccount(args, 0, usage), requirePositional(args, 1, usage), report);
       break;
     }
     case 'send': {
       const args = parseArgs(argv, { value: ['--title', '--attach'], boolean: ['--drain'] });
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       const usage = 'tacendum send <from> <to> ["<text>" | - | --attach <file>] [--title T]';
       const from = requireAccount(args, 0, usage);
       const to = requirePositional(args, 1, usage);
@@ -1693,7 +1700,7 @@ async function main(): Promise<ExitCode | number> {
         value: ['--seconds', '--leave-after', '--save-dir'],
         boolean: ['--calls', '--auto-answer', '--auto-decline', '--group', '--detail'],
       });
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       const name = requireAccount(args, 0, 'tacendum listen <name> [--calls]');
       if (flagBool(args, '--calls')) {
         // REFUSED, not ignored. `--detail` must be declared for the whole
@@ -1729,7 +1736,7 @@ async function main(): Promise<ExitCode | number> {
     }
     case 'sync': {
       const args = parseArgs(argv, { value: ['--save-dir'] });
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       await cmdSync(
         requireAccount(args, 0, 'tacendum sync <name>'),
         report,
@@ -1742,7 +1749,7 @@ async function main(): Promise<ExitCode | number> {
         value: ['--peer', '--limit'],
         boolean: ['--unread', '--peek', '--purge', '--detail'],
       });
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       const name = requireAccount(args, 0, 'tacendum inbox <name> [--peer <id>] [--limit N]');
       const peerFlag = flagString(args, '--peer');
       cmdInbox(
@@ -1763,13 +1770,13 @@ async function main(): Promise<ExitCode | number> {
     }
     case 'contacts': {
       const args = parseArgs(argv);
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       cmdContacts(requireAccount(args, 0, 'tacendum contacts <name>'), report);
       break;
     }
     case 'doctor': {
       const args = parseArgs(argv);
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       const code = await cmdDoctor(requirePositional(args, 0, 'tacendum doctor <name>'), report);
       report.done();
       return code;
@@ -1779,7 +1786,7 @@ async function main(): Promise<ExitCode | number> {
         value: ['--ice', '--seconds', '--leave-after', '--add', '--add-after'],
         boolean: ['--video', '--group'],
       });
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       const usage = 'tacendum call <from> <to> [--video] [--ice N]';
       if (flagBool(args, '--group')) {
         // `call <from> --group <peer>…` — the account stays positional 0, as
@@ -1831,36 +1838,32 @@ async function main(): Promise<ExitCode | number> {
     }
     case 'calllog': {
       const args = parseArgs(argv);
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       cmdCallLog(requireAccount(args, 0, 'tacendum calllog <name>'), report);
       break;
     }
     case 'gcall': {
       const args = parseArgs(argv);
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       cmdGroupCallState(requireAccount(args, 0, 'tacendum gcall <name>'), report);
       break;
     }
     case 'whoami': {
       const args = parseArgs(argv);
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       cmdWhoami(requireAccount(args, 0, 'tacendum whoami <name>'), report);
       break;
     }
     case 'safety': {
       const args = parseArgs(argv);
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       const usage = 'tacendum safety <name> <peer>';
-      await cmdSafety(
-        requireAccount(args, 0, usage),
-        requirePositional(args, 1, usage),
-        report,
-      );
+      await cmdSafety(requireAccount(args, 0, usage), requirePositional(args, 1, usage), report);
       break;
     }
     case 'trust': {
       const args = parseArgs(argv);
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       const usage = 'tacendum trust <name> <peer>';
       cmdTrust(requireAccount(args, 0, usage), requirePositional(args, 1, usage), report);
       break;
@@ -1904,6 +1907,25 @@ async function main(): Promise<ExitCode | number> {
       await cmdNotify(argv, report);
       break;
     }
+    case CODEX_NOTIFY_DISPATCH_COMMAND: {
+      // Private entrypoint installed in Codex's single legacy notify slot.
+      // Codex appends one opaque payload argument to the fixed plan argv;
+      // the dispatcher validates that exact positional shape, fans out, and
+      // records a payload-free status for setup/doctor. A launched child's
+      // delivery failure is diagnostic state rather than a Codex hook
+      // failure, so every valid invocation exits successfully and writes
+      // nothing through Reporter/stdout.
+      await runCodexNotifyDispatch(argv);
+      return EXIT.OK;
+    }
+    case 'claude-permission': {
+      // A blocking native PermissionRequest hook. Like notify, it owns its
+      // process lifetime so an abandoned network handle cannot outlive the
+      // host's configured timeout; unlike notify, waiting for the paired
+      // owner's answer is the command's purpose.
+      await cmdClaudePermission(argv, report);
+      break;
+    }
     case 'crew': {
       // Crew surface (crew-chat spec). `voice` prints the canonical
       // crew-chat instruction text so any host — including ones setup cannot
@@ -1917,16 +1939,19 @@ async function main(): Promise<ExitCode | number> {
         // one silently. parseArgs, not argv.length: global flags (--json,
         // --plain) legitimately remain in argv here.
         const args = parseArgs(argv.slice(1));
-        if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+        if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
         if (args.positionals.length > 0) {
           throw new CliError(EXIT.USAGE, 'usage: tacendum crew voice');
         }
-        report.emit({ ok: true, action: 'voice', text: CREW_VOICE_BODY }, CREW_VOICE_BODY.trimEnd());
+        report.emit(
+          { ok: true, action: 'voice', text: CREW_VOICE_BODY },
+          CREW_VOICE_BODY.trimEnd(),
+        );
         break;
       }
       if (sub === 'adopt') {
         const args = parseArgs(argv.slice(1));
-        if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+        if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
         const usage = 'tacendum crew adopt <account> <member-id>';
         // Exactly two positionals: a third rode through silently once, and an argument this command ignores is an argument
         // the operator believed did something.
@@ -1955,7 +1980,7 @@ async function main(): Promise<ExitCode | number> {
       const usage = 'tacendum consent grant|revoke <account> <agent-id> | consent list <account>';
       if (sub === 'grant' || sub === 'revoke') {
         const args = parseArgs(argv.slice(1));
-        if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+        if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
         // Exactly two positionals — crew adopt's rule: an argument this
         // command ignores is an argument the operator believed did something.
         if (args.positionals.length > 2) throw new CliError(EXIT.USAGE, `usage: ${usage}`);
@@ -1969,7 +1994,7 @@ async function main(): Promise<ExitCode | number> {
       }
       if (sub === 'list') {
         const args = parseArgs(argv.slice(1));
-        if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+        if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
         if (args.positionals.length > 1) throw new CliError(EXIT.USAGE, `usage: ${usage}`);
         cmdConsentList(requireAccount(args, 0, usage), report);
         break;
@@ -1981,18 +2006,14 @@ async function main(): Promise<ExitCode | number> {
       // supervised listen, and not an opportunistic drain inside notify, is
       // the shape that fits the routing-row rule).
       const args = parseArgs(argv);
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       const usage = 'tacendum service install|uninstall|status [<account>]';
       if (args.positionals.length > 2) throw new CliError(EXIT.USAGE, `usage: ${usage}`);
       // The account is OPTIONAL here, unlike everywhere else: bare `status`
       // answers for every account, and a bare mutation names the options
       // (service.ts records the reasoning). requireAccount would pre-empt
       // both with a usage line.
-      cmdService(
-        requirePositional(args, 0, usage),
-        args.positionals[1] ?? null,
-        report,
-      );
+      cmdService(requirePositional(args, 0, usage), args.positionals[1] ?? null, report);
       break;
     }
     case 'attend': {
@@ -2008,14 +2029,23 @@ async function main(): Promise<ExitCode | number> {
       // positional 0.
       const args = parseArgs(argv, {
         value: [
-          '--host', '--bin', '--workdir', '--turns', '--caps', '--driver',
-          '--approval-policy', '--approvals', '--stream', '--marker',
+          '--host',
+          '--bin',
+          '--workdir',
+          '--turns',
+          '--caps',
+          '--driver',
+          '--approval-policy',
+          '--approvals',
+          '--stream',
+          '--marker',
         ],
       });
-      if (flagBool(args, '--help') || flagBool(args, '-h')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help') || flagBool(args, '-h')) return (console.log(HELP), EXIT.OK);
       const usage =
         'tacendum attend enable|disable|run <account> [--host claude|codex|gemini] [--bin P] ' +
-        '[--workdir D] [--turns N] [--caps "<args>"] [--driver exec|app-server] ' +
+        '[--workdir D] [--turns N] [--caps "<args>"] ' +
+        '[--driver exec|app-server|subprocess|sdk] ' +
         '[--approval-policy untrusted|on-request|never] [--approvals <min-app-build>] ' +
         '[--stream <min-app-build>] [--marker <min-app-build>] | ' +
         'tacendum attend status [<account>] | ' +
@@ -2138,9 +2168,7 @@ async function main(): Promise<ExitCode | number> {
             // `turns >= null` true on every pass — attend bricked, exit 0,
             // "at its hourly limit" forever. The fallback is unreachable (the
             // flag is present) and exists only to satisfy the signature.
-            ...(args.flags.has('--turns')
-              ? { turnsPerHour: flagCount(args, '--turns', 0) }
-              : {}),
+            ...(args.flags.has('--turns') ? { turnsPerHour: flagCount(args, '--turns', 0) } : {}),
           },
           report,
         );
@@ -2169,7 +2197,7 @@ async function main(): Promise<ExitCode | number> {
       // floor (gate.unit-program-registered.test.ts is the red that proved
       // it, and the fence against the next unregistered variant).
       const args = parseArgs(argv);
-      if (flagBool(args, '--help') || flagBool(args, '-h')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help') || flagBool(args, '-h')) return (console.log(HELP), EXIT.OK);
       const usage =
         'tacendum review-peer run <account> | ' +
         'tacendum review-peer service install|uninstall|status <account>';
@@ -2193,7 +2221,7 @@ async function main(): Promise<ExitCode | number> {
     case 'credential': {
       const usage = 'usage: tacendum credential <name> [--migrate [--remove-file]]';
       const args = parseArgs(argv, { boolean: ['--migrate', '--remove-file'] });
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       // requirePositional, not requireAccount: this IS the credential
       // command, and the silent hook would pre-empt the loud path.
       cmdCredential(
@@ -2208,10 +2236,16 @@ async function main(): Promise<ExitCode | number> {
       // command; bare `mcp` is the stdio server, on which stdout belongs to
       // the protocol and stderr to everything else (see mcp.ts).
       if (argv[0] === 'install') {
-        const args = parseArgs(argv.slice(1), { value: ['--host', '--account'], boolean: ['--write'] });
-        if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+        const args = parseArgs(argv.slice(1), {
+          value: ['--host', '--account'],
+          boolean: ['--write'],
+        });
+        if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
         if (args.positionals.length > 0) {
-          throw new CliError(EXIT.USAGE, 'usage: tacendum mcp install --host <host> [--account <name>] [--write]');
+          throw new CliError(
+            EXIT.USAGE,
+            'usage: tacendum mcp install --host <host> [--account <name>] [--write]',
+          );
         }
         console.log(
           runMcpInstall({
@@ -2222,8 +2256,11 @@ async function main(): Promise<ExitCode | number> {
         );
         break;
       }
-      const args = parseArgs(argv, { value: ['--account'], boolean: ['--notify-owner', '--ask-owner'] });
-      if (flagBool(args, '--help')) return console.log(HELP), EXIT.OK;
+      const args = parseArgs(argv, {
+        value: ['--account'],
+        boolean: ['--notify-owner', '--ask-owner'],
+      });
+      if (flagBool(args, '--help')) return (console.log(HELP), EXIT.OK);
       if (args.positionals.length > 0) {
         // A stray positional is far more likely a mistyped subcommand than a
         // deliberate argument, and a server that starts anyway would sit
@@ -2358,9 +2395,7 @@ main().then(
     // it cannot disagree with `doctor`, which renders the same function.
     const raw = err instanceof Error ? err.message : String(err);
     const message = sanitizeForTerminal(
-      err instanceof UnusableTokenError
-        ? `${raw} ${registerForecast(err.account).advice}`
-        : raw,
+      err instanceof UnusableTokenError ? `${raw} ${registerForecast(err.account).advice}` : raw,
     );
     const code = exitCodeFor(err);
     // Retire the transient status line first. Without this every interactive

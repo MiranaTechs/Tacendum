@@ -2,7 +2,15 @@ package com.miranatechnologies.tacendum.call
 
 import android.content.Context
 import android.graphics.Color
+import android.os.Handler
+import android.os.Looper
 import android.widget.FrameLayout
+import com.facebook.react.bridge.Arguments
+import com.facebook.react.bridge.ReactContext
+import com.facebook.react.bridge.WritableMap
+import com.facebook.react.uimanager.UIManagerHelper
+import com.facebook.react.uimanager.events.Event
+import java.lang.ref.WeakReference
 import org.webrtc.RendererCommon
 import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoTrack
@@ -21,6 +29,10 @@ class TacendumVideoHost(context: Context) : FrameLayout(context) {
 
   private var renderer: SurfaceViewRenderer? = null
   private var attached: VideoTrack? = null
+  private var surfaceToken = ""
+  private var generation = 0
+  private var ready = false
+  private val main = Handler(Looper.getMainLooper())
   private var cid = ""
   private var role = VideoTrackRegistry.Role.REMOTE
 
@@ -51,7 +63,20 @@ class TacendumVideoHost(context: Context) : FrameLayout(context) {
     // controls, so without this the self-view is behind the call and invisible
     // on some devices and in front on others.
     fresh.setZOrderMediaOverlay(role == VideoTrackRegistry.Role.LOCAL)
-    fresh.init(CallEgl.context, null)
+    val epoch = generation
+    val owner = WeakReference(this)
+    val queue = main
+    fresh.init(CallEgl.context, object : RendererCommon.RendererEvents {
+      override fun onFirstFrameRendered() {
+        queue.post {
+          val host = owner.get() ?: return@post
+          if (host.generation != epoch || host.attached == null) return@post
+          host.ready = true
+          host.publishReadiness()
+        }
+      }
+      override fun onFrameResolutionChanged(width: Int, height: Int, rotation: Int) = Unit
+    })
     fresh.setScalingType(scaling)
     fresh.setMirror(mirrored)
     fresh.setEnableHardwareScaler(true)
@@ -76,17 +101,15 @@ class TacendumVideoHost(context: Context) : FrameLayout(context) {
    *
    * The view manager therefore keeps both props and calls this once with both.
    */
-  fun bind(nextCid: String, nextTrack: String?) {
+  fun bind(nextCid: String, nextTrack: String?, nextSurface: String) {
     val nextRole = VideoTrackRegistry.Role.from(nextTrack)
-    if (nextCid == cid && nextRole == role) return
-    val roleChanged = nextRole != role
+    if (nextCid == cid && nextRole == role && nextSurface == surfaceToken) return
     cid = nextCid
     role = nextRole
+    surfaceToken = nextSurface
     // The z-order is decided when the surface is created, so a role change has
     // to rebuild the renderer or a view recycled from remote to local composes
     // underneath the call it is supposed to sit on.
-    if (roleChanged) releaseRenderer()
-    installRenderer()
     resubscribe()
   }
 
@@ -114,6 +137,7 @@ class TacendumVideoHost(context: Context) : FrameLayout(context) {
     VideoTrackRegistry.stopObserving(this)
     detach()
     cid = ""
+    surfaceToken = ""
     role = VideoTrackRegistry.Role.REMOTE
     mirrored = false
     scaling = RendererCommon.ScalingType.SCALE_ASPECT_FILL
@@ -159,19 +183,22 @@ class TacendumVideoHost(context: Context) : FrameLayout(context) {
    * same person, and if no remote frame ever arrives it never resolves.
    *
    * A fresh renderer has no frame to show, so this host's black background
-   * reads through: "no video yet", which is the truth. Guarded on there HAVING
-   * been a track, so the common no-op paths do not churn a surface for nothing.
+   * reads through: "no video yet", which is the truth. Every binding lifetime
+   * gets a fresh renderer and readiness generation, even before a track arrives.
    */
   private fun detach() {
-    val track = attached ?: return
+    val track = attached
     val current = renderer
-    if (current != null) track.removeSink(current)
+    if (current != null && track != null) track.removeSink(current)
     attached = null
     releaseRenderer()
     installRenderer()
   }
 
   private fun releaseRenderer() {
+    generation += 1
+    ready = false
+    publishReadiness()
     val current = renderer ?: return
     renderer = null
     current.clearImage()
@@ -186,6 +213,8 @@ class TacendumVideoHost(context: Context) : FrameLayout(context) {
     // host still holds.
     val track = attached
     if (track != null) renderer?.let { track.removeSink(it) }
+    attached = null
+    VideoTrackRegistry.stopObserving(this)
     releaseRenderer()
     super.onDetachedFromWindow()
   }
@@ -193,7 +222,27 @@ class TacendumVideoHost(context: Context) : FrameLayout(context) {
   override fun onAttachedToWindow() {
     super.onAttachedToWindow()
     installRenderer()
-    val track = attached
-    if (track != null) renderer?.let { track.addSink(it) }
+    resubscribe()
+    publishReadiness()
+  }
+
+  fun publishReadiness() {
+    if (surfaceToken.isEmpty() || id == NO_ID) return
+    val reactContext = context as? ReactContext ?: return
+    val dispatcher = UIManagerHelper.getEventDispatcherForReactTag(reactContext, id) ?: return
+    dispatcher.dispatchEvent(FrameReadyEvent(UIManagerHelper.getSurfaceId(this), id, surfaceToken, generation, ready))
+  }
+}
+
+private class FrameReadyEvent(
+    surfaceId: Int, viewTag: Int, private val token: String,
+    private val generation: Int, private val ready: Boolean,
+) : Event<FrameReadyEvent>(surfaceId, viewTag) {
+  override fun getEventName() = "topFrameReady"
+  override fun canCoalesce() = false
+  override fun getEventData(): WritableMap = Arguments.createMap().apply {
+    putString("surfaceId", token)
+    putInt("generation", generation)
+    putBoolean("ready", ready)
   }
 }

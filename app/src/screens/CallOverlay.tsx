@@ -1,9 +1,15 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Animated, Pressable, StyleSheet, Text, View } from 'react-native';
-import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context';
+import {
+  useSafeAreaFrame,
+  useSafeAreaInsets,
+} from 'react-native-safe-area-context';
 import type { CallState } from '@tacendum/shared';
 import { TacendumVideoView } from 'tacendum-call';
-import { durationAnnouncementFrom, durationFrom } from '../components/CallControls';
+import {
+  durationAnnouncementFrom,
+  durationFrom,
+} from '../components/CallControls';
 import { Avatar } from '../ui/Avatar';
 import { EndCallGlyph } from '../ui/CallControlGlyphs';
 import { tileName } from '../ui/CallTile';
@@ -20,6 +26,7 @@ import { useKeyboardInset } from '../keyboardInset';
 import { useTheme } from '../theme';
 import { useReduceMotion } from '../useReduceMotion';
 import { statusLabel } from './CallScreen';
+import { useVideoReadiness } from '../ui/videoReadiness';
 
 /**
  * The MINIMIZED 1:1 call ("i should be able to
@@ -34,11 +41,10 @@ import { statusLabel } from './CallScreen';
  * brings the full call screen back.
  *
  * Two shapes, one component:
- *  - a VIDEO call is the peer's video in a 110pt 16:9 window — the same box
- *    the self-view has always been, so the two pictures read as one family
- *    — with their face standing in whenever their video is not flowing,
- *    exactly as the full screen does it (`PeerBackdrop`), and the running
- *    time under it;
+ *  - a VIDEO call is the peer's video in a 110pt 16:9 restore window — the
+ *    same box the self-view has always been, so the two pictures read as one
+ *    family — with their face standing in whenever their video is not
+ *    flowing, and an independent End target beside it;
  *  - an AUDIO call is a compact pill on the paper surface: their picture,
  *    their name, the running time, and an End control. Paper, not the media
  *    black: this window sits over the chat, and a black rectangle on
@@ -67,9 +73,13 @@ export const OVERLAY_TOP_CLEARANCE = 64;
  * the tab rail is 52, so 96 clears both with air. */
 export const OVERLAY_BOTTOM_CLEARANCE = 96;
 
-/** The video window: the self-view's box, in this surface's bands. */
+/** The video itself remains the self-view's 110pt box; its independent End
+ * target and an 8pt gutter are part of the DRAG geometry so neither can be
+ * parked outside the safe area. */
+export const OVERLAY_VIDEO_CONTROL_GAP = 8;
+export const OVERLAY_VIDEO_END_SIZE = 44;
 export const OVERLAY_VIDEO_BOX: PipBox = {
-  width: PIP_WIDTH,
+  width: PIP_WIDTH + OVERLAY_VIDEO_CONTROL_GAP + OVERLAY_VIDEO_END_SIZE,
   height: PIP_HEIGHT,
   topClearance: OVERLAY_TOP_CLEARANCE,
   bottomClearance: OVERLAY_BOTTOM_CLEARANCE,
@@ -95,7 +105,10 @@ export const OVERLAY_AUDIO_BOX: PipBox = {
  * only, zero for a floating palette, zero on Android where the window itself
  * resizes and the frame already follows.
  */
-export function overlayBox(shape: 'video' | 'audio', keyboardInset: number): PipBox {
+export function overlayBox(
+  shape: 'video' | 'audio',
+  keyboardInset: number,
+): PipBox {
   const base = shape === 'video' ? OVERLAY_VIDEO_BOX : OVERLAY_AUDIO_BOX;
   if (keyboardInset <= 0) return base;
   return { ...base, bottomClearance: base.bottomClearance + keyboardInset };
@@ -108,7 +121,7 @@ export interface CallOverlayProps {
   peerAvatarB64?: string | null;
   /** Tap: bring the full call screen back. */
   onRestore(): void;
-  /** The pill's End control. Optional: without it the pill is restore-only. */
+  /** The independent End control. Optional: without it the surface restores only. */
   onHangup?(): void;
   /** Test seam: a fixed clock keeps the duration deterministic. */
   now?: () => number;
@@ -134,13 +147,21 @@ export function overlayAccessibilityLabel(
   const shown = state.call ? tileName(state.call.peerId, peerName) : peerName;
   const spoken =
     state.name === 'connected'
-      ? durationAnnouncementFrom(state.call.connectedAt, now) || statusLabel(state)
+      ? durationAnnouncementFrom(state.call.connectedAt, now) ||
+        statusLabel(state)
       : statusLabel(state).replace(/…$/, '');
   return `${shown}, ${spoken}`;
 }
 
 export function CallOverlay(props: CallOverlayProps): React.JSX.Element | null {
-  const { state, peerName, peerAvatarB64, onRestore, onHangup, now = Date.now } = props;
+  const {
+    state,
+    peerName,
+    peerAvatarB64,
+    onRestore,
+    onHangup,
+    now = Date.now,
+  } = props;
   const theme = useTheme();
   const insets = useSafeAreaInsets();
   const frame = useSafeAreaFrame();
@@ -151,7 +172,9 @@ export function CallOverlay(props: CallOverlayProps): React.JSX.Element | null {
   const isVideo = call?.video === true || call?.peerVideo === true;
   /** The full screen's gate, unchanged: `connected` is the machine's word for
    * media flowing, `peerVideo` the far end's own report of its camera. */
-  const remoteVideoLive = state.name === 'connected' && call?.peerVideo === true;
+  const remoteExpected = state.name === 'connected' && call?.peerVideo === true;
+  const video = useVideoReadiness(call?.cid ?? '', 'remote', remoteExpected);
+  const remoteVideoLive = video.ready;
   /** The full screen's second gate, unchanged too: whether there is a remote
    * track for the peer's PHOTO to stand in for. Before the call connects
    * there is none, and a cover-cropped face where the remote camera goes is
@@ -163,7 +186,9 @@ export function CallOverlay(props: CallOverlayProps): React.JSX.Element | null {
    * context already carries it. A call cancelled before it connected has no
    * `connectedAt`, so it still ends on the letters. */
   const mediaEstablished =
-    state.name === 'connected' || state.name === 'reconnecting' || call?.connectedAt != null;
+    state.name === 'connected' ||
+    state.name === 'reconnecting' ||
+    call?.connectedAt != null;
 
   // The drag, above the idle early-return like every other hook here. The
   // box follows the call's shape and the keyboard: the peer's camera coming
@@ -172,7 +197,12 @@ export function CallOverlay(props: CallOverlayProps): React.JSX.Element | null {
   // corner for the new box either way.
   const pip = usePipDrag({
     frame: { width: frame.width, height: frame.height },
-    insets: { top: insets.top, bottom: insets.bottom, left: insets.left, right: insets.right },
+    insets: {
+      top: insets.top,
+      bottom: insets.bottom,
+      left: insets.left,
+      right: insets.right,
+    },
     box: overlayBox(isVideo ? 'video' : 'audio', keyboardInset),
     reduceMotion,
     motion: theme.motion,
@@ -218,7 +248,7 @@ export function CallOverlay(props: CallOverlayProps): React.JSX.Element | null {
   if (isVideo) {
     return (
       <Animated.View
-        style={[styles.video, position]}
+        style={[styles.videoRow, position]}
         testID="call-overlay-window"
         {...pip.panHandlers}
       >
@@ -226,9 +256,17 @@ export function CallOverlay(props: CallOverlayProps): React.JSX.Element | null {
             keeps the tap. PhotoViewer's parent-steals arrangement, exactly as
             the self-view: the pan claims only past the 12pt threshold, so a
             tap never becomes a 1px drag and a drag never restores. */}
-        <Pressable style={styles.fill} onPress={onRestore} testID="call-overlay" {...a11y}>
+        <Pressable
+          style={styles.videoBody}
+          onPress={onRestore}
+          testID="call-overlay"
+          {...a11y}
+        >
           <TacendumVideoView
+            key={video.surfaceId}
             style={styles.fill}
+            surfaceId={video.surfaceId}
+            onFrameReady={video.onFrameReady}
             cid={call.cid}
             track="remote"
             objectFit="cover"
@@ -246,10 +284,28 @@ export function CallOverlay(props: CallOverlayProps): React.JSX.Element | null {
           )}
           {/* Over the video with nothing between them — the full screen's
               header does the same, and theme.ts rules scrims out. */}
-          <Text style={styles.videoLine} numberOfLines={1} allowFontScaling={false}>
+          <Text
+            style={styles.videoLine}
+            numberOfLines={1}
+            allowFontScaling={false}
+          >
             {line}
           </Text>
         </Pressable>
+        {onHangup && (
+          <Pressable
+            style={({ pressed }) => [
+              styles.videoEnd,
+              pressed && styles.pillEndPressed,
+            ]}
+            onPress={onHangup}
+            accessibilityRole="button"
+            accessibilityLabel="End call"
+            testID="call-overlay-end"
+          >
+            <EndCallGlyph size={18} color={theme.color.mediaInk} />
+          </Pressable>
+        )}
       </Animated.View>
     );
   }
@@ -260,8 +316,18 @@ export function CallOverlay(props: CallOverlayProps): React.JSX.Element | null {
       testID="call-overlay-window"
       {...pip.panHandlers}
     >
-      <Pressable style={styles.pillBody} onPress={onRestore} testID="call-overlay" {...a11y}>
-        <Avatar peerId={call.peerId} displayName={shown} photoB64={peerAvatarB64} size={32} />
+      <Pressable
+        style={styles.pillBody}
+        onPress={onRestore}
+        testID="call-overlay"
+        {...a11y}
+      >
+        <Avatar
+          peerId={call.peerId}
+          displayName={shown}
+          photoB64={peerAvatarB64}
+          size={32}
+        />
         <View style={styles.pillText}>
           <Text style={styles.pillName} numberOfLines={1}>
             {shown}
@@ -278,7 +344,10 @@ export function CallOverlay(props: CallOverlayProps): React.JSX.Element | null {
           starts on End never ends the call. */}
       {onHangup && (
         <Pressable
-          style={({ pressed }) => [styles.pillEnd, pressed && styles.pillEndPressed]}
+          style={({ pressed }) => [
+            styles.pillEnd,
+            pressed && styles.pillEndPressed,
+          ]}
           onPress={onHangup}
           accessibilityRole="button"
           accessibilityLabel="End call"
@@ -296,21 +365,39 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
     fill: { flex: 1 },
     /** The video window: the self-view's box and treatment (12pt radius, a
      * media hairline, black under the surface). */
-    video: {
+    videoRow: {
       position: 'absolute',
       width: OVERLAY_VIDEO_BOX.width,
       height: OVERLAY_VIDEO_BOX.height,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: OVERLAY_VIDEO_CONTROL_GAP,
+    },
+    videoBody: {
+      width: PIP_WIDTH,
+      height: PIP_HEIGHT,
       borderRadius: 12,
       overflow: 'hidden',
       borderWidth: 1,
       borderColor: theme.color.mediaLine,
       backgroundColor: theme.color.mediaBlack,
     },
+    videoEnd: {
+      width: OVERLAY_VIDEO_END_SIZE,
+      height: OVERLAY_VIDEO_END_SIZE,
+      borderRadius: OVERLAY_VIDEO_END_SIZE / 2,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: theme.color.danger,
+    },
     videoLine: {
       position: 'absolute',
-      left: 8,
-      right: 8,
-      bottom: 6,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      backgroundColor: theme.color.mediaHud,
+      paddingHorizontal: 8,
+      paddingVertical: 6,
       color: theme.color.mediaInk,
       fontSize: 12,
       fontWeight: '600',

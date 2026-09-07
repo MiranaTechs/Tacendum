@@ -10,8 +10,10 @@
  * every half-completed state.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -27,6 +29,7 @@ import { parseGeminiHook } from '../src/hooks.js';
 import {
   CLAUDE_NOTIFICATION_MATCHER,
   codexNotifyLine,
+  inspectHostConfig,
   mergeClaudeSettings,
   mergeCodexNotify,
   mergeCursorHooks,
@@ -64,6 +67,15 @@ afterEach(() => {
 
 function io(target: string) {
   return { entryPath: entry, targetPath: join(dir, target) };
+}
+
+function managedPlan(text: string): unknown {
+  const line = text.split('\n').find(candidate => /^notify = \[/.test(candidate));
+  if (line === undefined) throw new Error('missing notify line');
+  const arrayText = line.slice(line.indexOf('['), line.lastIndexOf(']') + 1);
+  const argv = JSON.parse(arrayText) as string[];
+  expect(argv.slice(0, 4)).toEqual([process.execPath, entry, 'codex-notify-dispatch', '--plan-v1']);
+  return JSON.parse(Buffer.from(argv[4] ?? '', 'base64url').toString('utf8'));
 }
 
 describe('claude-code settings merge', () => {
@@ -115,6 +127,7 @@ describe('claude-code settings merge', () => {
     const second = writeHostConfig('claude-code', 'ci', io('settings.json'));
     expect(second.changed).toBe(false);
     expect(readFileSync(target, 'utf8')).toBe(once);
+
   });
 
   it('refuses a file that does not parse, touching nothing', () => {
@@ -153,6 +166,111 @@ describe('claude-code settings merge', () => {
     // names the first account.
     expect(JSON.stringify(root)).not.toMatch(/--account ci"/);
   });
+
+  it('adds the opt-in native PermissionRequest bridge without changing permission policy', () => {
+    const target = join(dir, 'settings.json');
+    writeFileSync(
+      target,
+      JSON.stringify({
+        permissions: { allow: ['Bash(git status:*)', 'Read(**)'] },
+        hooks: {
+          PermissionRequest: [
+            { matcher: 'Bash', hooks: [{ type: 'command', command: 'audit approvals' }] },
+          ],
+        },
+      }),
+    );
+
+    const out = writeHostConfig('claude-code', 'ci', io('settings.json'), {
+      claudePermission: { minimumAppBuild: 42 },
+    });
+    expect(out.approvalsConfigured).toBe(true);
+    const root = JSON.parse(readFileSync(target, 'utf8'));
+    expect(root.permissions).toEqual({ allow: ['Bash(git status:*)', 'Read(**)'] });
+    expect(root.hooks.PermissionRequest).toHaveLength(2);
+    expect(root.hooks.PermissionRequest[0].hooks[0].command).toBe('audit approvals');
+    const hook = root.hooks.PermissionRequest[1].hooks[0];
+    expect(hook).toEqual({
+      type: 'command',
+      command: `'${process.execPath}' '${entry}' claude-permission --account ci --approvals 42`,
+      timeout: 600,
+    });
+
+    const once = readFileSync(target, 'utf8');
+    const again = writeHostConfig('claude-code', 'ci', io('settings.json'), {
+      claudePermission: { minimumAppBuild: 42 },
+    });
+    expect(again).toEqual({
+      path: target,
+      changed: false,
+      backup: null,
+      approvalsConfigured: true,
+    });
+    expect(readFileSync(target, 'utf8')).toBe(once);
+
+    const plainRerun = writeHostConfig('claude-code', 'ci', io('settings.json'));
+    expect(plainRerun.changed).toBe(false);
+    expect(plainRerun.approvalsConfigured).toBe(true);
+    expect(readFileSync(target, 'utf8')).toBe(once);
+  });
+
+  it('leaves PermissionRequest untouched unless native approvals are explicitly requested', () => {
+    const target = join(dir, 'settings.json');
+    const permission = {
+      matcher: 'Bash',
+      hooks: [{ type: 'command', command: 'someone-else decides' }],
+    };
+    writeFileSync(target, JSON.stringify({ hooks: { PermissionRequest: [permission] } }));
+    const out = writeHostConfig('claude-code', 'ci', io('settings.json'));
+    expect(out.approvalsConfigured).toBe(false);
+    const root = JSON.parse(readFileSync(target, 'utf8'));
+    expect(root.hooks.PermissionRequest).toEqual([permission]);
+  });
+
+  it('preflights invalid or non-Claude native approval options before writing', () => {
+    const target = join(dir, 'settings.json');
+    expect(() =>
+      preflightHostConfig('claude-code', 'ci', io('settings.json'), {
+        claudePermission: { minimumAppBuild: 0 },
+      }),
+    ).toThrow(/positive whole number/i);
+    expect(existsSync(target)).toBe(false);
+
+    expect(() =>
+      preflightHostConfig(
+        'codex',
+        'ci',
+        { entryPath: entry, targetPath: join(dir, 'config.toml') },
+        { claudePermission: { minimumAppBuild: 42 } },
+      ),
+    ).toThrow(/only.*claude-code/i);
+  });
+
+  it('refuses an unowned command that imitates the private approval bridge', () => {
+    const target = join(dir, 'settings.json');
+    const original = JSON.stringify({
+      hooks: {
+        PermissionRequest: [
+          {
+            hooks: [
+              {
+                type: 'command',
+                command:
+                  '/foreign/node /foreign/main.js claude-permission --account theirs --approvals 9',
+              },
+            ],
+          },
+        ],
+      },
+    });
+    writeFileSync(target, original);
+    expect(() =>
+      writeHostConfig('claude-code', 'ci', io('settings.json'), {
+        claudePermission: { minimumAppBuild: 42 },
+      }),
+    ).toThrow(/approval.*ownership/i);
+    expect(readFileSync(target, 'utf8')).toBe(original);
+  });
 });
 
 describe('codex config.toml merge', () => {
@@ -160,7 +278,7 @@ describe('codex config.toml merge', () => {
     const out = writeHostConfig('codex', 'ci', io('config.toml'));
     const text = readFileSync(out.path, 'utf8');
     expect(text).toContain('notify = [');
-    expect(text).toContain('"notify", "--hook", "codex", "--account", "ci"');
+    expect(managedPlan(text)).toEqual({ v: 1, account: 'ci', previous: [] });
   });
 
   it('inserts BEFORE the first table header — a notify after one belongs to that table', () => {
@@ -176,20 +294,140 @@ describe('codex config.toml merge', () => {
     expect(text).toContain('command = "x"');
   });
 
-  it('refuses to replace a stranger\'s notify, without echoing it', () => {
+  it('composes a stranger\'s notify without losing its argv boundaries', () => {
     const target = join(dir, 'config.toml');
     writeFileSync(target, 'notify = ["my-secret-notifier", "hunter2"]\n');
-    let thrown: CliError | undefined;
-    try {
-      writeHostConfig('codex', 'ci', io('config.toml'));
-    } catch (err) {
-      thrown = err as CliError;
-    }
-    expect(thrown).toBeInstanceOf(CliError);
-    // The refusal explains without quoting: the existing argv is the
-    // operator's and could carry a token (the no-leak shape, applied to config).
-    expect(thrown?.message).not.toContain('hunter2');
-    expect(readFileSync(target, 'utf8')).toContain('my-secret-notifier');
+    const out = writeHostConfig('codex', 'ci', io('config.toml'));
+    expect(out.changed).toBe(true);
+    expect(managedPlan(readFileSync(target, 'utf8'))).toEqual({
+      v: 1,
+      account: 'ci',
+      previous: [{ argv: ['my-secret-notifier', 'hunter2'] }],
+    });
+  });
+
+  it('refuses a foreign executable that imitates Tacendum\'s direct notifier shape', () => {
+    const target = join(dir, 'config.toml');
+    const original =
+      'notify = ["/foreign/bin", "/foreign/main.js", "notify", "--hook", "codex", "--account", "theirs"]\n';
+    writeFileSync(target, original);
+    expect(() => writeHostConfig('codex', 'ci', io('config.toml'))).toThrow(/ambiguous.*notifier/i);
+    expect(readFileSync(target, 'utf8')).toBe(original);
+  });
+
+  it('refuses a foreign executable that imitates the private managed subcommand', () => {
+    const target = join(dir, 'config.toml');
+    const encoded = Buffer.from(JSON.stringify({ v: 1, account: 'theirs', previous: [] }))
+      .toString('base64url');
+    const original =
+      `notify = ["/foreign/node", "/foreign/main.js", "codex-notify-dispatch", "--plan-v1", "${encoded}"]\n`;
+    writeFileSync(target, original);
+    expect(() => writeHostConfig('codex', 'ci', io('config.toml'))).toThrow(/managed.*ownership/i);
+    expect(readFileSync(target, 'utf8')).toBe(original);
+  });
+
+  it('refuses duplicate top-level notify keys even when both imitate Tacendum', () => {
+    const target = join(dir, 'config.toml');
+    const original = [
+      'notify = ["/foreign/a", "/foreign/a.js", "notify", "--hook", "codex", "--account", "a"]',
+      '"notify" = ["/foreign/b", "/foreign/b.js", "notify", "--hook", "codex", "--account", "b"]',
+      '',
+    ].join('\n');
+    writeFileSync(target, original);
+    expect(() => writeHostConfig('codex', 'ci', io('config.toml'))).toThrow(/more than once/i);
+    expect(readFileSync(target, 'utf8')).toBe(original);
+  });
+
+  it('parses multiline TOML string arrays and keeps paths and arguments with spaces exact', () => {
+    const target = join(dir, 'config.toml');
+    writeFileSync(
+      target,
+      [
+        'notify = [',
+        "  '/Applications/Other Notifier/bin/send',",
+        '  "argument with spaces", # operator comment',
+        '  "quote: \\"; unicode: \\u263A",',
+        ']',
+        '',
+        '[projects."/tmp/work tree"]',
+        'trusted = true',
+        '',
+      ].join('\n'),
+    );
+    writeHostConfig('codex', 'ci', io('config.toml'));
+    expect(managedPlan(readFileSync(target, 'utf8'))).toEqual({
+      v: 1,
+      account: 'ci',
+      previous: [
+        {
+          argv: [
+            '/Applications/Other Notifier/bin/send',
+            'argument with spaces',
+            'quote: "; unicode: ☺',
+          ],
+        },
+      ],
+    });
+  });
+
+  it('migrates only an exact legacy dispatcher and rebuilds its Tacendum child', () => {
+    const target = join(dir, 'config.toml');
+    const legacy = join(dir, 'hooks', 'tacendum-notify.py');
+    mkdirSync(join(dir, 'hooks'));
+    const source = [
+      '#!/usr/bin/env python3',
+      "COMMANDS = [(['/Applications/Computer Use.app/notify', 'turn-ended'], {'KEEP': 'yes'}), (['/old node', '/old checkout/main.js', 'notify', '--hook', 'codex', '--account', 'old'], {'NODE_USE_SYSTEM_CA': '0', 'TACENDUM_ENV': 'aws', 'TACENDUM_API': 'https://example.invalid', 'TACENDUM_WS': 'wss://example.invalid'})]",
+      '',
+    ].join('\n');
+    writeFileSync(legacy, source);
+    const digest = createHash('sha256').update(source).digest('hex');
+    writeFileSync(target, `notify = ["/usr/bin/python3", ${JSON.stringify(legacy)}]\n`);
+
+    writeHostConfig('codex', 'ci', {
+      ...io('config.toml'),
+      legacyCodexDispatcherArgv: ['/usr/bin/python3', legacy],
+      legacyCodexDispatcherSha256: digest,
+    });
+    expect(managedPlan(readFileSync(target, 'utf8'))).toEqual({
+      v: 1,
+      account: 'ci',
+      previous: [
+        {
+          argv: ['/Applications/Computer Use.app/notify', 'turn-ended'],
+          env: { KEEP: 'yes' },
+        },
+      ],
+      tacendumEnv: {
+        NODE_USE_SYSTEM_CA: '0',
+        TACENDUM_ENV: 'aws',
+        TACENDUM_API: 'https://example.invalid',
+        TACENDUM_WS: 'wss://example.invalid',
+      },
+    });
+
+    // Re-running the managed form keeps one previous child and no old
+    // Tacendum argv from the Python dispatcher.
+    const once = readFileSync(target, 'utf8');
+    expect(writeHostConfig('codex', 'ci', io('config.toml')).changed).toBe(false);
+    expect(readFileSync(target, 'utf8')).toBe(once);
+  });
+
+  it('refuses an altered file at the legacy dispatcher path instead of risking two sends', () => {
+    const target = join(dir, 'config.toml');
+    const legacy = join(dir, 'hooks', 'tacendum-notify.py');
+    mkdirSync(join(dir, 'hooks'));
+    writeFileSync(legacy, 'COMMANDS = []\n# locally changed\n');
+    const original = `notify = ["/usr/bin/python3", ${JSON.stringify(legacy)}]\n`;
+    writeFileSync(target, original);
+
+    expect(() =>
+      writeHostConfig('codex', 'ci', {
+        ...io('config.toml'),
+        legacyCodexDispatcherArgv: ['/usr/bin/python3', legacy],
+        legacyCodexDispatcherSha256: '0'.repeat(64),
+      }),
+    ).toThrow(/legacy Codex dispatcher.*changed/i);
+    expect(readFileSync(target, 'utf8')).toBe(original);
   });
 
   it('replaces its own line idempotently', () => {
@@ -203,7 +441,7 @@ describe('codex config.toml merge', () => {
     writeHostConfig('codex', 'other', io('config.toml'));
     const text = readFileSync(target, 'utf8');
     expect(text.match(/^notify = /gm)).toHaveLength(1);
-    expect(text).toContain('"--account", "other"');
+    expect(managedPlan(text)).toEqual({ v: 1, account: 'other', previous: [] });
   });
 });
 
@@ -324,9 +562,9 @@ describe('preflight', () => {
   it('is the merge, not an existence check: a malformed config refuses at preflight', () => {
     // The docblock's promise is that EVERY refusal the final write can make
     // is made here, before setup registers anything. An existence-only
-    // preflight lets an unparseable settings.json and a foreign codex notify
+    // preflight lets an unparseable settings.json or unreadable Codex argv
     // through, to fail AFTER pairing — the half-completed state the
-    // preflight exists to refuse.
+    // preflight exists to refuse. A valid foreign argv composes safely.
     const settings = join(dir, 'settings.json');
     writeFileSync(settings, '{ definitely not json');
     expect(() =>
@@ -336,7 +574,7 @@ describe('preflight', () => {
     expect(readFileSync(settings, 'utf8')).toBe('{ definitely not json');
 
     const toml = join(dir, 'config.toml');
-    writeFileSync(toml, 'notify = ["acme", "notify", "--hook", "slack", "--account", "x"]\n');
+    writeFileSync(toml, 'notify = ["acme", 42]\n');
     expect(() =>
       preflightHostConfig('codex', 'ci', { entryPath: entry, targetPath: toml }),
     ).toThrow(CliError);
@@ -406,16 +644,21 @@ describe('ownership is an exact entry, not a substring (F6)', () => {
     expect(JSON.stringify(root)).not.toContain('--account old');
   });
 
-  it('refuses — never silently replaces — a foreign codex notify whose argv contains "notify"', () => {
-    // The old TOML test matched `"notify", "--hook"` anywhere, so this line
-    // was classified OURS and silently rewritten — disconnecting a notifier
-    // the operator trusts, which is exactly what the refusal branch exists
-    // to prevent.
+  it('preserves a foreign Codex argv whose own subcommand is named "notify"', () => {
+    // Composition is argv-structured: the foreign program and every fixed
+    // argument survive exactly, even when one happens to share our command
+    // word. The dispatcher later appends Codex's payload as one final argv.
     const target = join(dir, 'config.toml');
     const foreign = 'notify = ["acme", "notify", "--hook", "slack", "--account", "theirs"]\n';
     writeFileSync(target, foreign);
-    expect(() => writeHostConfig('codex', 'ci', io('config.toml'))).toThrow(CliError);
-    expect(readFileSync(target, 'utf8')).toBe(foreign);
+    writeHostConfig('codex', 'ci', io('config.toml'));
+    expect(managedPlan(readFileSync(target, 'utf8'))).toEqual({
+      v: 1,
+      account: 'ci',
+      previous: [
+        { argv: ['acme', 'notify', '--hook', 'slack', '--account', 'theirs'] },
+      ],
+    });
   });
 });
 
@@ -441,6 +684,55 @@ describe('the config write is atomic and keeps the host\'s permissions (F20)', (
 
     const fresh = writeHostConfig('claude-code', 'ci', io('settings.json'));
     expect(statSync(fresh.path).mode & 0o777).toBe(0o644);
+  });
+});
+
+describe('read-only maintained-handler inspection', () => {
+  it('recognises only the complete current handler for each surface', () => {
+    for (const [surface, target] of [
+      ['claude-code', 'claude.json'],
+      ['codex', 'codex.toml'],
+      ['cursor', 'cursor.json'],
+      ['gemini', 'gemini.json'],
+    ] as const) {
+      const seam = io(target);
+      writeHostConfig(surface, 'ci', seam);
+      expect(inspectHostConfig(surface, 'ci', seam)).toEqual({
+        state: 'configured',
+        notificationConfigured: true,
+        approvalsConfigured: false,
+      });
+    }
+  });
+
+  it('distinguishes absent and unreadable config without writing either', () => {
+    const absent = io('absent.json');
+    expect(inspectHostConfig('claude-code', 'ci', absent)).toEqual({
+      state: 'absent',
+      notificationConfigured: false,
+      approvalsConfigured: false,
+    });
+    const target = join(dir, 'broken.json');
+    writeFileSync(target, '{broken');
+    expect(inspectHostConfig('claude-code', 'ci', io('broken.json'))).toEqual({
+      state: 'unreadable',
+      notificationConfigured: false,
+      approvalsConfigured: false,
+    });
+    expect(readFileSync(target, 'utf8')).toBe('{broken');
+  });
+
+  it('reports a retained native approval bridge only while its exact synchronous shape remains', () => {
+    const seam = io('claude-approvals.json');
+    writeHostConfig('claude-code', 'ci', seam, {
+      claudePermission: { minimumAppBuild: 42 },
+    });
+    expect(inspectHostConfig('claude-code', 'ci', seam).approvalsConfigured).toBe(true);
+
+    const root = JSON.parse(readFileSync(seam.targetPath, 'utf8'));
+    root.hooks.PermissionRequest.at(-1).hooks[0].timeout = 60;
+    writeFileSync(seam.targetPath, JSON.stringify(root));
+    expect(inspectHostConfig('claude-code', 'ci', seam).approvalsConfigured).toBe(false);
   });
 });
 

@@ -40,9 +40,13 @@ interface FakeSocketApi {
   deliver(frame: unknown): void;
 }
 
-const wsCtl = vi.hoisted(
-  (): Scripted => ({ sent: [], acks: [], onListenOpen: null, dials: [], refuseSendDials: false }),
-);
+const wsCtl = vi.hoisted((): Scripted => ({
+  sent: [],
+  acks: [],
+  onListenOpen: null,
+  dials: [],
+  refuseSendDials: false,
+}));
 
 vi.mock('ws', () => {
   class FakeWebSocket implements FakeSocketApi {
@@ -73,7 +77,7 @@ vi.mock('ws', () => {
       return this;
     }
     off(event: string, cb: (...a: unknown[]) => void) {
-      this.handlers[event] = (this.handlers[event] ?? []).filter(h => h !== cb);
+      this.handlers[event] = (this.handlers[event] ?? []).filter((h) => h !== cb);
       return this;
     }
     removeAllListeners() {
@@ -96,7 +100,7 @@ vi.mock('ws', () => {
 /* ── a controllable saveProfile (F9a: the disk fails AFTER the bind) ────── */
 
 const profileCtl = vi.hoisted(() => ({ failOwnerSave: false }));
-vi.mock('../src/profile.js', async importOriginal => {
+vi.mock('../src/profile.js', async (importOriginal) => {
   const mod = await importOriginal<typeof import('../src/profile.js')>();
   return {
     ...mod,
@@ -158,9 +162,12 @@ const CHALLENGE = Buffer.from('a fixed 32-byte-ish challenge!!!').toString('base
 
 const server = createServer((req, res) => {
   const chunks: Buffer[] = [];
-  req.on('data', c => chunks.push(c as Buffer));
+  req.on('data', (c) => chunks.push(c as Buffer));
   req.on('end', () => {
-    const body = chunks.length > 0 ? (JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>) : {};
+    const body =
+      chunks.length > 0
+        ? (JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>)
+        : {};
     const reply = (status: number, payload: unknown): void => {
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(JSON.stringify(payload));
@@ -216,7 +223,7 @@ const server = createServer((req, res) => {
     return reply(500, { error: { code: 'unexpected', detail: url } });
   });
 });
-await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
 
 const home = mkdtempSync(join(tmpdir(), 'tacendum-setup-'));
 process.env.TACENDUM_HOME = home;
@@ -230,6 +237,9 @@ const { decryptEnvelope, encryptText, establishSession, generateAndStoreKeys, ha
   await import('../src/messaging.js');
 const { loadProfile, tryLoadProfile } = await import('../src/profile.js');
 const { Reporter } = await import('../src/output.js');
+const { decodeCodexNotifyPlan } = await import('../src/codex-notify-dispatch.js');
+const { unitPathFor } = await import('../src/service.js');
+const { saveAttendConfig } = await import('../src/attend.js');
 
 afterAll(() => {
   server.close();
@@ -241,7 +251,9 @@ const report = () => new Reporter({ json: false, plain: true });
 
 /** One "phone": its own real libsignal stores plus the bundle the stub
  * serves for it, so the CLI's X3DH bootstrap runs against genuine keys. */
-async function makePhone(name: string): Promise<{ userId: string; stores: InstanceType<typeof FileStores> }> {
+async function makePhone(
+  name: string,
+): Promise<{ userId: string; stores: InstanceType<typeof FileStores> }> {
   const stores = new FileStores(name);
   const upload = await generateAndStoreKeys(stores);
   const userId = ulid();
@@ -304,6 +316,13 @@ const io = (target: string, extra: Record<string, unknown> = {}) => ({
   // backstop (it caught exactly this omission once), but determinism belongs
   // to the test: assertions about the voice read THIS path.
   voice: { targetPath: join(confDir, `voice-${target}.md`) },
+  service: {
+    platform: 'darwin' as const,
+    unitDir: join(confDir, 'units'),
+    exec: () => {
+      throw new Error('no test service is running');
+    },
+  },
   pollMs: 25,
   ...extra,
 });
@@ -363,9 +382,27 @@ describe('argument refusals (all before any network call)', () => {
       exitCode: EXIT.USAGE,
     });
     await expect(cmdSetup(['codex'], report())).rejects.toMatchObject({ exitCode: EXIT.USAGE });
+    await expect(cmdSetup(['codex', '--name', 'x'.repeat(41)], report())).rejects.toMatchObject({
+      exitCode: EXIT.USAGE,
+    });
+  });
+
+  it('native approval setup is explicit, Claude-only, and requires a positive app build', async () => {
+    const argv = [
+      '--name',
+      'CI',
+      '--owner',
+      '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      '--account',
+      'approval-args',
+    ];
     await expect(
-      cmdSetup(['codex', '--name', 'x'.repeat(41)], report()),
+      cmdSetup(['codex', ...argv, '--approvals', '11'], report(), io('config.toml')),
     ).rejects.toMatchObject({ exitCode: EXIT.USAGE });
+    await expect(
+      cmdSetup(['claude-code', ...argv, '--approvals', '0'], report(), io('settings.json')),
+    ).rejects.toMatchObject({ exitCode: EXIT.USAGE });
+    expect(stub.authCalls).toHaveLength(0);
   });
 
   it('never echoes a rejected --owner value (it may be a mis-expanded secret)', async () => {
@@ -413,7 +450,10 @@ describe('argument refusals (all before any network call)', () => {
         ['codex', '--name', 'CI', '--owner', phone.userId, '--account', 'preflight-bot'],
         report(),
         {
-          hostConfig: { entryPath: join(confDir, 'never-built.js'), targetPath: join(confDir, 'config.toml') },
+          hostConfig: {
+            entryPath: join(confDir, 'never-built.js'),
+            targetPath: join(confDir, 'config.toml'),
+          },
         },
       );
     } catch (err) {
@@ -431,13 +471,13 @@ describe('argument refusals (all before any network call)', () => {
 
   it('a host config the merge would REFUSE also stops setup before any network — the preflight is the merge', async () => {
     // The preflight's promise is every refusal the final write can make, not
-    // just artifact existence: a foreign codex `notify` (and equally an
+    // just artifact existence: a malformed codex `notify` (and equally an
     // unparseable settings.json) used to surface only AFTER registration,
     // binding and both messages — the exact half-completed state the
     // docblock promises to prevent.
     const phone = await makePhone('phone-preflight-merge');
-    const foreign = 'notify = ["acme", "notify", "--hook", "slack", "--account", "x"]\n';
-    writeFileSync(join(confDir, 'config.toml'), foreign);
+    const malformed = 'notify = ["acme", 42]\n';
+    writeFileSync(join(confDir, 'config.toml'), malformed);
     await expect(
       cmdSetup(
         ['codex', '--name', 'CI', '--owner', phone.userId, '--account', 'preflight-merge-bot'],
@@ -449,7 +489,7 @@ describe('argument refusals (all before any network call)', () => {
     expect(stub.binds).toHaveLength(0);
     expect(wsCtl.sent).toHaveLength(0);
     expect(tryLoadProfile('preflight-merge-bot')).toBeNull();
-    expect(readFileSync(join(confDir, 'config.toml'), 'utf8')).toBe(foreign);
+    expect(readFileSync(join(confDir, 'config.toml'), 'utf8')).toBe(malformed);
   });
 });
 
@@ -496,7 +536,7 @@ describe('unrecoverable-state findings (F8, F9)', () => {
     // operator was told exactly that, plus the remedy.
     expect(stub.binds).toHaveLength(1);
     expect(loadProfile('f9a-bot').ownerUserId).toBeUndefined();
-    expect(notes.some(n => n.includes('ON THE SERVER') && n.includes('re-run'))).toBe(true);
+    expect(notes.some((n) => n.includes('ON THE SERVER') && n.includes('re-run'))).toBe(true);
 
     // The remedy is true: the server accepts a repeat bind to the same owner
     // (write-once but idempotent), so the re-run completes the pairing.
@@ -613,11 +653,121 @@ describe('a profile that will not READ is never treated as one that is GONE', ()
 });
 
 describe('the agent flow (--owner): the one an assistant can run unattended', () => {
+  it('publishes Claude SDK tasks only from current package and API-key observations', async () => {
+    const phone = await makePhone('phone-sdk-capability');
+    const account = 'sdk-capability-bot';
+    mkdirSync(join(home, account), { recursive: true });
+    saveAttendConfig(account, {
+      host: 'claude',
+      bin: process.execPath,
+      workdir: tmpdir(),
+      caps: ['--permission-mode', 'default'],
+      claudeDriver: 'sdk',
+      ownSession: '7d9f7c3a-1b2e-4c5d-8e9f-0a1b2c3d4e5f',
+      turnsPerHour: 10,
+    });
+
+    await cmdSetup(
+      ['claude-code', '--name', 'Claude SDK', '--owner', phone.userId, '--account', account],
+      report(),
+      io('settings.json', {
+        claudeSdkInstalled: () => true,
+        claudeSdkApiKeyPresent: () => true,
+      }),
+    );
+
+    const profile = loadProfile(account);
+    const card = wsCtl.sent[0] as {
+      msgType: 'prekey' | 'ciphertext';
+      payload: string;
+    };
+    const body = JSON.parse(
+      await decryptEnvelope(phone.stores, phone.userId, profile.userId, card.msgType, card.payload),
+    ) as Record<string, unknown>;
+    expect(body.work).toMatchObject({
+      provider: 'claude',
+      capabilities: { notifications: true, approvals: false, tasks: true },
+    });
+  });
+
+  it('opts into the native Claude bridge and runs an explicit durable notification test', async () => {
+    const phone = await makePhone('phone-native-approval');
+    const records: Record<string, unknown>[] = [];
+    const notes: string[] = [];
+    const r = report();
+    r.emit = (record: Record<string, unknown>): void => {
+      records.push(record);
+    };
+    r.note = (note: string): void => {
+      notes.push(note);
+    };
+
+    await cmdSetup(
+      [
+        'claude-code',
+        '--name',
+        'Claude',
+        '--owner',
+        phone.userId,
+        '--account',
+        'native-claude',
+        '--approvals',
+        '11',
+        '--test-notification',
+      ],
+      r,
+      io('settings.json'),
+    );
+
+    const settings = JSON.parse(readFileSync(join(confDir, 'settings.json'), 'utf8')) as {
+      hooks: { PermissionRequest: Array<{ hooks: Array<{ command: string; timeout: number }> }> };
+    };
+    expect(settings.hooks.PermissionRequest[0]?.hooks[0]).toMatchObject({ timeout: 600 });
+    expect(settings.hooks.PermissionRequest[0]?.hooks[0]?.command).toContain('claude-permission');
+    expect(records.at(-1)).toMatchObject({
+      approvalsConfigured: true,
+      capabilities: { notifications: true, approvals: false, tasks: false },
+      notificationTest: { action: 'notified', state: 'sent' },
+    });
+    expect(notes.some((note) => note.includes('tacendum service install native-claude'))).toBe(
+      true,
+    );
+
+    const me = loadProfile('native-claude');
+    const testFrame = wsCtl.sent.at(-1) as {
+      msgType: 'prekey' | 'ciphertext';
+      payload: string;
+      notify?: boolean;
+    };
+    expect(testFrame.notify).toBeUndefined();
+    const testText = await decryptEnvelope(
+      phone.stores,
+      phone.userId,
+      me.userId,
+      testFrame.msgType,
+      testFrame.payload,
+    );
+    expect(testText).toContain('Tacendum notification delivery test');
+  });
+
   it('registers an integration, binds it, and the phone can decrypt card then hello', async () => {
     const phone = await makePhone('phone-agent');
+    const notes: string[] = [];
+    const r = report();
+    r.note = (note: string): void => {
+      notes.push(note);
+    };
     await cmdSetup(
-      ['codex', '--name', 'CI Bot', '--owner', phone.userId.toLowerCase(), '--account', 'agent-bot'],
-      report(),
+      [
+        'codex',
+        '--name',
+        'CI Bot',
+        '--owner',
+        phone.userId.toLowerCase(),
+        '--account',
+        'agent-bot',
+      ],
+      r,
       io('config.toml'),
     );
 
@@ -647,16 +797,75 @@ describe('the agent flow (--owner): the one an assistant can run unattended', ()
     expect(card?.notify).toBe(false);
     expect(hello?.notify).toBeUndefined();
 
-    const cardText = await decryptEnvelope(phone.stores, phone.userId, profile.userId, card!.msgType, card!.payload);
+    const cardText = await decryptEnvelope(
+      phone.stores,
+      phone.userId,
+      profile.userId,
+      card!.msgType,
+      card!.payload,
+    );
     const parsed = JSON.parse(cardText) as Record<string, unknown>;
     expect(parsed.tcm).toBe('profile');
     expect(parsed.n).toBe('CI Bot');
-    const helloText = await decryptEnvelope(phone.stores, phone.userId, profile.userId, hello!.msgType, hello!.payload);
+    expect(parsed.work).toMatchObject({
+      provider: 'codex',
+      capabilities: { notifications: true, approvals: false, tasks: false },
+    });
+    expect((parsed.work as Record<string, unknown>).event).toBeUndefined();
+    const helloText = await decryptEnvelope(
+      phone.stores,
+      phone.userId,
+      profile.userId,
+      hello!.msgType,
+      hello!.payload,
+    );
     expect(helloText).toContain('CI Bot');
     expect(helloText).toContain('nobody else');
 
-    // And the host side is registered.
-    expect(readFileSync(join(confDir, 'config.toml'), 'utf8')).toContain('"--account", "agent-bot"');
+    // And the host side is registered inside the managed dispatcher's
+    // bounded plan (the private command no longer exposes a second account
+    // flag beside Codex's opaque final payload).
+    const config = readFileSync(join(confDir, 'config.toml'), 'utf8');
+    const encoded = /"--plan-v1", "([A-Za-z0-9_-]+)"/.exec(config)?.[1];
+    expect(encoded).toBeDefined();
+    expect(decodeCodexNotifyPlan(encoded as string).account).toBe('agent-bot');
+    expect(
+      notes.some(
+        (note) =>
+          note.includes('notification preferences') &&
+          note.includes('tacendum service install agent-bot'),
+      ),
+    ).toBe(true);
+  });
+
+  it('distinguishes an installed but stopped preference receiver', async () => {
+    const phone = await makePhone('phone-stopped-listener');
+    const unitDir = join(confDir, 'units');
+    mkdirSync(unitDir, { recursive: true });
+    writeFileSync(
+      unitPathFor('stopped-bot', { platform: 'darwin', unitDir }, 'listen'),
+      'installed fixture',
+    );
+    const notes: string[] = [];
+    const r = report();
+    r.note = (note: string): void => {
+      notes.push(note);
+    };
+
+    await cmdSetup(
+      ['codex', '--name', 'CI Bot', '--owner', phone.userId, '--account', 'stopped-bot'],
+      r,
+      io('config.toml'),
+    );
+
+    expect(
+      notes.some(
+        (note) =>
+          note.includes('notification preferences') &&
+          note.includes('tacendum service status stopped-bot'),
+      ),
+    ).toBe(true);
+    expect(notes.some((note) => note.includes('tacendum service install stopped-bot'))).toBe(false);
   });
 
   it('re-runs idempotently: no second bind, a fresh card, the config already current', async () => {
@@ -709,16 +918,14 @@ describe('the agent flow (--owner): the one an assistant can run unattended', ()
       original(text);
     };
     await expect(
-      cmdSetup(
-        ['codex', '--name', 'CI', '--owner', phone.userId, '--account', 'halffail-bot'],
-        r,
-        { hostConfig: { entryPath: entry, targetPath: join(entry, 'impossible', 'config.toml') } },
-      ),
+      cmdSetup(['codex', '--name', 'CI', '--owner', phone.userId, '--account', 'halffail-bot'], r, {
+        hostConfig: { entryPath: entry, targetPath: join(entry, 'impossible', 'config.toml') },
+      }),
     ).rejects.toThrow();
     // The pairing exists and survives…
     expect(loadProfile('halffail-bot').ownerUserId).toBe(phone.userId);
     // …and the operator was told exactly which state they are in.
-    expect(notes.some(n => n.includes('PAIRED') && n.includes('NOT written'))).toBe(true);
+    expect(notes.some((n) => n.includes('PAIRED') && n.includes('NOT written'))).toBe(true);
   });
 
   it('a plain fs error out of the config write maps to exit 1 — never 2, which every host reads as "block"', async () => {
@@ -806,19 +1013,30 @@ describe('the QR flow: the phone speaks first, so the CLI listens', () => {
     // The "phone": when the CLI's listen socket opens, scan-and-send — an
     // X3DH bootstrap against the keys the CLI just uploaded, exactly what
     // the app does with a scanned code.
-    wsCtl.onListenOpen = sock => {
+    wsCtl.onListenOpen = (sock) => {
       void (async () => {
         const me = loadProfile('claude-code');
         const upload = stub.uploads.get(me.userId);
         if (!upload) throw new Error('no upload captured for the integration');
-        await establishSession(phone.stores, phone.userId, bundleFromUpload(me.userId, upload) as never);
+        await establishSession(
+          phone.stores,
+          phone.userId,
+          bundleFromUpload(me.userId, upload) as never,
+        );
         const { msgType, payload } = await encryptText(
           phone.stores,
           phone.userId,
           me.userId,
           'hi from my phone',
         );
-        sock.deliver({ type: 'msg', from: phone.userId, msgId: ulid(), msgType, payload, ts: Date.now() });
+        sock.deliver({
+          type: 'msg',
+          from: phone.userId,
+          msgId: ulid(),
+          msgType,
+          payload,
+          ts: Date.now(),
+        });
       })();
     };
 
@@ -841,7 +1059,13 @@ describe('the QR flow: the phone speaks first, so the CLI listens', () => {
     expect(wsCtl.sent).toHaveLength(2);
     const me = loadProfile('claude-code');
     const card = wsCtl.sent[0] as { msgType: 'prekey' | 'ciphertext'; payload: string };
-    const text = await decryptEnvelope(phone.stores, phone.userId, me.userId, card.msgType, card.payload);
+    const text = await decryptEnvelope(
+      phone.stores,
+      phone.userId,
+      me.userId,
+      card.msgType,
+      card.payload,
+    );
     expect((JSON.parse(text) as { n: string }).n).toBe('My Claude');
 
     // And the Claude hooks landed.
@@ -857,19 +1081,30 @@ describe('the QR flow: the phone speaks first, so the CLI listens', () => {
     // spooled, ACKED — only the rendering is withheld.
     const SECRET = 'TOTP-SEED-JBSWY3DPEHPK3PXP';
     const phone = await makePhone('phone-secret');
-    wsCtl.onListenOpen = sock => {
+    wsCtl.onListenOpen = (sock) => {
       void (async () => {
         const me = loadProfile('muted-bot');
         const upload = stub.uploads.get(me.userId);
         if (!upload) throw new Error('no upload captured for the integration');
-        await establishSession(phone.stores, phone.userId, bundleFromUpload(me.userId, upload) as never);
+        await establishSession(
+          phone.stores,
+          phone.userId,
+          bundleFromUpload(me.userId, upload) as never,
+        );
         const { msgType, payload } = await encryptText(
           phone.stores,
           phone.userId,
           me.userId,
           `here is my vault seed: ${SECRET}`,
         );
-        sock.deliver({ type: 'msg', from: phone.userId, msgId: ulid(), msgType, payload, ts: Date.now() });
+        sock.deliver({
+          type: 'msg',
+          from: phone.userId,
+          msgId: ulid(),
+          msgType,
+          payload,
+          ts: Date.now(),
+        });
       })();
     };
 

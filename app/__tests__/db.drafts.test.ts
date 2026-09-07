@@ -89,3 +89,47 @@ describe('listDrafts', () => {
     await expect(db.listDrafts()).resolves.toEqual({});
   });
 });
+
+describe('composer draft metadata', () => {
+  it('reads the text and locally bound mention intent in one statement', async () => {
+    await db.initDb();
+    const mentionState = JSON.stringify({ v: 1, peerId: '01ROOM' });
+    answer(/SELECT text, mentionState FROM drafts/, [
+      { text: 'hello @Ana', mentionState },
+    ]);
+
+    await expect(db.getComposerDraft('01ROOM')).resolves.toEqual({
+      text: 'hello @Ana',
+      mentionState,
+    });
+  });
+
+  it('keeps old text-only rows compatible', async () => {
+    await db.initDb();
+    answer(/SELECT text, mentionState FROM drafts/, [
+      { text: 'old words', mentionState: null },
+    ]);
+    await expect(db.getComposerDraft('01ROOM')).resolves.toEqual({
+      text: 'old words',
+      mentionState: null,
+    });
+  });
+
+  it('writes text and mention intent atomically, then clears both with the row', async () => {
+    await db.initDb();
+    const mentionState = '{"v":1}';
+    const later = since();
+    await db.setDraft('01ROOM', 'hello @Ana', mentionState);
+    await db.setDraft('01ROOM', '');
+
+    const written = later();
+    expect(written[0]).toEqual([
+      `INSERT OR REPLACE INTO drafts (peerId, text, mentionState, updatedAt) VALUES (?, ?, ?, ?)`,
+      ['01ROOM', 'hello @Ana', mentionState, expect.any(Number)],
+    ]);
+    expect(written[1]).toEqual([
+      `DELETE FROM drafts WHERE peerId = ?`,
+      ['01ROOM'],
+    ]);
+  });
+});

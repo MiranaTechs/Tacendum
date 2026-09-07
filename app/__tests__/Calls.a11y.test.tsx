@@ -32,7 +32,9 @@ import { UNNAMED } from '../src/ui/CallTile';
 import { shortId } from '../src/person';
 import { themeTokens } from '../src/theme';
 
-const listAllCalls = db.listAllCalls as jest.MockedFunction<typeof db.listAllCalls>;
+const listAllCalls = db.listAllCalls as jest.MockedFunction<
+  typeof db.listAllCalls
+>;
 const listChats = db.listChats as jest.MockedFunction<typeof db.listChats>;
 
 const T0 = new Date('2026-07-25T12:00:00').getTime();
@@ -95,7 +97,8 @@ function accessibleAncestors(
     };
     if (
       p.accessible === true ||
-      (p.accessibilityRole === 'button' && typeof p.accessibilityLabel === 'string')
+      (p.accessibilityRole === 'button' &&
+        typeof p.accessibilityLabel === 'string')
     ) {
       out.push(cursor);
     }
@@ -117,7 +120,9 @@ describe('the Calls tab can be operated with VoiceOver', () => {
     // FALSIFYING CASE, run at authoring time: with the redial back inside the
     // row Pressable this finds the row and the assertion goes red, which is
     // the state that shipped.
-    expect(accessibleAncestors(redial).map(n => n.props.accessibilityLabel)).toEqual([]);
+    expect(
+      accessibleAncestors(redial).map(n => n.props.accessibilityLabel),
+    ).toEqual([]);
   });
 
   it('offers Call back as a rotor action on the row itself', async () => {
@@ -131,7 +136,9 @@ describe('the Calls tab can be operated with VoiceOver', () => {
       { name: 'call-back', label: 'Call back' },
     ]);
     await ReactTestRenderer.act(async () => {
-      row.props.onAccessibilityAction({ nativeEvent: { actionName: 'call-back' } });
+      row.props.onAccessibilityAction({
+        nativeEvent: { actionName: 'call-back' },
+      });
     });
     expect(onCall).toHaveBeenCalledWith('peer-2', 'video');
   });
@@ -146,7 +153,9 @@ describe('the Calls tab can be operated with VoiceOver', () => {
         String(n.props.accessibilityLabel ?? '').startsWith('Dawit,'),
     )[0]!;
     await ReactTestRenderer.act(async () => {
-      row.props.onAccessibilityAction({ nativeEvent: { actionName: 'magicTap' } });
+      row.props.onAccessibilityAction({
+        nativeEvent: { actionName: 'magicTap' },
+      });
     });
     expect(onCall).not.toHaveBeenCalled();
   });
@@ -155,7 +164,9 @@ describe('the Calls tab can be operated with VoiceOver', () => {
 const T = 1_800_000_000_000;
 
 function callState(
-  over: Partial<NonNullable<CallState['call']>> & { name?: CallState['name'] } = {},
+  over: Partial<NonNullable<CallState['call']>> & {
+    name?: CallState['name'];
+  } = {},
 ): CallState {
   const { name = 'connected', ...call } = over;
   return {
@@ -177,7 +188,9 @@ function callState(
   } as CallState;
 }
 
-function renderCall(over: Partial<React.ComponentProps<typeof CallScreen>> = {}) {
+function renderCall(
+  over: Partial<React.ComponentProps<typeof CallScreen>> = {},
+) {
   const props = {
     state: callState(),
     peerName: 'Dana',
@@ -218,23 +231,30 @@ function texts(node: ReactTestRenderer.ReactTestInstance): string[] {
 }
 
 describe('the 1:1 call screen says what kind of call it is, and never says an id', () => {
-  it('names video in the screen label when the camera is on', () => {
+  it('puts video kind and state on the accessible live status leaf', () => {
     const tree = renderCall({
-      state: callState({ video: true, peerVideo: true }),
+      state: callState({ name: 'reconnecting', video: true, peerVideo: true }),
       videoEnabled: true,
     });
-    const root = tree.root.findAll(
-      n => typeof n.type !== 'string' && n.props.accessibilityViewIsModal === true,
+    const status = tree.root.findAll(
+      n =>
+        typeof n.type !== 'string' &&
+        n.props.accessibilityLabel === 'Video call, Reconnecting',
     )[0]!;
-    expect(root.props.accessibilityLabel).toBe('Video call');
+    expect(status).toBeDefined();
+    expect(status.props.accessibilityLiveRegion).toBe('polite');
+    expect(accessibleAncestors(status)).toEqual([]);
   });
 
-  it('says plain Call for an audio one', () => {
+  it('puts audio kind and state on the same reachable status leaf', () => {
     const tree = renderCall();
-    const root = tree.root.findAll(
-      n => typeof n.type !== 'string' && n.props.accessibilityViewIsModal === true,
+    const status = tree.root.findAll(
+      n =>
+        typeof n.type !== 'string' &&
+        n.props.accessibilityLabel === 'Call, Connected',
     )[0]!;
-    expect(root.props.accessibilityLabel).toBe('Call');
+    expect(status).toBeDefined();
+    expect(accessibleAncestors(status)).toEqual([]);
   });
 
   it('speaks the placeholder for an unnamed peer in the header AND both video labels', () => {

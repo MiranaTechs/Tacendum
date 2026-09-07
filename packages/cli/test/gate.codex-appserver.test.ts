@@ -55,7 +55,16 @@ function resolveCodex(): string {
   } catch {
     /* fall through to the nvm sweep */
   }
-  const nvm = join(REAL_HOME, 'Library', 'Application Support', 'Herd', 'config', 'nvm', 'versions', 'node');
+  const nvm = join(
+    REAL_HOME,
+    'Library',
+    'Application Support',
+    'Herd',
+    'config',
+    'nvm',
+    'versions',
+    'node',
+  );
   try {
     for (const v of readdirSync(nvm)) {
       const p = join(nvm, v, 'bin', 'codex');
@@ -116,6 +125,10 @@ const cfg: AttendConfig = {
   // parks until answered.
   caps: ['-s', 'workspace-write'],
   codexDriver: 'app-server',
+  // Keep the live gate on the model this compatibility validation was
+  // approved and measured against. An isolated CODEX_HOME has no operator
+  // config from which the driver could otherwise capture a model pin.
+  codexModel: 'gpt-5.6-sol',
   ownSession: '7d9f7c3a-1b2e-4c5d-8e9f-0a1b2c3d4e5f',
   turnsPerHour: 10,
 };
@@ -153,68 +166,60 @@ describe('gate: codex app-server against the installed binary', () => {
     expect(help).toContain('--strict-config');
   });
 
-  it(
-    'a real approval APPROVED from the ask seam runs the command — the artifact exists',
-    async () => {
-      signedInHome();
-      const artifact = join(WORKDIR, 'approved-p22.txt');
-      rmSync(artifact, { force: true });
-      const payloads: string[] = [];
-      const res = await driverFor('codex').runTurn(
-        {
-          cfg,
-          route: { kind: 'own' },
-          prompt: 'Run the command: touch approved-p22.txt',
-          account: 'gate',
-          ask: async a => {
-            payloads.push(a.payload);
-            return 'approve';
-          },
+  it('a real approval APPROVED from the ask seam runs the command — the artifact exists', async () => {
+    signedInHome();
+    const artifact = join(WORKDIR, 'approved-p22.txt');
+    rmSync(artifact, { force: true });
+    const payloads: string[] = [];
+    const res = await driverFor('codex').runTurn(
+      {
+        cfg,
+        route: { kind: 'own' },
+        prompt: 'Run the command: touch approved-p22.txt',
+        account: 'gate',
+        ask: async (a) => {
+          payloads.push(a.payload);
+          return 'approve';
         },
-        io,
-      );
-      expect(payloads.length, 'the turn must ask before it may write').toBeGreaterThanOrEqual(1);
-      // The exact protocol payload, not model prose: the command names the file.
-      expect(payloads.join('\n')).toContain('approved-p22.txt');
-      expect(existsSync(artifact), 'approve must release the parked command').toBe(true);
-      expect(res.code).toBe(0);
-      expect(res.stdout, 'the reply is the completed agentMessage text').not.toBe('');
-      // The own-session key arrives on a frame and is a well-formed
-      // host key; it must not have leaked into the reply channel.
-      expect(res.sessionKey).toBeDefined();
-      expect(hostSessionKey(res.sessionKey)).toBe(res.sessionKey);
-      expect(res.stdout).not.toContain(res.sessionKey as string);
-    },
-    300_000,
-  );
+      },
+      io,
+    );
+    expect(payloads.length, 'the turn must ask before it may write').toBeGreaterThanOrEqual(1);
+    // The exact protocol payload, not model prose: the command names the file.
+    expect(payloads.join('\n')).toContain('approved-p22.txt');
+    expect(existsSync(artifact), 'approve must release the parked command').toBe(true);
+    expect(res.code).toBe(0);
+    expect(res.stdout, 'the reply is the completed agentMessage text').not.toBe('');
+    // The own-session key arrives on a frame and is a well-formed
+    // host key; it must not have leaked into the reply channel.
+    expect(res.sessionKey).toBeDefined();
+    expect(hostSessionKey(res.sessionKey)).toBe(res.sessionKey);
+    expect(res.stdout).not.toContain(res.sessionKey as string);
+  }, 300_000);
 
-  it(
-    'a real approval DECLINED does not run it — and a decline is not an error path',
-    async () => {
-      signedInHome();
-      const artifact = join(WORKDIR, 'denied-p22.txt');
-      rmSync(artifact, { force: true });
-      let asked = 0;
-      const res = await driverFor('codex').runTurn(
-        {
-          cfg,
-          route: { kind: 'own' },
-          prompt: 'Run the command: touch denied-p22.txt',
-          account: 'gate',
-          ask: async () => {
-            asked += 1;
-            return 'deny';
-          },
+  it('a real approval DECLINED does not run it — and a decline is not an error path', async () => {
+    signedInHome();
+    const artifact = join(WORKDIR, 'denied-p22.txt');
+    rmSync(artifact, { force: true });
+    let asked = 0;
+    const res = await driverFor('codex').runTurn(
+      {
+        cfg,
+        route: { kind: 'own' },
+        prompt: 'Run the command: touch denied-p22.txt',
+        account: 'gate',
+        ask: async () => {
+          asked += 1;
+          return 'deny';
         },
-        io,
-      );
-      expect(asked).toBeGreaterThanOrEqual(1);
-      expect(existsSync(artifact), 'deny must keep the command unexecuted').toBe(false);
-      // Measured on 0.144.0 and re-proven here on every run: the model
-      // narrates the refusal and the turn COMPLETES.
-      expect(res.code).toBe(0);
-      expect(res.stdout).not.toBe('');
-    },
-    300_000,
-  );
+      },
+      io,
+    );
+    expect(asked).toBeGreaterThanOrEqual(1);
+    expect(existsSync(artifact), 'deny must keep the command unexecuted').toBe(false);
+    // Measured on 0.144.0 and re-proven here on every run: the model
+    // narrates the refusal and the turn COMPLETES.
+    expect(res.code).toBe(0);
+    expect(res.stdout).not.toBe('');
+  }, 300_000);
 });

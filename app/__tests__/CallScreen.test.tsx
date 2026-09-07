@@ -1,8 +1,8 @@
 import React from 'react';
-import { StyleSheet } from 'react-native';
+import { AccessibilityInfo, StyleSheet } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import type { CallState } from '@tacendum/shared';
+import { RINGING_ACK_GRACE_MS, type CallState } from '@tacendum/shared';
 import {
   CallScreen,
   clampPip,
@@ -29,9 +29,8 @@ import { Avatar } from '../src/ui/Avatar';
 import { monogram, shortId } from '../src/person';
 
 /**
- * The call screen renders `CallState` and calls back — it holds no state and
- * touches no native module, which is why every case below is renderable
- * without a device.
+ * The call screen renders `CallState`, keeps only presentation state, and
+ * calls back. Every case below remains renderable without a device.
  *
  * The two things worth guarding hardest are not visual. A call that never
  * connected must not display a duration ("never connected" and "0:00"
@@ -40,8 +39,26 @@ import { monogram, shortId } from '../src/person';
  */
 
 const T = 1_800_000_000_000;
+const originalReduceMotion = AccessibilityInfo.isReduceMotionEnabled;
 
-function state(over: Partial<NonNullable<CallState['call']>> & { name?: CallState['name'] } = {}): CallState {
+beforeAll(() => {
+  // These tests do not exercise the async system preference. Leaving its
+  // default resolved promise live would update every mounted screen after a
+  // synchronous renderer act and bury real timing failures in act warnings.
+  AccessibilityInfo.isReduceMotionEnabled = jest.fn(
+    () => new Promise<boolean>(() => undefined),
+  );
+});
+
+afterAll(() => {
+  AccessibilityInfo.isReduceMotionEnabled = originalReduceMotion;
+});
+
+function state(
+  over: Partial<NonNullable<CallState['call']>> & {
+    name?: CallState['name'];
+  } = {},
+): CallState {
   const { name = 'connected', ...call } = over;
   if (name === 'idle') return { name: 'idle', call: null };
   return {
@@ -66,8 +83,10 @@ function state(over: Partial<NonNullable<CallState['call']>> & { name?: CallStat
 /** react-test-renderer, matching the rest of this suite. The SafeAreaProvider
  * wrapper is required: `useSafeAreaInsets` needs native measurements that do
  * not exist here, and without it every screen renders empty. */
-function renderScreen(over: Partial<React.ComponentProps<typeof CallScreen>> = {}) {
-  const props = {
+function renderScreen(
+  over: Partial<React.ComponentProps<typeof CallScreen>> = {},
+) {
+  let props: React.ComponentProps<typeof CallScreen> = {
     state: state(),
     peerName: 'Dana',
     muted: false,
@@ -82,23 +101,64 @@ function renderScreen(over: Partial<React.ComponentProps<typeof CallScreen>> = {
     now: () => T,
     ...over,
   };
+  const node = () => (
+    <SafeAreaProvider
+      initialMetrics={{
+        frame: { x: 0, y: 0, width: 390, height: 844 },
+        insets: { top: 47, left: 0, right: 0, bottom: 34 },
+      }}
+    >
+      <CallScreen {...props} />
+    </SafeAreaProvider>
+  );
   let tree!: ReactTestRenderer.ReactTestRenderer;
   ReactTestRenderer.act(() => {
-    tree = ReactTestRenderer.create(
-      <SafeAreaProvider
-        initialMetrics={{
-          frame: { x: 0, y: 0, width: 390, height: 844 },
-          insets: { top: 47, left: 0, right: 0, bottom: 34 },
-        }}
-      >
-        <CallScreen {...props} />
-      </SafeAreaProvider>,
-    );
+    tree = ReactTestRenderer.create(node());
   });
   const byLabel = (label: string) =>
-    tree.root.findAll(n => n.props.accessibilityLabel === label && typeof n.type !== 'string')[0];
+    tree.root.findAll(
+      n => n.props.accessibilityLabel === label && typeof n.type !== 'string',
+    )[0];
   mounted.push(tree);
-  return { tree, props, byLabel, toJSON: () => tree.toJSON() };
+  const rerender = (next: Partial<React.ComponentProps<typeof CallScreen>>) => {
+    props = { ...props, ...next };
+    ReactTestRenderer.act(() => tree.update(node()));
+  };
+  return { tree, props, byLabel, rerender, toJSON: () => tree.toJSON() };
+}
+
+/** Capture only the grace deadline. React's own scheduling stays native. */
+function captureGraceTimer() {
+  const nativeSetTimeout = globalThis.setTimeout;
+  const nativeClearTimeout = globalThis.clearTimeout;
+  type Handle = ReturnType<typeof setTimeout>;
+  const pending = new Map<Handle, () => void>();
+  const owned = new Set<Handle>();
+  const scheduled = jest.spyOn(globalThis, 'setTimeout').mockImplementation((
+    (callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+      if (delay !== RINGING_ACK_GRACE_MS) {
+        return nativeSetTimeout(callback, delay, ...args);
+      }
+      const handle = {} as Handle;
+      owned.add(handle);
+      pending.set(handle, () => callback(...args));
+      return handle;
+    }
+  ) as typeof setTimeout);
+  const cleared = jest.spyOn(globalThis, 'clearTimeout').mockImplementation(handle => {
+    if (owned.has(handle as Handle)) pending.delete(handle as Handle);
+    else nativeClearTimeout(handle);
+  });
+  return {
+    scheduled,
+    cleared,
+    fire(handle: Handle) {
+      const callback = pending.get(handle);
+      if (!callback) throw new Error('grace timer is absent or cancelled');
+      pending.delete(handle);
+      callback();
+    },
+  };
 }
 
 /**
@@ -131,7 +191,9 @@ describe('duration', () => {
   it('shows nothing when the call never connected', () => {
     // A call that rang and failed must not render 0:00 — that claims it
     // happened. `connectedAt` is null precisely to keep those apart.
-    expect(durationLabel(state({ connectedAt: null, name: 'outgoing_ringing' }), T)).toBeNull();
+    expect(
+      durationLabel(state({ connectedAt: null, name: 'outgoing_ringing' }), T),
+    ).toBeNull();
   });
 
   it('counts from when media flowed, not from when dialling started', () => {
@@ -142,15 +204,23 @@ describe('duration', () => {
 
   it('pads seconds and grows to hours', () => {
     expect(durationLabel(state({ connectedAt: T - 9_000 }), T)).toBe('0:09');
-    expect(durationLabel(state({ connectedAt: T - 3_725_000 }), T)).toBe('1:02:05');
+    expect(durationLabel(state({ connectedAt: T - 3_725_000 }), T)).toBe(
+      '1:02:05',
+    );
   });
 
   it('announces at MINUTE granularity for VoiceOver', () => {
     // A live region that changes every second makes a call unusable with a
     // screen reader — it would interrupt the other person continuously.
-    expect(durationAnnouncement(state({ connectedAt: T - 30_000 }), T)).toBe('Connected');
-    expect(durationAnnouncement(state({ connectedAt: T - 61_000 }), T)).toBe('1 minute');
-    expect(durationAnnouncement(state({ connectedAt: T - 185_000 }), T)).toBe('3 minutes');
+    expect(durationAnnouncement(state({ connectedAt: T - 30_000 }), T)).toBe(
+      'Connected',
+    );
+    expect(durationAnnouncement(state({ connectedAt: T - 61_000 }), T)).toBe(
+      '1 minute',
+    );
+    expect(durationAnnouncement(state({ connectedAt: T - 185_000 }), T)).toBe(
+      '3 minutes',
+    );
   });
 });
 
@@ -158,9 +228,9 @@ describe('status', () => {
   it('translates protocol states into something a person reads', () => {
     // remoteReady false spelled out: the helper's default context is a
     // CONNECTED call, and a connected call has been answered.
-    expect(statusLabel(state({ name: 'outgoing_connecting', remoteReady: false }))).toBe(
-      'Calling…',
-    );
+    expect(
+      statusLabel(state({ name: 'outgoing_connecting', remoteReady: false })),
+    ).toBe('Calling…');
     expect(statusLabel(state({ name: 'outgoing_ringing' }))).toBe('Ringing…');
     expect(statusLabel(state({ name: 'reconnecting' }))).toBe('Reconnecting…');
     expect(statusLabel(state({ name: 'connected' }))).toBe('Connected');
@@ -173,24 +243,181 @@ describe('status', () => {
     // picked up (Phase H hardware). `remoteReady` is the fact the
     // machine already holds about that moment — flipped by the answer, never
     // before — so the label can be honest in both directions:
-    expect(statusLabel(state({ name: 'outgoing_connecting', remoteReady: true }))).toBe(
-      'Connecting…',
-    );
+    expect(
+      statusLabel(state({ name: 'outgoing_connecting', remoteReady: true })),
+    ).toBe('Connecting…');
     // …and a call still dialling keeps saying so. If this line fails, the
     // label is claiming an answer nobody gave.
-    expect(statusLabel(state({ name: 'outgoing_connecting', remoteReady: false }))).toBe(
-      'Calling…',
-    );
+    expect(
+      statusLabel(state({ name: 'outgoing_connecting', remoteReady: false })),
+    ).toBe('Calling…');
   });
 
   it('renders nothing at all when idle', () => {
     const { tree } = renderScreen({ state: { name: 'idle', call: null } });
     // The provider still renders, but the screen contributes nothing.
-    expect(tree.root.findAll(n => n.props.accessibilityLabel === 'Call')).toHaveLength(0);
+    expect(
+      tree.root.findAll(n => n.props.accessibilityLabel === 'Call'),
+    ).toHaveLength(0);
+  });
+
+  it('qualifies an unacknowledged call only when the eight-second grace elapses', () => {
+    const grace = captureGraceTimer();
+    try {
+      let clock = T;
+      const { tree } = renderScreen({
+        state: state({
+          name: 'outgoing_connecting',
+          direction: 'out',
+          remoteReady: false,
+          connectedAt: null,
+          startedAt: T,
+        }),
+        now: () => clock,
+      });
+      const call = grace.scheduled.mock.calls.findIndex(
+        ([, delay]) => delay === RINGING_ACK_GRACE_MS,
+      );
+      expect(call).toBeGreaterThanOrEqual(0);
+      const handle = grace.scheduled.mock.results[call]!.value;
+      const visible = () =>
+        tree.root
+          .findAllByType(require('react-native').Text)
+          .flatMap(n => [n.props.children].flat())
+          .filter((v): v is string => typeof v === 'string');
+
+      clock = T + RINGING_ACK_GRACE_MS - 1;
+      expect(visible()).toContain('Calling…');
+      expect(visible()).not.toContain('Calling… They may be offline.');
+
+      clock = T + RINGING_ACK_GRACE_MS;
+      ReactTestRenderer.act(() => {
+        grace.fire(handle);
+      });
+      expect(visible()).toContain('Calling… They may be offline.');
+    } finally {
+      ReactTestRenderer.act(() => {
+        for (const tree of mounted.splice(0)) tree.unmount();
+      });
+      jest.restoreAllMocks();
+    }
+  });
+
+  it('cancels the waiting hint on ringing, answer, end, and unmount', () => {
+    const { scheduled, cleared } = captureGraceTimer();
+    try {
+      const pending = () =>
+        state({
+          name: 'outgoing_connecting',
+          direction: 'out',
+          remoteReady: false,
+          connectedAt: null,
+          startedAt: T,
+        });
+      const settled = [
+        state({
+          name: 'outgoing_ringing',
+          direction: 'out',
+          remoteReady: false,
+          connectedAt: null,
+          startedAt: T,
+        }),
+        state({
+          name: 'outgoing_connecting',
+          direction: 'out',
+          remoteReady: true,
+          connectedAt: null,
+          startedAt: T,
+        }),
+        state({
+          name: 'ending',
+          direction: 'out',
+          remoteReady: false,
+          connectedAt: null,
+          startedAt: T,
+        }),
+      ];
+      for (const next of settled) {
+        scheduled.mockClear();
+        cleared.mockClear();
+        const view = renderScreen({ state: pending(), now: () => T });
+        const call = scheduled.mock.calls.findIndex(
+          ([, delay]) => delay === RINGING_ACK_GRACE_MS,
+        );
+        expect(call).toBeGreaterThanOrEqual(0);
+        const graceTimer = scheduled.mock.results[call]!.value;
+        view.rerender({ state: next });
+        expect(cleared).toHaveBeenCalledWith(graceTimer);
+      }
+
+      scheduled.mockClear();
+      cleared.mockClear();
+      const view = renderScreen({ state: pending(), now: () => T });
+      const call = scheduled.mock.calls.findIndex(
+        ([, delay]) => delay === RINGING_ACK_GRACE_MS,
+      );
+      expect(call).toBeGreaterThanOrEqual(0);
+      const graceTimer = scheduled.mock.results[call]!.value;
+      ReactTestRenderer.act(() => view.tree.unmount());
+      mounted.splice(mounted.indexOf(view.tree), 1);
+      expect(cleared).toHaveBeenCalledWith(graceTimer);
+    } finally {
+      ReactTestRenderer.act(() => {
+        for (const tree of mounted.splice(0)) tree.unmount();
+      });
+      jest.restoreAllMocks();
+    }
+  });
+
+  it('never applies the offline qualifier after ringing or an answer', () => {
+    for (const pending of [
+      state({
+        name: 'outgoing_ringing',
+        direction: 'out',
+        remoteReady: false,
+        connectedAt: null,
+        startedAt: T - RINGING_ACK_GRACE_MS,
+      }),
+      state({
+        name: 'outgoing_connecting',
+        direction: 'out',
+        remoteReady: true,
+        connectedAt: null,
+        startedAt: T - RINGING_ACK_GRACE_MS,
+      }),
+      state({
+        name: 'ending',
+        direction: 'out',
+        remoteReady: false,
+        connectedAt: null,
+        startedAt: T - RINGING_ACK_GRACE_MS,
+      }),
+    ]) {
+      const { tree } = renderScreen({ state: pending });
+      expect(
+        tree.root.findAll(
+          n =>
+            n.props.accessibilityLabel ===
+            'Call, Calling. They may be offline.',
+        ),
+      ).toHaveLength(0);
+    }
   });
 });
 
 describe('video actually renders (found by review)', () => {
+  it('keeps the person visible until this surface receives a frame, then resets on track replacement', () => {
+    const { tree } = renderScreen({ state: state({ video: true, peerVideo: true }), videoEnabled: true });
+    const remote = () => tree.root.findAll(n => (n.type as unknown as string) === 'TacendumVideoView' && n.props.track === 'remote')[0]!;
+    const starting = () => JSON.stringify(tree.toJSON()).includes('Video starting…');
+    expect(starting()).toBe(true);
+    ReactTestRenderer.act(() => remote().props.onFrameReady({ nativeEvent: { surfaceId: remote().props.surfaceId, generation: 1, ready: true } }));
+    expect(starting()).toBe(false);
+    ReactTestRenderer.act(() => remote().props.onFrameReady({ nativeEvent: { surfaceId: remote().props.surfaceId, generation: 2, ready: false } }));
+    expect(starting()).toBe(true);
+    ReactTestRenderer.act(() => remote().props.onFrameReady({ nativeEvent: { surfaceId: remote().props.surfaceId, generation: 1, ready: true } }));
+    expect(starting()).toBe(true);
+  });
   /**
    * The module transmitted and received video and NOTHING displayed it: no
    * remote surface, no local preview, `remoteTrackAdded` unsubscribed, and the
@@ -204,7 +431,9 @@ describe('video actually renders (found by review)', () => {
 
   function views(tree: ReactTestRenderer.ReactTestRenderer) {
     // The jest mock renders the component as a host string.
-    return tree.root.findAll(n => (n.type as unknown as string) === 'TacendumVideoView');
+    return tree.root.findAll(
+      n => (n.type as unknown as string) === 'TacendumVideoView',
+    );
   }
 
   it('renders a remote surface for a video call', () => {
@@ -232,7 +461,9 @@ describe('video actually renders (found by review)', () => {
 
   it('renders no video surface at all for an audio call', () => {
     // An audio call shows the person, not a black rectangle.
-    const { tree } = renderScreen({ state: state({ video: false, peerVideo: false }) });
+    const { tree } = renderScreen({
+      state: state({ video: false, peerVideo: false }),
+    });
     expect(views(tree)).toHaveLength(0);
   });
 });
@@ -270,7 +501,9 @@ describe('the person, when there is no video of them', () => {
   }
 
   function views(tree: ReactTestRenderer.ReactTestRenderer) {
-    return tree.root.findAll(n => (n.type as unknown as string) === 'TacendumVideoView');
+    return tree.root.findAll(
+      n => (n.type as unknown as string) === 'TacendumVideoView',
+    );
   }
 
   /** The cover-cropped photo standing where the peer's video would be —
@@ -280,7 +513,8 @@ describe('the person, when there is no video of them', () => {
    * the whole distinction the pre-connect rule below turns on. */
   function backdropPhotos(node: ReactTestRenderer.ReactTestInstance) {
     return node.findAll(n => {
-      if (typeof n.type !== 'string' || n.props?.source?.uri !== PHOTO_URI) return false;
+      if (typeof n.type !== 'string' || n.props?.source?.uri !== PHOTO_URI)
+        return false;
       return StyleSheet.flatten(n.props.style)?.position === 'absolute';
     });
   }
@@ -458,6 +692,8 @@ describe('the person, when there is no video of them', () => {
       peerAvatarB64: PHOTO,
       videoEnabled: true,
     });
+    const remote = views(tree).find(v => v.props.track === 'remote')!;
+    ReactTestRenderer.act(() => remote.props.onFrameReady({ nativeEvent: { surfaceId: remote.props.surfaceId, generation: 1, ready: true } }));
     expect(backdropPhotos(tree.root)).toHaveLength(0);
     // Nothing covers the live video: no photo, no fill, no letters.
     expect(texts(byLabel("Dana's video, full screen"))).toHaveLength(0);
@@ -493,7 +729,9 @@ describe('the person, when there is no video of them', () => {
     expect(photo.props.resizeMode).toBe('cover');
     const flat = StyleSheet.flatten(photo.props.style);
     expect(flat.position).toBe('absolute');
-    expect([flat.top, flat.left, flat.right, flat.bottom]).toEqual([0, 0, 0, 0]);
+    expect([flat.top, flat.left, flat.right, flat.bottom]).toEqual([
+      0, 0, 0, 0,
+    ]);
     // Edge-pinned, never sized: a fixed width is exactly how 160 happened.
     expect(flat.width).toBeUndefined();
     expect(flat.height).toBeUndefined();
@@ -501,9 +739,12 @@ describe('the person, when there is no video of them', () => {
     const wrap = backdropWrap(byLabel("Dana's video, full screen"))!;
     const wrapFlat = StyleSheet.flatten(wrap.props.style);
     expect(wrapFlat.position).toBe('absolute');
-    expect([wrapFlat.top, wrapFlat.left, wrapFlat.right, wrapFlat.bottom]).toEqual([
-      0, 0, 0, 0,
-    ]);
+    expect([
+      wrapFlat.top,
+      wrapFlat.left,
+      wrapFlat.right,
+      wrapFlat.bottom,
+    ]).toEqual([0, 0, 0, 0]);
     // Inside an accessible Pressable that already says whose video this is;
     // a second accessible node would read the name twice…
     expect(wrap.props.accessibilityElementsHidden).toBe(true);
@@ -524,14 +765,18 @@ describe('the person, when there is no video of them', () => {
     const surface = byLabel("Dana's video, full screen");
     const wrap = backdropWrap(surface)!;
     const flat = StyleSheet.flatten(wrap.props.style);
-    expect([flat.top, flat.left, flat.right, flat.bottom]).toEqual([0, 0, 0, 0]);
+    expect([flat.top, flat.left, flat.right, flat.bottom]).toEqual([
+      0, 0, 0, 0,
+    ]);
     expect(flat.backgroundColor).toBe('rgba(14,107,69,0.10)');
     // The chat's monogram — `Dana` → `DA`, never a bare initial — at a size
     // that reads as the surface's subject. Pinned to the number because the
     // mutation audit proved the old sizes could mutate to 73 and 1 unnoticed.
     expect(monogram('P1', 'Dana')).toBe('DA');
     const letters = wrap.findAll(
-      n => String(n.type) === 'Text' && [n.props.children].flat().join('') === 'DA',
+      n =>
+        String(n.type) === 'Text' &&
+        [n.props.children].flat().join('') === 'DA',
     )[0]!;
     expect(StyleSheet.flatten(letters.props.style).fontSize).toBe(96);
     expect(letters.props.allowFontScaling).toBe(false);
@@ -593,7 +838,9 @@ describe('the person, when there is no video of them', () => {
       videoEnabled: true,
     });
     expect(backdropPhotos(tree.root)).toHaveLength(1);
-    ReactTestRenderer.act(() => byLabel("Dana's video, full screen").props.onPress());
+    ReactTestRenderer.act(() =>
+      byLabel("Dana's video, full screen").props.onPress(),
+    );
     // The full surface now carries MY video, uncovered…
     expect(backdropPhotos(byLabel('Your video, full screen'))).toHaveLength(0);
     // …and the corner carries the PEER'S photo, cover-cropped to its box.
@@ -603,7 +850,9 @@ describe('the person, when there is no video of them', () => {
     expect(corner[0]!.props.source.uri).toBe(PHOTO_URI);
     expect(corner[0]!.props.resizeMode).toBe('cover');
     const flat = StyleSheet.flatten(corner[0]!.props.style);
-    expect([flat.top, flat.left, flat.right, flat.bottom]).toEqual([0, 0, 0, 0]);
+    expect([flat.top, flat.left, flat.right, flat.bottom]).toEqual([
+      0, 0, 0, 0,
+    ]);
     // AND IT MUST NOT EAT THE TAP THAT PUT IT THERE, or the surfaces would
     // swap once and never swap back.
     expect(backdropWrap(pip)!.props.pointerEvents).toBe('none');
@@ -618,10 +867,14 @@ describe('the person, when there is no video of them', () => {
       peerAvatarB64: null,
       videoEnabled: true,
     });
-    ReactTestRenderer.act(() => byLabel("Dana's video, full screen").props.onPress());
+    ReactTestRenderer.act(() =>
+      byLabel("Dana's video, full screen").props.onPress(),
+    );
     const pip = byLabel("Dana's video, small");
     const letters = pip.findAll(
-      n => String(n.type) === 'Text' && [n.props.children].flat().join('') === 'DA',
+      n =>
+        String(n.type) === 'Text' &&
+        [n.props.children].flat().join('') === 'DA',
     )[0]!;
     expect(letters).toBeTruthy();
     // At the corner's own size — surface-sized letters would clip a 110pt box.
@@ -645,7 +898,9 @@ describe('the person, when there is no video of them', () => {
     });
     // Re-cut for the same reason as the full-screen case above: the corner's
     // label went through the raw name and said the id out loud.
-    ReactTestRenderer.act(() => byLabel("Someone's video, full screen").props.onPress());
+    ReactTestRenderer.act(() =>
+      byLabel("Someone's video, full screen").props.onPress(),
+    );
     const rendered = texts(byLabel("Someone's video, small"));
     expect(rendered).toContain('?');
     expect(rendered).not.toContain('P1');
@@ -661,11 +916,15 @@ describe('the person, when there is no video of them', () => {
       peerAvatarB64: PHOTO,
       videoEnabled: false,
     });
-    ReactTestRenderer.act(() => byLabel("Dana's video, full screen").props.onPress());
+    ReactTestRenderer.act(() =>
+      byLabel("Dana's video, full screen").props.onPress(),
+    );
     expect(views(tree).filter(v => v.props.track === 'remote')).toHaveLength(1);
     // Their video is LIVE, so no backdrop may cover it — in the corner any
     // more than full screen. (Falsifier: drop `!remoteVideoLive` from the
     // corner's gate; the photo paints over their live tile and this goes red.)
+    const remote = views(tree).find(v => v.props.track === 'remote')!;
+    ReactTestRenderer.act(() => remote.props.onFrameReady({ nativeEvent: { surfaceId: remote.props.surfaceId, generation: 1, ready: true } }));
     expect(backdropPhotos(tree.root)).toHaveLength(0);
   });
 
@@ -740,9 +999,13 @@ describe('the person, when there is no video of them', () => {
     // The drag rides an animated translation, not a re-render per move.
     expect(pip.transform).toHaveLength(2);
 
-    const remote = StyleSheet.flatten(byLabel("Dana's video, full screen").props.style);
+    const remote = StyleSheet.flatten(
+      byLabel("Dana's video, full screen").props.style,
+    );
     expect(remote.position).toBe('absolute');
-    expect([remote.top, remote.left, remote.right, remote.bottom]).toEqual([0, 0, 0, 0]);
+    expect([remote.top, remote.left, remote.right, remote.bottom]).toEqual([
+      0, 0, 0, 0,
+    ]);
   });
 });
 
@@ -766,13 +1029,25 @@ describe('controls are usable with VoiceOver', () => {
   // locally and blacked out the peer. The controls are now offered only on a
   // call that carries video.
   it('disables flip camera when the camera is off', () => {
-    const { byLabel } = renderScreen({ state: state({ video: true }), videoEnabled: false });
+    const { byLabel } = renderScreen({
+      state: state({ video: true }),
+      videoEnabled: false,
+    });
     expect(byLabel('Flip camera').props.accessibilityState.disabled).toBe(true);
   });
 
   it('gives every control a label', () => {
-    const { byLabel } = renderScreen({ state: state({ video: true }), videoEnabled: true });
-    for (const label of ['Mute', 'Turn camera off', 'Flip camera', 'Speaker on', 'End call']) {
+    const { byLabel } = renderScreen({
+      state: state({ video: true }),
+      videoEnabled: true,
+    });
+    for (const label of [
+      'Mute',
+      'Turn camera off',
+      'Flip camera',
+      'Speaker on',
+      'End call',
+    ]) {
       expect(byLabel(label)).toBeTruthy();
     }
   });
@@ -781,7 +1056,10 @@ describe('controls are usable with VoiceOver', () => {
     // Placed as audio, or a video invite answered without video: there is no
     // transceiver for a camera to feed, so there is no camera button and no
     // flip. Mute, speaker and End remain.
-    const { byLabel } = renderScreen({ state: state({ video: false }), videoEnabled: false });
+    const { byLabel } = renderScreen({
+      state: state({ video: false }),
+      videoEnabled: false,
+    });
     expect(byLabel('Turn camera on')).toBeUndefined();
     expect(byLabel('Turn camera off')).toBeUndefined();
     expect(byLabel('Flip camera')).toBeUndefined();
@@ -831,7 +1109,9 @@ describe('tapping a video swaps which one fills the screen', () => {
       videoEnabled: true,
     });
     const pip = tree.root.findAll(
-      n => typeof n.type !== 'string' && /Your video, small/.test(String(n.props?.accessibilityLabel)),
+      n =>
+        typeof n.type !== 'string' &&
+        /Your video, small/.test(String(n.props?.accessibilityLabel)),
     )[0]!;
 
     ReactTestRenderer.act(() => pip.props.onPress());
@@ -841,6 +1121,27 @@ describe('tapping a video swaps which one fills the screen', () => {
     expect(views[1]!.props.track).toBe('remote');
     expect(views[0]!.props.mirror).toBe(true);
     expect(views[1]!.props.mirror).toBe(false);
+  });
+
+  it('restores a same-call swapped choice and reports later changes', () => {
+    const onSwappedChange = jest.fn();
+    const { tree } = renderScreen({
+      state: state({ video: true, peerVideo: true }),
+      videoEnabled: true,
+      initialSwapped: true,
+      onSwappedChange,
+    });
+    const views = videoViews(tree);
+    expect(views[0]!.props.track).toBe('local');
+    expect(views[1]!.props.track).toBe('remote');
+
+    const full = tree.root.findAll(
+      n =>
+        typeof n.type !== 'string' &&
+        n.props.accessibilityLabel === 'Your video, full screen',
+    )[0]!;
+    ReactTestRenderer.act(() => full.props.onPress());
+    expect(onSwappedChange).toHaveBeenCalledWith(false);
   });
 });
 
@@ -886,8 +1187,13 @@ describe('the corner preview drags', () => {
     // the new frame.
     const LAND = { width: 1180, height: 820 };
     const PAD = { top: 24, bottom: 20, left: 0, right: 0 };
-    expect(pipAnchor('top-right', LAND, PAD)).toEqual({ x: 1180 - 16 - 110, y: 120 });
-    expect(pipAnchor('bottom-right', LAND, PAD).y).toBeCloseTo(820 - 20 - 96 - PIP_HEIGHT);
+    expect(pipAnchor('top-right', LAND, PAD)).toEqual({
+      x: 1180 - 16 - 110,
+      y: 120,
+    });
+    expect(pipAnchor('bottom-right', LAND, PAD).y).toBeCloseTo(
+      820 - 20 - 96 - PIP_HEIGHT,
+    );
     // A Split View sliver too short for any vertical travel: no position
     // clears both bands, so the shortfall is SPLIT — every corner collapses
     // to the midpoint between the band edges. The old clamp parked the pip
@@ -904,7 +1210,9 @@ describe('the corner preview drags', () => {
     // the one pinned: the intrusion into the control band equals the
     // intrusion into the header band — symmetric, never all on the buttons.
     const controlBandEdge = 400 - 20 - 96;
-    expect(sliverY + PIP_HEIGHT - controlBandEdge).toBeCloseTo(bandTop - sliverY);
+    expect(sliverY + PIP_HEIGHT - controlBandEdge).toBeCloseTo(
+      bandTop - sliverY,
+    );
     // And in a window with room, the split never engages: the bottom edge
     // stays strictly clear of the control band (the non-degenerate pin).
     const bl = pipAnchor('bottom-left', LAND, PAD);
@@ -954,8 +1262,9 @@ describe('the corner preview drags', () => {
     // Pressable lives inside it — still pressable, still hinting the swap.
     expect(wraps).toHaveLength(1);
     expect(
-      wraps[0]!.findAll(n => n.props?.accessibilityLabel === 'Your video, small')
-        .length,
+      wraps[0]!.findAll(
+        n => n.props?.accessibilityLabel === 'Your video, small',
+      ).length,
     ).toBeGreaterThan(0);
     const pip = byLabel('Your video, small');
     expect(typeof pip.props.onPress).toBe('function');
@@ -994,12 +1303,36 @@ describe('the corner preview drags', () => {
     // Driving one settles without throwing — the wiring is live, not
     // metadata that fell off the element.
     ReactTestRenderer.act(() => {
-      pip.props.onAccessibilityAction({ nativeEvent: { actionName: 'move-bottom-right' } });
+      pip.props.onAccessibilityAction({
+        nativeEvent: { actionName: 'move-bottom-right' },
+      });
     });
   });
 
+  it('restores a same-call corner and reports an accessible move', () => {
+    const onPipCornerChange = jest.fn();
+    const { tree, byLabel } = renderScreen({
+      state: state({ name: 'connected', video: true, peerVideo: true }),
+      videoEnabled: true,
+      initialPipCorner: 'bottom-left',
+      onPipCornerChange,
+    });
+    const wrap = StyleSheet.flatten(pipWrapper(tree)!.props.style);
+    expect(wrap.left).toBe(16);
+    expect(wrap.top).toBeCloseTo(844 - 34 - 96 - PIP_HEIGHT);
+
+    ReactTestRenderer.act(() => {
+      byLabel('Your video, small').props.onAccessibilityAction({
+        nativeEvent: { actionName: 'move-top-right' },
+      });
+    });
+    expect(onPipCornerChange).toHaveBeenCalledWith('top-right');
+  });
+
   it('an audio-only call has no preview and nothing draggable', () => {
-    const { tree } = renderScreen({ state: state({ video: false, peerVideo: false }) });
+    const { tree } = renderScreen({
+      state: state({ video: false, peerVideo: false }),
+    });
     expect(pipWrapper(tree)).toBeUndefined();
   });
 });
@@ -1016,7 +1349,9 @@ describe('the minimize control', () => {
   it('is absent unless offered — the header is unchanged for a call that cannot minimize', () => {
     const { tree, byLabel } = renderScreen();
     expect(byLabel('Minimize call')).toBeUndefined();
-    expect(tree.root.findAll(n => n.props.testID === 'call-minimize')).toHaveLength(0);
+    expect(
+      tree.root.findAll(n => n.props.testID === 'call-minimize'),
+    ).toHaveLength(0);
   });
 
   it('is a labeled button that says what it does, and fires onMinimize', () => {
@@ -1061,8 +1396,12 @@ describe('the notice restore tap', () => {
     // accessible name must be the visible text, not a paraphrase of it —
     // asserted against the RENDERED children, so copy drift cannot leave a
     // stale label behind and quietly break "say what you see".
-    expect(button.props.accessibilityLabel).toBe('Low Power Mode · Tap to restore');
-    expect([button.props.children].flat().join('')).toBe(button.props.accessibilityLabel);
+    expect(button.props.accessibilityLabel).toBe(
+      'Low Power Mode · Tap to restore',
+    );
+    expect([button.props.children].flat().join('')).toBe(
+      button.props.accessibilityLabel,
+    );
     expect(button.props.accessibilityHint).toMatch(/battery/i);
 
     ReactTestRenderer.act(() => button.props.onPress());

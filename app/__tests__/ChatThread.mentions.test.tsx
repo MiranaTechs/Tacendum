@@ -65,6 +65,9 @@ const NAME_ROWS = [
   { peerId: CARA, displayName: 'Cara', localName: 'Sis' },
 ];
 
+let savedComposerDraft: { text: string; mentionState: string | null } | null;
+let groupReadGate: Promise<void> | null;
+
 type Row = Record<string, unknown>;
 
 /** Ana the owner in, me in, Cara in — and Ben admitted by Ana but OUT by
@@ -84,8 +87,24 @@ function installRoomDb(messageRows: Row[]) {
   instance.execute.mockImplementation(
     async (sql: string, params?: unknown[]) => {
       const s = String(sql);
+      if (s.includes('SELECT text, mentionState FROM drafts')) {
+        return { rows: savedComposerDraft ? [savedComposerDraft] : [] };
+      }
+      if (s.includes('INSERT OR REPLACE INTO drafts')) {
+        savedComposerDraft = {
+          text: String(params?.[1] ?? ''),
+          mentionState:
+            typeof params?.[2] === 'string' ? params[2] : null,
+        };
+        return { rows: [] };
+      }
+      if (s.includes('DELETE FROM drafts WHERE peerId')) {
+        savedComposerDraft = null;
+        return { rows: [] };
+      }
       if (s.includes('FROM messages')) return { rows: messageRows };
       if (s.includes('SELECT groupId, ownerId, name FROM groups')) {
+        if (groupReadGate) await groupReadGate;
         return params?.[0] === ROOM
           ? { rows: [{ groupId: ROOM, ownerId: ANA, name: 'Kitchen' }] }
           : { rows: [] };
@@ -190,6 +209,8 @@ beforeEach(async () => {
   sqlite.reset();
   db.setWorkspace('real');
   await db.initDb();
+  savedComposerDraft = null;
+  groupReadGate = null;
   installRoomDb([]);
 });
 
@@ -270,6 +291,87 @@ test('choosing someone sends ONE mark and the id — fanOut with a mention envel
   expect(body).not.toContain('Ana');
   // My own chat list previews the words as I typed them — names resolved.
   expect(opts?.preview).toBe('@Ana hello');
+});
+
+test('a selected mention survives leaving and reopening, then sends the same eligible identity once', async () => {
+  const fanOut = jest
+    .spyOn(messaging, 'fanOut')
+    .mockResolvedValue({ localMsgId: `${ME}.MX`, skipped: [] });
+  const first = await renderThread();
+  await type(first, '@');
+  await press(first, `mention-pick-${ANA}`);
+  await type(first, '@Ana at five');
+  await caret(first, 0);
+  await type(first, 'Tea with @Ana at five');
+
+  await ReactTestRenderer.act(async () => first.unmount());
+  await ReactTestRenderer.act(async () => {});
+  expect(savedComposerDraft?.text).toBe('Tea with @Ana at five');
+  expect(savedComposerDraft?.mentionState).toContain(ANA);
+
+  const reopened = await renderThread();
+  expect(input(reopened).props.value).toBe('Tea with @Ana at five');
+  expect(has(reopened, 'mention-chips')).toBe(true);
+  await press(reopened, 'composer-send');
+
+  expect(fanOut).toHaveBeenCalledTimes(1);
+  expect(JSON.parse(fanOut.mock.calls[0]![1] as string)).toEqual({
+    tcm: 'mention',
+    text: `Tea with ${MENTION_MARK} at five`,
+    who: [ANA],
+  });
+  expect(savedComposerDraft).toBeNull();
+});
+
+test('leaving before the roster read finishes preserves the unopened saved mention binding', async () => {
+  const text = 'Tea with @Ana';
+  const encoded = JSON.stringify({
+    v: 1,
+    peerId: ROOM,
+    text,
+    chips: [{ id: ANA, name: 'Ana', start: 9, end: 13 }],
+  });
+  savedComposerDraft = { text, mentionState: encoded };
+  let releaseGroup!: () => void;
+  groupReadGate = new Promise<void>(resolve => {
+    releaseGroup = resolve;
+  });
+
+  const first = await renderThread();
+  expect(input(first).props.value).toBe(text);
+  // The group answer is still pending, so the saved binding has not yet been
+  // trusted into a live chip. Leaving here must carry the opaque binding,
+  // rather than rewriting the same words as an ordinary text-only draft.
+  expect(has(first, 'mention-chips')).toBe(false);
+  await ReactTestRenderer.act(async () => first.unmount());
+  await ReactTestRenderer.act(async () => {});
+  expect(savedComposerDraft).toEqual({ text, mentionState: encoded });
+
+  groupReadGate = null;
+  releaseGroup();
+  await ReactTestRenderer.act(async () => {});
+});
+
+test('a restored mention for a member no longer eligible stays visible as plain text and summons nobody', async () => {
+  const staleText = 'Tea with @Ana at five';
+  savedComposerDraft = {
+    text: staleText,
+    mentionState: JSON.stringify({
+      v: 1,
+      peerId: ROOM,
+      text: staleText,
+      chips: [{ id: BEN, name: 'Ana', start: 9, end: 13 }],
+    }),
+  };
+  const fanOut = jest
+    .spyOn(messaging, 'fanOut')
+    .mockResolvedValue({ localMsgId: `${ME}.MX`, skipped: [] });
+  const tree = await renderThread();
+
+  expect(input(tree).props.value).toBe(staleText);
+  expect(has(tree, 'mention-chips')).toBe(false);
+  await press(tree, 'composer-send');
+  expect(fanOut).toHaveBeenCalledWith(ROOM, staleText);
 });
 
 test('marks and ids stay in TEXT order even when the second mention is inserted before the first', async () => {

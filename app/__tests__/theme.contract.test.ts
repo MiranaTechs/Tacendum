@@ -98,6 +98,7 @@ const SURFACES: ColorName[] = [
 /** Inks that live on one fill only, asserted against that fill and no other. */
 const FIXED: [ColorName, ColorName][] = [
   ['onPine', 'pine'],
+  ['onPine', 'danger'],
   ['onBubbleOut', 'bubbleOut'],
   ['mediaInk', 'mediaBlack'],
   ['mediaInkMuted', 'mediaBlack'],
@@ -127,6 +128,7 @@ const MARKS: ColorName[] = ['warningMark'];
  * under text that is itself asserted above.
  * pinePressed as a SURFACE, bubbleOutPressed — the moment a finger is down.
  * pinePressed is asserted as an INK above.
+ * mediaHud — translucent video backing, measured over white below.
  *
  * The paper* tokens are also not compared with each other: adjacent surfaces
  * are separated by a hairline and by content, never by contrast alone.
@@ -139,6 +141,7 @@ const EXCLUDED: ColorName[] = [
   'pineWashFaint',
   'dangerWash',
   'mediaLine',
+  'mediaHud',
   'bubbleOutLine',
   'bubbleOutLinePressed',
   'bubbleOutPressed',
@@ -179,6 +182,18 @@ describe.each(MODES)('the %s palette', mode => {
       }
     }
     expect(failures).toEqual([]);
+  });
+
+  test('call text stays readable over an entirely white video frame', () => {
+    const rgba = /^rgba\((\d+),(\d+),(\d+),([\d.]+)\)$/.exec(t.color.mediaHud);
+    expect(rgba).not.toBeNull();
+    const alpha = Number(rgba![4]);
+    const composited = `#${rgba!.slice(1, 4).map(byte =>
+      Math.round(Number(byte) * alpha + 255 * (1 - alpha))
+        .toString(16).padStart(2, '0'),
+    ).join('')}`;
+    expect(contrast(t.color.mediaInk, composited)).toBeGreaterThanOrEqual(4.5);
+    expect(contrast(t.color.mediaInkMuted, composited)).toBeGreaterThanOrEqual(4.5);
   });
 
   test('every non-text mark reaches 3:1 on every surface', () => {

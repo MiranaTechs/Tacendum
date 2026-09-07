@@ -74,7 +74,10 @@ import { messaging } from '../src/messaging';
 import { session } from '../src/session';
 import { CallScreen } from '../src/screens/CallScreen';
 import { CallOverlay } from '../src/screens/CallOverlay';
-import { deriveSurfaceFacts, type SurfaceRouteName } from '../src/visibleSurface';
+import {
+  deriveSurfaceFacts,
+  type SurfaceRouteName,
+} from '../src/visibleSurface';
 
 jest.setTimeout(120_000);
 
@@ -92,7 +95,10 @@ test('every route decides the window: `full` is exactly the set that proves no w
       routes: [{ name }],
       overlays: { call: false, groupCall: false },
     }).provesWorkspaceOpen;
-    expect([name, CALL_OVERLAY_SURFACE[name]]).toEqual([name, proves ? 'window' : 'full']);
+    expect([name, CALL_OVERLAY_SURFACE[name]]).toEqual([
+      name,
+      proves ? 'window' : 'full',
+    ]);
   }
   expect(names.filter(n => CALL_OVERLAY_SURFACE[n] === 'full').sort()).toEqual(
     // updateRequired joins the pre-workspace set:
@@ -120,7 +126,11 @@ interface FakeDb {
 }
 const sqlite = (
   jest.requireMock('@op-engineering/op-sqlite') as {
-    __sqlite: { reset: () => void; opened: string[]; instances: Map<string, FakeDb> };
+    __sqlite: {
+      reset: () => void;
+      opened: string[];
+      instances: Map<string, FakeDb>;
+    };
   }
 ).__sqlite;
 const callEvents = (
@@ -208,7 +218,10 @@ const devNav = () =>
 const currentRoute = () =>
   (globalThis as unknown as Record<string, unknown>).TacendumDevRoute as string;
 
-async function unlock(tree: ReactTestRenderer.ReactTestRenderer, code: string): Promise<void> {
+async function unlock(
+  tree: ReactTestRenderer.ReactTestRenderer,
+  code: string,
+): Promise<void> {
   for (const key of code.split('')) {
     await press(tree, `pin-key-${key}`);
   }
@@ -218,9 +231,9 @@ async function unlock(tree: ReactTestRenderer.ReactTestRenderer, code: string): 
   });
 }
 
-async function connectedCall(cid = CID): Promise<void> {
+async function connectedCall(cid = CID, video = false): Promise<void> {
   await ReactTestRenderer.act(async () => {
-    await calling.callController().placeCall(PEER, cid, false);
+    await calling.callController().placeCall(PEER, cid, video);
     callEvents.emit('iceState', { cid, state: 'connected' });
     await flush();
   });
@@ -240,7 +253,9 @@ const coverCount = (tree: ReactTestRenderer.ReactTestRenderer) =>
 /** The chat list, by the props only it carries. */
 const chatList = (tree: ReactTestRenderer.ReactTestRenderer) =>
   tree.root.findAll(
-    n => typeof n.props.onStartChat === 'function' && typeof n.props.onOpenChat === 'function',
+    n =>
+      typeof n.props.onStartChat === 'function' &&
+      typeof n.props.onOpenChat === 'function',
   ).length;
 
 const realFetch = globalThis.fetch;
@@ -267,12 +282,13 @@ beforeEach(async () => {
   globalThis.fetch = fetchMock as unknown as typeof fetch;
 
   appStateListeners = [];
-  jest
-    .spyOn(AppState, 'addEventListener')
-    .mockImplementation(((_type: string, fn: (next: string) => void) => {
-      appStateListeners.push(fn);
-      return { remove: jest.fn() };
-    }) as unknown as typeof AppState.addEventListener);
+  jest.spyOn(AppState, 'addEventListener').mockImplementation(((
+    _type: string,
+    fn: (next: string) => void,
+  ) => {
+    appStateListeners.push(fn);
+    return { remove: jest.fn() };
+  }) as unknown as typeof AppState.addEventListener);
 
   // The transport, spied as App.relockcall.test.tsx spies it: this file is
   // about what is ON GLASS, not about the ratchet or the relay.
@@ -369,7 +385,9 @@ test('the window never renders on the locked route — the full screen, the surf
     devNav()({ name: 'locked' });
     await flush();
   });
-  expect(tree.root.findAllByProps({ testID: 'lock-screen' }).length).toBeGreaterThan(0);
+  expect(
+    tree.root.findAllByProps({ testID: 'lock-screen' }).length,
+  ).toBeGreaterThan(0);
   expect(windows(tree)).toBe(0);
   expect(fullScreens(tree)).toBe(1);
   // Nothing to minimize TO behind the lock.
@@ -397,16 +415,19 @@ test('a relock ends a minimized call and its window through the same funnel as t
     await flush();
   });
 
-  expect(tree.root.findAllByProps({ testID: 'lock-screen' }).length).toBeGreaterThan(0);
+  expect(
+    tree.root.findAllByProps({ testID: 'lock-screen' }).length,
+  ).toBeGreaterThan(0);
   // Rule 14: the call cannot outlive its signalling path — the peer was
   // told, BEFORE the socket died, and the machine is idle…
   const sends = (messaging.sendCallEnvelope as jest.Mock).mock.calls;
   const end = sends.find(c => c[1]?.tcm === 'call.end' && c[1]?.cid === CID);
   expect(end).toBeDefined();
-  const endOrder = (messaging.sendCallEnvelope as jest.Mock).mock.invocationCallOrder[
-    sends.indexOf(end!)
-  ];
-  expect(endOrder).toBeLessThan((messaging.stop as jest.Mock).mock.invocationCallOrder[0]);
+  const endOrder = (messaging.sendCallEnvelope as jest.Mock).mock
+    .invocationCallOrder[sends.indexOf(end!)];
+  expect(endOrder).toBeLessThan(
+    (messaging.stop as jest.Mock).mock.invocationCallOrder[0],
+  );
   expect(native.close).toHaveBeenCalledWith(CID);
   expect(calling.callController().state.name).toBe('idle');
   // …and nothing of the call is on glass: no window, no full screen.
@@ -433,6 +454,38 @@ test('End from the window ends the call; the next call starts full screen', asyn
   expect(fullScreens(tree)).toBe(1);
   expect(windows(tree)).toBe(0);
   expect(minimizeOffered(tree)).toBe(true);
+});
+
+test('a video call keeps its swapped preview and corner across minimize, then resets for the next call', async () => {
+  const tree = await renderApp();
+  await unlock(tree, '123456');
+  await connectedCall(CID, true);
+
+  const screen = () => tree.root.findByType(CallScreen);
+  const localPreview = tree.root.findAll(
+    n =>
+      n.props.accessibilityLabel === 'Your video, small' &&
+      typeof n.type !== 'string',
+  )[0]!;
+  ReactTestRenderer.act(() => {
+    localPreview.props.onPress();
+    localPreview.props.onAccessibilityAction({
+      nativeEvent: { actionName: 'move-bottom-left' },
+    });
+  });
+
+  await press(tree, 'call-minimize');
+  await press(tree, 'call-overlay');
+  expect(screen().props.initialSwapped).toBe(true);
+  expect(screen().props.initialPipCorner).toBe('bottom-left');
+
+  await ReactTestRenderer.act(async () => {
+    await calling.callController().hangup();
+    await flush();
+  });
+  await connectedCall(CID2, true);
+  expect(screen().props.initialSwapped).toBe(false);
+  expect(screen().props.initialPipCorner).toBe('top-right');
 });
 
 test('the peer ending the call dismisses the window too', async () => {

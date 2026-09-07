@@ -15,10 +15,12 @@
 import { MENTION_MARK } from '../src/envelope';
 import {
   caretAfterEdit,
+  encodeMentionDraft,
   liveMentionChips,
   mentionQueryAt,
   mentionWire,
   namesInSentence,
+  restoreMentionDraft,
   shiftMentionChips,
   type MentionChip,
 } from '../src/thread/mentions';
@@ -168,5 +170,87 @@ describe('namesInSentence reads a list the way a person says it', () => {
     expect(namesInSentence(['you'])).toBe('you');
     expect(namesInSentence(['you', 'Ana'])).toBe('you and Ana');
     expect(namesInSentence(['Ana', 'Ben', 'you'])).toBe('Ana, Ben and you');
+  });
+});
+
+describe('saved mention intent stays bound to the exact local draft', () => {
+  const peerId = 'room-kitchen';
+  const ana = 'member-ana';
+  const otherAna = 'member-other-ana';
+  const text = 'Tea with @Ana at five';
+  const chip = chipFor(text, ana, 'Ana');
+  const eligible = new Map([[ana, 'Ana']]);
+
+  test('an exact peer, text, range, identity and current name restores once', () => {
+    const saved = encodeMentionDraft(peerId, text, [chip]);
+    expect(restoreMentionDraft(peerId, text, saved, eligible)).toEqual([chip]);
+  });
+
+  test('ordinary text stores no structured mention metadata', () => {
+    expect(encodeMentionDraft(peerId, 'literal @Ana', [])).toBeNull();
+  });
+
+  test.each([
+    ['another room', 'room-hall', text, eligible],
+    ['changed words', peerId, `Later: ${text}`, eligible],
+    ['removed member', peerId, text, new Map<string, string>()],
+    ['same name, different identity', peerId, text, new Map([[otherAna, 'Ana']])],
+    ['renamed member', peerId, text, new Map([[ana, 'Anita']])],
+  ])('%s preserves words but restores no recipient', (_label, currentPeer, currentText, roster) => {
+    const saved = encodeMentionDraft(peerId, text, [chip]);
+    expect(
+      restoreMentionDraft(currentPeer, currentText, saved, roster),
+    ).toEqual([]);
+  });
+
+  test('corrupt, overlapping and stale-range metadata fails closed', () => {
+    expect(restoreMentionDraft(peerId, text, '{bad json', eligible)).toEqual([]);
+    expect(
+      restoreMentionDraft(
+        peerId,
+        text,
+        JSON.stringify({
+          v: 1,
+          peerId,
+          text,
+          chips: [chip, { ...chip, id: 'member-ben' }],
+        }),
+        new Map([
+          [ana, 'Ana'],
+          ['member-ben', 'Ana'],
+        ]),
+      ),
+    ).toEqual([]);
+    expect(
+      restoreMentionDraft(
+        peerId,
+        text,
+        JSON.stringify({
+          v: 1,
+          peerId,
+          text,
+          chips: [{ ...chip, start: chip.start + 1 }],
+        }),
+        eligible,
+      ),
+    ).toEqual([]);
+  });
+
+  test('a final mention whose saved span runs past the draft fails closed', () => {
+    const finalText = 'Tea with @Ana';
+    const finalChip = chipFor(finalText, ana, 'Ana');
+    expect(
+      restoreMentionDraft(
+        peerId,
+        finalText,
+        JSON.stringify({
+          v: 1,
+          peerId,
+          text: finalText,
+          chips: [{ ...finalChip, end: finalText.length + 12 }],
+        }),
+        eligible,
+      ),
+    ).toEqual([]);
   });
 });

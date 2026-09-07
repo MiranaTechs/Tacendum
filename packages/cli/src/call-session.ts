@@ -37,6 +37,7 @@ import {
 } from './messaging.js';
 import { apiGetPrekeyBundle } from './api.js';
 import { MAX_BODY_BYTES } from './send.js';
+import { applyOwnerNotifyPreference, composeNotifyPreferenceAck } from './ai-notify-preference.js';
 import { CliError, EXIT } from './exit.js';
 import { AuthSession } from './session.js';
 import { WsClient } from './wsclient.js';
@@ -534,6 +535,30 @@ export class CallSession {
     // nothing. Room state above still applied; see inbound.ts for why the
     // fold must never be forked by a local block list.
     const blocked = isBlocked(this.name, frame.from);
+
+    // `listen --calls` owns the account's queue while it runs, so an owner
+    // preference arriving here cannot be left for attachInbound: this path is
+    // about to mark the frame seen and purge the relay copy. Apply the same
+    // authenticated owner rule before that ack. A fresh frame carrying the
+    // same q can then re-ack a lost application response without rebinding it.
+    let notifyPreferenceAck: string | undefined;
+    if (!blocked) {
+      try {
+        const applied = applyOwnerNotifyPreference(
+          this.name,
+          frame.from,
+          this.profile.ownerUserId,
+          body,
+        );
+        if (applied !== null) {
+          notifyPreferenceAck = composeNotifyPreferenceAck(applied);
+        }
+      } catch {
+        console.error(
+          '!! notification preference could not be saved — request not applied; retry from phone',
+        );
+      }
+    }
     // The SAME spool rule the plain listener uses — plain text and replies
     // only. Persisting every non-call body wrote profile cards and reactions
     // into the plaintext spool that ordinary `listen` deliberately keeps out.
@@ -591,6 +616,25 @@ export class CallSession {
 
     this.stores.markSeen(frame.msgId);
     this.ws.send({ type: 'ack', msgId: frame.msgId });
+
+    // This application ack is transport, never conversation: it bypasses the
+    // spool and rings nothing. `sendAcked` uses this session's live socket,
+    // serial send chain and ratchet owner, then waits a bounded five seconds
+    // for the server to accept it. The preference is already durable, so a
+    // failed response is retried by a fresh owner request with the same q.
+    if (notifyPreferenceAck !== undefined) {
+      let receipt: ReceiptKind | null = null;
+      try {
+        receipt = await this.sendAcked(frame.from, notifyPreferenceAck, false);
+      } catch {
+        // The fixed diagnostic below owns every post-apply failure shape.
+      }
+      if (receipt === null) {
+        console.error(
+          '!! notification preference applied; acknowledgement could not be sent — retry from phone',
+        );
+      }
+    }
 
     if (wasCall) {
       // A SESSION is answered once, by a person — not once per leg — so a
@@ -763,7 +807,7 @@ export class CallSession {
   >();
 
   /**
-   * How long a roster delta waits for the server to say it took the frame.
+   * How long a tracked transport frame waits for the server to say it took it.
    *
    * The receipt is posted the moment the server has QUEUED the ciphertext
    * (`handlers/ws.ts`, `state: 'sent' | 'delivered'`), so this is a round trip
@@ -777,14 +821,10 @@ export class CallSession {
   /**
    * Send, and report whether the SERVER acknowledged taking it.
    *
-   * The group session's roster fan-out is the only caller, and it exists
-   * because `sendEncrypted` alone cannot support the claim the gate reads off
-   * it. That method returns once the ciphertext has been written to an open
-   * socket, which proves the frame was ATTEMPTED — `ws.send` is void, takes no
-   * callback and reports nothing — so a fan-out counting its resolutions
-   * reported "n of n" for frames the server may never have seen. The receipt
-   * frame is the only thing on this protocol that distinguishes the two, and
-   * the server posts one per accepted send, keyed by the msgId WE minted.
+   * The group session's roster fan-out and the owner preference application
+   * ack are the two callers. `sendEncrypted` alone returns once ciphertext has
+   * been written to an open socket, which proves only that the frame was
+   * attempted. The receipt is the protocol fact that the server accepted it.
    *
    * A refusal is not a receipt: the server answers a rejected send with an
    * `error` frame and returns before the receipt, so a rate-limited or
@@ -971,10 +1011,10 @@ export class CallSession {
       // server's receipt can be on the socket in the very next turn.
       if (trackReceipt) this.pendingReceipts.set(msgId, { acked: false, kind: null, wake: null });
       try {
-        // notify:false on EVERY frame this method sends, because every frame it
-        // sends is call signalling — this is the call session's transport, and
-        // ordinary messages never come through here (send.ts owns those, and
-        // its docblock names this method's exemption). It is the CLI mirror of
+        // notify:false on EVERY frame this method sends, because every frame is
+        // non-conversational transport: call signalling or the exact owner
+        // preference application ack. Ordinary messages never come through
+        // here (send.ts owns those). It is the CLI mirror of
         // the app's one derivation: isCarrierEnvelope treats all `call.*` as
         // carrier, so app/src/messaging.ts stamps notify:false on every call
         // frame at its send choke point. The server reads this bit to decide

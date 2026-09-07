@@ -1,9 +1,19 @@
-import React from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
-import { MAX_APPROVAL_PAYLOAD_BYTES } from '@tacendum/shared';
+import React, { useEffect, useState } from 'react';
+import {
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  useWindowDimensions,
+  View,
+} from 'react-native';
+import {
+  MAX_APPROVAL_PAYLOAD_BYTES,
+  displayAiWorkTimestamp,
+  type AiWorkMetadata,
+} from '@tacendum/shared';
 import type { ApprovalKind, ApprovalRow } from '../db';
-import { DEVICE_NOUN } from '../deviceNoun';
-import { clockLabel } from '../time';
+import { clockLabel, dayLabel } from '../time';
 import { hairline, useTheme, type Theme } from '../theme';
 import { InfoDisclosure } from './InfoDisclosure';
 import { PrimaryButton } from './primitives';
@@ -11,10 +21,9 @@ import { PrimaryButton } from './primitives';
 /**
  * The approval card — one machine asking one question.
  *
- * A pure function of one stored `approvals` row plus injected callbacks, the
- * `CallTile` discipline: it reads nothing, subscribes to nothing and decides
- * nothing. The screen owns the store, the clock tick and the send; the card
- * owns only what is honest to SAY.
+ * The screen owns the store, the clock tick and the send. The card owns its
+ * disclosures and requires the exact request to be exposed before Approve
+ * can call the injected handler; it never sends or settles anything itself.
  *
  * Three rules do the real work, and each is asserted rather than trusted:
  *
@@ -53,7 +62,10 @@ export const APPROVAL_KIND_COPY: Record<ApprovalKind, string> = {
 export type ApprovalDisplayState = 'pending' | 'answered' | 'lapsed';
 
 /** The settled sentences. Total by type: a new state must bring its copy. */
-const SETTLED_COPY: Record<Exclude<ApprovalDisplayState, 'answered'>, string> = {
+const SETTLED_COPY: Record<
+  Exclude<ApprovalDisplayState, 'answered'>,
+  string
+> = {
   pending: '', // unreachable through settledLine; listed so the Record is total
   lapsed: 'Lapsed — nothing was approved.',
 };
@@ -62,14 +74,31 @@ const SETTLED_COPY: Record<Exclude<ApprovalDisplayState, 'answered'>, string> = 
  * `a` renders no button — never reads as approve, never reaches the wire. */
 export const RECOGNISED_VERBS = ['approve', 'deny'] as const;
 
-/** The receipt's verb word. Past tense because the receipt is a record of an
- * act, not a control; the fallback quotes the stored verb rather than
- * guessing at its grammar. */
-function receiptVerb(verb: string | null): string {
-  if (verb === 'approve') return 'Approved';
-  if (verb === 'deny') return 'Denied';
-  return `Answered “${verb ?? ''}”`;
+/** What this phone queued. It is deliberately not phrased as host execution. */
+function queuedAnswer(verb: string | null): string {
+  if (verb === 'approve') return 'Approve answer queued';
+  if (verb === 'deny') return 'Deny answer queued';
+  return `“${verb ?? ''}” answer queued`;
 }
+
+export const AI_PROVIDER_COPY: Record<AiWorkMetadata['provider'], string> = {
+  claude: 'Claude',
+  codex: 'Codex',
+  gemini: 'Gemini',
+  cursor: 'Cursor',
+};
+
+export const APPROVAL_OBSERVATION_COPY: Record<
+  NonNullable<AiWorkMetadata['approvalObservation']>,
+  (provider: string) => string
+> = {
+  'answer-received': () => 'The agent reports receiving a matching answer.',
+  'decision-returned': provider =>
+    `The agent reports returning the decision to ${provider}.`,
+  'provider-received': provider =>
+    `The agent reports ${provider} acknowledged the decision.`,
+  expired: () => 'The agent reports this request expired.',
+};
 
 /** The local deadline — display only; expiry is decided on the CLI's clock. */
 export function approvalDeadline(a: ApprovalRow): number {
@@ -106,7 +135,11 @@ export function payloadRefusal(a: ApprovalRow): string | null {
   }
   // A high surrogate not followed by a low one, or a low one not preceded by
   // a high one — either renders as a substitute character, not the byte.
-  if (/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(a.payload)) {
+  if (
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(
+      a.payload,
+    )
+  ) {
     return 'This request contains text that cannot be shown exactly, so it cannot be approved from here.';
   }
   return null;
@@ -120,6 +153,42 @@ export function countdownLabel(msLeft: number): string {
   const s = total % 60;
   const two = (n: number) => String(n).padStart(2, '0');
   return h > 0 ? `${h}:${two(m)}:${two(s)} left` : `${m}:${two(s)} left`;
+}
+
+/** A convenience preview, never the authorization text. Only the Claude
+ * permission wrapper emitted by our bridge has known command semantics.
+ * Other JSON stays opaque; the full original is available in the review. */
+function requestPreview(payload: string): {
+  description?: string;
+  command?: string;
+} {
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed))
+      return {};
+    const wrapper = parsed as Record<string, unknown>;
+    if (
+      typeof wrapper.tool_name !== 'string' ||
+      typeof wrapper.cwd !== 'string'
+    )
+      return {};
+    const input = wrapper.tool_input;
+    if (typeof input !== 'object' || input === null || Array.isArray(input))
+      return {};
+    const fields = input as Record<string, unknown>;
+    return {
+      ...(typeof fields.description === 'string' && fields.description.trim()
+        ? { description: fields.description }
+        : {}),
+      ...(wrapper.tool_name === 'Bash' && typeof fields.command === 'string'
+        ? { command: fields.command }
+        : {}),
+    };
+  } catch {
+    // Plain commands and diffs can be previewed, but only the disclosure
+    // renders them as the exact selectable authorization text.
+    return { command: payload };
+  }
 }
 
 export function ApprovalCard({
@@ -141,11 +210,22 @@ export function ApprovalCard({
   testID?: string;
 }): React.JSX.Element {
   const t = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const actionMinimum = Math.max(96, Math.ceil(80 * fontScale));
   const styles = makeStyles(t);
   const state = approvalDisplayState(approval, now);
   const refusal = payloadRefusal(approval);
   const redacted = approval.payload === '' && state !== 'pending';
   const kindCopy = APPROVAL_KIND_COPY[approval.kind];
+  // Defence in depth over the store's correlation rule. Supplementary facts
+  // for a different request never render around these exact payload bytes.
+  const work = approval.work?.requestId === approval.q ? approval.work : null;
+  const provider = work ? AI_PROVIDER_COPY[work.provider] : null;
+  const context = work?.context;
+  const hostObservation = approval.hostObservation ?? null;
+  const hostProvider = approval.hostObservationProvider
+    ? AI_PROVIDER_COPY[approval.hostObservationProvider]
+    : provider;
 
   // One button per declared verb, in the request's own order, recognised
   // ones only. When the payload is refused, `approve` drops out: what cannot
@@ -155,15 +235,44 @@ export function ApprovalCard({
   );
   const offered = refusal === null ? verbs : verbs.filter(v => v !== 'approve');
 
-  const settled = state !== 'pending';
+  const settled = state !== 'pending' || hostObservation !== null;
+  // Bind the open state to the exact row and bytes. A recycled list row or
+  // changed payload must never inherit permission to approve from a review
+  // of something else. Settling also returns the card to its compact receipt.
+  const [review, setReview] = useState<{
+    peerId: string;
+    q: string;
+    payload: string;
+    settled: boolean;
+  } | null>(null);
+  const payloadOpen =
+    review?.peerId === approval.peerId &&
+    review.q === approval.q &&
+    review.payload === approval.payload &&
+    review.settled === settled;
+  // Release the previous payload after redaction, replacement or settlement.
+  // The equality guard above closes approval immediately, before this effect.
+  useEffect(() => {
+    setReview(null);
+  }, [approval.peerId, approval.q, approval.payload, settled]);
+  const [contextOpen, setContextOpen] = useState(false);
+  const preview =
+    refusal === null && !redacted ? requestPreview(approval.payload) : {};
+  const answer = (verb: string) => {
+    if (busy || settled || !offered.includes(verb)) return;
+    if (verb === 'approve' && !payloadOpen) return;
+    onAnswer(verb);
+  };
   const settledLine =
     state === 'answered'
-      ? `${receiptVerb(approval.answerVerb)} · ${clockLabel(
+      ? `${queuedAnswer(approval.answerVerb)} · ${clockLabel(
           approval.settledAt ?? now,
-        )} · from this ${DEVICE_NOUN}`
+        )} · saved here`
       : state === 'lapsed'
         ? SETTLED_COPY.lapsed
-        : '';
+        : hostObservation !== null
+          ? 'No answer is waiting on this device.'
+          : '';
 
   return (
     <View
@@ -172,62 +281,304 @@ export function ApprovalCard({
       style={[styles.card, settled && styles.settled]}
     >
       <View style={styles.header}>
-        <Text style={[t.type.utilityLabel, { color: t.color.pine }]}>
-          APPROVAL
-        </Text>
-        <Text style={[t.type.compactStrong, styles.kind, { color: t.color.inkStrong }]}>
-          {kindCopy}
-        </Text>
-        {approval.sessionTag ? (
-          <View style={styles.tagChip} testID={testID ? `${testID}-tag` : undefined}>
-            <Text style={[t.type.utilityData, { color: t.color.inkMuted }]}>
-              {approval.sessionTag}
+        {fontScale <= 1.5 ? (
+          <View
+            style={[styles.mark, { backgroundColor: t.color.pineWash }]}
+            accessibilityElementsHidden
+          >
+            <Text
+              allowFontScaling={false}
+              style={[t.type.iconGlyph, { color: t.color.pine }]}
+            >
+              {approval.kind === 'exec'
+                ? '›_'
+                : approval.kind === 'file'
+                  ? '≡'
+                  : '?'}
             </Text>
           </View>
         ) : null}
-        {state === 'pending' ? (
-          <Text
-            style={[t.type.timeStatus, styles.clock, { color: t.color.warningInk }]}
-            testID={testID ? `${testID}-countdown` : undefined}
-          >
-            {countdownLabel(approvalDeadline(approval) - now)}
+        <View style={styles.titles}>
+          <View style={styles.labelRow}>
+            <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
+              Approval
+            </Text>
+            {!settled ? (
+              <Text
+                style={[
+                  t.type.compactBody,
+                  styles.clock,
+                  { color: t.color.warningInk },
+                ]}
+                testID={testID ? `${testID}-countdown` : undefined}
+              >
+                {countdownLabel(approvalDeadline(approval) - now)}
+              </Text>
+            ) : hostObservation !== null ? (
+              <Text
+                style={[
+                  t.type.compactBody,
+                  styles.clock,
+                  { color: t.color.inkMuted },
+                ]}
+                testID={testID ? `${testID}-host-observed` : undefined}
+              >
+                Host updated
+              </Text>
+            ) : null}
+          </View>
+          <Text style={[t.type.sectionTitle, { color: t.color.inkStrong }]}>
+            {kindCopy}
           </Text>
-        ) : null}
+        </View>
       </View>
+
+      {work || approval.sessionTag ? (
+        <View style={styles.sourceStrip}>
+          {work ? (
+            <View
+              style={styles.sourceIdentity}
+              testID={testID ? `${testID}-source` : undefined}
+            >
+              <Text style={[t.type.compactStrong, { color: t.color.pine }]}>
+                {provider}
+              </Text>
+              {work.project ? (
+                <Text
+                  numberOfLines={1}
+                  style={[
+                    t.type.compactBody,
+                    styles.sourceProject,
+                    { color: t.color.inkMuted },
+                  ]}
+                >
+                  {work.project}
+                </Text>
+              ) : null}
+            </View>
+          ) : null}
+          {approval.sessionTag ? (
+            <Text
+              numberOfLines={1}
+              style={[
+                t.type.compactBody,
+                styles.tagChip,
+                { color: t.color.inkMuted },
+              ]}
+              testID={testID ? `${testID}-tag` : undefined}
+            >
+              {approval.sessionTag}
+            </Text>
+          ) : null}
+        </View>
+      ) : null}
+
+      {(preview.description || preview.command) && !redacted ? (
+        <View
+          style={styles.preview}
+          testID={testID ? `${testID}-preview` : undefined}
+        >
+          {preview.description ? (
+            <Text
+              numberOfLines={2}
+              style={[t.type.body, { color: t.color.inkBody }]}
+            >
+              {preview.description}
+            </Text>
+          ) : null}
+          {preview.command ? (
+            <Text
+              numberOfLines={settled ? 1 : 2}
+              style={[t.type.utilityData, { color: t.color.inkMuted }]}
+            >
+              {preview.command}
+            </Text>
+          ) : null}
+        </View>
+      ) : null}
+
+      {context && contextOpen ? (
+        <View
+          style={[styles.contextBox, { borderColor: t.color.lineSoft }]}
+          testID={testID ? `${testID}-context` : undefined}
+        >
+          <Text style={[t.type.compactStrong, { color: t.color.inkMuted }]}>
+            Agent context
+          </Text>
+          {context.availability === 'unavailable' ? (
+            <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
+              The agent could not capture repository or result context for this
+              request.
+            </Text>
+          ) : (
+            <>
+              <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
+                {(() => {
+                  const shown = displayAiWorkTimestamp(
+                    context.capturedAt,
+                    approval.workReceivedAt ?? approval.arrivedAt,
+                  );
+                  const stamp = `${dayLabel(shown.at)} at ${clockLabel(shown.at)}`;
+                  if (!shown.trusted) {
+                    return `Received ${stamp} · source time untrusted. Repository state may have changed.`;
+                  }
+                  return context.availability === 'stale'
+                    ? `The agent marked this context stale. Captured ${stamp}.`
+                    : `Agent-reported capture · ${stamp}. Repository state may have changed since capture.`;
+                })()}
+              </Text>
+              {context.repository ? (
+                <View style={styles.factRow}>
+                  <Text
+                    style={[
+                      t.type.compactStrong,
+                      styles.factLabel,
+                      { color: t.color.inkMuted },
+                    ]}
+                  >
+                    Repository
+                  </Text>
+                  <Text
+                    selectable
+                    style={[
+                      t.type.utilityData,
+                      styles.factValue,
+                      { color: t.color.inkBody },
+                    ]}
+                  >
+                    {context.repository}
+                  </Text>
+                </View>
+              ) : null}
+              {context.branch ? (
+                <View style={styles.factRow}>
+                  <Text
+                    style={[
+                      t.type.compactStrong,
+                      styles.factLabel,
+                      { color: t.color.inkMuted },
+                    ]}
+                  >
+                    Branch
+                  </Text>
+                  <Text
+                    selectable
+                    style={[
+                      t.type.utilityData,
+                      styles.factValue,
+                      { color: t.color.inkBody },
+                    ]}
+                  >
+                    {context.branch}
+                  </Text>
+                </View>
+              ) : null}
+              {context.resultSummary ? (
+                <View style={styles.summary}>
+                  <Text
+                    style={[t.type.compactStrong, { color: t.color.inkMuted }]}
+                  >
+                    Agent-reported result
+                  </Text>
+                  <Text
+                    selectable
+                    style={[t.type.compactBody, { color: t.color.inkBody }]}
+                  >
+                    {context.resultSummary}
+                  </Text>
+                </View>
+              ) : null}
+            </>
+          )}
+        </View>
+      ) : null}
 
       {refusal !== null ? (
         // THE REFUSAL, in place of the payload — a stated reason, never a
         // truncation. The sentence says why AND what that costs (no
         // approve); the machine's own copy of the payload is untouched.
-        <View style={styles.payloadBox} testID={testID ? `${testID}-refusal` : undefined}>
+        <View
+          style={[styles.payloadBox, styles.payloadContent]}
+          testID={testID ? `${testID}-refusal` : undefined}
+        >
           <Text style={[t.type.compactBody, { color: t.color.warningInk }]}>
             {refusal}
           </Text>
         </View>
       ) : redacted ? (
-        <View style={styles.payloadBox}>
-          <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
-            {`Cleared after settling · ${approval.payloadBytes} bytes`}
-          </Text>
-        </View>
+        <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
+          {`Cleared after settling · ${approval.payloadBytes} bytes`}
+        </Text>
       ) : (
-        // THE FEATURE: the exact bytes, monospace, selectable, scrolling
-        // INSIDE the block — no markdown pass, no trimming, no ellipsis.
-        <ScrollView
-          style={[styles.payloadBox, settled && styles.payloadSettled]}
-          nestedScrollEnabled
-          testID={testID ? `${testID}-payload` : undefined}
-        >
-          <Text
-            selectable
-            style={[
-              t.type.utilityData,
-              { color: settled ? t.color.inkMuted : t.color.inkBody },
+        <View style={styles.details}>
+          <Pressable
+            onPress={() =>
+              setReview(
+                payloadOpen
+                  ? null
+                  : {
+                      peerId: approval.peerId,
+                      q: approval.q,
+                      payload: approval.payload,
+                      settled,
+                    },
+              )
+            }
+            accessibilityRole="button"
+            accessibilityLabel={
+              payloadOpen ? 'Hide full request' : 'Review full request'
+            }
+            accessibilityHint={
+              !settled
+                ? 'Open the exact request text to enable Approve.'
+                : undefined
+            }
+            accessibilityState={{ expanded: payloadOpen }}
+            testID={testID ? `${testID}-details` : undefined}
+            style={({ pressed }) => [
+              styles.detailsToggle,
+              pressed && { backgroundColor: t.color.pineWash },
             ]}
           >
-            {approval.payload}
-          </Text>
-        </ScrollView>
+            <View style={styles.detailLabels}>
+              <Text style={[t.type.buttonCompact, { color: t.color.pine }]}>
+                {payloadOpen
+                  ? 'Full request'
+                  : settled
+                    ? 'View request'
+                    : 'Review full request'}
+              </Text>
+              {!settled && !payloadOpen && offered.includes('approve') ? (
+                <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
+                  Required to approve
+                </Text>
+              ) : null}
+            </View>
+            <Text
+              allowFontScaling={false}
+              style={[t.type.iconGlyph, { color: t.color.pine }]}
+            >
+              {payloadOpen ? '⌄' : '›'}
+            </Text>
+          </Pressable>
+          {payloadOpen ? (
+            // Only this block is authorization text: exact original bytes,
+            // selectable and scrolling, with no trim, pretty-print or ellipsis.
+            <ScrollView
+              style={styles.payloadBox}
+              contentContainerStyle={styles.payloadContent}
+              nestedScrollEnabled
+              testID={testID ? `${testID}-payload` : undefined}
+            >
+              <Text
+                selectable
+                style={[t.type.utilityData, { color: t.color.inkBody }]}
+              >
+                {approval.payload}
+              </Text>
+            </ScrollView>
+          ) : null}
+        </View>
       )}
 
       {settled ? (
@@ -244,16 +595,17 @@ export function ApprovalCard({
               <PrimaryButton
                 key={verb}
                 label="Approve"
+                disabled={!payloadOpen}
                 busy={busy}
                 busyLabel="Approving…"
-                onPress={() => onAnswer(verb)}
+                onPress={() => answer(verb)}
                 testID={testID ? `${testID}-approve` : undefined}
-                style={styles.actionButton}
+                style={[styles.actionButton, { minWidth: actionMinimum }]}
               />
             ) : (
               <Pressable
                 key={verb}
-                onPress={() => onAnswer(verb)}
+                onPress={() => answer(verb)}
                 disabled={busy}
                 accessibilityRole="button"
                 accessibilityLabel="Deny"
@@ -261,6 +613,7 @@ export function ApprovalCard({
                 testID={testID ? `${testID}-deny` : undefined}
                 style={({ pressed }) => [
                   styles.denyButton,
+                  { minWidth: actionMinimum },
                   // Alone in the row (a refused payload, or a request that
                   // declared no approve), Deny takes the width Approve
                   // would have held — a lone content-width pill would read
@@ -282,15 +635,65 @@ export function ApprovalCard({
         </View>
       )}
 
-      <InfoDisclosure
-        label="What approving does"
-        lines={[
-          'These buttons send a word to your machine — nothing else travels.',
-          'Your machine runs only the exact text shown here, which it already holds.',
-          'If the timer runs out, nothing runs.',
-        ]}
-        testID={testID ? `${testID}-info` : undefined}
-      />
+      {hostObservation !== null ? (
+        <View
+          style={styles.hostState}
+          testID={testID ? `${testID}-host-state` : undefined}
+        >
+          <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
+            {APPROVAL_OBSERVATION_COPY[hostObservation](
+              hostProvider ?? 'the provider',
+            )}
+          </Text>
+          <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
+            Execution not confirmed.
+          </Text>
+        </View>
+      ) : state === 'answered' ? (
+        <Text
+          style={[t.type.compactBody, { color: t.color.inkMuted }]}
+          testID={testID ? `${testID}-host-waiting` : undefined}
+        >
+          Waiting for an update from the agent.
+        </Text>
+      ) : null}
+
+      <View style={styles.footer}>
+        {context ? (
+          <Pressable
+            onPress={() => setContextOpen(v => !v)}
+            accessibilityRole="button"
+            accessibilityLabel="Agent context"
+            accessibilityState={{ expanded: contextOpen }}
+            testID={testID ? `${testID}-context-toggle` : undefined}
+            style={({ pressed }) => [
+              styles.contextToggle,
+              pressed && { backgroundColor: t.color.pineWash },
+            ]}
+          >
+            <Text style={[t.type.buttonCompact, { color: t.color.inkMuted }]}>
+              Agent context
+            </Text>
+            <Text
+              allowFontScaling={false}
+              style={[t.type.compactBody, { color: t.color.inkMuted }]}
+            >
+              {contextOpen ? '⌄' : '›'}
+            </Text>
+          </Pressable>
+        ) : null}
+        <InfoDisclosure
+          label="About approval"
+          lines={[
+            'The preview and agent context are supplementary. Review the full original request before approving.',
+            'These buttons send a word to your machine — nothing else travels.',
+            'Your machine already holds the full request shown here.',
+            'A queued answer is not proof that the operation ran.',
+            'This does not confirm that the command or file change ran.',
+          ]}
+          testID={testID ? `${testID}-info` : undefined}
+        />
+      </View>
     </View>
   );
 }
@@ -301,47 +704,114 @@ function makeStyles(t: Theme) {
       alignSelf: 'stretch',
       marginHorizontal: t.layout.gutter,
       marginVertical: t.space.s4,
-      padding: t.space.s5,
+      padding: t.space.s6,
       gap: t.space.s5,
-      borderRadius: t.radius.drawer,
+      borderRadius: t.radius.bubble,
       borderWidth: 1,
-      borderColor: t.color.lineSoft,
-      backgroundColor: t.color.paperLayer,
+      borderColor: t.color.pineLine,
+      backgroundColor: t.color.paperSheet,
     },
-    /** Settled reads quieter than live — and never colour alone: the settled
-     * line says the word (the CallTile rule). The quiet is the PAYLOAD box
-     * receding (soft edge, muted ink, see `payloadSettled`), not a card-wide
-     * opacity: 0.66 put the settled line at ≈2.8:1, under the 4.5:1 AA
-     * floor, and primitives.tsx's rule is "a recessed surface, never
-     * opacity". */
-    settled: {},
+    /** Settled reads quieter than live — and never colour alone: the
+     * settled line says the word (the CallTile rule). The quiet is the
+     * payload collapsing and the soft card outline, not a card-wide
+     * opacity: 0.66 put the settled line at about 2.8:1, below the 4.5:1
+     * AA floor. Use a recessed surface, never opacity. */
+    settled: { borderColor: t.color.lineSoft },
     header: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: t.space.s5,
+    },
+    mark: {
+      width: 44,
+      height: 44,
+      borderRadius: t.radius.button,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    titles: { flex: 1, gap: t.space.s1 },
+    labelRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      flexWrap: 'wrap',
+      gap: t.space.s2,
+    },
+    tagChip: {
+      flexShrink: 1,
+      paddingHorizontal: t.space.s3,
+      paddingVertical: t.space.s1,
+      borderRadius: t.radius.small,
+      backgroundColor: t.color.paperGround,
+    },
+    clock: { marginLeft: 'auto' },
+    sourceStrip: {
       flexDirection: 'row',
       alignItems: 'center',
       gap: t.space.s4,
       flexWrap: 'wrap',
     },
-    kind: { flexShrink: 1 },
-    tagChip: {
-      paddingHorizontal: t.space.s3,
-      paddingVertical: t.space.s1,
-      borderRadius: t.radius.small,
-      backgroundColor: t.color.paperInset,
-      borderWidth: hairline,
-      borderColor: t.color.lineSoft,
+    sourceIdentity: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: t.space.s4,
+      flexShrink: 1,
     },
-    clock: { marginLeft: 'auto' },
+    sourceProject: { flexShrink: 1 },
+    preview: { gap: t.space.s3 },
+    details: { gap: t.space.s4 },
+    detailsToggle: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: t.space.s4,
+      minHeight: t.layout.touchTarget,
+      borderRadius: t.radius.small,
+      paddingHorizontal: t.space.s5,
+      paddingVertical: t.space.s4,
+      backgroundColor: t.color.pineWashFaint,
+    },
+    detailLabels: { flex: 1, gap: t.space.s1 },
+    contextBox: {
+      padding: t.space.s4,
+      borderWidth: hairline,
+      borderRadius: t.radius.tail,
+      gap: t.space.s3,
+    },
+    factRow: {
+      flexDirection: 'row',
+      alignItems: 'flex-start',
+      gap: t.space.s4,
+    },
+    factLabel: { width: 74 },
+    factValue: { flex: 1 },
+    summary: { gap: t.space.s1 },
     payloadBox: {
       maxHeight: 220,
-      padding: t.space.s5,
-      borderRadius: t.radius.tail,
+      borderRadius: t.radius.small,
       borderWidth: hairline,
-      borderColor: t.color.lineStrong,
-      backgroundColor: t.color.paperInset,
+      borderColor: t.color.lineSoft,
+      backgroundColor: t.color.paperGround,
     },
-    /** A settled card's payload: the same recessed surface with its edge
-     * softened — the command it showed is no longer the thing to act on. */
-    payloadSettled: { borderColor: t.color.lineSoft },
+    payloadContent: { padding: t.space.s5 },
+    hostState: {
+      gap: t.space.s2,
+    },
+    footer: {
+      borderTopWidth: hairline,
+      borderTopColor: t.color.lineSoft,
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      columnGap: t.space.s4,
+    },
+    contextToggle: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: t.space.s4,
+      minHeight: t.layout.touchTarget,
+      borderRadius: t.radius.small,
+    },
     /**
      * The button row, on the call-actions anatomy (IncomingCallScreen):
      * a row with a gap, children stretched to one shared height, and every
@@ -356,19 +826,28 @@ function makeStyles(t: Theme) {
      */
     actions: {
       flexDirection: 'row',
+      flexWrap: 'wrap',
       alignItems: 'stretch',
       gap: t.space.s5,
     },
-    /** Approve: prominent — it grows into all width Deny does not need.
+    /** Balanced actions: each grows from a zero basis; Deny owns a safe
+     * minimum so its label cannot be crushed by the primitive's width.
      * `flexBasis: 0` + `width: 'auto'` retire the primitive's full-bleed
      * width inside this row (the basis would otherwise BE 100%). */
-    actionButton: { flexGrow: 1, flexShrink: 1, flexBasis: 0, width: 'auto', minWidth: 0 },
+    actionButton: {
+      flexGrow: 1,
+      flexShrink: 1,
+      flexBasis: 0,
+      width: 'auto',
+      minWidth: 0,
+    },
     /** Deny: a real button, destructive-outline. `flexShrink: 0` plus the
      * minWidth is the one-line guarantee — no row width can compress the
      * label below its own layout, so "Deny" can never wrap. */
     denyButton: {
-      flexGrow: 0,
+      flexGrow: 1,
       flexShrink: 0,
+      flexBasis: 0,
       minWidth: 96,
       minHeight: t.layout.buttonHeight,
       paddingHorizontal: t.space.s6,

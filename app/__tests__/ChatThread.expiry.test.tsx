@@ -129,6 +129,26 @@ async function elapse(ms: number): Promise<void> {
 const onGlass = (tree: ReactTestRenderer.ReactTestRenderer, msgId: string) =>
   tree.root.findAllByProps({ testID: `msg-${msgId}` }).length > 0;
 
+async function press(
+  tree: ReactTestRenderer.ReactTestRenderer,
+  testID: string,
+): Promise<void> {
+  const node = tree.root
+    .findAllByProps({ testID })
+    .find(n => typeof n.props.onPress === 'function');
+  await ReactTestRenderer.act(async () => node!.props.onPress());
+}
+
+async function openRail(
+  tree: ReactTestRenderer.ReactTestRenderer,
+  msgId: string,
+): Promise<void> {
+  const bubble = tree.root
+    .findAllByProps({ testID: `msg-${msgId}` })
+    .find(n => typeof n.props.onLongPress === 'function');
+  await ReactTestRenderer.act(async () => bubble!.props.onLongPress());
+}
+
 test('a row past its expiresAt leaves the glass without a remount', async () => {
   const tree = await renderThread();
   expect(onGlass(tree, '01EXPIRING')).toBe(true);
@@ -179,4 +199,83 @@ test('coming to the foreground sweeps again — a pocketed phone missed its time
   await ReactTestRenderer.act(() => {
     tree.unmount();
   });
+});
+
+test('an expiring reply target clears its quote and the typed words send as an ordinary message', async () => {
+  const sendText = jest.spyOn(messaging, 'sendText').mockResolvedValue();
+  const sendReply = jest.spyOn(messaging, 'sendReply').mockResolvedValue();
+  const tree = await renderThread();
+  await openRail(tree, '01EXPIRING');
+  await press(tree, 'reply-01EXPIRING');
+  const input = tree.root.findByProps({ testID: 'composer-input' });
+  await ReactTestRenderer.act(async () => input.props.onChangeText('still coming'));
+  expect(tree.root.findAllByProps({ testID: 'composer-chip' })).not.toHaveLength(0);
+
+  await elapse(EXPIRES_IN_MS + 100);
+  expect(tree.root.findAllByProps({ testID: 'composer-chip' })).toHaveLength(0);
+  expect(tree.root.findByProps({ testID: 'composer-input' }).props.value).toBe(
+    'still coming',
+  );
+  await press(tree, 'composer-send');
+  expect(sendReply).not.toHaveBeenCalled();
+  expect(sendText).toHaveBeenCalledWith('peer-1', 'still coming');
+  await ReactTestRenderer.act(() => tree.unmount());
+});
+
+test('an expiring edit target restores the shelved draft and cannot dispatch an edit', async () => {
+  live.push({
+    msgId: '01OUTEXPIRING',
+    peerId: 'peer-1',
+    direction: 'out',
+    body: 'old sent words',
+    ts: T0 - 10_000,
+    status: 'sent',
+    expiresAt: T0 + EXPIRES_IN_MS,
+  });
+  const sendText = jest.spyOn(messaging, 'sendText').mockResolvedValue();
+  const sendEdit = jest.spyOn(messaging, 'sendEdit').mockResolvedValue();
+  const tree = await renderThread();
+  const input = tree.root.findByProps({ testID: 'composer-input' });
+  await ReactTestRenderer.act(async () => input.props.onChangeText('unsent words'));
+  await openRail(tree, '01OUTEXPIRING');
+  await press(tree, 'edit-01OUTEXPIRING');
+  expect(tree.root.findByProps({ testID: 'composer-input' }).props.value).toBe(
+    'old sent words',
+  );
+
+  await elapse(EXPIRES_IN_MS + 100);
+  expect(tree.root.findAllByProps({ testID: 'composer-chip' })).toHaveLength(0);
+  expect(tree.root.findByProps({ testID: 'composer-input' }).props.value).toBe(
+    'unsent words',
+  );
+  await press(tree, 'composer-send');
+  expect(sendEdit).not.toHaveBeenCalled();
+  expect(sendText).toHaveBeenCalledWith('peer-1', 'unsent words');
+  await ReactTestRenderer.act(() => tree.unmount());
+});
+
+test('Send racing an edit target expiry restores the shelf before the sweep can run', async () => {
+  live.push({
+    msgId: '01OUTEXPIRING', peerId: 'peer-1', direction: 'out',
+    body: 'old sent words', ts: T0 - 10_000, status: 'sent',
+    expiresAt: T0 + EXPIRES_IN_MS,
+  });
+  const sendEdit = jest.spyOn(messaging, 'sendEdit').mockResolvedValue();
+  const sendText = jest.spyOn(messaging, 'sendText').mockResolvedValue();
+  const saveDraft = jest.spyOn(db, 'setDraft');
+  const tree = await renderThread();
+  await ReactTestRenderer.act(async () => tree.root.findByProps({ testID: 'composer-input' }).props.onChangeText('unsent words'));
+  await openRail(tree, '01OUTEXPIRING');
+  await press(tree, 'edit-01OUTEXPIRING');
+  expect(tree.root.findByProps({ testID: 'composer-input' }).props.value).toBe('old sent words');
+
+  // Wall time passes without running timers: Send wins the event-loop race.
+  jest.setSystemTime(T0 + EXPIRES_IN_MS + 1);
+  await press(tree, 'composer-send');
+  expect(sendEdit).not.toHaveBeenCalled();
+  expect(sendText).not.toHaveBeenCalled();
+  expect(tree.root.findAllByProps({ testID: 'composer-chip' })).toHaveLength(0);
+  expect(tree.root.findByProps({ testID: 'composer-input' }).props.value).toBe('unsent words');
+  await ReactTestRenderer.act(async () => tree.unmount());
+  expect(saveDraft).toHaveBeenLastCalledWith('peer-1', 'unsent words', null);
 });

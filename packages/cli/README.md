@@ -92,6 +92,21 @@ host's hook configuration. The edited file receives one rolling `.bak` backup
 with mode `0600`. Supported surfaces are `claude-code`, `codex`, `cursor`, and
 `gemini`.
 
+Native Claude phone approvals are an explicit setup option:
+
+```
+tacendum setup claude-code --account claude --name "Claude" --approvals 11
+tacendum service install claude
+```
+
+This installs a blocking `PermissionRequest` bridge for native **interactive**
+Claude Code. The listener receives the owner's encrypted decision. It can use
+Claude Code's own sign-in and does not change Claude's permission rules.
+Noninteractive `claude -p` attend turns do not fire `PermissionRequest` and
+therefore have no phone tool-approval lane. The separate `attend` `sdk` driver
+can relay its own tool asks, but that remote SDK answerer requires an
+operator-supplied `ANTHROPIC_API_KEY`.
+
 ### `notify`
 
 ```sh
