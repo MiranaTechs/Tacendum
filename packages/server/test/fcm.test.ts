@@ -44,7 +44,7 @@ const SEND_PATH = '/v1/projects/tacendum-test/messages:send';
 beforeAll(async () => {
   server = createServer((req, res) => {
     let body = '';
-    req.on('data', chunk => (body += chunk));
+    req.on('data', (chunk) => (body += chunk));
     req.on('end', () => {
       received.push({ path: req.url ?? '', headers: req.headers, body });
       const reply = req.url === TOKEN_PATH ? tokenReply : sendReply;
@@ -52,7 +52,7 @@ beforeAll(async () => {
       res.end(reply.body ?? '');
     });
   });
-  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   credentials = {
     projectId: 'tacendum-test',
@@ -63,7 +63,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await new Promise<void>(resolve => server.close(() => resolve()));
+  await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
 beforeEach(() => {
@@ -76,8 +76,8 @@ beforeEach(() => {
 });
 
 const DEVICE = `device-instance-id:APA91b${'x'.repeat(120)}`;
-const sends = () => received.filter(r => r.path === SEND_PATH);
-const tokenMints = () => received.filter(r => r.path === TOKEN_PATH);
+const sends = () => received.filter((r) => r.path === SEND_PATH);
+const tokenMints = () => received.filter((r) => r.path === TOKEN_PATH);
 
 function decodeJwt(assertion: string) {
   const [h, p, s] = assertion.split('.');
@@ -92,7 +92,11 @@ function decodeJwt(assertion: string) {
 describe('the request FCM receives', () => {
   it('posts a data-only, high-priority message to the project send path', async () => {
     const client = makeFcmClient({ credentials, origin });
-    await client.sendCallWake(DEVICE, { from: 'user-caller', ts: 1_700_000_000_000 });
+    await client.sendCallWake(DEVICE, {
+      from: 'user-caller',
+      to: 'user-recipient',
+      ts: 1_700_000_000_000,
+    });
 
     expect(sends()).toHaveLength(1);
     const send = sends()[0]!;
@@ -112,7 +116,7 @@ describe('the request FCM receives', () => {
     // FCM's default is four WEEKS; unset, a phone coming out of a pocket
     // days later would ring for a call that ended.
     const client = makeFcmClient({ credentials, origin });
-    await client.sendCallWake(DEVICE, { from: 'user-caller', ts: 1 });
+    await client.sendCallWake(DEVICE, { from: 'user-caller', to: 'user-recipient', ts: 1 });
     const body = JSON.parse(sends()[0]!.body) as {
       message: { android: { ttl: string } };
     };
@@ -135,7 +139,11 @@ describe('the request FCM receives', () => {
 
   it('the call wake carries only what the recipient could already derive — and no cid', async () => {
     const client = makeFcmClient({ credentials, origin });
-    await client.sendCallWake(DEVICE, { from: 'user-caller', ts: 1_700_000_000_000 });
+    await client.sendCallWake(DEVICE, {
+      from: 'user-caller',
+      to: 'user-recipient',
+      ts: 1_700_000_000_000,
+    });
 
     const body = JSON.parse(sends()[0]!.body) as {
       message: { data: Record<string, string> };
@@ -145,6 +153,7 @@ describe('the request FCM receives', () => {
     expect(body.message.data).toEqual({
       kind: 'call',
       fromUser: 'user-caller',
+      to: 'user-recipient',
       ts: '1700000000000',
     });
     // `from` is an FCM RESERVED data key (Google refuses the send with 400
@@ -186,7 +195,7 @@ describe('the request FCM receives', () => {
     // Message lane: the iOS collapse id coalesces BANNERS, and on Android
     // the banner is drawn by the app after decrypt, not by this push.
     const client = makeFcmClient({ credentials, origin });
-    await client.sendCallWake(DEVICE, { from: 'u', ts: 1 });
+    await client.sendCallWake(DEVICE, { from: 'u', to: 'user-recipient', ts: 1 });
     await client.sendMessageWake(DEVICE, {
       from: 'u',
       ts: 1,
@@ -202,7 +211,7 @@ describe('the request FCM receives', () => {
 describe('the authentication exchange', () => {
   it('signs an RS256 JWT that verifies against the service-account key', async () => {
     const client = makeFcmClient({ credentials, origin });
-    await client.sendCallWake(DEVICE, { from: 'u', ts: 1 });
+    await client.sendCallWake(DEVICE, { from: 'u', to: 'user-recipient', ts: 1 });
 
     const mint = tokenMints()[0]!;
     expect(mint.headers['content-type']).toBe('application/x-www-form-urlencoded');
@@ -224,21 +233,23 @@ describe('the authentication exchange', () => {
   it('reuses the access token across sends, then re-mints before Google would reject it', async () => {
     let now = 1_700_000_000_000;
     const client = makeFcmClient({ credentials, origin, now: () => now });
-    await client.sendCallWake(DEVICE, { from: 'u', ts: 1 });
-    await client.sendCallWake(DEVICE, { from: 'u', ts: 2 });
+    await client.sendCallWake(DEVICE, { from: 'u', to: 'user-recipient', ts: 1 });
+    await client.sendCallWake(DEVICE, { from: 'u', to: 'user-recipient', ts: 2 });
     expect(tokenMints()).toHaveLength(1);
     expect(sends()).toHaveLength(2);
 
     // Access tokens live 3600 s; re-mint with room to spare.
     now += 51 * 60_000;
-    await client.sendCallWake(DEVICE, { from: 'u', ts: 3 });
+    await client.sendCallWake(DEVICE, { from: 'u', to: 'user-recipient', ts: 3 });
     expect(tokenMints()).toHaveLength(2);
   });
 
   it('a failed exchange is `failed`, not cached, and the next send retries it', async () => {
     tokenReply = { status: 503, body: '' };
     const client = makeFcmClient({ credentials, origin });
-    expect(await client.sendCallWake(DEVICE, { from: 'u', ts: 1 })).toMatchObject({
+    expect(
+      await client.sendCallWake(DEVICE, { from: 'u', to: 'user-recipient', ts: 1 }),
+    ).toMatchObject({
       outcome: 'failed',
     });
     expect(sends()).toHaveLength(0); // nothing was sent without a bearer
@@ -247,7 +258,9 @@ describe('the authentication exchange', () => {
       status: 200,
       body: JSON.stringify({ access_token: 'ya29.recovered', expires_in: 3600 }),
     };
-    expect(await client.sendCallWake(DEVICE, { from: 'u', ts: 2 })).toMatchObject({
+    expect(
+      await client.sendCallWake(DEVICE, { from: 'u', to: 'user-recipient', ts: 2 }),
+    ).toMatchObject({
       outcome: 'sent',
     });
     expect(sends()[0]!.headers.authorization).toBe('Bearer ya29.recovered');
@@ -278,7 +291,9 @@ function fcmError(code: number, status: string, errorCode?: string): string {
 describe('what the response means', () => {
   it('reports success on 200', async () => {
     const client = makeFcmClient({ credentials, origin });
-    expect(await client.sendCallWake(DEVICE, { from: 'u', ts: 1 })).toMatchObject({
+    expect(
+      await client.sendCallWake(DEVICE, { from: 'u', to: 'user-recipient', ts: 1 }),
+    ).toMatchObject({
       outcome: 'sent',
     });
   });
@@ -286,7 +301,9 @@ describe('what the response means', () => {
   it('reports a DEAD TOKEN on 404 UNREGISTERED, so the caller can prune the row', async () => {
     sendReply = { status: 404, body: fcmError(404, 'NOT_FOUND', 'UNREGISTERED') };
     const client = makeFcmClient({ credentials, origin });
-    expect(await client.sendCallWake(DEVICE, { from: 'u', ts: 1 })).toMatchObject({
+    expect(
+      await client.sendCallWake(DEVICE, { from: 'u', to: 'user-recipient', ts: 1 }),
+    ).toMatchObject({
       outcome: 'token_invalid',
       reason: 'UNREGISTERED',
     });
@@ -298,7 +315,9 @@ describe('what the response means', () => {
       body: fcmError(403, 'PERMISSION_DENIED', 'SENDER_ID_MISMATCH'),
     };
     const client = makeFcmClient({ credentials, origin });
-    expect(await client.sendCallWake(DEVICE, { from: 'u', ts: 1 })).toMatchObject({
+    expect(
+      await client.sendCallWake(DEVICE, { from: 'u', to: 'user-recipient', ts: 1 }),
+    ).toMatchObject({
       outcome: 'token_invalid',
     });
   });
@@ -309,7 +328,9 @@ describe('what the response means', () => {
       body: fcmError(400, 'INVALID_ARGUMENT', 'INVALID_ARGUMENT'),
     };
     const client = makeFcmClient({ credentials, origin });
-    expect(await client.sendCallWake(DEVICE, { from: 'u', ts: 1 })).toMatchObject({
+    expect(
+      await client.sendCallWake(DEVICE, { from: 'u', to: 'user-recipient', ts: 1 }),
+    ).toMatchObject({
       outcome: 'failed',
     });
   });
@@ -320,7 +341,9 @@ describe('what the response means', () => {
       body: fcmError(429, 'RESOURCE_EXHAUSTED', 'QUOTA_EXCEEDED'),
     };
     const client = makeFcmClient({ credentials, origin });
-    expect(await client.sendCallWake(DEVICE, { from: 'u', ts: 1 })).toMatchObject({
+    expect(
+      await client.sendCallWake(DEVICE, { from: 'u', to: 'user-recipient', ts: 1 }),
+    ).toMatchObject({
       outcome: 'failed',
     });
     expect(sends()).toHaveLength(1);
@@ -329,7 +352,9 @@ describe('what the response means', () => {
   it('retries a 500 exactly once, then gives up quietly', async () => {
     sendReply = { status: 500, body: fcmError(500, 'INTERNAL', 'INTERNAL') };
     const client = makeFcmClient({ credentials, origin });
-    expect(await client.sendCallWake(DEVICE, { from: 'u', ts: 1 })).toMatchObject({
+    expect(
+      await client.sendCallWake(DEVICE, { from: 'u', to: 'user-recipient', ts: 1 }),
+    ).toMatchObject({
       outcome: 'failed',
     });
     expect(sends()).toHaveLength(2);

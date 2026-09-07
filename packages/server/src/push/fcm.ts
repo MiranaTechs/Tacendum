@@ -130,8 +130,7 @@ function signJwt(credentials: FcmCredentials, nowMs: number): string {
     iat,
     exp: iat + JWT_LIFETIME_SECONDS,
   };
-  const encode = (value: unknown) =>
-    Buffer.from(JSON.stringify(value)).toString('base64url');
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
   const signingInput = `${encode(header)}.${encode(claims)}`;
   const signature = createSign('RSA-SHA256')
     .update(signingInput)
@@ -143,10 +142,7 @@ function signJwt(credentials: FcmCredentials, nowMs: number): string {
 export interface FcmClient {
   readonly origin: string;
   sendCallWake(deviceToken: string, payload: VoipPayload): Promise<FcmResult>;
-  sendMessageWake(
-    deviceToken: string,
-    payload: FcmMessageWakePayload,
-  ): Promise<FcmResult>;
+  sendMessageWake(deviceToken: string, payload: FcmMessageWakePayload): Promise<FcmResult>;
 }
 
 export function makeFcmClient(options: FcmClientOptions): FcmClient {
@@ -167,7 +163,7 @@ export function makeFcmClient(options: FcmClientOptions): FcmClient {
     }
     if (!minting) {
       minting = mintAccessToken(at)
-        .then(token => {
+        .then((token) => {
           cached = { token, mintedAt: at };
           return token;
         })
@@ -217,27 +213,24 @@ export function makeFcmClient(options: FcmClientOptions): FcmClient {
     kind: 'call' | 'message',
   ): Promise<{ status: number; body: string }> {
     const bearer = await accessToken();
-    const res = await fetch(
-      `${origin}/v1/projects/${credentials.projectId}/messages:send`,
-      {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${bearer}`,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          message: {
-            token: deviceToken,
-            data,
-            android: {
-              priority: 'HIGH',
-              ttl: `${kind === 'call' ? CALL_TTL_SECONDS : MESSAGE_TTL_SECONDS}s`,
-            },
-          },
-        }),
-        signal: AbortSignal.timeout(ATTEMPT_TIMEOUT_MS),
+    const res = await fetch(`${origin}/v1/projects/${credentials.projectId}/messages:send`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${bearer}`,
+        'content-type': 'application/json',
       },
-    );
+      body: JSON.stringify({
+        message: {
+          token: deviceToken,
+          data,
+          android: {
+            priority: 'HIGH',
+            ttl: `${kind === 'call' ? CALL_TTL_SECONDS : MESSAGE_TTL_SECONDS}s`,
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(ATTEMPT_TIMEOUT_MS),
+    });
     return { status: res.status, body: await res.text() };
   }
 
@@ -251,8 +244,7 @@ export function makeFcmClient(options: FcmClientOptions): FcmClient {
       // The FcmError detail's errorCode is the precise verdict
       // (UNREGISTERED vs INVALID_ARGUMENT both arrive under generic RPC
       // statuses); the RPC status is the fallback when no detail names one.
-      const errorCode =
-        parsed.error?.details?.map(d => d.errorCode).find(Boolean) ?? '';
+      const errorCode = parsed.error?.details?.map((d) => d.errorCode).find(Boolean) ?? '';
       reason = errorCode || String(parsed.error?.status ?? '');
     } catch {
       // A body we cannot parse tells us nothing; fall back to the status.
@@ -306,7 +298,7 @@ export function makeFcmClient(options: FcmClientOptions): FcmClient {
     async sendCallWake(deviceToken, payload) {
       return send(
         deviceToken,
-        { kind: 'call', fromUser: payload.from, ts: String(payload.ts) },
+        { kind: 'call', fromUser: payload.from, to: payload.to, ts: String(payload.ts) },
         'call',
       );
     },

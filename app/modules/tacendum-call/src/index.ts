@@ -89,6 +89,11 @@ export type DevicePressureEvent = z.infer<typeof DevicePressureEvent>;
 
 // --- lifecycle --------------------------------------------------------------
 
+/** Bind native calling state to one signed-in account; empty clears it. */
+export function setAccountOwner(userId: string): Promise<void> {
+  return NativeTacendumCall.setAccountOwner(userId);
+}
+
 export function configure(iceServers: IceServer[], relayOnly: boolean): Promise<void> {
   return NativeTacendumCall.configure(JSON.stringify(iceServers), relayOnly);
 }

@@ -985,6 +985,8 @@ test('the App Lock nudge comes back to the chat list, and Settings reached throu
     });
     expect(currentRoute()).toBe('settings');
     expect(await back()).toBe(true);
+    expect(currentRoute()).toBe('settings');
+    expect(await back()).toBe(true);
     expect(currentRoute()).toBe('chats');
 
     // And the ordinary door still behaves: chats → profile → settings pops

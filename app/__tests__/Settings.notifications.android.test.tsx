@@ -66,6 +66,7 @@ async function render(): Promise<void> {
       />,
     );
   });
+  await press('settings-category-notifications');
 }
 
 const propOf = (testID: string, prop: string): unknown => {
@@ -121,9 +122,7 @@ test('the note says where the button lands, not where we wish it landed', async 
   expect(note).not.toMatch(/opens the channel|takes you to the channel/i);
   // …and it no longer opens by restating what the Message sounds note two
   // rows above already tells an Android reader about the system settings.
-  expect(note).not.toContain(
-    'are set in the system settings, not here',
-  );
+  expect(note).not.toContain('are set in the system settings, not here');
 });
 
 test('the full-screen ring is disclosed, behind the ⓘ', async () => {
@@ -154,6 +153,9 @@ test('it sits at the FOOT of NOTIFICATIONS, under the rows it cannot change', as
     tree_.indexOf('Message sounds'),
   );
   expect(tree_.indexOf('Notification settings')).toBeLessThan(
-    tree_.indexOf('APPEARANCE'),
+    tree_.indexOf('Calls that take over the screen'),
   );
+  expect(
+    tree.root.findAllByProps({ testID: 'settings-appearance-light' }),
+  ).toHaveLength(0);
 });

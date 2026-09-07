@@ -42,6 +42,20 @@ public final class CallKitCenter: NSObject {
   private var voipRegistry: PKPushRegistry?
   private var voipToken = ""
 
+  /**
+   * Durable, install-local ownership for every native call surface.
+   *
+   * This deliberately lives in an atomic Application Support file rather
+   * than the shared crypto directory: account deletion erases that directory,
+   * and native must retain the explicit empty marker across a crash/relaunch
+   * until JS adopts a real account again. An upgraded install with no file
+   * starts empty and fails closed until its first adoption.
+   */
+  private static let accountOwnerStore = AccountCallOwnerStore.live()
+  private let accountOwner = AccountCallOwner(
+    initialOwner: CallKitCenter.accountOwnerStore.read()
+  )
+
   /// cid ↔ CallKit UUID. CallKit speaks UUIDs; the protocol speaks ULIDs, and
   /// neither can be derived from the other.
   private var uuidByCid: [String: UUID] = [:]
@@ -98,6 +112,109 @@ public final class CallKitCenter: NSObject {
     let watch = AudioUnitStartWatch { [weak self] in self?.audioUnitStartFailed() }
     audioUnitWatch = watch
     RTCAudioSession.sharedInstance().add(watch)
+  }
+
+  private func accountBoundaryError() -> NSError {
+    NSError(
+      domain: "TacendumCall",
+      code: 41,
+      userInfo: [NSLocalizedDescriptionKey: "native calling has no current account"]
+    )
+  }
+
+  /** A lease for direct JS call/media work. Empty ownership is denied. */
+  func currentAccountLease() -> AccountCallLease? {
+    accountOwner.currentLease()
+  }
+
+  /** A lease for a push, which must name the exact current recipient. */
+  private func accountLease(for recipient: String) -> AccountCallLease? {
+    accountOwner.lease(for: recipient)
+  }
+
+  func isCurrentAccountLease(_ lease: AccountCallLease) -> Bool {
+    accountOwner.isCurrent(lease)
+  }
+
+  /**
+   * Clear one account's native state before adopting another.
+   *
+   * Serialized on main with PushKit delivery and CallKit reporting. The owner
+   * is invalidated and the empty value persisted first; only after CallKit,
+   * queued events, and peer connections are cleared is a different nonempty
+   * owner persisted. A same-owner call is intentionally a no-op.
+   */
+  @objc public func setAccountOwner(
+    userId: String,
+    completion: @escaping (Error?) -> Void
+  ) {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async {
+        self.setAccountOwner(userId: userId, completion: completion)
+      }
+      return
+    }
+
+    guard let change = accountOwner.beginChange(to: userId) else {
+      completion(nil)
+      return
+    }
+
+    // Persist denial before touching state. If the process dies during the
+    // boundary, the next launch cannot resurrect the old account's calls.
+    do {
+      try Self.accountOwnerStore.write("")
+    } catch {
+      // Ownership is already denied in memory. End native state even though
+      // JS will abort the account transition on this error; otherwise a live
+      // old call could survive behind a bridge that now refuses to control it.
+      clearCallsForAccountChange()
+      TacendumCallImpl.shared.clearForAccountChange()
+      completion(error)
+      return
+    }
+    clearCallsForAccountChange()
+    TacendumCallImpl.shared.clearForAccountChange()
+
+    do {
+      // Persist before publishing the in-memory owner. A failed write leaves
+      // this process denied and setup fails until retry, rather than becoming
+      // a false same-owner no-op. If atomic replacement completed before a
+      // later fsync error, a relaunch may safely read the intended new owner.
+      try Self.accountOwnerStore.write(change.owner)
+    } catch {
+      completion(error)
+      return
+    }
+    accountOwner.finishChange(change)
+    completion(nil)
+  }
+
+  private func clearCallsForAccountChange() {
+    routeLock.lock()
+    desiredSpeaker = false
+    routeLock.unlock()
+
+    lock.lock()
+    let ids = Array(cidByUuid.keys)
+    uuidByCid.removeAll()
+    cidByUuid.removeAll()
+    unansweredIncoming.removeAll()
+    outgoingConnected.removeAll()
+    pendingPush = nil
+    pendingAnswered = false
+    pendingPushConfirmed = false
+    let parked = parkedRebind
+    parkedRebind = nil
+    cancelPlaceholderWatchdogLocked()
+    lock.unlock()
+
+    parked?.completion(accountBoundaryError())
+    guard !ids.isEmpty else { return }
+    let activeProvider = ensureProvider()
+    for id in ids {
+      activeProvider.reportCall(with: id, endedAt: nil, reason: .failed)
+    }
   }
 
   /// `RTCAudioSession.useManualAudio = true`, `isAudioEnabled` low, exactly
@@ -182,6 +299,7 @@ public final class CallKitCenter: NSObject {
     let handle: String
     let displayName: String
     let hasVideo: Bool
+    let lease: AccountCallLease
     let completion: (Error?) -> Void
   }
   private var parkedRebind: ParkedRebind? = nil
@@ -420,6 +538,20 @@ public final class CallKitCenter: NSObject {
     hasVideo: Bool,
     completion: @escaping (Error?) -> Void
   ) {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async {
+        self.reportIncomingCall(
+          cid: cid, peerId: peerId, handle: handle,
+          displayName: displayName, hasVideo: hasVideo,
+          completion: completion
+        )
+      }
+      return
+    }
+    guard let lease = currentAccountLease() else {
+      completion(accountBoundaryError())
+      return
+    }
     // THE REBIND. If a VoIP push already rang this call under a synthetic
     // cid, this report is the decrypted offer catching up — the same call,
     // now with its real identity. Reporting it as NEW rang the phone twice
@@ -432,6 +564,11 @@ public final class CallKitCenter: NSObject {
     // succession cannot adopt each other's placeholder. An empty peerId
     // (an older JS layer) falls back to adopting the single pending call.
     lock.lock()
+    guard accountOwner.isCurrent(lease) else {
+      lock.unlock()
+      completion(accountBoundaryError())
+      return
+    }
     if let pending = pendingPush, pending.from == peerId || peerId.isEmpty,
        !pendingPushConfirmed {
       // The report's verdict is STILL IN FLIGHT. Adopting now would re-key a
@@ -448,6 +585,7 @@ public final class CallKitCenter: NSObject {
       parkedRebind = ParkedRebind(
         cid: cid, peerId: peerId, handle: handle,
         displayName: displayName, hasVideo: hasVideo,
+        lease: lease,
         completion: completion
       )
       lock.unlock()
@@ -499,7 +637,10 @@ public final class CallKitCenter: NSObject {
     // placeholder, never to a raw id.
     let resolved = displayName.isEmpty ? (mirroredName(for: peerId) ?? "") : displayName
     let effective = resolved.isEmpty ? "Incoming call" : resolved
-    reportFresh(cid: cid, handle: effective, displayName: effective, hasVideo: hasVideo, completion: completion)
+    reportFresh(
+      cid: cid, handle: effective, displayName: effective,
+      hasVideo: hasVideo, lease: lease, completion: completion
+    )
   }
 
   /// Adopt the parked rebind — decided and re-keyed under ONE lock hold, so
@@ -516,7 +657,8 @@ public final class CallKitCenter: NSObject {
       return
     }
     parkedRebind = nil
-    guard let pending = pendingPush, pendingPushConfirmed,
+    guard accountOwner.isCurrent(parked.lease),
+          let pending = pendingPush, pendingPushConfirmed,
           pending.from == parked.peerId || parked.peerId.isEmpty,
           let existing = uuidByCid.removeValue(forKey: pending.cid)
     else {
@@ -556,6 +698,7 @@ public final class CallKitCenter: NSObject {
     handle: String,
     displayName: String,
     hasVideo: Bool,
+    lease: AccountCallLease,
     completion: @escaping (Error?) -> Void
   ) {
     let update = CXCallUpdate()
@@ -579,22 +722,81 @@ public final class CallKitCenter: NSObject {
     update.supportsUngrouping = false
     update.supportsDTMF = false
     configureAudioSession(video: hasVideo)
-    let id = uuid(for: cid)
     // Every fresh incoming report starts UNANSWERED; the system-UI answer or
     // `answerFromApp` consumes the entry, and every path that drops the
     // cid↔UUID mapping drops it too. Inserted BEFORE the report so an answer
     // racing the verdict cannot miss it; removed on refusal, where there is
     // no CallKit call to ever answer.
     lock.lock()
+    guard accountOwner.isCurrent(lease) else {
+      lock.unlock()
+      completion(accountBoundaryError())
+      return
+    }
+    let id: UUID
+    if let existing = uuidByCid[cid] {
+      id = existing
+    } else {
+      id = UUID()
+      uuidByCid[cid] = id
+      cidByUuid[id] = cid
+    }
     unansweredIncoming.insert(id)
     lock.unlock()
     ensureProvider().reportNewIncomingCall(with: id, update: update) { [weak self] error in
-      if error != nil, let self {
-        self.lock.lock()
-        self.unansweredIncoming.remove(id)
-        self.lock.unlock()
+      // Account changes and PushKit entry are main-serialized. Bring CallKit's
+      // asynchronous verdict onto that same queue before its generation check
+      // so it cannot pass the check and then race a clear before touching maps
+      // or driving the push callback.
+      DispatchQueue.main.async {
+        guard let self else {
+          completion(error)
+          return
+        }
+        if !self.accountOwner.isCurrent(lease) {
+          self.lock.lock()
+          if self.cidByUuid[id] == cid {
+            self.cidByUuid.removeValue(forKey: id)
+            self.uuidByCid.removeValue(forKey: cid)
+          }
+          self.unansweredIncoming.remove(id)
+          self.lock.unlock()
+          self.ensureProvider().reportCall(with: id, endedAt: nil, reason: .failed)
+          completion(self.accountBoundaryError())
+          return
+        }
+        if error != nil {
+          self.lock.lock()
+          self.unansweredIncoming.remove(id)
+          self.lock.unlock()
+        }
+        completion(error)
       }
-      completion(error)
+    }
+  }
+
+  /**
+   * Fulfil iOS's one-report-per-VoIP-push obligation for an unauthorized
+   * recipient without adopting any call state or waking JavaScript.
+   */
+  private func reportRejectedPush(
+    completion: @escaping () -> Void
+  ) {
+    let update = CXCallUpdate()
+    update.remoteHandle = CXHandle(type: .generic, value: "Incoming call")
+    update.localizedCallerName = "Incoming call"
+    update.hasVideo = false
+    update.supportsHolding = false
+    update.supportsGrouping = false
+    update.supportsUngrouping = false
+    update.supportsDTMF = false
+    // Ephemeral by design: no cid↔UUID mapping, unanswered marker, pending
+    // push, parked answer, or event can cross this account boundary.
+    let id = UUID()
+    let activeProvider = ensureProvider()
+    activeProvider.reportNewIncomingCall(with: id, update: update) { _ in
+      activeProvider.reportCall(with: id, endedAt: nil, reason: .unanswered)
+      completion()
     }
   }
 
@@ -1412,6 +1614,16 @@ extension CallKitCenter: PKPushRegistryDelegate {
     // name is corrected by updateDisplay once the envelope decrypts.
     let cid = payload.dictionaryPayload["cid"] as? String ?? UUID().uuidString
     let from = payload.dictionaryPayload["from"] as? String ?? ""
+    let to = payload.dictionaryPayload["to"] as? String ?? ""
+
+    // PushKit still requires a report when the target is absent, stale, or
+    // belongs to another account. That report is deliberately ephemeral and
+    // immediately ended: it cannot become pending native state and it cannot
+    // wake JS to fetch an old account's offer.
+    guard let lease = accountLease(for: to) else {
+      reportRejectedPush(completion: completion)
+      return
+    }
 
     // The mirror gives the ring its real name on the FIRST paint. Fall back
     // to the placeholder, never the raw ULID — an opaque id on a full-screen
@@ -1430,6 +1642,11 @@ extension CallKitCenter: PKPushRegistryDelegate {
     // as empty and rings — see `blockedPeers()`.
     let blocked = !from.isEmpty && blockedPeers().contains(from)
     lock.lock()
+    guard accountOwner.isCurrent(lease) else {
+      lock.unlock()
+      reportRejectedPush(completion: completion)
+      return
+    }
     // NEVER OVERWRITE a pending ring. Every announced end is urgent, so a
     // caller cancelling (or timing out) while this phone is dead sends a
     // SECOND VoIP push — and pointing `pendingPush` at its fresh synthetic
@@ -1456,8 +1673,16 @@ extension CallKitCenter: PKPushRegistryDelegate {
       cid: cid,
       handle: name,
       displayName: name,
-      hasVideo: false
+      hasVideo: false,
+      lease: lease
     ) { error in
+      // Account deletion/rotation may have completed while CallKit decided
+      // the report. `reportFresh` has already ended and forgotten this UUID;
+      // nothing from the old generation may touch pending state or JS.
+      guard self.accountOwner.isCurrent(lease) else {
+        completion()
+        return
+      }
       if blocked {
         // REPORT-THEN-IMMEDIATELY-END. The report above satisfied PushKit;
         // this takes the call down before the ring can persist — no watchdog

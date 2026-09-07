@@ -25,7 +25,7 @@ jest.mock('../src/aiWritingService', () => ({
   selectWritingProvider: jest.fn(),
 }));
 
-const CONNECTED = {
+const API_KEY_CONFIGURED = {
   status: 'completed' as const,
   state: {
     mode: 'api' as const,
@@ -107,11 +107,12 @@ async function render(
 
 beforeEach(() => {
   jest.clearAllMocks();
-  (getWritingConnections as jest.Mock).mockResolvedValue(CONNECTED);
+  (getWritingConnections as jest.Mock).mockResolvedValue(API_KEY_CONFIGURED);
   (getWritingRevision as jest.Mock).mockReturnValue(12);
 });
 
 test('opening the assistant stays local until a writing action is pressed', async () => {
+  const openURL = jest.spyOn(Linking, 'openURL').mockResolvedValue(undefined);
   const { tree, props } = await render();
 
   expect(props.onRequest).not.toHaveBeenCalled();
@@ -129,9 +130,10 @@ test('opening the assistant stays local until a writing action is pressed', asyn
     { kind: 'shorter' },
     expect.any(AbortSignal),
   );
+  expect(openURL).not.toHaveBeenCalled();
 });
 
-test('an external action copies only after the press, opens a fixed origin, and never reads the clipboard', async () => {
+test('an external action copies without opening a website', async () => {
   (getWritingConnections as jest.Mock).mockResolvedValue(EXTERNAL);
   const setString = jest.spyOn(Clipboard, 'setString').mockImplementation(() => {});
   const getString = jest.spyOn(Clipboard, 'getString').mockResolvedValue('must not read');
@@ -147,8 +149,14 @@ test('an external action copies only after the press, opens a fixed origin, and 
 
   expect(setString).not.toHaveBeenCalled();
   expect(openURL).not.toHaveBeenCalled();
-  expect(copy(tree)).toMatch(/copy this draft and open ChatGPT/i);
-  expect(copy(tree)).toMatch(/Paste it there, then bring the reply back here/i);
+  expect(copy(tree)).toMatch(/manual copy & paste/i);
+  expect(copy(tree)).toContain(
+    'Signing in on the ChatGPT website does not connect that account to Tacendum.',
+  );
+  expect(copy(tree)).toMatch(/open ChatGPT when you are ready/i);
+  expect(control(tree, 'writing-action-improve').props.accessibilityLabel).toBe(
+    'Copy rewrite request',
+  );
 
   await ReactTestRenderer.act(async () => {
     await control(tree, 'writing-action-improve').props.onPress();
@@ -156,10 +164,169 @@ test('an external action copies only after the press, opens a fixed origin, and 
 
   expect(setString).toHaveBeenCalledTimes(1);
   expect(setString).toHaveBeenCalledWith(prompt);
-  expect(openURL).toHaveBeenCalledWith('https://chatgpt.com/');
+  expect(openURL).not.toHaveBeenCalled();
   expect(getString).not.toHaveBeenCalled();
   expect(props.onUse).not.toHaveBeenCalled();
   expect(copy(tree)).toContain('Request copied');
+  expect(control(tree, 'writing-handoff-open').props.label).toBe('Open ChatGPT');
+});
+
+test('Open ChatGPT launches the fixed website once for a rapid double press', async () => {
+  (getWritingConnections as jest.Mock).mockResolvedValue(EXTERNAL);
+  jest.spyOn(Clipboard, 'setString').mockImplementation(() => {});
+  const opened = deferred<void>();
+  const openURL = jest.spyOn(Linking, 'openURL').mockReturnValue(opened.promise);
+  const onRequest = jest.fn(async (): Promise<AiWritingResult> => ({
+    status: 'handoff',
+    provider: 'chatgpt',
+    prompt: 'Fixed task\n\n"private draft"',
+    url: 'https://chatgpt.com/',
+  }));
+  const { tree } = await render({ onRequest });
+
+  await ReactTestRenderer.act(async () => {
+    await control(tree, 'writing-action-improve').props.onPress();
+  });
+  const open = control(tree, 'writing-handoff-open').props.onPress;
+  ReactTestRenderer.act(() => {
+    void open();
+    void open();
+  });
+
+  expect(openURL).toHaveBeenCalledTimes(1);
+  expect(openURL).toHaveBeenCalledWith('https://chatgpt.com/');
+  expect(control(tree, 'writing-handoff-open').props.disabled).toBe(true);
+
+  await ReactTestRenderer.act(async () => {
+    opened.resolve(undefined);
+    await opened.promise;
+  });
+  expect(control(tree, 'writing-handoff-open').props.disabled).toBe(false);
+});
+
+test('a changed writing revision blocks an explicit website launch', async () => {
+  (getWritingConnections as jest.Mock).mockResolvedValue(EXTERNAL);
+  jest.spyOn(Clipboard, 'setString').mockImplementation(() => {});
+  const openURL = jest.spyOn(Linking, 'openURL').mockResolvedValue(undefined);
+  const onRequest = jest.fn(async (): Promise<AiWritingResult> => ({
+    status: 'handoff',
+    provider: 'chatgpt',
+    prompt: 'Fixed task\n\n"private draft"',
+    url: 'https://chatgpt.com/',
+  }));
+  const { tree } = await render({ onRequest });
+
+  await ReactTestRenderer.act(async () => {
+    await control(tree, 'writing-action-improve').props.onPress();
+  });
+  (getWritingRevision as jest.Mock).mockReturnValue(13);
+  await ReactTestRenderer.act(async () => {
+    await control(tree, 'writing-handoff-open').props.onPress();
+  });
+
+  expect(openURL).not.toHaveBeenCalled();
+  expect(copy(tree)).toContain(
+    'The writing connection changed. Copy a new request.',
+  );
+});
+
+test.each(['writing-close', 'writing-manage'])(
+  'a saved Open callback cannot launch after %s retires its handoff',
+  async retireControl => {
+    (getWritingConnections as jest.Mock).mockResolvedValue(EXTERNAL);
+    jest.spyOn(Clipboard, 'setString').mockImplementation(() => {});
+    const openURL = jest.spyOn(Linking, 'openURL').mockResolvedValue(undefined);
+    const onRequest = jest.fn(async (): Promise<AiWritingResult> => ({
+      status: 'handoff',
+      provider: 'chatgpt',
+      prompt: 'Fixed task\n\n"private draft"',
+      url: 'https://chatgpt.com/',
+    }));
+    const { tree } = await render({ onRequest });
+
+    await ReactTestRenderer.act(async () => {
+      await control(tree, 'writing-action-improve').props.onPress();
+    });
+    const staleOpen = control(tree, 'writing-handoff-open').props.onPress;
+    await ReactTestRenderer.act(async () => {
+      control(tree, retireControl).props.onPress();
+    });
+    await ReactTestRenderer.act(async () => {
+      void staleOpen();
+    });
+
+    expect(openURL).not.toHaveBeenCalled();
+  },
+);
+
+test('a saved Open callback cannot launch after a pasted reply enters review', async () => {
+  (getWritingConnections as jest.Mock).mockResolvedValue(EXTERNAL);
+  jest.spyOn(Clipboard, 'setString').mockImplementation(() => {});
+  const openURL = jest.spyOn(Linking, 'openURL').mockResolvedValue(undefined);
+  const onRequest = jest.fn(async (): Promise<AiWritingResult> => ({
+    status: 'handoff',
+    provider: 'chatgpt',
+    prompt: 'Fixed task\n\n"private draft"',
+    url: 'https://chatgpt.com/',
+  }));
+  const { tree } = await render({ onRequest });
+
+  await ReactTestRenderer.act(async () => {
+    await control(tree, 'writing-action-improve').props.onPress();
+  });
+  const staleOpen = control(tree, 'writing-handoff-open').props.onPress;
+  await ReactTestRenderer.act(async () => {
+    tree.root
+      .findByProps({ testID: 'writing-paste-input' })
+      .props.onChangeText('Reply ready for review.');
+  });
+  await ReactTestRenderer.act(async () => {
+    control(tree, 'writing-paste-review').props.onPress();
+  });
+  await ReactTestRenderer.act(async () => {
+    void staleOpen();
+  });
+
+  expect(copy(tree)).toContain('Reply ready for review.');
+  expect(openURL).not.toHaveBeenCalled();
+});
+
+test('an explicit website launch failure stays inline and leaves Open available', async () => {
+  (getWritingConnections as jest.Mock).mockResolvedValue(EXTERNAL);
+  jest.spyOn(Clipboard, 'setString').mockImplementation(() => {});
+  const openURL = jest
+    .spyOn(Linking, 'openURL')
+    .mockRejectedValue(new Error('no browser'));
+  const onRequest = jest.fn(async (): Promise<AiWritingResult> => ({
+    status: 'handoff',
+    provider: 'chatgpt',
+    prompt: 'Fixed task\n\n"private draft"',
+    url: 'https://chatgpt.com/',
+  }));
+  const { tree } = await render({ onRequest });
+
+  await ReactTestRenderer.act(async () => {
+    await control(tree, 'writing-action-improve').props.onPress();
+  });
+  await ReactTestRenderer.act(async () => {
+    await control(tree, 'writing-handoff-open').props.onPress();
+  });
+
+  expect(openURL).toHaveBeenCalledTimes(1);
+  expect(copy(tree)).toContain(
+    'Couldn’t open ChatGPT. The request is still copied.',
+  );
+  expect(
+    tree.root.findAll(
+      node =>
+        node.props.testID === 'writing-handoff-open-error' &&
+        node.props.accessibilityRole === 'alert',
+    )[0]!.props,
+  ).toMatchObject({
+    accessibilityLiveRegion: 'polite',
+    accessibilityRole: 'alert',
+  });
+  expect(control(tree, 'writing-handoff-open').props.disabled).toBe(false);
 });
 
 test('a manually pasted external reply is validated before review and adopted only through Use text', async () => {

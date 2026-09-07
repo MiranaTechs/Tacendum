@@ -28,6 +28,7 @@ jest.mock('../src/lock', () => ({ clearAll: jest.fn() }));
 
 import * as api from '../src/api';
 import * as db from '../src/db';
+import * as nativeCall from 'tacendum-call';
 import {
   AccountMismatchError,
   createOrRestoreAccount,
@@ -178,6 +179,23 @@ test('a genuinely fresh install still mints', async () => {
   expect(crypto.existingKeysForUpload).not.toHaveBeenCalled();
   expect(profile.userId).toBe('NEW-USER-ULID');
   expect(profile.registrationId).toBe(4242);
+  expect(nativeCall.setAccountOwner).toHaveBeenCalledWith('NEW-USER-ULID');
+});
+
+test('new native call ownership is established after profile/auth persistence and before setup resolves', async () => {
+  jest.mocked(nativeCall.setAccountOwner).mockImplementationOnce(async id => {
+    expect(id).toBe('OLD-USER-ULID');
+    expect(crypto.__keychain.get('authToken')).toBe('tok');
+    expect(dbM.saveProfile).toHaveBeenCalledWith(expect.objectContaining({ userId: id }));
+  });
+  await createOrRestoreAccount();
+  expect(nativeCall.setAccountOwner).toHaveBeenCalledTimes(1);
+});
+
+test('setup cannot report success when native account adoption fails', async () => {
+  jest.mocked(nativeCall.setAccountOwner).mockRejectedValueOnce(new Error('owner could not be stored'));
+  await expect(createOrRestoreAccount()).rejects.toThrow('owner could not be stored');
+  expect(dbM.saveProfile).toHaveBeenCalled();
 });
 
 test('duress still refuses before anything at all', async () => {

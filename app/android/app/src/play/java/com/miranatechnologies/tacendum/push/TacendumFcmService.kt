@@ -25,7 +25,7 @@ import java.util.UUID
  *
  * Both overrides run on FCM's own background thread and are handed nothing
  * but ids: `onMessageReceived` forwards the data map through the router,
- * which reads three keys and drops the rest — THE WAKE CARRIES NO WORDS —
+ * which reads four keys and drops the rest — THE WAKE CARRIES NO WORDS —
  * and `onNewToken` forwards the one token that feeds both JS events.
  * Nothing here logs.
  */

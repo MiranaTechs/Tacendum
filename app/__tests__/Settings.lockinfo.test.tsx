@@ -72,9 +72,10 @@ afterEach(async () => {
 });
 
 describe('"One code, two doors", re-readable without changing your code', () => {
-  it('sits on the menu behind a ⓘ while App Lock is on — closed, then open in place', async () => {
+  it('sits in Privacy & security behind a ⓘ while App Lock is on — closed, then open in place', async () => {
     await lock.setup('123456');
     await render();
+    await press('settings-category-privacy');
 
     expect(has('settings-lock-info')).toBe(true);
     expect(rendered()).not.toContain(SECOND_DOOR);
@@ -85,6 +86,7 @@ describe('"One code, two doors", re-readable without changing your code', () => 
 
   it('is absent while App Lock is off — there is no second door to describe yet', async () => {
     await render();
+    await press('settings-category-privacy');
     expect(has('settings-lock-enable')).toBe(true);
     expect(has('settings-lock-info')).toBe(false);
   });
@@ -92,12 +94,15 @@ describe('"One code, two doors", re-readable without changing your code', () => 
   it('renders the SAME sentence the ceremony renders — no second copy of it', async () => {
     await lock.setup('123456');
     await render();
+    await press('settings-category-privacy');
     await press('settings-lock-info');
-    const onMenu = rendered();
+    const inCategory = rendered();
     // The exact clause the ceremony has always shown, plus the true
     // forgotten-code cost that rides with it.
-    expect(onMenu).toContain(SECOND_DOOR);
-    expect(onMenu).toContain('There is no way to recover a forgotten code.');
+    expect(inCategory).toContain(SECOND_DOOR);
+    expect(inCategory).toContain(
+      'There is no way to recover a forgotten code.',
+    );
   });
 });
 
@@ -105,6 +110,7 @@ describe('the Auto-lock ⓘ (AD-6: "Right away" stops overclaiming)', () => {
   it('sits beside Auto-lock and says what each choice really does', async () => {
     await lock.setup('123456');
     await render();
+    await press('settings-category-privacy');
 
     expect(has('settings-autolock-info')).toBe(true);
     expect(rendered()).not.toContain('locks Tacendum the moment you leave it');
@@ -126,7 +132,9 @@ describe('the Auto-lock ⓘ (AD-6: "Right away" stops overclaiming)', () => {
     expect(AUTOLOCK_INFO_LINES.android).toContain(
       'hand the screen to another app for a moment',
     );
-    expect(AUTOLOCK_INFO_LINES.android).toContain('one minute is the smaller step');
+    expect(AUTOLOCK_INFO_LINES.android).toContain(
+      'one minute is the smaller step',
+    );
   });
 
   it('neither arm names a device or carries a capture word — so neither owes an inventory row', () => {

@@ -33,6 +33,16 @@ async function render(): Promise<void> {
       />,
     );
   });
+  await press('settings-category-notifications');
+}
+
+async function press(testID: string): Promise<void> {
+  const node = tree.root
+    .findAllByProps({ testID })
+    .find(item => typeof item.props.onPress === 'function')!;
+  await ReactTestRenderer.act(async () => {
+    node.props.onPress();
+  });
 }
 
 const has = (testID: string): boolean =>

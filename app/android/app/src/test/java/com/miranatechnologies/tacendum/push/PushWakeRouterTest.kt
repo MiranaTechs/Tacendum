@@ -11,7 +11,7 @@ import org.junit.Test
  *
  * The wire shape under test is the server's
  * (packages/server/src/push/fcm.ts, sendCallWake/sendMessageWake):
- * call = {kind, fromUser, ts}; message = {kind, fromUser, ts, msgId, msgType}.
+ * call = {kind, fromUser, to, ts}; message = {kind, fromUser, ts, msgId, msgType}.
  * `fromUser`, not `from` — `from` is an FCM RESERVED data key Google refuses
  * with 400 INVALID_ARGUMENT (measured against the live API);
  * both sides renamed the key in the same change.
@@ -26,21 +26,51 @@ class PushWakeRouterTest {
   fun callWakeRingsUnderAMintedCid() {
     val wake =
         PushWakeRouter.route(
-            mapOf("kind" to "call", "fromUser" to "01ARZ3NDEKTSV4RRFFQ69G5FAV", "ts" to "123"),
+            mapOf(
+                "kind" to "call",
+                "fromUser" to "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "to" to "01RECIPIENT0000000000000000",
+                "ts" to "123",
+            ),
             ::mint,
         )
 
-    assertEquals(PushWake.CallRing(cid = "minted-cid", from = "01ARZ3NDEKTSV4RRFFQ69G5FAV"), wake)
+    assertEquals(
+        PushWake.CallRing(
+            cid = "minted-cid",
+            from = "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            to = "01RECIPIENT0000000000000000",
+        ),
+        wake,
+    )
   }
 
   @Test
-  fun callWakeWithNoFromStillRings() {
+  fun callWakeWithNoFromStillCarriesItsRecipient() {
     // iOS parity: PushKit's handler defaults an absent `from` to "" and the
     // placeholder says "Incoming call". An anonymous wake must not be a
     // dropped call.
-    val wake = PushWakeRouter.route(mapOf("kind" to "call", "ts" to "123"), ::mint)
+    val wake =
+        PushWakeRouter.route(
+            mapOf("kind" to "call", "to" to "01RECIPIENT0000000000000000", "ts" to "123"),
+            ::mint,
+        )
 
-    assertEquals(PushWake.CallRing(cid = "minted-cid", from = ""), wake)
+    assertEquals(
+        PushWake.CallRing(cid = "minted-cid", from = "", to = "01RECIPIENT0000000000000000"),
+        wake,
+    )
+  }
+
+  @Test
+  fun callWakeWithoutARecipientIsIgnored() {
+    val wake =
+        PushWakeRouter.route(
+            mapOf("kind" to "call", "fromUser" to "01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            ::mint,
+        )
+
+    assertEquals(PushWake.Ignored, wake)
   }
 
   // --- message wake ---

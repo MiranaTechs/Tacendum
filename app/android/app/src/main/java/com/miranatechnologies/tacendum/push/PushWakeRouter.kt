@@ -4,7 +4,7 @@ package com.miranatechnologies.tacendum.push
  * What one FCM data message may become.
  *
  * THE WAKE CARRIES NO WORDS, and this file is where that is enforced: the
- * router reads exactly three keys — `kind`, `fromUser`, `msgId` — and every
+ * router reads exactly four keys — `kind`, `fromUser`, `to`, `msgId` — and every
  * other byte of the payload ceases to exist here. No preview, no ciphertext,
  * no display text can arrive by push, because nothing downstream is ever
  * handed the map. The server agrees from its side
@@ -18,7 +18,7 @@ package com.miranatechnologies.tacendum.push
  * data-only, HIGH priority, all values strings, TTL 45 s for a
  * call and a day for a message —
  *
- *   call wake:     { kind: "call",    fromUser, ts }
+ *   call wake:     { kind: "call",    fromUser, to, ts }
  *   message wake:  { kind: "message", fromUser, ts, msgId, msgType }
  *
  * `fromUser`, NOT `from`: `from` is one of FCM's RESERVED data-payload keys,
@@ -39,7 +39,7 @@ package com.miranatechnologies.tacendum.push
  */
 internal sealed interface PushWake {
   /** Ring NOW, under a synthetic cid, before anything decrypts. */
-  data class CallRing(val cid: String, val from: String) : PushWake
+  data class CallRing(val cid: String, val from: String, val to: String) : PushWake
 
   /** One message is queued; announce it through the NSE-role handler. */
   data class Message(val from: String, val msgId: String) : PushWake
@@ -54,6 +54,7 @@ internal object PushWakeRouter {
   const val KIND_CALL = "call"
   const val KIND_MESSAGE = "message"
   const val KEY_FROM = "fromUser"
+  const val KEY_TO = "to"
   const val KEY_MSG_ID = "msgId"
 
   /**
@@ -64,12 +65,18 @@ internal object PushWakeRouter {
    */
   fun route(data: Map<String, String>, mintCid: () -> String): PushWake =
       when (data[KEY_KIND]) {
-        KIND_CALL ->
+        KIND_CALL -> {
+          val to = data[KEY_TO].orEmpty()
+          if (to.isEmpty()) {
+            PushWake.Ignored
+          } else {
             // An empty `from` still rings — the placeholder says "Incoming
             // call", which is iOS's behaviour for the same payload — but it
             // cannot pass the blocked-caller gate as anyone, because it names
             // no one.
-            PushWake.CallRing(cid = mintCid(), from = data[KEY_FROM].orEmpty())
+            PushWake.CallRing(cid = mintCid(), from = data[KEY_FROM].orEmpty(), to = to)
+          }
+        }
         KIND_MESSAGE -> {
           val from = data[KEY_FROM].orEmpty()
           val msgId = data[KEY_MSG_ID].orEmpty()

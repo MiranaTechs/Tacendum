@@ -13,11 +13,18 @@ import {
   wsDisconnectHandler,
   type WsDeps,
 } from '../src/handlers/ws.js';
+import { deleteAccountHandler } from '../src/handlers/account.js';
 import { IDKEY_CLAIM_PREFIX, type TestOnlyDataLayer } from '../src/db/data.js';
 import { LIMITS } from '../src/ratelimit.js';
 import { ACTIVITY_TOUCH_TIMEOUT_MS } from '../src/activity.js';
 import { activityActorRef } from '../src/opaque-ref.js';
-import { allQueued, makeMemoryDb, makeTestDeps, testIdentityKey, type TestDeps } from './helpers.js';
+import {
+  allQueued,
+  makeMemoryDb,
+  makeTestDeps,
+  testIdentityKey,
+  type TestDeps,
+} from './helpers.js';
 
 /** Fake transport: records frames per connectionId; `dead` connections refuse. */
 function makeFakeSender() {
@@ -176,9 +183,7 @@ describe('websocket handlers', () => {
       throw new Error('drain schedule failed');
     };
 
-    await expect(connect(aliceToken, 'conn-no-activity')).rejects.toThrow(
-      'drain schedule failed',
-    );
+    await expect(connect(aliceToken, 'conn-no-activity')).rejects.toThrow('drain schedule failed');
 
     expect(touch).not.toHaveBeenCalled();
   });
@@ -267,7 +272,11 @@ describe('websocket handlers', () => {
     // The transitional bearer branch is DELETED: a perfectly valid
     // session token in the URL is refused exactly like no credential at all.
     const bearer = await wsConnectHandler(
-      { routeKey: '$connect', connectionId: 'conn-y', queryStringParameters: { token: aliceToken } },
+      {
+        routeKey: '$connect',
+        connectionId: 'conn-y',
+        queryStringParameters: { token: aliceToken },
+      },
       wsDeps,
     );
     expect(bearer.statusCode).toBe(401);
@@ -438,11 +447,7 @@ describe('websocket handlers', () => {
     const frames = (sender.inbox.get('conn-b') ?? []).filter((f) => f.type === 'msg');
     expect(frames.map((f) => (f.type === 'msg' ? f.msgId : ''))).toEqual([mAbove]);
     // Expired rows are left for DynamoDB TTL to reap; drain still never deletes.
-    expect((await allQueued(db, bobId)).map((m) => m.msgId)).toEqual([
-      mBefore,
-      mAt,
-      mAbove,
-    ]);
+    expect((await allQueued(db, bobId)).map((m) => m.msgId)).toEqual([mBefore, mAt, mAbove]);
   });
 
   it('drain delivers live messages in msgId order across interleaved expired rows', async () => {
@@ -473,7 +478,56 @@ describe('websocket handlers', () => {
     const res = await sendFrame('01JNKJNKJNKJNKJNKJNKJNKJNK', ulid(), 'conn-a', aliceId);
     expect(res.statusCode).toBe(404);
     const aliceFrames = sender.inbox.get('conn-a') ?? [];
-    expect(aliceFrames.some((f) => f.type === 'error' && f.code === 'unknown_recipient')).toBe(true);
+    expect(aliceFrames.some((f) => f.type === 'error' && f.code === 'unknown_recipient')).toBe(
+      true,
+    );
+  });
+
+  it('never schedules a call to a deleted old ID, while the replacement ID still schedules', async () => {
+    // The same device can delete and recreate an account, but the old ULID is
+    // permanently dead. A caller holding that stale contact must get the
+    // ordinary unknown-recipient refusal; only a call addressed to the new
+    // account may cross the push-scheduling seam.
+    const oldId = bobId;
+    expect(
+      (
+        await deleteAccountHandler({ method: 'DELETE', path: '/v1/account', headers: {} }, deps, {
+          userId: oldId,
+        })
+      ).statusCode,
+    ).toBe(200);
+    const replacement = await makeUser(BOB_KEY);
+    expect(replacement.userId).not.toBe(oldId);
+
+    const scheduled: Parameters<WsDeps['schedulePush']>[] = [];
+    wsDeps.schedulePush = async (...args) => {
+      scheduled.push(args);
+    };
+    await connect(aliceToken, 'conn-a');
+    const call = (to: string) =>
+      wsDefaultHandler(
+        {
+          routeKey: '$default',
+          connectionId: 'conn-a',
+          senderUserId: aliceId,
+          body: JSON.stringify({
+            type: 'send',
+            to,
+            msgId: ulid(),
+            msgType: 'ciphertext',
+            payload: B64,
+            urgent: true,
+          }),
+        },
+        wsDeps,
+      );
+
+    expect((await call(oldId)).statusCode).toBe(404);
+    expect(scheduled).toEqual([]);
+
+    expect((await call(replacement.userId)).statusCode).toBe(200);
+    expect(scheduled).toHaveLength(1);
+    expect(scheduled[0]?.slice(0, 3)).toEqual([replacement.userId, aliceId, 'call']);
   });
 
   it('idkey-claim ids are never recipients: registered and unregistered keys are indistinguishable', async () => {
@@ -556,7 +610,13 @@ describe('websocket handlers', () => {
         routeKey: '$default',
         connectionId: 'conn-a',
         senderUserId: aliceId,
-        body: JSON.stringify({ type: 'send', to: bobId, msgId: ulid(), msgType: 'ciphertext', payload: big }),
+        body: JSON.stringify({
+          type: 'send',
+          to: bobId,
+          msgId: ulid(),
+          msgType: 'ciphertext',
+          payload: big,
+        }),
       },
       wsDeps,
     );
@@ -724,9 +784,7 @@ describe('websocket handlers', () => {
       const over = await ack('conn-b', bobId);
       expect(over.statusCode).toBe(429);
       const errors = (sender.inbox.get('conn-b') ?? []).filter((f) => f.type === 'error');
-      expect(errors).toEqual([
-        { type: 'error', code: 'rate_limited', detail: expect.any(String) },
-      ]);
+      expect(errors).toEqual([{ type: 'error', code: 'rate_limited', detail: expect.any(String) }]);
       // One refusal is not a teardown: the socket and its row survive.
       expect(deps.disconnected).toEqual([]);
       expect((await db.getConnection(bobId))?.connectionId).toBe('conn-b');

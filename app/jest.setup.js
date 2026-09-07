@@ -257,6 +257,7 @@ jest.mock('tacendum-call', () => {
     addIceCandidates: jest.fn(async () => undefined),
     restartIce: jest.fn(async () => 'v=0\r\nRESTART'),
     close: jest.fn(async () => undefined),
+    setAccountOwner: jest.fn(async () => undefined),
     // The APPLIED VERDICT: the real module answers
     // whether that cid had a live connection whose track was changed. `true`
     // is the ordinary case; a test that means "this leg could not be

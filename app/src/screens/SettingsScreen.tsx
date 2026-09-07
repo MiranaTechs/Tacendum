@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   BackHandler,
   Linking,
@@ -9,6 +9,7 @@ import {
   Text,
   View,
 } from 'react-native';
+import { ACCOUNT_LIFECYCLE_COPY } from '../accountLifecycleCopy';
 import { ACCOUNTS_COPY } from '../accountsCopy';
 import { ACCOUNTS_USERNAME_COPY } from '../accountsUsernameCopy';
 import { appearanceChoice, setAppearanceChoice } from '../appearance';
@@ -28,13 +29,12 @@ import { LINKING_COPY } from '../linkingCopy';
 import * as lock from '../lock';
 import { LOSS_COPY } from '../lossCopy';
 import { messageSoundEnabled, setMessageSound } from '../messageSound';
-import {
-  previewLevel,
-  setPreviewLevel,
-  type PreviewLevel,
-} from '../previews';
+import { previewLevel, setPreviewLevel, type PreviewLevel } from '../previews';
 import { readReceiptsEnabled, setReadReceipts } from '../readReceipts';
-import { setTypingIndicators, typingIndicatorsEnabled } from '../typingIndicators';
+import {
+  setTypingIndicators,
+  typingIndicatorsEnabled,
+} from '../typingIndicators';
 import {
   alwaysRelayEnabled,
   restorePushTokens,
@@ -49,12 +49,7 @@ import { screenSecurity } from '../screenSecurity';
 import { session } from '../session';
 import { useTheme } from '../theme';
 import { USERNAME_UI_ENABLED } from '../usernameUi';
-import {
-  PRIVACY_URL,
-  SOURCE_URL,
-  TERMS_URL,
-  VERSION_LABEL,
-} from '../version';
+import { PRIVACY_URL, SOURCE_URL, TERMS_URL, VERSION_LABEL } from '../version';
 import { ChoiceRow } from '../ui/ChoiceRow';
 import { WritingConnection } from '../ui/WritingConnection';
 import { InfoDisclosure } from '../ui/InfoDisclosure';
@@ -65,6 +60,7 @@ import {
   PrimaryButton,
   RuledLabel,
   ScreenHeader,
+  TextAction,
 } from '../ui/primitives';
 
 /**
@@ -109,6 +105,45 @@ export const AUTOLOCK_INFO_LINES = {
 
 const COPY = {
   title: 'Settings',
+  categories: [
+    {
+      id: 'account',
+      title: 'Account',
+      summary: USERNAME_UI_ENABLED
+        ? 'Email, username and linked devices'
+        : 'Email and linked devices',
+    },
+    {
+      id: 'privacy',
+      title: 'Privacy & security',
+      summary: 'Field Mode, App Lock, screen sharing and links',
+    },
+    {
+      id: 'chats',
+      title: 'Chats & calls',
+      summary: 'Receipts, typing indicators and call privacy',
+    },
+    {
+      id: 'notifications',
+      title: 'Notifications',
+      summary: 'Message previews and sounds',
+    },
+    {
+      id: 'appearance',
+      title: 'Appearance',
+      summary: 'Light, dark or automatic',
+    },
+    {
+      id: 'writing',
+      title: 'Writing assistant',
+      summary: 'Choose how you rewrite and translate',
+    },
+    {
+      id: 'about',
+      title: 'About',
+      summary: 'Policies, source code, licenses and version',
+    },
+  ],
   // The two account entries. The LABELS live in the
   // linking/accounts copy decks — the device-noun chokepoints — never here.
   accountSection: 'ACCOUNT',
@@ -119,6 +154,9 @@ const COPY = {
   // nor the room. Label from the username deck, never a literal here.
   accountUsernameRow: ACCOUNTS_USERNAME_COPY.settingsRow,
   lockSection: 'APP LOCK',
+  lockStatusLoading: 'Loading App Lock…',
+  lockStatusFailed: 'Couldn’t load App Lock settings. Try again.',
+  retry: 'Retry',
   enableRow: 'Turn on App Lock',
   changeRow: 'Change code',
   resetDecoysRow: 'Rebuild decoy conversations',
@@ -283,6 +321,7 @@ const COPY = {
     '• SQLite — public domain\n\n' +
     'Full texts ship in the source tree.',
   receiptsLabel: 'Read receipts',
+  chatsSection: 'CHATS',
   receiptOptions: [
     { label: 'On', value: true },
     { label: 'Off', value: false },
@@ -493,6 +532,15 @@ const COPY = {
   ],
 } as const;
 
+export type SettingsSection =
+  | 'account'
+  | 'privacy'
+  | 'chats'
+  | 'notifications'
+  | 'appearance'
+  | 'writing'
+  | 'about';
+
 type Flow =
   | { step: 'menu' }
   | { step: 'current'; next: 'change' | 'disable' | 'reset' }
@@ -504,6 +552,13 @@ type Flow =
 
 interface Props {
   onBack: () => void;
+  /** Gives the owning route transition the same guarded back operation used
+   * by this screen's header and Android hardware Back. */
+  backHandlerRef?: React.MutableRefObject<(() => boolean) | null>;
+  /** Restores a category after an account child route returns to Settings. */
+  initialSection?: SettingsSection;
+  /** Lets the owning router preserve the category across child routes. */
+  onSectionChange?: (section: SettingsSection | null) => void;
   /** Opens the linked-devices roster (the one Settings
    * entry that route was waiting on). */
   onOpenLinkedDevices: () => void;
@@ -527,6 +582,9 @@ interface Props {
 
 export function SettingsScreen({
   onBack,
+  backHandlerRef,
+  initialSection,
+  onSectionChange,
   onOpenLinkedDevices,
   onOpenAccountEmail,
   onOpenAccountUsername,
@@ -545,9 +603,13 @@ export function SettingsScreen({
    */
   const duressRows = session.mode === 'duress' ? fieldModeDuressRows() : null;
   const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [lockStatusFailed, setLockStatusFailed] = useState(false);
   const [autolockSec, setAutolockSec] = useState(0);
   const [flow, setFlow] = useState<Flow>({ step: 'menu' });
-  const [writingOpen, setWritingOpen] = useState(false);
+  const [section, setSection] = useState<SettingsSection | null>(
+    initialSection ?? null,
+  );
+  const scrollRef = useRef<ScrollView>(null);
   const [value, setValue] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -608,14 +670,31 @@ export function SettingsScreen({
   const fieldBusyRef = useRef(false);
   const [fieldBusy, setFieldBusy] = useState(false);
 
-  useEffect(() => {
-    void lock.status().then(s => {
-      // The session override wins over the Keychain: in duress, mutations
-      // are Keychain no-ops, but the session must tell ONE story.
-      setEnabled(session.lockUi.enabled ?? s.enabled);
-      setAutolockSec(session.lockUi.autolockSec ?? s.autolockSec);
-    });
+  const lockStatusReadRef = useRef(0);
+  const loadLockStatus = useCallback(() => {
+    const owner = ++lockStatusReadRef.current;
+    setEnabled(null);
+    setLockStatusFailed(false);
+    void lock
+      .status()
+      .then(s => {
+        if (lockStatusReadRef.current !== owner) return;
+        // The session override wins over the Keychain: in duress, mutations
+        // are Keychain no-ops, but the session must tell ONE story.
+        setEnabled(session.lockUi.enabled ?? s.enabled);
+        setAutolockSec(session.lockUi.autolockSec ?? s.autolockSec);
+      })
+      .catch(() => {
+        if (lockStatusReadRef.current === owner) setLockStatusFailed(true);
+      });
   }, []);
+
+  useEffect(() => {
+    loadLockStatus();
+    return () => {
+      lockStatusReadRef.current += 1;
+    };
+  }, [loadLockStatus]);
 
   /**
    * Keep the coerced session's copy of the four mapped rows current (rule
@@ -637,59 +716,86 @@ export function SettingsScreen({
     });
   }, [preview, relayAll, silenceUnknown, blankEnabled]);
 
+  const resetScroll = () => {
+    scrollRef.current?.scrollTo({ y: 0, animated: false });
+  };
+
   const toFlow = (next: Flow) => {
     setValue('');
     setError(null);
     setFlow(next);
+    resetScroll();
   };
 
-  /** Read by the system-back handler, which is registered once and must see
-   * which step is open — and reach the current `toFlow` — at the moment of
-   * the press, not at subscription. */
-  const flowRef = useRef(flow);
-  const toFlowRef = useRef(toFlow);
-  flowRef.current = flow;
-  toFlowRef.current = toFlow;
+  /**
+   * Settings is one router surface with a small navigation stack of its own:
+   * home → category → optional sub-step. Account routes leave this component,
+   * so the owner can mirror the selected category through `onSectionChange`
+   * and hand it back through `initialSection` on return.
+   */
+  const sectionRef = useRef(section);
+  sectionRef.current = section;
+  const changeSection = (next: SettingsSection | null) => {
+    toFlow({ step: 'menu' });
+    setSection(next);
+    onSectionChange?.(next);
+  };
 
   useEffect(() => {
-    // ANDROID SYSTEM BACK returns to the App Lock menu instead of leaving
-    // Settings. This is the worst
-    // case the sweep exists for: half way through entering a new passcode —
-    // one digit in, or on the confirm step with the first code already
-    // typed — the press that means "undo this step" popped the route and
-    // landed the person on Profile with the whole ceremony discarded, and
-    // the sub-step's own Cancel is the only thing that ever put them back.
-    //
-    // ONE STEP OR ALL OF THEM? All of them, to `menu`, because that is what
-    // the screen's OWN controls do: every CancelLink and every DoneLink on
-    // these sub-steps goes straight to `menu`, none of them walks back one.
-    // A back button with a motion the visible controls do not have would be
-    // a second, invisible navigation model.
-    //
-    // The licences page and the loss page are the same `flow` and so the
-    // same case — they are pages this screen shows in place of its menu,
-    // and back returns to the menu, exactly as their Done does.
-    //
-    // MID-COMMIT, THE PRESS IS SWALLOWED. `busyRef` guards a commit that may
-    // be building a whole decoy workspace; yielding would pop the route out
-    // from under it. It consumes the press and changes nothing, the way
-    // Register refuses mid-flight.
-    //
-    // With the menu showing it yields (`false`) and the router pops as it
-    // always did. Refs, not state: registered once, and a press can land
-    // before a state has flushed. On iOS `BackHandler` is inert, so this
-    // registers unconditionally.
+    const next = initialSection ?? null;
+    if (sectionRef.current === next) return;
+    setFlow({ step: 'menu' });
+    setValue('');
+    setError(null);
+    setSection(next);
+    resetScroll();
+  }, [initialSection]);
+
+  /** Read by the system-back handler, which is registered once and must see
+   * the current sub-step, category and callbacks at the moment of the press. */
+  const flowRef = useRef(flow);
+  const toFlowRef = useRef(toFlow);
+  const changeSectionRef = useRef(changeSection);
+  flowRef.current = flow;
+  toFlowRef.current = toFlow;
+  changeSectionRef.current = changeSection;
+
+  const backWithinSettings = (): boolean => {
+    // setupDecoy and the Field Mode batch are security writes. Keep their
+    // owning surface mounted until each operation reaches its own `finally`.
+    if (busyRef.current || fieldBusyRef.current) return true;
+    if (flowRef.current.step !== 'menu') {
+      toFlowRef.current({ step: 'menu' });
+      return true;
+    }
+    if (sectionRef.current !== null) {
+      changeSectionRef.current(null);
+      return true;
+    }
+    return false;
+  };
+  const backWithinSettingsRef = useRef(backWithinSettings);
+  backWithinSettingsRef.current = backWithinSettings;
+
+  const handleHeaderBack = () => {
+    if (!backWithinSettings()) onBack();
+  };
+
+  useEffect(() => {
+    // Android and the route edge gesture follow the same visible stack as the
+    // header. Mid-write presses are consumed so a security operation cannot
+    // outlive its surface.
+    const handler = () => backWithinSettingsRef.current();
+    if (backHandlerRef) backHandlerRef.current = handler;
     const subscription = BackHandler.addEventListener(
       'hardwareBackPress',
-      () => {
-        if (flowRef.current.step === 'menu') return false;
-        if (busyRef.current) return true;
-        toFlowRef.current({ step: 'menu' });
-        return true;
-      },
+      handler,
     );
-    return () => subscription.remove();
-  }, []);
+    return () => {
+      if (backHandlerRef?.current === handler) backHandlerRef.current = null;
+      subscription.remove();
+    };
+  }, [backHandlerRef]);
 
   /**
    * Hand a policy or source URL to the system browser.
@@ -741,8 +847,10 @@ export function SettingsScreen({
         // the real lock. A DURESS session keeps accepting both, as
         // everything here does: the coerced change must look
         // like it worked.
-        if (session.mode === 'real' && result.verdict !== 'real') return setError(COPY.wrong);
-        if (flow.next === 'change') return toFlow({ step: 'enter', mode: 'change' });
+        if (session.mode === 'real' && result.verdict !== 'real')
+          return setError(COPY.wrong);
+        if (flow.next === 'change')
+          return toFlow({ step: 'enter', mode: 'change' });
         if (flow.next === 'reset') {
           await setupDecoy();
           setNotice(COPY.decoysRebuilt);
@@ -818,12 +926,7 @@ export function SettingsScreen({
    * optimistic shape.
    */
   type RowKey =
-    | 'autolock'
-    | 'screensec'
-    | 'receipts'
-    | 'typing'
-    | 'preview'
-    | 'fieldmode';
+    'autolock' | 'screensec' | 'receipts' | 'typing' | 'preview' | 'fieldmode';
   const [rowError, setRowError] = useState<RowKey | null>(null);
   const rowErrorFor = (row: RowKey): string | null =>
     rowError === row ? COPY.settingFailed : null;
@@ -1078,125 +1181,208 @@ export function SettingsScreen({
         ? COPY.confirmPrompt
         : COPY.enterPrompt;
 
+  const sectionCopy = section
+    ? COPY.categories.find(item => item.id === section)
+    : undefined;
+  const headerTitle =
+    flow.step === 'licenses'
+      ? COPY.licensesTitle
+      : flow.step === 'loss'
+        ? LOSS_COPY.title
+        : flow.step !== 'menu'
+          ? 'App Lock'
+          : (sectionCopy?.title ?? COPY.title);
+  const headerBackLabel =
+    flow.step !== 'menu'
+      ? `Back to ${sectionCopy?.title ?? COPY.title}`
+      : section
+        ? 'Back to Settings'
+        : 'Back';
+
   return (
     <View style={styles.container} testID="settings-screen">
-      <ScreenHeader title={COPY.title} onBack={onBack} testIDBack="settings-back" />
+      <ScreenHeader
+        title={headerTitle}
+        onBack={handleHeaderBack}
+        backLabel={headerBackLabel}
+        testIDBack="settings-back"
+      />
       <ScrollView
-        contentContainerStyle={[styles.content, { paddingHorizontal: t.layout.gutter }]}
+        ref={scrollRef}
+        contentContainerStyle={[
+          styles.content,
+          { paddingHorizontal: t.layout.gutter },
+        ]}
       >
         {/* The reading column: capped at contentMax
             like Register/Profile, so a medium/expanded pane hands this
             screen an honest width instead of stretching every row across
             the glass. Width-only; on phones the cap never engages. */}
         <View style={[styles.column, { maxWidth: t.layout.contentMax }]}>
-          {/* FIELD MODE sits ABOVE App Lock — the first thing a hurried
-              person reaches — while every row it governs stays exactly where
-              it has always been. It is a statement ABOUT those rows, not a
-              replacement for them, so it is a section of one. */}
-          {/* EVERY SECTION LABEL ON THIS SCREEN PASSES `heading`
-             , and nothing else on it does. This is the longest
-              scroll in the app, and without the role the rotor's Headings
-              navigator offered no stops at all — reaching APPEARANCE meant
-              swiping past every row above it. The prop is opt-in because the
-              same component draws the thread's date dividers, where a
-              heading per day would flood the very navigator this is meant to
-              make useful; each screen passes it for its own sections. */}
-          {flow.step === 'menu' && enabled !== null && (
+          {flow.step === 'menu' && section === null ? (
+            <SettingsSheet>
+              {COPY.categories.map((item, index) => (
+                <React.Fragment key={item.id}>
+                  {index > 0 ? <RowRule /> : null}
+                  <MenuRow
+                    label={item.title}
+                    detail={item.summary}
+                    testID={`settings-category-${item.id}`}
+                    first={index === 0}
+                    onPress={() => changeSection(item.id)}
+                  />
+                </React.Fragment>
+              ))}
+            </SettingsSheet>
+          ) : null}
+
+          {flow.step === 'menu' && section === 'account' ? (
             <>
-              <RuledLabel
-                heading
-                label={FIELD_MODE_COPY.sectionLabel}
-                marginTop={24}
-                marginBottom={12}
-              />
-              <View
+              {USERNAME_UI_ENABLED ? (
+                <Text
+                  testID="settings-account-verification-note"
+                  style={[
+                    t.type.body,
+                    styles.categoryLead,
+                    styles.detailStart,
+                    { color: t.color.inkBody },
+                  ]}
+                >
+                  {ACCOUNTS_USERNAME_COPY.verificationSummary}
+                </Text>
+              ) : null}
+              <Text
+                testID="settings-account-without-verification"
                 style={[
-                  styles.sheet,
-                  {
-                    marginHorizontal: -t.layout.gutter,
-                    backgroundColor: t.color.paperSheet,
-                    borderColor: t.color.lineSoft,
-                    borderTopWidth: t.hairline,
-                    borderBottomWidth: t.hairline,
-                  },
+                  t.type.compactBody,
+                  styles.categoryNote,
+                  !USERNAME_UI_ENABLED ? styles.detailStart : null,
+                  { color: t.color.inkMuted },
                 ]}
               >
-                <ChoiceRow
-                  label={FIELD_MODE_COPY.label}
-                  options={FIELD_MODE_COPY.options}
-                  value={fieldOn}
-                  onChange={next => void chooseFieldMode(next)}
-                  // Five writes behind one chip: grey out for the duration
-                  // rather than let a second tap interleave with the first.
-                  disabled={fieldBusy}
-                  testIDPrefix="settings-fieldmode"
-                  // What the one tap changes stays VISIBLE (consent-grade);
-                  // the teaching paragraphs sit behind the row's ⓘ.
-                  note={
-                    enabled
-                      ? `${FIELD_MODE_COPY.consent} ${FIELD_MODE_COPY.consentAutolock}`
-                      : FIELD_MODE_COPY.consent
-                  }
-                  info={{
-                    label: COPY.infoLabel,
-                    lines: FIELD_MODE_COPY.infoLines,
-                  }}
-                  error={rowErrorFor('fieldmode')}
+                {ACCOUNTS_USERNAME_COPY.withoutVerification}
+              </Text>
+              <SettingsSheet>
+                <MenuRow
+                  label={COPY.linkedDevicesRow}
+                  testID="settings-linked-devices"
+                  first
+                  onPress={onOpenLinkedDevices}
                 />
-                {/* Status, not a control: Field Mode never turns App Lock on
-                    (that needs the code ceremony and setupDecoy), so this
-                    says what is missing and stops. */}
-                {!enabled ? (
-                  <Text
-                    testID="settings-fieldmode-needslock"
-                    style={[
-                      t.type.compactBody,
-                      styles.needsLock,
-                      { color: t.color.inkMuted },
-                    ]}
-                  >
-                    {FIELD_MODE_COPY.needsLock}
-                  </Text>
+                <RowRule />
+                <MenuRow
+                  label={COPY.accountEmailRow}
+                  testID="settings-account-email"
+                  onPress={onOpenAccountEmail}
+                />
+                {USERNAME_UI_ENABLED ? (
+                  <>
+                    <RowRule />
+                    <MenuRow
+                      label={COPY.accountUsernameRow}
+                      testID="settings-account-username"
+                      onPress={() => onOpenAccountUsername?.()}
+                    />
+                  </>
                 ) : null}
+              </SettingsSheet>
+              <View style={styles.sectionInfo}>
+                <InfoDisclosure
+                  label={ACCOUNT_LIFECYCLE_COPY.title}
+                  lines={[
+                    ACCOUNT_LIFECYCLE_COPY.summary,
+                    ...ACCOUNT_LIFECYCLE_COPY.details,
+                  ]}
+                  testID="settings-account-lifecycle-info"
+                />
               </View>
             </>
-          )}
+          ) : null}
 
-          {/* THE LABEL AND THE NOTICE RIDE THE SHEET'S OWN GUARD.
-              Both used to render unconditionally, so tapping Open-source
-              licenses printed APP LOCK across the top of the AGPL notice and
-              a stale "App Lock is on." painted over the PIN flow — a heading
-              for a feature you are not looking at, and a sentence about a
-              step you have already left. The FIELD MODE block above was
-              always gated this way; this is the same condition, not a new
-              one. */}
-          {flow.step === 'menu' && enabled !== null && (
+          {flow.step === 'menu' && section === 'privacy' ? (
             <>
+              {enabled !== null ? (
+                <>
+                  <RuledLabel
+                    heading
+                    label={FIELD_MODE_COPY.sectionLabel}
+                    marginTop={24}
+                    marginBottom={12}
+                  />
+                  <SettingsSheet>
+                    <ChoiceRow
+                      label={FIELD_MODE_COPY.label}
+                      options={FIELD_MODE_COPY.options}
+                      value={fieldOn}
+                      onChange={next => void chooseFieldMode(next)}
+                      disabled={fieldBusy}
+                      testIDPrefix="settings-fieldmode"
+                      note={
+                        enabled
+                          ? `${FIELD_MODE_COPY.consent} ${FIELD_MODE_COPY.consentAutolock}`
+                          : FIELD_MODE_COPY.consent
+                      }
+                      info={{
+                        label: COPY.infoLabel,
+                        lines: FIELD_MODE_COPY.infoLines,
+                      }}
+                      error={rowErrorFor('fieldmode')}
+                    />
+                    {!enabled ? (
+                      <Text
+                        testID="settings-fieldmode-needslock"
+                        style={[
+                          t.type.compactBody,
+                          styles.needsLock,
+                          { color: t.color.inkMuted },
+                        ]}
+                      >
+                        {FIELD_MODE_COPY.needsLock}
+                      </Text>
+                    ) : null}
+                  </SettingsSheet>
+                </>
+              ) : null}
+
               <RuledLabel
                 heading
                 label={COPY.lockSection}
-                // The branch is kept verbatim: inside this guard it always
-                // resolves to 32, and keeping it means the spacing cannot
-                // silently change if the guard is ever loosened again.
-                marginTop={flow.step === 'menu' && enabled !== null ? 32 : 24}
+                marginTop={enabled === null ? 24 : 32}
                 marginBottom={12}
               />
               {notice ? (
                 <InlineNotice message={notice} tone="pine" marginTop={0} />
               ) : null}
-              <View
-                style={[
-                  styles.sheet,
-                  {
-                    marginHorizontal: -t.layout.gutter,
-                    backgroundColor: t.color.paperSheet,
-                    borderColor: t.color.lineSoft,
-                    borderTopWidth: t.hairline,
-                    borderBottomWidth: t.hairline,
-                  },
-                ]}
-              >
-                {!enabled ? (
+              <SettingsSheet>
+                {enabled === null ? (
+                  <View style={styles.lockStatus}>
+                    {lockStatusFailed ? (
+                      <>
+                        <InlineError
+                          message={COPY.lockStatusFailed}
+                          testID="settings-lock-status-error"
+                          marginTop={0}
+                        />
+                        <TextAction
+                          label={COPY.retry}
+                          testID="settings-lock-status-retry"
+                          onPress={loadLockStatus}
+                        />
+                      </>
+                    ) : (
+                      <Text
+                        testID="settings-lock-status-loading"
+                        style={[
+                          t.type.compactBody,
+                          styles.lockStatusLoading,
+                          { color: t.color.inkMuted },
+                        ]}
+                      >
+                        {COPY.lockStatusLoading}
+                      </Text>
+                    )}
+                  </View>
+                ) : !enabled ? (
                   <MenuRow
                     label={COPY.enableRow}
                     testID="settings-lock-enable"
@@ -1208,7 +1394,9 @@ export function SettingsScreen({
                     <MenuRow
                       label={COPY.changeRow}
                       testID="settings-lock-change"
-                      onPress={() => toFlow({ step: 'current', next: 'change' })}
+                      onPress={() =>
+                        toFlow({ step: 'current', next: 'change' })
+                      }
                       first
                     />
                     <RowRule />
@@ -1218,9 +1406,6 @@ export function SettingsScreen({
                       value={autolockSec}
                       onChange={sec => void chooseAutolock(sec)}
                       testIDPrefix="settings-autolock"
-                      // 'Right away' means
-                      // something different on each platform, and the row
-                      // must say which one this build is.
                       info={{
                         label: COPY.autolockInfoLabel,
                         lines: COPY.autolockInfo,
@@ -1233,16 +1418,6 @@ export function SettingsScreen({
                       testID="settings-lock-reset-decoys"
                       onPress={() => toFlow({ step: 'current', next: 'reset' })}
                     />
-                    {/* LOCK NOW, above the irreversible row: the
-                        drawer doctrine this app follows everywhere else is
-                        reversible above irreversible, and locking is the
-                        most reversible thing here — you type your code and
-                        you are back. Rendered only when App.tsx has handed
-                        down its `relock`, and identical in both sessions
-                        with no `session.mode` branch: a coerced tap locks
-                        the decoy exactly as it locks the real workspace,
-                        and the lock screen that comes back is already
-                        pixel-identical for both codes. */}
                     {onLockNow ? (
                       <>
                         <RowRule />
@@ -1267,21 +1442,20 @@ export function SettingsScreen({
                     <MenuRow
                       label={COPY.disableRow}
                       testID="settings-lock-disable"
-                      onPress={() => toFlow({ step: 'current', next: 'disable' })}
+                      onPress={() =>
+                        toFlow({ step: 'current', next: 'disable' })
+                      }
                       danger
                     />
                   </>
                 )}
-              </View>
-              {/* "One code, two doors", RE-READABLE. These exact
-                  strings used to render only at `flow.step === 'explain'` —
-                  inside the enable/change ceremony — so re-reading how the
-                  second door works meant entering your current code and
-                  inventing a new one twice. That is the wrong thing to ask
-                  of someone who is checking, under pressure, what the
-                  reversed code does. Zero new copy: the same two strings, at
-                  a second site, behind the section ⓘ. Only while the lock is
-                  on, because with it off there is no second door yet. */}
+                <RowRule />
+                <MenuRow
+                  label={LOSS_COPY.row}
+                  testID="settings-loss"
+                  onPress={() => toFlow({ step: 'loss' })}
+                />
+              </SettingsSheet>
               {enabled ? (
                 <View style={styles.sectionInfo}>
                   <InfoDisclosure
@@ -1291,73 +1465,6 @@ export function SettingsScreen({
                   />
                 </View>
               ) : null}
-            </>
-          )}
-
-          {flow.step === 'menu' && (
-            <>
-              {/* The two account entries:
-                  each row is the ONE Settings door to a surface that already
-                  landed — routes, screens, back mapping and DEPTH already live
-                  in App.tsx; each entry here is exactly one line. */}
-              <RuledLabel
-                heading
-                label={COPY.accountSection}
-                marginTop={32}
-                marginBottom={12}
-              />
-              <View
-                style={[
-                  styles.sheet,
-                  {
-                    marginHorizontal: -t.layout.gutter,
-                    backgroundColor: t.color.paperSheet,
-                    borderColor: t.color.lineSoft,
-                    borderTopWidth: t.hairline,
-                    borderBottomWidth: t.hairline,
-                  },
-                ]}
-              >
-                <MenuRow
-                  label={COPY.linkedDevicesRow}
-                  testID="settings-linked-devices"
-                  first
-                  onPress={onOpenLinkedDevices}
-                />
-                <RowRule />
-                <MenuRow
-                  label={COPY.accountEmailRow}
-                  testID="settings-account-email"
-                  onPress={onOpenAccountEmail}
-                />
-                {/* THE USERNAME DOOR, dark behind the
-                    build pin exactly as the surface it opens is. */}
-                {USERNAME_UI_ENABLED ? (
-                  <>
-                    <RowRule />
-                    <MenuRow
-                      label={COPY.accountUsernameRow}
-                      testID="settings-account-username"
-                      onPress={() => onOpenAccountUsername?.()}
-                    />
-                  </>
-                ) : null}
-                {/* "If this is lost or taken", at the foot of the
-                    section that already holds the account: a second
-                    IN-SCREEN step, the Licenses idiom, never a route — so
-                    `visibleSurface.ts` and its matrix do not move for a page
-                    of four paragraphs. The honest inventory of what a lost
-                    device costs is true of this build today and is written
-                    down in four places, none of them reachable after
-                    registration; this is the one place a person can read it
-                    before the day rather than on it. */}
-                <RowRule />
-                <MenuRow
-                  label={LOSS_COPY.row}
-                  testID="settings-loss"
-                  onPress={() => toFlow({ step: 'loss' })}
-                />
-              </View>
 
               <RuledLabel
                 heading
@@ -1365,18 +1472,7 @@ export function SettingsScreen({
                 marginTop={32}
                 marginBottom={12}
               />
-              <View
-                style={[
-                  styles.sheet,
-                  {
-                    marginHorizontal: -t.layout.gutter,
-                    backgroundColor: t.color.paperSheet,
-                    borderColor: t.color.lineSoft,
-                    borderTopWidth: t.hairline,
-                    borderBottomWidth: t.hairline,
-                  },
-                ]}
-              >
+              <SettingsSheet>
                 <ChoiceRow
                   label={COPY.blankLabel}
                   options={COPY.blankOptions}
@@ -1385,6 +1481,31 @@ export function SettingsScreen({
                   testIDPrefix="settings-screensec"
                   error={rowErrorFor('screensec')}
                 />
+              </SettingsSheet>
+              <View style={styles.sectionInfo}>
+                <InfoDisclosure
+                  label={COPY.shotLabel}
+                  lines={[COPY.shotNote]}
+                  testID="settings-shot-info"
+                />
+                <InfoDisclosure
+                  label={COPY.linksLabel}
+                  lines={[COPY.linksNote]}
+                  testID="settings-links-info"
+                />
+              </View>
+            </>
+          ) : null}
+
+          {flow.step === 'menu' && section === 'chats' ? (
+            <>
+              <RuledLabel
+                heading
+                label={COPY.chatsSection}
+                marginTop={24}
+                marginBottom={12}
+              />
+              <SettingsSheet>
                 <ChoiceRow
                   label={COPY.receiptsLabel}
                   options={COPY.receiptOptions}
@@ -1403,62 +1524,24 @@ export function SettingsScreen({
                   info={{ label: COPY.infoLabel, lines: [COPY.typingNote] }}
                   error={rowErrorFor('typing')}
                 />
-              </View>
-              {/* The screenshot truth belongs to the SECTION, not to a row:
-                  its ⓘ sits under the sheet. */}
-              <View style={styles.sectionInfo}>
-                <InfoDisclosure
-                  label={COPY.shotLabel}
-                  lines={[COPY.shotNote]}
-                  testID="settings-shot-info"
-                />
-                {/* Beside the screenshot truth, because both are statements
-                    about what this app does with what is on the glass and
-                    what leaves it. The address that opens is not
-                    always the address that was typed, and a person who is
-                    never told that would find out from a browser's address
-                    bar and reasonably wonder what else was edited. */}
-                <InfoDisclosure
-                  label={COPY.linksLabel}
-                  lines={[COPY.linksNote]}
-                  testID="settings-links-info"
-                />
-              </View>
+              </SettingsSheet>
 
-              {/* The design. Its own section rather than a row under SCREEN: this one
-                  is about what leaves the phone over the network, not about
-                  what is on the glass. */}
               <RuledLabel
                 heading
                 label={COPY.callsSection}
                 marginTop={32}
                 marginBottom={12}
               />
-              <View
-                style={[
-                  styles.sheet,
-                  {
-                    marginHorizontal: -t.layout.gutter,
-                    backgroundColor: t.color.paperSheet,
-                    borderColor: t.color.lineSoft,
-                    borderTopWidth: t.hairline,
-                    borderBottomWidth: t.hairline,
-                  },
-                ]}
-              >
+              <SettingsSheet>
                 <ChoiceRow
                   label={COPY.relayLabel}
                   options={COPY.relayOptions}
                   value={relayAll}
                   onChange={next => void chooseRelay(next)}
                   testIDPrefix="settings-relay"
-                  // The IP disclosure stays VISIBLE (consent-grade); the rest
-                  // of the machinery sits behind the row's ⓘ.
                   note={COPY.relayConsent}
                   info={{ label: COPY.infoLabel, lines: [COPY.relayNote] }}
                 />
-                {/* in this sheet rather than its own section: both rows
-                    decide what a call is allowed to do to this phone. */}
                 <ChoiceRow
                   label={COPY.silenceLabel}
                   options={COPY.silenceOptions}
@@ -1467,26 +1550,13 @@ export function SettingsScreen({
                   testIDPrefix="settings-silence"
                   info={{ label: COPY.infoLabel, lines: [COPY.silenceNote] }}
                 />
-              </View>
+              </SettingsSheet>
+            </>
+          ) : null}
 
-              <RuledLabel
-                heading
-                label={COPY.notificationsSection}
-                marginTop={32}
-                marginBottom={12}
-              />
-              <View
-                style={[
-                  styles.sheet,
-                  {
-                    marginHorizontal: -t.layout.gutter,
-                    backgroundColor: t.color.paperSheet,
-                    borderColor: t.color.lineSoft,
-                    borderTopWidth: t.hairline,
-                    borderBottomWidth: t.hairline,
-                  },
-                ]}
-              >
+          {flow.step === 'menu' && section === 'notifications' ? (
+            <>
+              <SettingsSheet top>
                 <ChoiceRow
                   label={COPY.previewLabel}
                   options={COPY.previewOptions}
@@ -1496,11 +1566,6 @@ export function SettingsScreen({
                   info={{ label: COPY.infoLabel, lines: [COPY.previewNote] }}
                   error={rowErrorFor('preview')}
                 />
-                {/* Below the preview control because it is the
-                    broader switch: previews decide what a notification SHOWS,
-                    this decides whether Apple holds a token for this device at
-                    all. The consent-grade cost stays VISIBLE under the chips;
-                    the mechanism sits behind the row's ⓘ. */}
                 <ChoiceRow
                   label={COPY.pushLabel}
                   options={COPY.pushOptions}
@@ -1512,10 +1577,6 @@ export function SettingsScreen({
                   info={{ label: COPY.infoLabel, lines: [COPY.pushNote] }}
                   error={pushFailed ? COPY.pushFailed : null}
                 />
-                {/* The message chime. Below the push row, the
-                    outer authority: that one decides whether a wake reaches
-                    this device at all, this only whether a message that
-                    does makes a sound. */}
                 <ChoiceRow
                   label={COPY.soundLabel}
                   options={COPY.soundOptions}
@@ -1524,12 +1585,6 @@ export function SettingsScreen({
                   testIDPrefix="settings-sound"
                   info={{ label: COPY.infoLabel, lines: [COPY.soundNote] }}
                 />
-                {/* ANDROID ONLY, and last in the section:
-                    everything above is a setting this screen owns, and this
-                    is the one row that admits what it cannot. On iOS the
-                    sound switch above really does govern the extension's
-                    banner sound, so the note would be false and the row
-                    would answer a question the platform does not ask. */}
                 {Platform.OS === 'android' ? (
                   <>
                     <RowRule />
@@ -1550,11 +1605,7 @@ export function SettingsScreen({
                     </Text>
                   </>
                 ) : null}
-              </View>
-              {/* The full-screen ring, disclosed rather than discovered: the
-                  call module's own code owes a Settings line for this state
-                  and this is it. Section-level, beside the row that opens
-                  the place the permission lives. */}
+              </SettingsSheet>
               {Platform.OS === 'android' ? (
                 <View style={styles.sectionInfo}>
                   <InfoDisclosure
@@ -1564,71 +1615,36 @@ export function SettingsScreen({
                   />
                 </View>
               ) : null}
+            </>
+          ) : null}
 
-              <RuledLabel
-                heading
-                label={COPY.appearanceSection}
-                marginTop={32}
-                marginBottom={12}
+          {flow.step === 'menu' && section === 'appearance' ? (
+            <SettingsSheet top>
+              <ChoiceRow
+                label={COPY.appearanceLabel}
+                options={COPY.appearanceOptions}
+                value={appearance}
+                onChange={next => {
+                  setAppearanceChoice(next);
+                  setAppearance(next);
+                }}
+                testIDPrefix="settings-appearance"
               />
-              <View
-                style={[
-                  styles.sheet,
-                  {
-                    marginHorizontal: -t.layout.gutter,
-                    backgroundColor: t.color.paperSheet,
-                    borderColor: t.color.lineSoft,
-                    borderTopWidth: t.hairline,
-                    borderBottomWidth: t.hairline,
-                  },
-                ]}
-              >
-                <ChoiceRow
-                  label={COPY.appearanceLabel}
-                  options={COPY.appearanceOptions}
-                  value={appearance}
-                  onChange={next => {
-                    setAppearanceChoice(next);
-                    setAppearance(next);
-                  }}
-                  testIDPrefix="settings-appearance"
-                />
-              </View>
+            </SettingsSheet>
+          ) : null}
 
-              <RuledLabel heading label="WRITING ASSISTANT" marginTop={32} marginBottom={12} />
-              <View style={[styles.sheet, {
-                marginHorizontal: -t.layout.gutter,
-                backgroundColor: t.color.paperSheet,
-                borderColor: t.color.lineSoft,
-                borderTopWidth: t.hairline,
-                borderBottomWidth: t.hairline,
-              }]}>
-                <MenuRow
-                  label="Your AI connections"
-                  testID="settings-writing"
-                  onPress={() => setWritingOpen(open => !open)}
-                />
-              </View>
-              {writingOpen ? <WritingConnection onDone={() => setWritingOpen(false)} /> : null}
-
-              <RuledLabel
-                heading
-                label={COPY.aboutSection}
-                marginTop={32}
-                marginBottom={12}
+          {flow.step === 'menu' && section === 'writing' ? (
+            <View style={styles.detailStart}>
+              <WritingConnection
+                showHeading={false}
+                onDone={() => changeSection(null)}
               />
-              <View
-                style={[
-                  styles.sheet,
-                  {
-                    marginHorizontal: -t.layout.gutter,
-                    backgroundColor: t.color.paperSheet,
-                    borderColor: t.color.lineSoft,
-                    borderTopWidth: t.hairline,
-                    borderBottomWidth: t.hairline,
-                  },
-                ]}
-              >
+            </View>
+          ) : null}
+
+          {flow.step === 'menu' && section === 'about' ? (
+            <>
+              <SettingsSheet top>
                 <MenuRow
                   label={COPY.privacyRow}
                   testID="settings-privacy"
@@ -1653,20 +1669,9 @@ export function SettingsScreen({
                   testID="settings-licenses"
                   onPress={() => toFlow({ step: 'licenses' })}
                 />
-              </View>
-              {/*
-                The version is here rather than in a row of its own because it
-                is a fact, not an action — and because a bug report, an App
-                Review note and the source link above all have to agree on
-                which build is being discussed. SOURCE_URL is derived from the
-                same constant this line prints (version.ts), so they cannot
-                drift apart.
-              */}
+              </SettingsSheet>
               <Text
                 testID="settings-version"
-                // Mono, matching the other small factual readouts in the app
-                // (timestamps, safety numbers). A version string is a thing you
-                // transcribe into a bug report, not prose.
                 style={[
                   t.type.timeStatus,
                   styles.versionLine,
@@ -1677,40 +1682,32 @@ export function SettingsScreen({
                 {VERSION_LABEL}
               </Text>
             </>
-          )}
+          ) : null}
 
-          {flow.step === 'licenses' && (
+          {flow.step === 'licenses' ? (
             <View style={styles.pinFlow}>
               <Text style={[t.type.sectionTitle, { color: t.color.inkStrong }]}>
                 {COPY.licensesTitle}
               </Text>
-              {/*
-                Offline on purpose. This text is the NOTICE that has to travel
-                with the binary; a screen that fetched it would show nothing on
-                a plane, and "your licence terms require a network" is not a
-                defensible reading of AGPL §6.
-              */}
               <Text
                 testID="settings-licenses-body"
-                style={[t.type.body, styles.explain, { color: t.color.inkBody }]}
+                style={[
+                  t.type.body,
+                  styles.explain,
+                  { color: t.color.inkBody },
+                ]}
               >
                 {COPY.licensesBody}
               </Text>
               <DoneLink onPress={() => toFlow({ step: 'menu' })} />
             </View>
-          )}
+          ) : null}
 
-          {flow.step === 'loss' && (
+          {flow.step === 'loss' ? (
             <View style={styles.pinFlow}>
               <Text style={[t.type.sectionTitle, { color: t.color.inkStrong }]}>
                 {LOSS_COPY.title}
               </Text>
-              {/* Four paragraphs, each one checked against the module that
-                  owns its truth (see lossCopy.ts). Identical in both
-                  sessions with no `session.mode` branch: what a lost device
-                  costs is the same fact whichever code opened the app, and
-                  a page that read differently under coercion would be a
-                  discriminator for nothing. */}
               <View testID="settings-loss-body">
                 {LOSS_COPY.lines.map(line => (
                   <Text
@@ -1734,11 +1731,11 @@ export function SettingsScreen({
               </View>
               <DoneLink onPress={() => toFlow({ step: 'menu' })} />
             </View>
-          )}
+          ) : null}
 
-          {(flow.step === 'current' ||
-            flow.step === 'enter' ||
-            flow.step === 'confirm') && (
+          {flow.step === 'current' ||
+          flow.step === 'enter' ||
+          flow.step === 'confirm' ? (
             <View style={styles.pinFlow}>
               <Text
                 style={[t.type.body, styles.prompt, { color: t.color.inkBody }]}
@@ -1760,9 +1757,9 @@ export function SettingsScreen({
               />
               <CancelLink onPress={() => toFlow({ step: 'menu' })} />
             </View>
-          )}
+          ) : null}
 
-          {flow.step === 'explain' && (
+          {flow.step === 'explain' ? (
             <View style={styles.pinFlow}>
               <Text style={[t.type.sectionTitle, { color: t.color.inkStrong }]}>
                 {COPY.explainTitle}
@@ -1771,20 +1768,19 @@ export function SettingsScreen({
                 <InlineError message={error} testID="settings-commit-error" />
               ) : null}
               <Text
-                style={[t.type.body, styles.explain, { color: t.color.inkBody }]}
+                style={[
+                  t.type.body,
+                  styles.explain,
+                  { color: t.color.inkBody },
+                ]}
               >
                 {COPY.explain}
               </Text>
-              {/* PrimaryButton, not a bare Pressable: `commit`
-                  awaits `setupDecoy()`, which fabricates a whole decoy
-                  workspace of chats, rooms, messages and vault items. With a
-                  static label the person tapped and nothing visibly happened
-                  for as long as that took. This is the control every other
-                  long action in the app already uses — spinner, busy label
-                  and `accessibilityState.busy` for VoiceOver. */}
               <PrimaryButton
                 label={
-                  flow.mode === 'enable' ? COPY.confirmEnable : COPY.confirmChange
+                  flow.mode === 'enable'
+                    ? COPY.confirmEnable
+                    : COPY.confirmChange
                 }
                 busy={busy}
                 busyLabel={COPY.commitBusy}
@@ -1793,21 +1789,50 @@ export function SettingsScreen({
               />
               <CancelLink onPress={() => toFlow({ step: 'menu' })} />
             </View>
-          )}
+          ) : null}
         </View>
       </ScrollView>
     </View>
   );
 }
 
+function SettingsSheet({
+  children,
+  top,
+}: {
+  children: React.ReactNode;
+  top?: boolean;
+}) {
+  const t = useTheme();
+  return (
+    <View
+      style={[
+        styles.sheet,
+        top ? styles.detailStart : null,
+        {
+          marginHorizontal: -t.layout.gutter,
+          backgroundColor: t.color.paperSheet,
+          borderColor: t.color.lineSoft,
+          borderTopWidth: t.hairline,
+          borderBottomWidth: t.hairline,
+        },
+      ]}
+    >
+      {children}
+    </View>
+  );
+}
+
 function MenuRow({
   label,
+  detail,
   onPress,
   testID,
   first,
   danger,
 }: {
   label: string;
+  detail?: string;
   onPress: () => void;
   testID: string;
   first?: boolean;
@@ -1818,6 +1843,7 @@ function MenuRow({
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={label}
+      accessibilityHint={detail}
       testID={testID}
       onPress={onPress}
       style={({ pressed }) => [
@@ -1830,14 +1856,27 @@ function MenuRow({
         },
       ]}
     >
-      <Text
-        style={[
-          t.type.rowTitle,
-          { color: danger ? t.color.danger : t.color.inkStrong },
-        ]}
-      >
-        {label}
-      </Text>
+      <View style={styles.menuRowText}>
+        <Text
+          style={[
+            t.type.rowTitle,
+            { color: danger ? t.color.danger : t.color.inkStrong },
+          ]}
+        >
+          {label}
+        </Text>
+        {detail ? (
+          <Text
+            style={[
+              t.type.compactBody,
+              styles.menuRowDetail,
+              { color: t.color.inkMuted },
+            ]}
+          >
+            {detail}
+          </Text>
+        ) : null}
+      </View>
       <Text style={[t.type.iconGlyph, { color: t.color.inkMuted }]}>›</Text>
     </Pressable>
   );
@@ -1896,7 +1935,11 @@ function StepLink({
 
 function CancelLink({ onPress }: { onPress: () => void }) {
   return (
-    <StepLink label={COPY.cancel} testID="settings-pin-cancel" onPress={onPress} />
+    <StepLink
+      label={COPY.cancel}
+      testID="settings-pin-cancel"
+      onPress={onPress}
+    />
   );
 }
 
@@ -1916,7 +1959,15 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    paddingVertical: 10,
   },
+  menuRowText: { flex: 1, paddingRight: 12 },
+  menuRowDetail: { marginTop: 2 },
+  categoryLead: { marginBottom: 8 },
+  categoryNote: { marginBottom: 16 },
+  detailStart: { marginTop: 24 },
+  lockStatus: { paddingHorizontal: 10, paddingTop: 10 },
+  lockStatusLoading: { paddingHorizontal: 6, paddingBottom: 10 },
   pinFlow: { marginTop: 16, alignItems: 'center' },
   /** The section-level ⓘ under a sheet (the screenshot truth). */
   sectionInfo: { marginTop: 10 },

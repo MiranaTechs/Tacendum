@@ -1,6 +1,13 @@
 import { RegisterPushTokenRequest } from '@tacendum/shared';
 import { LIMITS } from '../ratelimit.js';
-import { errorResult, parseJson, rateLimitedResult, type AuthedHandler } from './http.js';
+import {
+  errorResult,
+  parseJson,
+  rateLimitedResult,
+  type AuthedHandler,
+  type Deps,
+  type HttpResult,
+} from './http.js';
 
 /**
  * VoIP push-token registration.
@@ -19,6 +26,39 @@ import { errorResult, parseJson, rateLimitedResult, type AuthedHandler } from '.
  * The client re-PUTs on every launch, so this only reaps the dead. */
 const TOKEN_TTL_SECONDS = 90 * 24 * 3600;
 
+const accountGoneResult = (): HttpResult =>
+  errorResult(409, 'account_gone', 'this device account no longer exists');
+
+async function discardRegistration(
+  deps: Pick<Deps, 'db' | 'log'>,
+  userId: string,
+  state: 'absent' | 'tombstoned',
+): Promise<HttpResult> {
+  await deps.db.deletePushToken(userId);
+  deps.log('push_token_registration_discarded', { state });
+  return accountGoneResult();
+}
+
+/**
+ * Close the delete/register race after the token write.
+ *
+ * Authentication proves the account was live when the request was admitted,
+ * not that it is still live when a delayed write commits. Account deletion
+ * removes the user row before sweeping its token, so every ordering is
+ * covered by that sweep or this strong post-write read. If deletion won, the
+ * unconditional cleanup is safe because account ULIDs are never reused.
+ */
+async function finishRegistration(
+  deps: Pick<Deps, 'db' | 'log'>,
+  userId: string,
+  fields: Record<string, string>,
+): Promise<HttpResult> {
+  const state = await deps.db.userAccountState(userId);
+  if (state !== 'live') return discardRegistration(deps, userId, state);
+  deps.log('push_token_registered', fields);
+  return { statusCode: 204 };
+}
+
 // PUT /v1/push-token -> 204
 export const registerPushTokenHandler: AuthedHandler = async (event, deps, auth) => {
   const retry = await deps.rateLimit.take(`push-token:${auth.userId}`, LIMITS.pushToken);
@@ -27,8 +67,12 @@ export const registerPushTokenHandler: AuthedHandler = async (event, deps, auth)
   // Integration accounts have no phone to wake and no business holding a
   // wake capability: a notifier that can register a
   // push token is a notifier that can be made to ring something.
-  const caller = await deps.db.getUserById(auth.userId);
-  if (caller?.accountClass === 'integration') {
+  const caller = await deps.db.getUserById(auth.userId, undefined, { consistent: true });
+  if (!caller) return discardRegistration(deps, auth.userId, 'absent');
+  if (caller.tombstoned === true) {
+    return discardRegistration(deps, auth.userId, 'tombstoned');
+  }
+  if (caller.accountClass === 'integration') {
     return errorResult(403, 'integration_forbidden', 'integrations cannot register push tokens');
   }
 
@@ -53,8 +97,7 @@ export const registerPushTokenHandler: AuthedHandler = async (event, deps, auth)
     });
     // Platform only — the token itself is never logged, same as the
     // iOS arm below.
-    deps.log('push_token_registered', { platform: 'android' });
-    return { statusCode: 204 };
+    return finishRegistration(deps, auth.userId, { platform: 'android' });
   }
 
   // A REGISTRATION NEVER DOWNGRADES THE ROW. The client's first upload of a
@@ -86,8 +129,10 @@ export const registerPushTokenHandler: AuthedHandler = async (event, deps, auth)
 
   // Environment only. The token itself is never logged: log access
   // must not become the ability to ring someone's phone.
-  deps.log('push_token_registered', { platform: 'ios', env: parsed.data.env });
-  return { statusCode: 204 };
+  return finishRegistration(deps, auth.userId, {
+    platform: 'ios',
+    env: parsed.data.env,
+  });
 };
 
 // DELETE /v1/push-token -> 204

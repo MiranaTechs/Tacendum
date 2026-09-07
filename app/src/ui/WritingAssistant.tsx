@@ -61,7 +61,12 @@ type ViewState =
       phase: 'handoff';
       action: AiWritingAction;
       provider: AiWritingExternalProvider;
+      owner: number;
+      sourceKey: string;
+      revision: number;
       opened: boolean;
+      opening: boolean;
+      openError: string | null;
     }
   | {
       phase: 'review';
@@ -149,6 +154,17 @@ function progressCopy(
     : workingCopy(action);
 }
 
+function actionLabel(
+  action: (typeof ACTIONS)[number],
+  mode: AiWritingMode | null,
+): string {
+  if (mode !== 'external') return action.label;
+  if (action.kind === 'improve') return 'Copy rewrite request';
+  if (action.kind === 'shorter') return 'Copy shorter request';
+  if (action.kind === 'warmer') return 'Copy warmer request';
+  return action.label;
+}
+
 export function WritingAssistant({
   sourceKey,
   onRequest,
@@ -166,6 +182,8 @@ export function WritingAssistant({
     controller: AbortController;
   } | null>(null);
   const connectionLoadRef = useRef(0);
+  const handoffOwnerRef = useRef(0);
+  const handoffOpeningRef = useRef<number | null>(null);
 
   const [view, setView] = useState<ViewState>({ phase: 'choose' });
   const [selectedLanguage, setSelectedLanguage] = useState<string | null>(null);
@@ -186,13 +204,19 @@ export function WritingAssistant({
     requestRef.current = null;
   }, []);
 
+  const retireHandoff = useCallback(() => {
+    handoffOwnerRef.current += 1;
+    handoffOpeningRef.current = null;
+  }, []);
+
   const resetWriting = useCallback(() => {
     retireRequest();
+    retireHandoff();
     setView({ phase: 'choose' });
     setShowLanguages(false);
     setSelectedLanguage(null);
     setPastedReply('');
-  }, [retireRequest]);
+  }, [retireHandoff, retireRequest]);
 
   const loadConnection = useCallback(async () => {
     const owner = ++connectionLoadRef.current;
@@ -234,8 +258,9 @@ export function WritingAssistant({
       mountedRef.current = false;
       connectionLoadRef.current += 1;
       retireRequest();
+      retireHandoff();
     };
-  }, [loadConnection, retireRequest]);
+  }, [loadConnection, retireHandoff, retireRequest]);
 
   useLayoutEffect(() => {
     sourceRef.current = sourceKey;
@@ -251,7 +276,11 @@ export function WritingAssistant({
       view.phase === 'working'
         ? progressCopy(view.action, connectionMode, externalProvider)
         : view.phase === 'handoff'
-        ? view.opened
+        ? view.openError
+          ? null
+          : view.opening
+          ? `Opening ${AI_WRITING_EXTERNAL_PROVIDER_LABELS[view.provider]}.`
+          : view.opened
           ? `Request copied. ${AI_WRITING_EXTERNAL_PROVIDER_LABELS[view.provider]} opened.`
           : `Request copied. Open ${AI_WRITING_EXTERNAL_PROVIDER_LABELS[view.provider]} to paste it.`
         : view.phase === 'review'
@@ -267,6 +296,7 @@ export function WritingAssistant({
     async (action: AiWritingAction) => {
       if (requestRef.current) return;
       retireRequest();
+      retireHandoff();
       const id = ++requestIdRef.current;
       const controller = new AbortController();
       const requestSource = sourceRef.current;
@@ -333,12 +363,6 @@ export function WritingAssistant({
             });
             return;
           }
-          let opened = true;
-          try {
-            await Linking.openURL(url);
-          } catch {
-            opened = false;
-          }
           if (
             !mountedRef.current ||
             controller.signal.aborted ||
@@ -349,11 +373,17 @@ export function WritingAssistant({
             return;
           }
           requestRef.current = null;
+          const owner = ++handoffOwnerRef.current;
           setView({
             phase: 'handoff',
             action,
             provider: result.provider,
-            opened,
+            owner,
+            sourceKey: requestSource,
+            revision,
+            opened: false,
+            opening: false,
+            openError: null,
           });
           return;
         }
@@ -375,11 +405,79 @@ export function WritingAssistant({
         });
       }
     },
-    [onRequest, retireRequest],
+    [onRequest, retireHandoff, retireRequest],
+  );
+
+  const openHandoff = useCallback(
+    async (handoff: Extract<ViewState, { phase: 'handoff' }>) => {
+      if (
+        !mountedRef.current ||
+        handoffOwnerRef.current !== handoff.owner ||
+        sourceRef.current !== handoff.sourceKey ||
+        handoffOpeningRef.current !== null
+      ) {
+        return;
+      }
+      if (getWritingRevision() !== handoff.revision) {
+        setView(current =>
+          current.phase === 'handoff' && current.owner === handoff.owner
+            ? {
+                ...current,
+                opening: false,
+                openError:
+                  'The writing connection changed. Copy a new request.',
+              }
+            : current,
+        );
+        return;
+      }
+
+      const owner = handoff.owner;
+      handoffOpeningRef.current = owner;
+      setView(current =>
+        current.phase === 'handoff' && current.owner === owner
+          ? { ...current, opening: true, openError: null }
+          : current,
+      );
+
+      let failed = false;
+      try {
+        await Linking.openURL(AI_WRITING_EXTERNAL_URLS[handoff.provider]);
+      } catch {
+        failed = true;
+      }
+      if (handoffOpeningRef.current === owner) {
+        handoffOpeningRef.current = null;
+      }
+      if (
+        !mountedRef.current ||
+        handoffOwnerRef.current !== owner ||
+        sourceRef.current !== handoff.sourceKey ||
+        getWritingRevision() !== handoff.revision
+      ) {
+        return;
+      }
+      setView(current =>
+        current.phase === 'handoff' && current.owner === owner
+          ? {
+              ...current,
+              opened: !failed,
+              opening: false,
+              openError: failed
+                ? `Couldn’t open ${
+                    AI_WRITING_EXTERNAL_PROVIDER_LABELS[handoff.provider]
+                  }. The request is still copied.`
+                : null,
+            }
+          : current,
+      );
+    },
+    [],
   );
 
   const reviewPasted = useCallback(() => {
     if (pastedReply.trim().length === 0) return;
+    retireHandoff();
     const requestSource = sourceRef.current;
     const revision = getWritingRevision();
     let result: AiWritingResult;
@@ -413,7 +511,7 @@ export function WritingAssistant({
     }
     setPastedReply('');
     setView({ phase: 'review', action: null, text: result.text, revision });
-  }, [onReview, pastedReply]);
+  }, [onReview, pastedReply, retireHandoff]);
 
   const close = useCallback(() => {
     resetWriting();
@@ -479,7 +577,7 @@ export function WritingAssistant({
           </Text>
           {providerLabel && !manageConnection ? (
             <Text style={[t.type.timeStatus, { color: t.color.inkMuted }]}>
-              {providerLabel} · {connectionMode === 'external' ? 'App handoff' : 'API key'}
+              {providerLabel} · {connectionMode === 'external' ? 'Manual copy & paste' : 'API key'}
             </Text>
           ) : null}
         </View>
@@ -529,7 +627,7 @@ export function WritingAssistant({
                 ]}
               >
                 {connectionMode === 'external'
-                  ? `Choose an action to copy this draft and open ${providerLabel}. Paste it there, then bring the reply back here.`
+                  ? `Signing in on the ${providerLabel} website does not connect that account to Tacendum. Choose an action to copy a request. Open ${providerLabel} when you are ready, paste it there, then bring the reply back here.`
                   : `Only this draft goes to ${providerLabel}. Review before using.`}
               </Text>
               <TextAction
@@ -557,10 +655,12 @@ export function WritingAssistant({
                       key={action.kind}
                       testID={`writing-action-${action.kind}`}
                       accessibilityRole="button"
-                      accessibilityLabel={action.label}
+                      accessibilityLabel={actionLabel(action, connectionMode)}
                       accessibilityHint={
                         connectionMode === 'external'
-                          ? `${action.description}. Copies a request and opens ${providerLabel}.`
+                          ? action.kind === 'translate'
+                            ? `${action.description}. Choose a language, then copy a request. Open ${providerLabel} only when you choose Open ${providerLabel}.`
+                            : `${action.description}. Copies a request. Open ${providerLabel} only when you choose Open ${providerLabel}.`
                           : action.description
                       }
                       onPress={() => {
@@ -583,7 +683,7 @@ export function WritingAssistant({
                       ]}
                     >
                       <Text style={[t.type.button, { color: t.color.pine }]}>
-                        {action.label}
+                        {actionLabel(action, connectionMode)}
                       </Text>
                       <Text
                         style={[
@@ -652,7 +752,11 @@ export function WritingAssistant({
                       })}
                     </View>
                     <PrimaryButton
-                      label="Translate"
+                      label={
+                        connectionMode === 'external'
+                          ? 'Copy translation request'
+                          : 'Translate'
+                      }
                       testID="writing-translate-submit"
                       disabled={!selectedLanguage}
                       onPress={() => {
@@ -708,20 +812,26 @@ export function WritingAssistant({
                   Request copied
                 </Text>
                 <Text style={[t.type.compactBody, { color: t.color.inkBody }]}>
-                  {view.opened
-                    ? `${AI_WRITING_EXTERNAL_PROVIDER_LABELS[view.provider]} opened. Paste the request there, then return and paste its reply below.`
-                    : `${AI_WRITING_EXTERNAL_PROVIDER_LABELS[view.provider]} didn’t open. Open it yourself and paste the copied request.`}
+                  Open {AI_WRITING_EXTERNAL_PROVIDER_LABELS[view.provider]} when
+                  you are ready, paste the request there, then return and paste
+                  its reply below.
                 </Text>
-                {!view.opened ? (
-                  <OutlineButton
-                    size="compact"
-                    label={`Open ${AI_WRITING_EXTERNAL_PROVIDER_LABELS[view.provider]}`}
-                    testID="writing-handoff-open"
-                    onPress={() => {
-                      void Linking.openURL(
-                        AI_WRITING_EXTERNAL_URLS[view.provider],
-                      ).catch(() => undefined);
-                    }}
+                <OutlineButton
+                  size="compact"
+                  label={
+                    view.opening
+                      ? `Opening ${AI_WRITING_EXTERNAL_PROVIDER_LABELS[view.provider]}…`
+                      : `Open ${AI_WRITING_EXTERNAL_PROVIDER_LABELS[view.provider]}`
+                  }
+                  testID="writing-handoff-open"
+                  disabled={view.opening}
+                  onPress={() => void openHandoff(view)}
+                />
+                {view.openError ? (
+                  <InlineError
+                    message={view.openError}
+                    testID="writing-handoff-open-error"
+                    marginTop={2}
                   />
                 ) : null}
               </View>

@@ -342,6 +342,7 @@ export class CallController {
   private unsubscribe: (() => void) | null = null;
   private credentials: { servers: IceServer[]; expiresAt: number } | null = null;
   private refreshing: Promise<void> | null = null;
+  private credentialGeneration = 0;
   /**
    * Envelope handling, serialized.
    *
@@ -1881,6 +1882,31 @@ export class CallController {
     return this.queue;
   }
 
+  /** After native ownership is cleared, messaging stops, and queued work and
+   * hangup settle, forget the deleted account without disposing this process's
+   * reusable controller. No old timer may act on a replacement account. */
+  clearAccountState(): void {
+    for (const peerId of [...this.cancelObligations.keys()]) this.dischargeCancelObligation(peerId);
+    for (const timer of this.ringProofFuses.values()) clearTimeout(timer);
+    this.ringProofFuses.clear();
+    this.ringProofOwed.clear();
+    this.ringProofDeadlines.clear();
+    this.ringProofReasons.clear();
+    this.cancelHolds.clear();
+    this.placeholderOwnerHolds.clear();
+    this.pushRings.clear();
+    this.pushDeclines.clear();
+    this.ringCids.clear();
+    this.endedCids.clear();
+    this.ringingOfferCid = null;
+    this.relayForThisCall = false;
+    this.relayForThisSession = false;
+    this.credentialGeneration += 1;
+    this.credentials = null;
+    this.refreshing = null;
+    this.appliedRelayOnly = null;
+  }
+
   /** Subscribe to envelopes and register for VoIP wakes. Idempotent. */
   async start(): Promise<void> {
     if (!this.unsubscribe) {
@@ -2957,12 +2983,14 @@ export class CallController {
     if (this.credentials && this.deps.now() + minRemainingMs < this.credentials.expiresAt) return;
     if (this.refreshing) return this.refreshing;
 
+    const generation = this.credentialGeneration;
     this.refreshing = (async () => {
       try {
         const { iceServers, ttlSeconds } = await withTimeout(
           this.deps.fetchTurnCredentials(),
           CREDENTIAL_TIMEOUT_MS,
         );
+        if (generation !== this.credentialGeneration) return;
         this.credentials = {
           servers: iceServers,
           expiresAt: this.deps.now() + ttlSeconds * 1000 * REFRESH_AT,
@@ -2970,6 +2998,7 @@ export class CallController {
         this.appliedRelayOnly = this.effectiveRelayOnly();
         await this.deps.native.configure(iceServers, this.appliedRelayOnly);
       } catch {
+        if (generation !== this.credentialGeneration) return;
         // No relay is a DEGRADED state, not a failure: a direct call still
         // works for most networks, and refusing to place one because the
         // credential endpoint is down would turn a partial outage into a
@@ -2978,7 +3007,7 @@ export class CallController {
         this.appliedRelayOnly = this.effectiveRelayOnly();
         await this.deps.native.configure([], this.appliedRelayOnly).catch(() => undefined);
       } finally {
-        this.refreshing = null;
+        if (generation === this.credentialGeneration) this.refreshing = null;
       }
     })();
     return this.refreshing;

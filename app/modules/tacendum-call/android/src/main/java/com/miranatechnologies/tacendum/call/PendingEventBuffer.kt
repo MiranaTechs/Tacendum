@@ -109,6 +109,11 @@ internal class PendingEventBuffer(private val capacity: Int = MAX_PENDING) {
     ready = false
   }
 
+  /** Account deletion drops events that belong to the departing identity. */
+  fun clear() {
+    queued.clear()
+  }
+
   companion object {
     /**
      * Deep enough for a cold launch's handful of Telecom events, shallow

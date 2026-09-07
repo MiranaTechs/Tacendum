@@ -428,6 +428,12 @@ export function AccountUsernameScreen({ onBack, onOpenAccountEmail }: Props) {
               message={ACCOUNTS_USERNAME_COPY.needsIdentifier}
               testID="account-username-needs-identifier"
             />
+            <Text
+              testID="account-username-without-verification"
+              style={[t.type.compactBody, { color: t.color.inkMuted }]}
+            >
+              {ACCOUNTS_USERNAME_COPY.withoutVerification}
+            </Text>
             {/* The step the sentence names, one tap away. */}
             {onOpenAccountEmail ? (
               <TextAction

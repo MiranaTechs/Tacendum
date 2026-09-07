@@ -57,10 +57,19 @@ async function press(
   });
 }
 
+async function enterAccount(
+  tree: ReactTestRenderer.ReactTestRenderer,
+): Promise<void> {
+  await press(tree, 'settings-category-account');
+}
+
 describe('Settings → ACCOUNT (screen level)', () => {
   it('renders both entries, labeled from the copy decks — never a literal here', async () => {
     const tree = await renderSettings({});
-    const devices = tree.root.findByProps({ testID: 'settings-linked-devices' });
+    await enterAccount(tree);
+    const devices = tree.root.findByProps({
+      testID: 'settings-linked-devices',
+    });
     const email = tree.root.findByProps({ testID: 'settings-account-email' });
     // The label IS the deck slot: linkingCopy.ts owns row 23's words,
     // accountsCopy.ts owns row 29a's. device-noun.test.ts pins the slots'
@@ -80,6 +89,7 @@ describe('Settings → ACCOUNT (screen level)', () => {
       onOpenLinkedDevices,
       onOpenAccountEmail,
     });
+    await enterAccount(tree);
     await press(tree, 'settings-linked-devices');
     expect(onOpenLinkedDevices).toHaveBeenCalledTimes(1);
     expect(onOpenAccountEmail).not.toHaveBeenCalled();
@@ -95,6 +105,7 @@ describe('Settings → ACCOUNT (screen level)', () => {
       onOpenLinkedDevices,
       onOpenAccountEmail,
     });
+    await enterAccount(tree);
     await press(tree, 'settings-account-email');
     expect(onOpenAccountEmail).toHaveBeenCalledTimes(1);
     expect(onOpenLinkedDevices).not.toHaveBeenCalled();
@@ -125,10 +136,12 @@ describe('Settings → ACCOUNT (App wiring)', () => {
     });
 
     devNavTo('settings');
+    await enterAccount(tree);
     await press(tree, 'settings-linked-devices');
     expect(devRoute()).toBe('linkedDevices');
 
     devNavTo('settings');
+    await enterAccount(tree);
     await press(tree, 'settings-account-email');
     expect(devRoute()).toBe('accountEmail');
 

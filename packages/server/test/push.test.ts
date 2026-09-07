@@ -1,8 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import {
-  deletePushTokenHandler,
-  registerPushTokenHandler,
-} from '../src/handlers/push.js';
+import { deletePushTokenHandler, registerPushTokenHandler } from '../src/handlers/push.js';
 import type { AuthContext, HttpEvent } from '../src/handlers/http.js';
 import type { TestOnlyDataLayer } from '../src/db/data.js';
 import { makeMemoryDb, makeTestDeps, parseBody, type TestDeps } from './helpers.js';
@@ -42,13 +39,15 @@ const VALID = {
 
 let db: TestOnlyDataLayer;
 let deps: TestDeps;
-beforeEach(() => {
+beforeEach(async () => {
   db = makeMemoryDb();
   deps = makeTestDeps(db);
+  await db.createUser({ userId: ALICE.userId, createdAt: deps.now() });
+  await db.createUser({ userId: BOB.userId, createdAt: deps.now() });
 });
 
 describe('registering a token', () => {
-  it('stores the caller\'s token and answers 204', async () => {
+  it("stores the caller's token and answers 204", async () => {
     const result = await registerPushTokenHandler(put(VALID), deps, ALICE);
     expect(result.statusCode).toBe(204);
 
@@ -97,14 +96,10 @@ describe('registering a token', () => {
     expect(await db.getPushToken(ALICE.userId)).toBeUndefined();
   });
 
-  it('writes ONLY to the caller\'s own row — the body cannot name another user', async () => {
+  it("writes ONLY to the caller's own row — the body cannot name another user", async () => {
     // There is no userId field in the request by design; prove that smuggling
     // one changes nothing about which row is written.
-    await registerPushTokenHandler(
-      put({ ...VALID, userId: BOB.userId }),
-      deps,
-      ALICE,
-    );
+    await registerPushTokenHandler(put({ ...VALID, userId: BOB.userId }), deps, ALICE);
     expect(await db.getPushToken(ALICE.userId)).toBeDefined();
     expect(await db.getPushToken(BOB.userId)).toBeUndefined();
   });
@@ -121,9 +116,7 @@ describe('registering a token', () => {
       if (r.statusCode === 429) limited++;
     }
     expect(limited).toBeGreaterThan(0);
-    expect(
-      (await registerPushTokenHandler(put(VALID), deps, BOB)).statusCode,
-    ).toBe(204);
+    expect((await registerPushTokenHandler(put(VALID), deps, BOB)).statusCode).toBe(204);
   });
 });
 
@@ -202,7 +195,7 @@ describe('registering an ANDROID token', () => {
 });
 
 describe('deleting a token', () => {
-  it('removes the caller\'s row on logout', async () => {
+  it("removes the caller's row on logout", async () => {
     await registerPushTokenHandler(put(VALID), deps, ALICE);
     const result = await deletePushTokenHandler(del(), deps, ALICE);
     expect(result.statusCode).toBe(204);
@@ -214,7 +207,7 @@ describe('deleting a token', () => {
     expect((await deletePushTokenHandler(del(), deps, ALICE)).statusCode).toBe(204);
   });
 
-  it('cannot delete someone else\'s token', async () => {
+  it("cannot delete someone else's token", async () => {
     await registerPushTokenHandler(put(VALID), deps, ALICE);
     await deletePushTokenHandler(del(), deps, BOB);
     expect(await db.getPushToken(ALICE.userId)).toBeDefined();

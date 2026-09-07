@@ -804,6 +804,38 @@ export function groupCall(): GroupCallCoordinator {
  * session without one — a roster that omits this device is a loud throw in
  * the pure module, and an empty selfId would produce exactly that. */
 let selfAccountId: string | null = null;
+let accountGeneration = 0;
+let accountBinding: Promise<void> = Promise.resolve();
+
+/** Serialize native ownership writes: an old bind may never land after a reset. */
+export function bindCallingAccount(userId: string): Promise<void> {
+  const generation = accountGeneration;
+  const work = accountBinding.then(async () => {
+    if (generation !== accountGeneration || session.mode !== 'real') return;
+    await native.setAccountOwner(userId);
+  });
+  accountBinding = work.catch(() => undefined);
+  return work;
+}
+
+/** Called after messaging stops, before any identity/database erasure. */
+export async function clearCallingAccount(): Promise<void> {
+  accountGeneration += 1;
+  setSelfAccountId(null);
+  adoptPushRegistration({ real: false });
+  const reset = accountBinding.then(() => {
+    // A queued reset can outlive the real opening that requested deletion.
+    if (session.mode !== 'real') throw new Error('call_account_reset_deferred');
+    return native.setAccountOwner('');
+  });
+  accountBinding = reset.catch(() => undefined);
+  await reset;
+  // An already decrypted offer belongs to the old database. Let that work
+  // settle while native admission is closed, then end anything it adopted.
+  await controller?.whenIdle();
+  await endCallOnQuiesce();
+  controller?.clearAccountState();
+}
 
 export function setSelfAccountId(id: string | null): void {
   selfAccountId = id;
@@ -826,8 +858,15 @@ export function setSelfAccountId(id: string | null): void {
  * is closed behind the lock screen and the boot read can only fail there.
  */
 export async function refreshSelfAccountId(): Promise<string | null> {
+  const generation = accountGeneration;
   const profile = await db.loadProfile().catch(() => null);
+  if (generation !== accountGeneration) return selfAccountId;
   setSelfAccountId(profile?.userId ?? null);
+  if (profile && session.mode === 'real') {
+    // Existing installs acquire a durable owner on their first real opening.
+    // A native storage failure must not send boot through account healing.
+    await bindCallingAccount(profile.userId).catch(() => undefined);
+  }
   return selfAccountId;
 }
 
@@ -1574,10 +1613,15 @@ export async function adoptWorkspaceForCalling(): Promise<void> {
  * withdrawal that undoes itself is worse than none.
  */
 let pushRegistrationAdopted = false;
+let pushRegistrationGeneration = 0;
 
 export function adoptPushRegistration(opts: { real: boolean }): void {
+  pushRegistrationGeneration += 1;
   pushRegistrationAdopted = opts.real;
-  if (!opts.real) return;
+  if (!opts.real) {
+    clearAlertRetry();
+    return;
+  }
   // Six polls, five seconds apart, armed fresh per session: far past any APNs
   // round trip, bounded so a denied permission does not poll forever.
   alertRetriesLeft = ALERT_RETRY_BUDGET;
@@ -1687,6 +1731,9 @@ function clearAlertRetry(): void {
 }
 
 export async function uploadPushTokens(): Promise<void> {
+  const generation = pushRegistrationGeneration;
+  const stillCurrent = () => generation === pushRegistrationGeneration &&
+    pushRegistrationAdopted && session.mode === 'real';
   // NO VERDICT, NO REGISTRATION — checked HERE rather than at the two token
   // listeners, for the reason `api.ts` gives about its own duress guard: this
   // is the one place every caller passes through, and a rule repeated at each
@@ -1699,7 +1746,7 @@ export async function uploadPushTokens(): Promise<void> {
   // Nothing is lost by refusing: `adoptPushRegistration` re-reads whatever
   // tokens exist the moment a real verdict lands, so the ordinary launch
   // registers exactly as before — one PUT, a few hundred milliseconds later.
-  if (!pushRegistrationAdopted) {
+  if (!stillCurrent()) {
     if (
       typeof jest === 'undefined' &&
       typeof __DEV__ !== 'undefined' &&
@@ -1724,6 +1771,9 @@ export async function uploadPushTokens(): Promise<void> {
     native.getAlertToken().catch(() => ''),
     native.bundleId().catch(() => ''),
   ]);
+  // A token read can finish after deletion or a different unlock. It must
+  // neither register with the next account's bearer nor re-arm its timers.
+  if (!stillCurrent()) return;
   // Presence only, never the values: a device token is the capability to push
   // to that phone, and a console log is not a place to put one. Dev-only,
   // because on a device build this is the ONLY visible evidence of a path
@@ -1769,6 +1819,7 @@ export async function uploadPushTokens(): Promise<void> {
 
   try {
     const auth = await getSecret(AUTH_TOKEN_KEY);
+    if (!stillCurrent() || !pushTokensAllowed()) return;
     if (!auth) {
       trace('no auth token');
       return;
@@ -1801,6 +1852,7 @@ export async function uploadPushTokens(): Promise<void> {
     // hand, upload dead on a flapping network, and nothing tried again until
     // the next launch. A failed registration is exactly as unregistered as a
     // missing token.
+    if (!stillCurrent()) return;
     armAlertRetry();
     trace(
       'registration failed',
@@ -2285,6 +2337,9 @@ export function currentStateForTests(): CallState {
 
 /** Test seam: drop the singleton so a suite can build a fresh one. */
 export function resetCallingForTests(): void {
+  accountGeneration += 1;
+  accountBinding = Promise.resolve();
+  pushRegistrationGeneration += 1;
   clearAlertRetry();
   controller?.stop();
   controller = null;

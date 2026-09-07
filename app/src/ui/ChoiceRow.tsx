@@ -137,8 +137,9 @@ const styles = StyleSheet.create({
   },
   // Vertical padding here (not on the row) so the chips' hitSlop has parent
   // bounds to land in — RN hitSlop never extends past the parent view.
-  choices: { flexDirection: 'row', gap: 8, paddingVertical: 5 },
+  choices: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, paddingVertical: 5 },
   chip: {
+    maxWidth: '100%',
     paddingHorizontal: 14,
     paddingVertical: 8,
     alignItems: 'center',

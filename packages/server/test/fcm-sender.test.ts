@@ -76,7 +76,7 @@ describe('sending', () => {
     await sender.wake(ANDROID_TOKEN, 'user-caller');
     await sender.notify(ANDROID_TOKEN, ALERT);
     await sender.wake(ANDROID_TOKEN, 'user-caller');
-    expect(logs.filter(l => l.event === 'fcm_unconfigured')).toHaveLength(1);
+    expect(logs.filter((l) => l.event === 'fcm_unconfigured')).toHaveLength(1);
   });
 
   it('never logs the key material or the device token', async () => {
@@ -121,6 +121,19 @@ describe('sending', () => {
     },
   );
 
+  it('binds a call wake to the recipient from the server-owned token row', async () => {
+    sendCallWakeMock.mockResolvedValue({ outcome: 'sent' });
+    const sender = makeFcmPushSender({ credentials: CREDENTIALS, log });
+
+    await sender.wake(ANDROID_TOKEN, 'user-caller');
+
+    expect(sendCallWakeMock).toHaveBeenCalledWith(FCM_TOKEN, {
+      from: 'user-caller',
+      to: ANDROID_TOKEN.userId,
+      ts: expect.any(Number),
+    });
+  });
+
   it('returns `failed` when the transport throws', async () => {
     sendCallWakeMock.mockRejectedValue(new Error('transport unavailable'));
     const sender = makeFcmPushSender({ credentials: CREDENTIALS, log });
@@ -155,7 +168,7 @@ describe('sending', () => {
     const sender = makeFcmPushSender({ credentials: CREDENTIALS, log });
     await sender.notify(ANDROID_TOKEN, ALERT);
 
-    const refusal = logs.find(l => l.event === 'fcm_refused');
+    const refusal = logs.find((l) => l.event === 'fcm_refused');
     expect(refusal?.fields).toEqual({ kind: 'message', status: 404, reason: 'UNREGISTERED' });
     expect(JSON.stringify(logs)).not.toContain(FCM_TOKEN);
   });

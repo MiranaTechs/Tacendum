@@ -48,14 +48,14 @@ const openSessions = new Set<http2.ServerHttp2Session>();
 
 beforeAll(async () => {
   server = http2.createServer();
-  server.on('session', session => {
+  server.on('session', (session) => {
     sessionsOpened += 1;
     openSessions.add(session);
     session.on('close', () => openSessions.delete(session));
   });
   server.on('stream', (stream, headers) => {
     let body = '';
-    stream.on('data', chunk => (body += chunk));
+    stream.on('data', (chunk) => (body += chunk));
     stream.on('end', () => {
       const index = received.push({ headers, body }) - 1;
       const r = typeof reply === 'function' ? reply(index) : reply;
@@ -64,13 +64,13 @@ beforeAll(async () => {
       stream.end(r.body ?? '');
     });
   });
-  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 
 afterAll(async () => {
   for (const session of openSessions) session.destroy();
-  await new Promise<void>(resolve => server.close(() => resolve()));
+  await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
 beforeEach(() => {
@@ -94,7 +94,11 @@ function decodeJwt(token: string) {
 describe('the request APNs receives', () => {
   it('posts to the device path with the VoIP headers Apple requires', async () => {
     const client = makeApnsClient({ credentials: CREDENTIALS, origin });
-    await client.sendVoip(TOKEN, { from: 'user-caller', ts: 1_700_000_000_000 });
+    await client.sendVoip(TOKEN, {
+      from: 'user-caller',
+      to: 'user-recipient',
+      ts: 1_700_000_000_000,
+    });
 
     expect(received).toHaveLength(1);
     const { headers } = received[0]!;
@@ -116,7 +120,7 @@ describe('the request APNs receives', () => {
       origin,
       now: () => now,
     });
-    await client.sendVoip(TOKEN, { from: 'user-caller', ts: now });
+    await client.sendVoip(TOKEN, { from: 'user-caller', to: 'user-recipient', ts: now });
     const expiration = Number(received[0]!.headers['apns-expiration']);
     const seconds = expiration - Math.floor(now / 1000);
     expect(seconds).toBeGreaterThan(0);
@@ -126,10 +130,18 @@ describe('the request APNs receives', () => {
 
   it('carries only what the recipient could already derive — and no cid', async () => {
     const client = makeApnsClient({ credentials: CREDENTIALS, origin });
-    await client.sendVoip(TOKEN, { from: 'user-caller', ts: 1_700_000_000_000 });
+    await client.sendVoip(TOKEN, {
+      from: 'user-caller',
+      to: 'user-recipient',
+      ts: 1_700_000_000_000,
+    });
 
     const payload = JSON.parse(received[0]!.body);
-    expect(payload).toEqual({ from: 'user-caller', ts: 1_700_000_000_000 });
+    expect(payload).toEqual({
+      from: 'user-caller',
+      to: 'user-recipient',
+      ts: 1_700_000_000_000,
+    });
     // The server cannot know a cid — it is inside the ciphertext — and must
     // never appear to. No name, no phone number, no "video call" flag.
     expect(received[0]!.body).not.toMatch(/cid/i);
@@ -141,7 +153,7 @@ describe('the request APNs receives', () => {
 describe('the authentication token', () => {
   it('is an ES256 JWT that verifies against the signing key', async () => {
     const client = makeApnsClient({ credentials: CREDENTIALS, origin });
-    await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
+    await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 1 });
 
     const auth = String(received[0]!.headers.authorization);
     expect(auth.startsWith('bearer ')).toBe(true);
@@ -153,9 +165,9 @@ describe('the authentication token', () => {
 
     // Verified for real, against the public half of the generated key.
     const verifier = createVerify('SHA256').update(jwt.signingInput);
-    expect(
-      verifier.verify({ key: publicKey, dsaEncoding: 'ieee-p1363' }, jwt.signature),
-    ).toBe(true);
+    expect(verifier.verify({ key: publicKey, dsaEncoding: 'ieee-p1363' }, jwt.signature)).toBe(
+      true,
+    );
     await client.close();
   });
 
@@ -166,14 +178,14 @@ describe('the authentication token', () => {
       origin,
       now: () => now,
     });
-    await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
-    await client.sendVoip(TOKEN, { from: 'u', ts: 2 });
+    await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 1 });
+    await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 2 });
     const first = received[0]!.headers.authorization;
     expect(received[1]!.headers.authorization).toBe(first);
 
     // APNs rejects a JWT older than 60 minutes; regenerate before that.
     now += 51 * 60_000;
-    await client.sendVoip(TOKEN, { from: 'u', ts: 3 });
+    await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 3 });
     expect(received[2]!.headers.authorization).not.toBe(first);
     await client.close();
   });
@@ -182,7 +194,7 @@ describe('the authentication token', () => {
 describe('what the response means', () => {
   it('reports success on 200', async () => {
     const client = makeApnsClient({ credentials: CREDENTIALS, origin });
-    const result = await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
+    const result = await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 1 });
     expect(result).toMatchObject({ outcome: 'sent' });
     await client.close();
   });
@@ -190,7 +202,7 @@ describe('what the response means', () => {
   it('reports a DEAD TOKEN on 410, so the caller can delete the row', async () => {
     reply = { status: 410, body: JSON.stringify({ reason: 'Unregistered' }) };
     const client = makeApnsClient({ credentials: CREDENTIALS, origin });
-    const result = await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
+    const result = await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 1 });
     expect(result).toMatchObject({ outcome: 'token_invalid' });
     await client.close();
   });
@@ -198,7 +210,7 @@ describe('what the response means', () => {
   it('treats BadDeviceToken (400) as a dead token too, not a retryable failure', async () => {
     reply = { status: 400, body: JSON.stringify({ reason: 'BadDeviceToken' }) };
     const client = makeApnsClient({ credentials: CREDENTIALS, origin });
-    expect(await client.sendVoip(TOKEN, { from: 'u', ts: 1 })).toMatchObject({
+    expect(await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 1 })).toMatchObject({
       outcome: 'token_invalid',
     });
     await client.close();
@@ -207,7 +219,7 @@ describe('what the response means', () => {
   it('does NOT retry a 429 — by the time a retry landed the call is over', async () => {
     reply = { status: 429, body: JSON.stringify({ reason: 'TooManyRequests' }) };
     const client = makeApnsClient({ credentials: CREDENTIALS, origin });
-    const result = await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
+    const result = await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 1 });
     expect(result).toMatchObject({ outcome: 'failed' });
     expect(received).toHaveLength(1);
     await client.close();
@@ -216,7 +228,7 @@ describe('what the response means', () => {
   it('retries a 500 exactly once, then gives up quietly', async () => {
     reply = { status: 500, body: JSON.stringify({ reason: 'InternalServerError' }) };
     const client = makeApnsClient({ credentials: CREDENTIALS, origin });
-    const result = await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
+    const result = await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 1 });
     expect(result).toMatchObject({ outcome: 'failed' });
     expect(received).toHaveLength(2);
     await client.close();
@@ -225,7 +237,7 @@ describe('what the response means', () => {
   it('succeeds if the retry succeeds', async () => {
     reply = { status: 503 };
     const client = makeApnsClient({ credentials: CREDENTIALS, origin });
-    const pending = client.sendVoip(TOKEN, { from: 'u', ts: 1 });
+    const pending = client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 1 });
     // Flip the server's answer after the first attempt has been recorded.
     const flip = setInterval(() => {
       if (received.length >= 1) {
@@ -245,9 +257,9 @@ describe('host selection', () => {
     expect(makeApnsClient({ credentials: CREDENTIALS, env: 'sandbox' }).origin).toBe(
       'https://api.sandbox.push.apple.com',
     );
-    expect(
-      makeApnsClient({ credentials: CREDENTIALS, env: 'production' }).origin,
-    ).toBe('https://api.push.apple.com');
+    expect(makeApnsClient({ credentials: CREDENTIALS, env: 'production' }).origin).toBe(
+      'https://api.push.apple.com',
+    );
   });
 });
 
@@ -324,9 +336,7 @@ describe('an alert push for a message', () => {
     expect(headers['apns-collapse-id']).toBe(from);
     // One fact, two headers: the collapse key IS the thread key.
     expect(headers['apns-collapse-id']).toBe(body.aps['thread-id']);
-    expect(
-      Buffer.byteLength(String(headers['apns-collapse-id'])),
-    ).toBeLessThanOrEqual(64);
+    expect(Buffer.byteLength(String(headers['apns-collapse-id']))).toBeLessThanOrEqual(64);
     await client.close();
   });
 
@@ -337,6 +347,7 @@ describe('an alert push for a message', () => {
     const client = makeApnsClient({ credentials: CREDENTIALS, origin });
     await client.sendVoip(TOKEN, {
       from: '01ARZ3NDEKTSV4RRFFQ69G5SND',
+      to: 'user-recipient',
       ts: 1_700_000_000_000,
     });
 
@@ -387,7 +398,7 @@ describe('an alert that would exceed the 4 KB APNs cap', () => {
     const client = makeApnsClient({
       credentials: CREDENTIALS,
       origin,
-      log: event => logs.push(event),
+      log: (event) => logs.push(event),
     });
     const result = await client.sendAlert(TOKEN, BIG);
 
@@ -421,7 +432,7 @@ describe('an alert that would exceed the 4 KB APNs cap', () => {
     const client = makeApnsClient({
       credentials: CREDENTIALS,
       origin,
-      log: event => logs.push(event),
+      log: (event) => logs.push(event),
     });
     const small = { ...BIG, payload: 'Y2lwaGVydGV4dA==' };
     await client.sendAlert(TOKEN, small);
@@ -435,7 +446,7 @@ describe('an alert that would exceed the 4 KB APNs cap', () => {
   it('retries a 413 exactly once without the ciphertext — Apple is the authority on its own cap', async () => {
     // A body under our threshold that Apple still refuses (the cap has moved,
     // or is measured differently): the second attempt drops the ciphertext.
-    reply = index =>
+    reply = (index) =>
       index === 0
         ? { status: 413, body: JSON.stringify({ reason: 'PayloadTooLarge' }) }
         : { status: 200 };
@@ -470,17 +481,17 @@ describe('an alert that would exceed the 4 KB APNs cap', () => {
  * so the next attempt dials fresh. */
 describe('a stalled session is not reused', () => {
   it('dials a fresh session after an attempt times out', async () => {
-    reply = index => (index === 0 ? 'hang' : { status: 200 });
+    reply = (index) => (index === 0 ? 'hang' : { status: 200 });
     const client = makeApnsClient({
       credentials: CREDENTIALS,
       origin,
       attemptTimeoutMs: 100,
     });
-    const first = await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
+    const first = await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 1 });
     expect(first).toMatchObject({ outcome: 'failed' });
     expect(sessionsOpened).toBe(1);
 
-    const second = await client.sendVoip(TOKEN, { from: 'u', ts: 2 });
+    const second = await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 2 });
     expect(second).toMatchObject({ outcome: 'sent' });
     // The proof: a SECOND session, not a second stream on the first.
     expect(sessionsOpened).toBe(2);
@@ -489,8 +500,8 @@ describe('a stalled session is not reused', () => {
 
   it('keeps reusing a healthy session between successful sends', async () => {
     const client = makeApnsClient({ credentials: CREDENTIALS, origin });
-    await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
-    await client.sendVoip(TOKEN, { from: 'u', ts: 2 });
+    await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 1 });
+    await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 2 });
     expect(received).toHaveLength(2);
     expect(sessionsOpened).toBe(1);
     await client.close();
@@ -513,28 +524,28 @@ describe('a provider-token 403 re-mints the JWT', () => {
   }
 
   it('retries once with a fresh token on ExpiredProviderToken and succeeds', async () => {
-    reply = index =>
+    reply = (index) =>
       index === 0
         ? { status: 403, body: JSON.stringify({ reason: 'ExpiredProviderToken' }) }
         : { status: 200 };
     const client = makeApnsClient({ credentials: CREDENTIALS, origin, now: tickingClock() });
-    const result = await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
+    const result = await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 1 });
 
     expect(result).toMatchObject({ outcome: 'sent' });
     expect(received).toHaveLength(2);
-    const [rejected, fresh] = received.map(r => String(r.headers.authorization));
+    const [rejected, fresh] = received.map((r) => String(r.headers.authorization));
     expect(fresh).not.toBe(rejected);
     expect(decodeJwt(fresh!.slice('bearer '.length)).payload.iat).toBeGreaterThan(
       decodeJwt(rejected!.slice('bearer '.length)).payload.iat,
     );
     // The fresh token is the one now cached: the next send reuses it.
-    await client.sendVoip(TOKEN, { from: 'u', ts: 2 });
+    await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 2 });
     expect(String(received[2]!.headers.authorization)).toBe(fresh);
     await client.close();
   });
 
   it('does the same on the alert arm', async () => {
-    reply = index =>
+    reply = (index) =>
       index === 0
         ? { status: 403, body: JSON.stringify({ reason: 'InvalidProviderToken' }) }
         : { status: 200 };
@@ -555,7 +566,7 @@ describe('a provider-token 403 re-mints the JWT', () => {
   it('does NOT retry a 403 for any other reason — a new token would not fix it', async () => {
     reply = { status: 403, body: JSON.stringify({ reason: 'TopicDisallowed' }) };
     const client = makeApnsClient({ credentials: CREDENTIALS, origin, now: tickingClock() });
-    const result = await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
+    const result = await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 1 });
     expect(result).toMatchObject({ outcome: 'failed', status: 403, reason: 'TopicDisallowed' });
     expect(received).toHaveLength(1);
     await client.close();
@@ -564,7 +575,7 @@ describe('a provider-token 403 re-mints the JWT', () => {
   it('gives up after one re-mint if Apple rejects the fresh token too', async () => {
     reply = { status: 403, body: JSON.stringify({ reason: 'ExpiredProviderToken' }) };
     const client = makeApnsClient({ credentials: CREDENTIALS, origin, now: tickingClock() });
-    const result = await client.sendVoip(TOKEN, { from: 'u', ts: 1 });
+    const result = await client.sendVoip(TOKEN, { from: 'u', to: 'user-recipient', ts: 1 });
     expect(result).toMatchObject({ outcome: 'failed', status: 403 });
     expect(received).toHaveLength(2);
     await client.close();

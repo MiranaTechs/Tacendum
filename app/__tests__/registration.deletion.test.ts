@@ -9,6 +9,8 @@ jest.mock('../src/db', () => ({
 }));
 jest.mock('../src/call', () => ({
   endCallOnQuiesce: jest.fn(async () => undefined), disposeGroupCall: jest.fn(), quiesceCallMetrics: jest.fn(),
+  clearCallingAccount: jest.fn(async () => undefined),
+  bindCallingAccount: jest.fn(async () => undefined),
 }));
 jest.mock('../src/messaging', () => ({
   ...jest.requireActual('../src/reauth'), messaging: { stop: jest.fn() },
@@ -94,6 +96,38 @@ test('confirmed deletion resumes local cleanup without a second network request'
   expect(api.apiDeleteAccount).not.toHaveBeenCalled();
   expect(crypto.resetProtocolState).toHaveBeenCalled();
   expect(crypto.__keychain.has(MARKER)).toBe(false);
+});
+
+test('account deletion clears the native call owner before identity or database erasure', async () => {
+  const calls = jest.requireMock('../src/call') as Mocks;
+  calls.clearCallingAccount.mockImplementation(async () => {
+    expect(db.clearLocalState).not.toHaveBeenCalled();
+    expect(crypto.resetProtocolState).not.toHaveBeenCalled();
+  });
+  await reg.deleteAccount();
+  expect(calls.clearCallingAccount).toHaveBeenCalledTimes(1);
+});
+
+test('a failed native call reset keeps setup blocked until reset succeeds', async () => {
+  const calls = jest.requireMock('../src/call') as Mocks;
+  calls.clearCallingAccount.mockRejectedValueOnce(new Error('native reset unavailable'));
+  await expect(reg.deleteAccount()).rejects.toThrow('account_cleanup_pending');
+  expect(crypto.__keychain.has(MARKER)).toBe(true);
+  expect(crypto.resetProtocolState).not.toHaveBeenCalled();
+  calls.clearCallingAccount.mockResolvedValue(undefined);
+  await reg.deleteAccount();
+  expect(crypto.__keychain.has(MARKER)).toBe(false);
+});
+
+test('duress beginning while hangup settles preserves the real native owner', async () => {
+  const calls = jest.requireMock('../src/call') as Mocks;
+  calls.endCallOnQuiesce.mockImplementationOnce(async () => {
+    jest.requireActual('../src/session').session.setMode('duress');
+  });
+  await expect(reg.deleteAccount()).rejects.toThrow();
+  expect(calls.clearCallingAccount).not.toHaveBeenCalled();
+  expect(db.clearLocalState).not.toHaveBeenCalled();
+  expect(crypto.__keychain.has(MARKER)).toBe(true);
 });
 
 test.each([[409, 'account_gone'], [403, 'identity_tombstoned'], [409, 'account_conflict']])(

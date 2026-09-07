@@ -446,10 +446,10 @@ test("the App Lock nudge's Open Settings lands on Settings and settles the nudge
       await flushMicrotasks();
     });
 
-    // The Settings surface is on glass, and the one showing is spent.
+    // The nudge opens the App Lock controls directly and is then spent.
     expect(route()).toBe('settings');
     expect(
-      tree.root.findAllByProps({ testID: 'settings-account-email' }).length,
+      tree.root.findAllByProps({ testID: 'settings-lock-enable' }).length,
     ).toBeGreaterThan(0);
     expect(crypto.__keychain.get('lockNudge.dismissed')).toBe('1');
   } finally {

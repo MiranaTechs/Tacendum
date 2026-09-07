@@ -17,6 +17,8 @@ import {
   apiUploadKeys,
 } from './api';
 import {
+  bindCallingAccount,
+  clearCallingAccount,
   disposeGroupCall,
   endCallOnQuiesce,
   quiesceCallMetrics,
@@ -113,6 +115,10 @@ async function finishAccountDeletion(): Promise<void> {
   messaging.stop();
   disposeGroupCall();
   quiesceCallMetrics();
+  // A reused PushKit/FCM token must no longer belong to the retiring account.
+  // Failure retains the confirmed deletion marker and blocks fresh setup.
+  refuseInDuress();
+  await clearCallingAccount();
   let incomplete = false;
   for (const clear of [
     () => db.clearLocalState(),
@@ -462,5 +468,8 @@ export async function createOrRestoreAccount(): Promise<db.ProfileRow> {
           profileVersion: 0,
         };
   await db.saveProfile(profile);
+  refuseInDuress();
+  await bindCallingAccount(userId);
+  refuseInDuress();
   return profile;
 }

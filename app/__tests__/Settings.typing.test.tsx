@@ -19,7 +19,10 @@ const SELF = '01HQ5E1F00000000000000000A';
 jest.mock('../src/api', () => ({
   apiDeletePushToken: jest.fn(async () => undefined),
   apiRegisterPushToken: jest.fn(async () => undefined),
-  apiTurnCredentials: jest.fn(async () => ({ iceServers: [], ttlSeconds: 3600 })),
+  apiTurnCredentials: jest.fn(async () => ({
+    iceServers: [],
+    ttlSeconds: 3600,
+  })),
 }));
 
 const keychain = (
@@ -50,7 +53,14 @@ function installTables(): void {
     if (/FROM chats WHERE peerId/.test(text)) {
       return {
         rows: known.has(String(args[0]))
-          ? [{ peerId: args[0], displayName: 'Ana', localName: null, lastMessageAt: 1 }]
+          ? [
+              {
+                peerId: args[0],
+                displayName: 'Ana',
+                localName: null,
+                lastMessageAt: 1,
+              },
+            ]
           : [],
       };
     }
@@ -95,13 +105,16 @@ afterEach(async () => {
 async function render(): Promise<ReactTestRenderer.ReactTestRenderer> {
   let tree!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(async () => {
-    tree = ReactTestRenderer.create(<SettingsScreen
-      onBack={() => {}}
-      onOpenLinkedDevices={() => {}}
-      onOpenAccountEmail={() => {}}
-    />);
+    tree = ReactTestRenderer.create(
+      <SettingsScreen
+        onBack={() => {}}
+        onOpenLinkedDevices={() => {}}
+        onOpenAccountEmail={() => {}}
+      />,
+    );
     await flush();
   });
+  await press(tree, 'settings-category-chats');
   return tree;
 }
 
@@ -122,7 +135,6 @@ function selected(
   return tree.root.findByProps({ testID }).props.accessibilityState
     .selected as boolean;
 }
-
 
 import {
   loadTypingIndicators,

@@ -30,7 +30,10 @@ const SELF = '01HQ5E1F00000000000000000A';
 jest.mock('../src/api', () => ({
   apiDeletePushToken: jest.fn(async () => undefined),
   apiRegisterPushToken: jest.fn(async () => undefined),
-  apiTurnCredentials: jest.fn(async () => ({ iceServers: [], ttlSeconds: 3600 })),
+  apiTurnCredentials: jest.fn(async () => ({
+    iceServers: [],
+    ttlSeconds: 3600,
+  })),
 }));
 
 const crypto = jest.requireMock('tacendum-crypto') as {
@@ -60,7 +63,14 @@ function installTables(): void {
     if (/FROM chats WHERE peerId/.test(text)) {
       return {
         rows: known.has(String(args[0]))
-          ? [{ peerId: args[0], displayName: 'Ana', localName: null, lastMessageAt: 1 }]
+          ? [
+              {
+                peerId: args[0],
+                displayName: 'Ana',
+                localName: null,
+                lastMessageAt: 1,
+              },
+            ]
           : [],
       };
     }
@@ -109,8 +119,13 @@ afterEach(async () => {
 
 /** Open a row's ⓘ: the testID lands on the disclosure composite first, so
  * the press names the node that actually carries onPress. */
-async function openInfo(tree: ReactTestRenderer.ReactTestRenderer, testID: string): Promise<void> {
-  const node = tree.root.findAllByProps({ testID }).find(n => n.props.onPress !== undefined)!;
+async function openInfo(
+  tree: ReactTestRenderer.ReactTestRenderer,
+  testID: string,
+): Promise<void> {
+  const node = tree.root
+    .findAllByProps({ testID })
+    .find(n => n.props.onPress !== undefined)!;
   await ReactTestRenderer.act(async () => {
     node.props.onPress();
   });
@@ -119,13 +134,16 @@ async function openInfo(tree: ReactTestRenderer.ReactTestRenderer, testID: strin
 async function render(): Promise<ReactTestRenderer.ReactTestRenderer> {
   let tree!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(async () => {
-    tree = ReactTestRenderer.create(<SettingsScreen
-      onBack={() => {}}
-      onOpenLinkedDevices={() => {}}
-      onOpenAccountEmail={() => {}}
-    />);
+    tree = ReactTestRenderer.create(
+      <SettingsScreen
+        onBack={() => {}}
+        onOpenLinkedDevices={() => {}}
+        onOpenAccountEmail={() => {}}
+      />,
+    );
     await flush();
   });
+  await press(tree, 'settings-category-notifications');
   return tree;
 }
 
@@ -150,11 +168,14 @@ function selected(
 /** Every chip testID in document order — the row's place in the sheet.
  * Composite and host nodes both carry the prop; the Set keeps one each. */
 function chipOrder(tree: ReactTestRenderer.ReactTestRenderer): string[] {
-  const CHIP = /^settings-(preview-(full|sender|none)|push-(on|off)|sound-(on|off))$/;
+  const CHIP =
+    /^settings-(preview-(full|sender|none)|push-(on|off)|sound-(on|off))$/;
   return [
     ...new Set(
       tree.root
-        .findAll(n => typeof n.props.testID === 'string' && CHIP.test(n.props.testID))
+        .findAll(
+          n => typeof n.props.testID === 'string' && CHIP.test(n.props.testID),
+        )
         .map(n => n.props.testID as string),
     ),
   ];
@@ -170,18 +191,29 @@ describe('the Message sounds toggle', () => {
     // Preview chips, then the push pair, then this pair: the outer
     // authority sits above the narrower switch.
     const order = chipOrder(tree);
-    expect(order.indexOf('settings-push-off')).toBeLessThan(order.indexOf('settings-sound-on'));
-    expect(order.slice(-2)).toEqual(['settings-sound-on', 'settings-sound-off']);
+    expect(order.indexOf('settings-push-off')).toBeLessThan(
+      order.indexOf('settings-sound-on'),
+    );
+    expect(order.slice(-2)).toEqual([
+      'settings-sound-on',
+      'settings-sound-off',
+    ]);
   });
 
   it('the teaching copy names the three limits and the outer authority', async () => {
     const tree = await render();
     // Behind the row's ⓘ: closed until opened, under its row.
-    expect(JSON.stringify(tree.toJSON())).not.toContain('A short tone when a message arrives');
+    expect(JSON.stringify(tree.toJSON())).not.toContain(
+      'A short tone when a message arrives',
+    );
     await openInfo(tree, 'settings-sound-info');
     const note = tree.root
       .findAllByType(require('react-native').Text)
-      .map(n => (Array.isArray(n.props.children) ? n.props.children.join('') : String(n.props.children ?? '')))
+      .map(n =>
+        Array.isArray(n.props.children)
+          ? n.props.children.join('')
+          : String(n.props.children ?? ''),
+      )
       .find(s => s.startsWith('A short tone when a message arrives'));
     // iOS (jest's default Platform): both halves of the switch are named —
     // the in-app tone and the notification's sound — plus the limits.
@@ -255,8 +287,9 @@ describe('the Message sounds toggle', () => {
   });
 
   it('a duress load reads no file and leaves the coercer’s Off standing — leaving and returning to Settings shows Off', async () => {
-    const read = (jest.requireMock('tacendum-crypto') as { readSharedState: jest.Mock })
-      .readSharedState;
+    const read = (
+      jest.requireMock('tacendum-crypto') as { readSharedState: jest.Mock }
+    ).readSharedState;
     session.setMode('duress');
     await setMessageSound(false);
     read.mockClear();
@@ -268,8 +301,9 @@ describe('the Message sounds toggle', () => {
   });
 
   it('a write that fails never rejects: the choice stands in memory for this session', async () => {
-    const write = (jest.requireMock('tacendum-crypto') as { writeSharedState: jest.Mock })
-      .writeSharedState;
+    const write = (
+      jest.requireMock('tacendum-crypto') as { writeSharedState: jest.Mock }
+    ).writeSharedState;
     const tree = await render();
     write.mockRejectedValueOnce(new Error('container unavailable'));
     await expect(setMessageSound(false)).resolves.toBeUndefined();

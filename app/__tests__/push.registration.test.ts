@@ -212,7 +212,9 @@ describe('the latch and the guards are shared, not forked', () => {
   });
 
   it('the latch, the consent check and the token reads come BEFORE either branch', () => {
-    const latchAt = body.indexOf('if (!pushRegistrationAdopted)');
+    // The generation predicate includes the adoption latch and is rechecked
+    // after awaited reads; runtime account-switch cases pin those races.
+    const latchAt = body.indexOf('if (!stillCurrent())');
     const consentAt = body.indexOf('if (!pushTokensAllowed())');
     const androidAt = body.indexOf('apiRegisterFcmToken(');
     const iosAt = body.indexOf('apiRegisterPushToken(');

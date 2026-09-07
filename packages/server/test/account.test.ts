@@ -1,8 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { deleteAccountHandler, deleteAccountRoute } from '../src/handlers/account.js';
 import { requireAuth } from '../src/handlers/auth.js';
+import { registerPushTokenHandler } from '../src/handlers/push.js';
 import { json, type AuthContext, type HttpEvent } from '../src/handlers/http.js';
-import { DeleteCommand, TransactWriteCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import {
+  DeleteCommand,
+  TransactWriteCommand,
+  type DynamoDBDocumentClient,
+} from '@aws-sdk/lib-dynamodb';
 import { IDKEY_CLAIM_PREFIX, makeDataLayer, type DataLayer } from '../src/db/data.js';
 import { activityActorRef } from '../src/opaque-ref.js';
 import {
@@ -158,6 +163,51 @@ describe('delete account', () => {
     expect(await deps.db.getPushToken('user-1')).toBeUndefined();
   });
 
+  it('removes a push-token registration that was admitted before account deletion', async () => {
+    // The route's strong auth read can admit a PUT while the account still
+    // exists, then deletion can commit and sweep its token before the PUT's
+    // write resumes. An unconditional late write used to recreate the old
+    // userId -> device capability after the account was gone.
+    const merge = deps.db.mergePushToken.bind(deps.db);
+    let enteredMerge = () => {};
+    let releaseMerge = () => {};
+    const mergeEntered = new Promise<void>((resolve) => {
+      enteredMerge = resolve;
+    });
+    const mergeReleased = new Promise<void>((resolve) => {
+      releaseMerge = resolve;
+    });
+    vi.spyOn(deps.db, 'mergePushToken').mockImplementation(async (record) => {
+      enteredMerge();
+      await mergeReleased;
+      await merge(record);
+    });
+
+    const registration = requireAuth(registerPushTokenHandler)(
+      {
+        method: 'PUT',
+        path: '/v1/push-token',
+        headers: { authorization: 'Bearer token-1' },
+        body: JSON.stringify({
+          voipToken: 'a'.repeat(64),
+          env: 'sandbox',
+          bundleId: 'com.miranatechnologies.tacendum',
+        }),
+      },
+      deps,
+    );
+    await mergeEntered;
+
+    expect((await deleteAccountRoute(event(), deps)).statusCode).toBe(200);
+    releaseMerge();
+
+    const result = await registration;
+    expect(result.statusCode).toBe(409);
+    expect(parseBody<{ error: { code: string } }>(result.body).error.code).toBe('account_gone');
+    expect(await deps.db.userAccountState('user-1')).toBe('absent');
+    expect(await deps.db.getPushToken('user-1')).toBeUndefined();
+  });
+
   it('deleting an account with no registered device still succeeds', async () => {
     // The delete is unconditional and keyed by userId alone, which is what
     // makes the sweep retry-safe — but it also means the no-token case must
@@ -191,13 +241,14 @@ describe('delete account', () => {
     // The key identifies the account exactly as the phone number used to, so
     // it stays out of the retained operational log for the same reason.
     await deleteAccountHandler(event(), deps, auth);
-    const entry = deps.logs.find(l => l.event === 'account_deleted');
+    const entry = deps.logs.find((l) => l.event === 'account_deleted');
     expect(entry).toBeDefined();
     expect(JSON.stringify(entry)).not.toContain(IDENTITY_KEY);
   });
 
   it('a crew appearing between the read-time check and the delete leg is refused (crew_not_empty)', async () => {
-    // The read-then-delete gap, produced deterministically ('s backstop): the handler's read sees no crew and proceeds;
+    // The read-then-delete gap, produced deterministically: the handler's read
+    // sees no crew and proceeds;
     // an adopt's committed footprint lands on the owner row before the
     // delete leg runs. The memory db mirrors the DynamoDB row condition, so
     // the delete must refuse rather than remove the owner of a live crew —

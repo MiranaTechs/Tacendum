@@ -1,11 +1,13 @@
 /**
- * The Settings sections become rotor stops.
+ * The Settings detail sections remain rotor stops.
  *
  * `RuledLabel` renders a plain row, so every section label on the longest
  * scroll in the app was invisible to the VoiceOver rotor's Headings
  * navigator: reaching APPEARANCE meant swiping past every row above it.
  * The component has an opt-in `heading` prop; this screen is the
- * first owner to pass it. The writing assistant adds a ninth section.
+ * first owner to pass it. The category home is a set of buttons. Details
+ * with multiple sections expose only the section headings that belong to
+ * them; a single-section detail already has its ScreenHeader title.
  *
  * OPT-IN IS THE POINT. The same component draws the thread's date dividers
  * and Register's consent labels, where a heading per day would flood the
@@ -37,6 +39,17 @@ async function render(): Promise<void> {
   });
 }
 
+async function press(testID: string): Promise<void> {
+  await ReactTestRenderer.act(async () => {
+    (
+      tree.root
+        .findAllByProps({ testID })
+        .find(node => node.props.onPress !== undefined)!.props
+        .onPress as () => void
+    )();
+  });
+}
+
 interface Rendered {
   type?: string;
   props?: Record<string, unknown>;
@@ -57,7 +70,10 @@ function headings(): string[] {
   const walk = (node: unknown): void => {
     if (node === null || typeof node !== 'object') return;
     const n = node as Rendered;
-    if (n.props?.accessibilityRole === 'header' && n.props?.accessible === true) {
+    if (
+      n.props?.accessibilityRole === 'header' &&
+      n.props?.accessible === true
+    ) {
       out.push(textOf(n).join(' '));
     }
     for (const child of n.children ?? []) walk(child);
@@ -66,16 +82,14 @@ function headings(): string[] {
   return out;
 }
 
-const SECTIONS = [
-  'FIELD MODE',
-  'APP LOCK',
-  'ACCOUNT',
-  'SCREEN',
-  'CALLS',
-  'NOTIFICATIONS',
-  'APPEARANCE',
-  'WRITING ASSISTANT',
-  'ABOUT',
+const CATEGORY_SECTIONS: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ['settings-category-account', []],
+  ['settings-category-privacy', ['FIELD MODE', 'APP LOCK', 'SCREEN']],
+  ['settings-category-chats', ['CHATS', 'CALLS']],
+  ['settings-category-notifications', []],
+  ['settings-category-appearance', []],
+  ['settings-category-writing', []],
+  ['settings-category-about', []],
 ];
 
 beforeEach(() => {
@@ -89,18 +103,27 @@ afterEach(async () => {
   });
 });
 
-test('all nine sections are rotor headings, in the order they are read', async () => {
+test('each category detail exposes its exact rotor headings in reading order', async () => {
   await lock.setup('123456');
   await render();
-  expect(headings()).toEqual(SECTIONS);
+
+  for (const [category, sections] of CATEGORY_SECTIONS) {
+    await press(category);
+    expect(headings()).toEqual(sections);
+    await press('settings-back');
+  }
 });
 
-test('nothing else on the screen claims to be one', async () => {
+test('category tiles are not headings, and nothing else in a detail claims to be one', async () => {
   await lock.setup('123456');
   await render();
-  // Exactly nine — a tenth heading would be a row or a note that took the
-  // role it should not have, and the rotor's value is that it is short.
-  expect(headings()).toHaveLength(9);
+  expect(headings()).toEqual([]);
+
+  for (const [category, sections] of CATEGORY_SECTIONS) {
+    await press(category);
+    expect(headings()).toHaveLength(sections.length);
+    await press('settings-back');
+  }
 });
 
 test('a sub-step offers no section stops at all', async () => {
@@ -110,12 +133,9 @@ test('a sub-step offers no section stops at all', async () => {
   // the walker above would have said so if it were counting something else.
   await lock.setup('123456');
   await render();
-  expect(headings()).toHaveLength(9);
+  await press('settings-category-about');
+  expect(headings()).toEqual([]);
 
-  await ReactTestRenderer.act(async () => {
-    (tree.root
-      .findAllByProps({ testID: 'settings-licenses' })
-      .find(n => n.props.onPress !== undefined)!.props.onPress as () => void)();
-  });
+  await press('settings-licenses');
   expect(headings()).toEqual([]);
 });

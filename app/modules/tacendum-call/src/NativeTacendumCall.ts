@@ -27,6 +27,16 @@ export interface Spec extends TurboModule {
   // --- lifecycle ---
 
   /**
+   * Bind every native call surface to the signed-in Tacendum account.
+   *
+   * Empty clears the binding and ends native call state. A different account
+   * clears the old state before adopting the new id. Incoming pushes whose
+   * `to` does not match are refused natively, before they can wake JS or bind
+   * a CallKit/Telecom answer to the new account.
+   */
+  setAccountOwner(userId: string): Promise<void>;
+
+  /**
    * Install the ICE server list and the relay-only policy. Called before any
    * call and again whenever credentials are refreshed; the servers come from
    * `/v1/turn-credentials` and expire, so this is not one-time setup.

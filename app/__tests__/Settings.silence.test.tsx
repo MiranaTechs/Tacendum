@@ -54,7 +54,10 @@ const SDP = 'v=0\r\na=fingerprint:sha-256 AA:BB\r\nOFFER';
 jest.mock('../src/api', () => ({
   apiDeletePushToken: jest.fn(async () => undefined),
   apiRegisterPushToken: jest.fn(async () => undefined),
-  apiTurnCredentials: jest.fn(async () => ({ iceServers: [], ttlSeconds: 3600 })),
+  apiTurnCredentials: jest.fn(async () => ({
+    iceServers: [],
+    ttlSeconds: 3600,
+  })),
 }));
 
 const keychain = (
@@ -89,7 +92,14 @@ function installTables(): void {
     if (/FROM chats WHERE peerId/.test(text)) {
       return {
         rows: known.has(String(args[0]))
-          ? [{ peerId: args[0], displayName: 'Ana', localName: null, lastMessageAt: 1 }]
+          ? [
+              {
+                peerId: args[0],
+                displayName: 'Ana',
+                localName: null,
+                lastMessageAt: 1,
+              },
+            ]
           : [],
       };
     }
@@ -108,7 +118,13 @@ let listener: EnvelopeListener | null = null;
 function deliverOffer(peerId: string): void {
   listener?.(
     peerId,
-    { tcm: 'call.offer', cid: OFFER_CID, sdp: SDP, vid: false, exp: Date.now() + 45_000 },
+    {
+      tcm: 'call.offer',
+      cid: OFFER_CID,
+      sdp: SDP,
+      vid: false,
+      exp: Date.now() + 45_000,
+    },
     { msgId: '01HQMSG0000000000000000001', ts: Date.now() },
   );
 }
@@ -149,8 +165,13 @@ afterEach(async () => {
 
 /** Open a row's ⓘ: the testID lands on the disclosure composite first, so
  * the press names the node that actually carries onPress. */
-async function openInfo(tree: ReactTestRenderer.ReactTestRenderer, testID: string): Promise<void> {
-  const node = tree.root.findAllByProps({ testID }).find(n => n.props.onPress !== undefined)!;
+async function openInfo(
+  tree: ReactTestRenderer.ReactTestRenderer,
+  testID: string,
+): Promise<void> {
+  const node = tree.root
+    .findAllByProps({ testID })
+    .find(n => n.props.onPress !== undefined)!;
   await ReactTestRenderer.act(async () => {
     node.props.onPress();
   });
@@ -159,13 +180,16 @@ async function openInfo(tree: ReactTestRenderer.ReactTestRenderer, testID: strin
 async function render(): Promise<ReactTestRenderer.ReactTestRenderer> {
   let tree!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(async () => {
-    tree = ReactTestRenderer.create(<SettingsScreen
-      onBack={() => {}}
-      onOpenLinkedDevices={() => {}}
-      onOpenAccountEmail={() => {}}
-    />);
+    tree = ReactTestRenderer.create(
+      <SettingsScreen
+        onBack={() => {}}
+        onOpenLinkedDevices={() => {}}
+        onOpenAccountEmail={() => {}}
+      />,
+    );
     await flush();
   });
+  await press(tree, 'settings-category-chats');
   return tree;
 }
 
@@ -235,7 +259,9 @@ describe('Settings → CALLS → silence unknown callers', () => {
     // off to fix a problem it does not have.
     const tree = await render();
     // Behind the row's ⓘ: closed until opened, under its row.
-    expect(JSON.stringify(tree.toJSON())).not.toMatch(/never exchanged a message/);
+    expect(JSON.stringify(tree.toJSON())).not.toMatch(
+      /never exchanged a message/,
+    );
     await openInfo(tree, 'settings-silence-info');
     const note = JSON.stringify(tree.toJSON());
 
@@ -261,7 +287,9 @@ describe('the fail-safe direction', () => {
     // `restoreAllMocks`, and a Keychain left throwing would silently make
     // every later test in this file read as "storage unavailable" — which is
     // the state this very test claims is safe, so the leak would hide itself.
-    const crypto = jest.requireMock('tacendum-crypto') as { getSecret: jest.Mock };
+    const crypto = jest.requireMock('tacendum-crypto') as {
+      getSecret: jest.Mock;
+    };
     const real = crypto.getSecret.getMockImplementation()!;
     crypto.getSecret.mockImplementation(async () => {
       throw new Error('keychain unavailable');
@@ -349,8 +377,9 @@ describe('what the setting does to an arriving call', () => {
     await calling.callController().whenIdle();
     await flush();
 
-    const writes = (sqlite.instances.get('tacendum.sqlite')?.execute.mock.calls ?? [])
-      .map(c => ({ sql: String(c[0]), params: (c[1] ?? []) as unknown[] }));
+    const writes = (
+      sqlite.instances.get('tacendum.sqlite')?.execute.mock.calls ?? []
+    ).map(c => ({ sql: String(c[0]), params: (c[1] ?? []) as unknown[] }));
     const opened = writes.filter(w => /INSERT INTO call_log/.test(w.sql));
     expect(opened).toHaveLength(1);
     expect(opened[0]!.params).toContain(STRANGER);
@@ -360,7 +389,9 @@ describe('what the setting does to an arriving call', () => {
     // the row a person reads must not accuse them of blocking someone.
     // `endCallLog`'s UPDATE specifically — startup sweeps a stale 'active' row
     // to 'failed_media' with no parameters at all, and that is not this call.
-    const closed = writes.filter(w => /UPDATE call_log/.test(w.sql) && /missed = \?/.test(w.sql));
+    const closed = writes.filter(
+      w => /UPDATE call_log/.test(w.sql) && /missed = \?/.test(w.sql),
+    );
     expect(closed).toHaveLength(1);
     expect(closed[0]!.sql).toMatch(/missed = \?/);
     expect(closed[0]!.params[0]).toBe('decline');

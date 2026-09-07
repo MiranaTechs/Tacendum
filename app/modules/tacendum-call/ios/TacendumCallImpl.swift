@@ -254,6 +254,24 @@ public final class TacendumCallImpl: NSObject {
     lock.unlock()
   }
 
+  /**
+   * Remove every native object and buffered callback owned by the account that
+   * is leaving. `CallKitCenter` invalidates the owner generation before this
+   * runs, so an in-flight negotiation cannot reinstall itself afterwards.
+   */
+  func clearForAccountChange() {
+    lock.lock()
+    let oldCalls = Array(calls.values)
+    for cid in calls.keys { markClosedLocked(cid) }
+    for cid in inFlightCids.keys { markClosedLocked(cid) }
+    calls.removeAll()
+    pending.removeAll()
+    configuration = nil
+    lock.unlock()
+    for call in oldCalls { call.close() }
+    refreshIdleTimer()
+  }
+
   private func ensureFactory() -> RTCPeerConnectionFactory {
     if let f = factory { return f }
     RTCInitializeSSL()
@@ -440,7 +458,8 @@ public final class TacendumCallImpl: NSObject {
     closedCidOrder = kept
   }
 
-  private func makeCall(_ cid: String) throws -> CallPeerConnection {
+  private func makeCall(_ cid: String, lease: AccountCallLease) throws -> CallPeerConnection {
+    guard CallKitCenter.shared.isCurrentAccountLease(lease) else { throw CallError.closed }
     guard let config = configuration else { throw CallError.notConfigured }
     // Refused before the connection is built when the close already landed:
     // constructing one only to throw it away would still have taken the
@@ -463,7 +482,7 @@ public final class TacendumCallImpl: NSObject {
     // A close landing between them would otherwise be overwritten by the very
     // assignment it was racing, and only a test that is atomic with the
     // insertion can see it.
-    if closedCids.contains(cid) {
+    if closedCids.contains(cid) || !CallKitCenter.shared.isCurrentAccountLease(lease) {
       lock.unlock()
       pc.close()
       throw CallError.closed
@@ -561,13 +580,22 @@ public final class TacendumCallImpl: NSObject {
     resolve: @escaping (Any?) -> Void,
     reject: @escaping (String, String, Error?) -> Void
   ) {
+    guard let lease = CallKitCenter.shared.currentAccountLease() else {
+      reject("offer_failed", "could not create an offer", nil)
+      return
+    }
     // Before the Task, never inside it: see `inFlightCids`.
     beginNegotiation(cid)
     Task {
       defer { self.endNegotiation(cid) }
       do {
-        let pc = try makeCall(cid)
+        guard CallKitCenter.shared.isCurrentAccountLease(lease) else { throw CallError.closed }
+        let pc = try makeCall(cid, lease: lease)
         let sdp = try await pc.createOffer(withVideo: withVideo)
+        guard CallKitCenter.shared.isCurrentAccountLease(lease) else {
+          pc.close()
+          throw CallError.closed
+        }
         // The local tracks were born inside the call above; the proximity
         // rule's video input can only be read now.
         refreshProximity()
@@ -583,6 +611,10 @@ public final class TacendumCallImpl: NSObject {
     resolve: @escaping (Any?) -> Void,
     reject: @escaping (String, String, Error?) -> Void
   ) {
+    guard let lease = CallKitCenter.shared.currentAccountLease() else {
+      reject("answer_failed", "could not create an answer", nil)
+      return
+    }
     // THE IN-APP ANSWER'S CALLKIT HALF. Every accept path funnels through
     // this method, and an accept taken on the app's own screen used to be
     // invisible to CallKit: no CXAnswerCallAction, so no audio-session
@@ -597,10 +629,15 @@ public final class TacendumCallImpl: NSObject {
     Task {
       defer { self.endNegotiation(cid) }
       do {
+        guard CallKitCenter.shared.isCurrentAccountLease(lease) else { throw CallError.closed }
         // The offer may already have a peer connection if a restart arrived;
         // reuse it so the ICE credentials continue rather than reset.
-        let pc = try call(cid) ?? makeCall(cid)
+        let pc = try call(cid) ?? makeCall(cid, lease: lease)
         let sdp = try await pc.createAnswer(remoteOfferSdp: remoteOfferSdp, withVideo: withVideo)
+        guard CallKitCenter.shared.isCurrentAccountLease(lease) else {
+          pc.close()
+          throw CallError.closed
+        }
         refreshProximity()
         resolve(sdp)
       } catch {

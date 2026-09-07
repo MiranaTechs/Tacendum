@@ -51,18 +51,18 @@ function jest_fn_listQueued(target: TestOnlyDataLayer): { calls: number } {
 
 let db: TestOnlyDataLayer;
 let deps: TestDeps;
-beforeEach(() => {
+beforeEach(async () => {
   db = makeMemoryDb();
   deps = makeTestDeps(db);
+  // registerPushTokenHandler is normally reached through requireAuth, whose
+  // strong account-state read guarantees this row exists at admission. Keep
+  // direct handler tests honest about that precondition.
+  await db.createUser({ userId: ALICE.userId, createdAt: deps.now() });
 });
 
 describe('a device registers whichever tokens it actually has', () => {
   it('accepts an ALERT token with no VoIP token', async () => {
-    const result = await registerPushTokenHandler(
-      put({ ...BASE, alertToken: ALERT }),
-      deps,
-      ALICE,
-    );
+    const result = await registerPushTokenHandler(put({ ...BASE, alertToken: ALERT }), deps, ALICE);
 
     expect(result.statusCode).toBe(204);
     const stored = await db.getPushToken(ALICE.userId);
@@ -73,11 +73,7 @@ describe('a device registers whichever tokens it actually has', () => {
   });
 
   it('accepts a VoIP token with no alert token', async () => {
-    const result = await registerPushTokenHandler(
-      put({ ...BASE, voipToken: VOIP }),
-      deps,
-      ALICE,
-    );
+    const result = await registerPushTokenHandler(put({ ...BASE, voipToken: VOIP }), deps, ALICE);
 
     expect(result.statusCode).toBe(204);
     expect((await db.getPushToken(ALICE.userId))?.voipToken).toBe(VOIP);
@@ -159,9 +155,7 @@ describe('the badge the server deliberately does NOT send', () => {
 
     await push('msg-3');
 
-    expect(deps.alertsSent).toEqual([
-      { userId: ALICE.userId, msgId: 'msg-3', badge: undefined },
-    ]);
+    expect(deps.alertsSent).toEqual([{ userId: ALICE.userId, msgId: 'msg-3', badge: undefined }]);
   });
 
   it('does not read the queue at all on the push path', async () => {
@@ -241,17 +235,9 @@ describe('a registration never downgrades the row', () => {
   });
 
   it('a fresh token still replaces the stored one', async () => {
-    await registerPushTokenHandler(
-      put({ ...BASE, alertToken: ALERT }),
-      deps,
-      ALICE,
-    );
+    await registerPushTokenHandler(put({ ...BASE, alertToken: ALERT }), deps, ALICE);
 
-    await registerPushTokenHandler(
-      put({ ...BASE, alertToken: 'd'.repeat(64) }),
-      deps,
-      ALICE,
-    );
+    await registerPushTokenHandler(put({ ...BASE, alertToken: 'd'.repeat(64) }), deps, ALICE);
 
     expect((await db.getPushToken(ALICE.userId))?.alertToken).toBe('d'.repeat(64));
   });
@@ -434,6 +420,49 @@ describe('push wake outcomes', () => {
     await expect(
       deliverPushWake({ recipientId: ALICE.userId, senderUserId: SENDER }, deps),
     ).resolves.toBe('no_token');
+  });
+
+  it.each([
+    { state: 'absent' as const, userId: 'user-deleted' },
+    { state: 'tombstoned' as const, userId: 'user-revoked' },
+  ])(
+    'refuses a delayed wake for a $state recipient even when a stale token row exists',
+    async ({ state, userId }) => {
+      if (state === 'tombstoned') {
+        await db.createUser({ userId, createdAt: deps.now(), tombstoned: true });
+      }
+      await db.putPushToken({
+        userId,
+        voipToken: VOIP,
+        env: 'sandbox',
+        bundleId: BASE.bundleId,
+        updatedAt: deps.now(),
+        expiresAt: Math.floor(deps.now() / 1000) + 86_400,
+      });
+
+      await expect(
+        deliverPushWake({ recipientId: userId, senderUserId: SENDER }, deps),
+      ).resolves.toBe('no_token');
+      expect(deps.pushesSent).toEqual([]);
+    },
+  );
+
+  it('still wakes a newly-created account using the same physical device token', async () => {
+    const newUserId = 'user-new-account';
+    await db.createUser({ userId: newUserId, createdAt: deps.now() });
+    await db.putPushToken({
+      userId: newUserId,
+      voipToken: VOIP,
+      env: 'sandbox',
+      bundleId: BASE.bundleId,
+      updatedAt: deps.now(),
+      expiresAt: Math.floor(deps.now() / 1000) + 86_400,
+    });
+
+    await expect(
+      deliverPushWake({ recipientId: newUserId, senderUserId: SENDER }, deps),
+    ).resolves.toBe('sent');
+    expect(deps.pushesSent).toEqual([{ userId: newUserId, fromUserId: SENDER }]);
   });
 
   it.each(['sent', 'failed'] as const)('returns sender outcome `%s` unchanged', async (outcome) => {

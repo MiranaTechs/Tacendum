@@ -201,6 +201,7 @@ async function renderSettings(): Promise<ReactTestRenderer.ReactTestRenderer> {
   await ReactTestRenderer.act(async () => {
     tree = ReactTestRenderer.create(
       React.createElement(SettingsScreen, {
+        initialSection: 'notifications',
         onBack: () => {},
         onOpenLinkedDevices: () => {},
         onOpenAccountEmail: () => {},

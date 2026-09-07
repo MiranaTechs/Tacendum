@@ -86,13 +86,20 @@ Copy may describe those modes but must not characterize provider retention,
 training, or terms beyond the operator's applicable agreement. Vendor terms
 can change; the statements above are dated rather than permanent assurances.
 
-### 2.2 Optional writing assistant (build 31, 2026-09-07)
+### 2.2 Optional writing assistant (build 31 and follow-up, 2026-09-07)
 
-The default option uses the person's existing ChatGPT or Claude account in the
-provider's own app or website. Choosing a writing action copies a prepared
-request and opens a fixed official HTTPS origin without any draft text in its
-URL. The person pastes the request there, then returns and pastes the reply into
-Tacendum for review. This requires switching apps. Tacendum never collects
+The default option is manual copy and paste with the person's existing ChatGPT
+or Claude account in the provider's own app or website. A browser sign-in stays
+with the provider; it does not connect that account to Tacendum or enable
+automatic writing in the composer. The selected provider is a preference, not
+an authenticated connection.
+
+Build 31 copied the prepared request and opened the provider whenever a writing
+action was chosen. The follow-up removes that automatic navigation: a writing
+action only copies the request, and a separate explicit Open button opens the
+fixed official HTTPS origin without any draft text in its URL. The person
+pastes the request there, then returns and pastes the reply into Tacendum for
+review. This still requires switching apps. Tacendum never collects
 consumer subscription credentials or makes an API request in this mode. Account
 availability and limits remain the provider's. The explicitly copied request
 stays on the OS clipboard until replaced; Tacendum never automatically reads it.

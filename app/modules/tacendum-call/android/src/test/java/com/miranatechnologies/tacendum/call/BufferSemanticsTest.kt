@@ -137,4 +137,19 @@ class BufferSemanticsTest {
     buffer.flush()
     assertEquals(2, buffer.deliveredCount())
   }
+
+  @Test
+  fun accountClearDropsOldEventsWithoutUnbindingCurrentJs() {
+    val buffer = PendingEventBuffer()
+    buffer.record("callKitAnswer", """{"cid":"old"}""")
+    buffer.clear()
+
+    assertEquals(0, buffer.size())
+    assertFalse(buffer.isReady())
+
+    buffer.flush()
+    buffer.clear()
+    assertTrue("a clear does not make attached listeners disappear", buffer.isReady())
+    assertTrue(buffer.record("callKitAnswer", """{"cid":"new"}"""))
+  }
 }

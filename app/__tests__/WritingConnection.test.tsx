@@ -102,24 +102,34 @@ beforeEach(() => {
   (selectWritingProvider as jest.Mock).mockResolvedValue(OPENAI_SAVED);
 });
 
-test('consumer apps are primary and explain the explicit switch without promising integrated sign-in', async () => {
+test('manual copy and paste is primary and explains that website sign-in is separate', async () => {
   const tree = await render();
   const words = copy(tree);
 
-  expect(words).toContain('Use ChatGPT or Claude');
-  expect(words).toMatch(/switch apps/i);
+  expect(words).toContain('Manual copy & paste');
+  expect(words).toContain(
+    'Signing in on the ChatGPT or Claude website does not connect either account to Tacendum.',
+  );
   expect(words).toMatch(/does not make a paid API request/i);
-  expect(words).not.toMatch(/sign in|connected to your account/i);
+  expect(words).not.toMatch(
+    /Your app and account|OPEN WITH|In use|Use this app/i,
+  );
+  expect(
+    control(tree, 'writing-external-chatgpt').props.accessibilityLabel,
+  ).toBe('ChatGPT, selected');
+  expect(
+    control(tree, 'writing-external-claude').props.accessibilityLabel,
+  ).toBe('Claude, choose');
   expect(controlState(tree, 'writing-mode-external')).toMatchObject({
     selected: true,
   });
-  expect(tree.root.findAllByProps({ testID: 'writing-key-input' })).toHaveLength(
-    0,
-  );
+  expect(
+    tree.root.findAllByProps({ testID: 'writing-key-input' }),
+  ).toHaveLength(0);
   expect(saveWritingConnection).not.toHaveBeenCalled();
 });
 
-test('choosing Claude stores only the external-app preference', async () => {
+test('choosing Claude stores only the manual website preference', async () => {
   const onChanged = jest.fn();
   const onDone = jest.fn();
   const tree = await render({ onChanged, onDone });
@@ -130,8 +140,30 @@ test('choosing Claude stores only the external-app preference', async () => {
 
   expect(selectExternalWritingProvider).toHaveBeenCalledWith('claude');
   expect(saveWritingConnection).not.toHaveBeenCalled();
+  expect(copy(tree)).toContain('Selected');
+  expect(copy(tree)).not.toMatch(/In use|Use this app/i);
   expect(onChanged).toHaveBeenCalledTimes(1);
   expect(onDone).toHaveBeenCalledTimes(1);
+});
+
+test('opening the manual tab from API mode does not claim a website is selected', async () => {
+  (getWritingConnections as jest.Mock).mockResolvedValue(OPENAI_SAVED);
+  const tree = await render();
+
+  await ReactTestRenderer.act(async () => {
+    control(tree, 'writing-mode-external').props.onPress();
+  });
+
+  expect(
+    control(tree, 'writing-external-chatgpt').props.accessibilityLabel,
+  ).toBe('ChatGPT, choose');
+  expect(
+    control(tree, 'writing-external-claude').props.accessibilityLabel,
+  ).toBe('Claude, choose');
+  expect(controlState(tree, 'writing-external-chatgpt')).toMatchObject({
+    selected: false,
+  });
+  expect(selectExternalWritingProvider).not.toHaveBeenCalled();
 });
 
 test('API keys remain an explicit secondary mode with separate billing copy', async () => {
@@ -141,7 +173,9 @@ test('API keys remain an explicit secondary mode with separate billing copy', as
     control(tree, 'writing-mode-api').props.onPress();
   });
 
-  expect(controlState(tree, 'writing-mode-api')).toMatchObject({ selected: true });
+  expect(controlState(tree, 'writing-mode-api')).toMatchObject({
+    selected: true,
+  });
   expect(copy(tree)).toContain(
     'API billing is separate from ChatGPT and Claude subscriptions',
   );
@@ -180,6 +214,26 @@ test('a denied connection read accepts no key and offers an explicit retry', asy
     selected: true,
   });
   expect(getWritingConnections).toHaveBeenCalledTimes(2);
+});
+
+test('an enclosing screen can own the sole heading in loaded and error states', async () => {
+  const loaded = await render({ showHeading: false });
+  expect(
+    loaded.root.findAll(
+      node => node.type === Text && node.props.accessibilityRole === 'header',
+    ),
+  ).toHaveLength(0);
+
+  (getWritingConnections as jest.Mock).mockRejectedValueOnce(
+    new Error('Keychain unavailable'),
+  );
+  const failed = await render({ showHeading: false });
+  expect(copy(failed)).toContain('Couldn’t access secure storage. Try again.');
+  expect(
+    failed.root.findAll(
+      node => node.type === Text && node.props.accessibilityRole === 'header',
+    ),
+  ).toHaveLength(0);
 });
 
 test('saving requires an explicit provider key and never exposes a saved key', async () => {

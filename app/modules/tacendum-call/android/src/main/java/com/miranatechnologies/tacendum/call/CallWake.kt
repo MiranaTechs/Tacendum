@@ -34,8 +34,12 @@ import android.content.Context
  */
 object CallWake {
 
-  fun reportIncomingPlaceholder(context: Context, cid: String, from: String) {
+  fun reportIncomingPlaceholder(context: Context, cid: String, from: String, to: String) {
     val app = context.applicationContext
+    // Android has no PushKit-style report obligation. Refuse before Telecom,
+    // notification setup, or event buffering when this install has no owner
+    // or the push names another account.
+    val lease = AccountCallOwnership.leaseFor(app, to) ?: return
     CallNotifications.ensureChannels(app)
     // The register verdict is CHECKED, not
     // discarded — recorded into TelecomGuard for the report path below to
@@ -46,7 +50,7 @@ object CallWake {
     // survives on a device whose calls cannot ring. That asymmetry IS the
     // Recorded divergence: calls fail closed with a reason, messaging unaffected.
     TelecomGuard.recordVerdict(TelecomCenter.register(app))
-    TelecomCenter.reportIncomingPlaceholder(cid, from) {
+    TelecomCenter.reportIncomingPlaceholder(cid, from, lease) {
       // No JS to answer — see the class note.
     }
   }

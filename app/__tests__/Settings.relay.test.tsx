@@ -29,13 +29,21 @@ const keychain = (
 jest.mock('../src/api', () => ({
   apiDeletePushToken: jest.fn(async () => undefined),
   apiRegisterPushToken: jest.fn(async () => undefined),
-  apiTurnCredentials: jest.fn(async () => ({ iceServers: [], ttlSeconds: 3600 })),
+  apiTurnCredentials: jest.fn(async () => ({
+    iceServers: [],
+    ttlSeconds: 3600,
+  })),
 }));
 
 /** Open a row's ⓘ: the testID lands on the disclosure composite first, so
  * the press names the node that actually carries onPress. */
-async function openInfo(tree: ReactTestRenderer.ReactTestRenderer, testID: string): Promise<void> {
-  const node = tree.root.findAllByProps({ testID }).find(n => n.props.onPress !== undefined)!;
+async function openInfo(
+  tree: ReactTestRenderer.ReactTestRenderer,
+  testID: string,
+): Promise<void> {
+  const node = tree.root
+    .findAllByProps({ testID })
+    .find(n => n.props.onPress !== undefined)!;
   await ReactTestRenderer.act(async () => {
     node.props.onPress();
   });
@@ -44,12 +52,15 @@ async function openInfo(tree: ReactTestRenderer.ReactTestRenderer, testID: strin
 async function render(): Promise<ReactTestRenderer.ReactTestRenderer> {
   let tree!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(async () => {
-    tree = ReactTestRenderer.create(<SettingsScreen
-      onBack={() => {}}
-      onOpenLinkedDevices={() => {}}
-      onOpenAccountEmail={() => {}}
-    />);
+    tree = ReactTestRenderer.create(
+      <SettingsScreen
+        onBack={() => {}}
+        onOpenLinkedDevices={() => {}}
+        onOpenAccountEmail={() => {}}
+      />,
+    );
   });
+  await press(tree, 'settings-category-chats');
   return tree;
 }
 
@@ -128,10 +139,11 @@ describe('Settings → CALLS', () => {
     // without that last one, "Off" reads as "hand my address to strangers".
     const tree = await render();
     // The consent-grade cost — the IP disclosure — stays VISIBLE under the
-    // chips; the machinery sits behind the row's ⓘ, closed until opened,
-    // and directly under its own row rather than after the sheet.
-    const consent = tree.root.findByProps({ testID: 'settings-relay-note' }).props
-      .children as string;
+    // chips; the machinery sits behind the row's ⓘ, closed
+    // until opened, and directly under its own row rather than after the
+    // sheet.
+    const consent = tree.root.findByProps({ testID: 'settings-relay-note' })
+      .props.children as string;
     expect(consent).toMatch(/IP address/);
     expect(JSON.stringify(tree.toJSON())).not.toMatch(/hear none of it/i);
 

@@ -32,6 +32,7 @@ async function render(): Promise<ReactTestRenderer.ReactTestRenderer> {
       />,
     );
   });
+  await press(tree, 'settings-category-privacy');
   return tree;
 }
 
@@ -93,7 +94,9 @@ test('a double-tap on "Turn on App Lock" generates the decoy exactly once', asyn
   let release!: () => void;
   const setup = jest
     .spyOn(decoy, 'setupDecoy')
-    .mockImplementation(() => new Promise<void>(resolve => (release = resolve)));
+    .mockImplementation(
+      () => new Promise<void>(resolve => (release = resolve)),
+    );
   try {
     const tree = await render();
     await press(tree, 'settings-lock-enable');
@@ -137,12 +140,14 @@ describe('the "current code" step and the duress verdict', () => {
     await typeDigits(tree, '654321'); // the give-away code
     await press(tree, 'pin-submit');
 
-    expect(tree.root.findAllByProps({ testID: 'settings-pin-error' }).length).toBeGreaterThan(0);
+    expect(
+      tree.root.findAllByProps({ testID: 'settings-pin-error' }).length,
+    ).toBeGreaterThan(0);
     expect(JSON.stringify(tree.toJSON())).toContain('Wrong code.');
     // Still on the "current code" step: the change door did not open.
-    expect(tree.root.findByProps({ testID: 'settings-pin-prompt' }).props.children).toBe(
-      'Enter your current code',
-    );
+    expect(
+      tree.root.findByProps({ testID: 'settings-pin-prompt' }).props.children,
+    ).toBe('Enter your current code');
     expect(keychain.get('lock.passcode')).toBe('123456');
   });
 
@@ -153,7 +158,9 @@ describe('the "current code" step and the duress verdict', () => {
     await typeDigits(tree, '654321');
     await press(tree, 'pin-submit');
 
-    expect(tree.root.findAllByProps({ testID: 'settings-pin-error' }).length).toBeGreaterThan(0);
+    expect(
+      tree.root.findAllByProps({ testID: 'settings-pin-error' }).length,
+    ).toBeGreaterThan(0);
     expect(keychain.get('lock.enabled')).toBe('1');
   });
 
@@ -165,15 +172,19 @@ describe('the "current code" step and the duress verdict', () => {
     await typeDigits(tree, '654321');
     await press(tree, 'pin-submit');
 
-    expect(tree.root.findAllByProps({ testID: 'settings-pin-error' })).toHaveLength(0);
-    expect(tree.root.findByProps({ testID: 'settings-pin-prompt' }).props.children).toBe(
-      'Choose a code — 4 to 10 digits',
-    );
+    expect(
+      tree.root.findAllByProps({ testID: 'settings-pin-error' }),
+    ).toHaveLength(0);
+    expect(
+      tree.root.findByProps({ testID: 'settings-pin-prompt' }).props.children,
+    ).toBe('Choose a code — 4 to 10 digits');
     // …and the real code opens the same door in duress, exactly as before.
     const second = await render();
     await press(second, 'settings-lock-change');
     await typeDigits(second, '123456');
     await press(second, 'pin-submit');
-    expect(second.root.findAllByProps({ testID: 'settings-pin-error' })).toHaveLength(0);
+    expect(
+      second.root.findAllByProps({ testID: 'settings-pin-error' }),
+    ).toHaveLength(0);
   });
 });

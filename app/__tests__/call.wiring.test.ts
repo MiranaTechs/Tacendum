@@ -776,12 +776,12 @@ describe('quiescing', () => {
     const CLOSED = /adoptPushRegistration\(\{\s*real:\s*false\s*\}\)/;
     expect(bodyOf('const relock = useCallback(')).toMatch(CLOSED);
     expect(bodyOf('const enterDecoyWorkspace = useCallback(')).toMatch(CLOSED);
-    // …and the real arm is the only thing that opens it.
+    // A real unlock and a newly created real account are the two openings.
     const opens = src
       .split('\n')
       .map((text, i) => ({ text, line: i + 1 }))
       .filter(({ text }) => /adoptPushRegistration\(\{\s*real:\s*true\s*\}\)/.test(text));
-    expect(opens).toHaveLength(1);
+    expect(opens).toHaveLength(2);
     expect(bodyOf('const enterRealWorkspace = useCallback(')).toContain(
       'adoptPushRegistration({ real: true })',
     );

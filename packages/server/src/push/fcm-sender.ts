@@ -65,6 +65,7 @@ export function makeFcmPushSender(options: FcmPushSenderOptions): PushSender {
       try {
         const result = await clientFor(credentials).sendCallWake(token.fcmToken, {
           from: fromUserId,
+          to: token.userId,
           ts: Date.now(),
         });
         if (result.outcome !== 'sent') {
@@ -102,15 +103,12 @@ export function makeFcmPushSender(options: FcmPushSenderOptions): PushSender {
         // destructured: the FCM message-wake carries routing facts only, and
         // the client's own payload type has no field to smuggle it through
         // (FcmMessageWakePayload, push/fcm.ts — the why lives there).
-        const result = await clientFor(credentials).sendMessageWake(
-          token.fcmToken,
-          {
-            from: message.from,
-            ts: message.ts,
-            msgId: message.msgId,
-            msgType: message.msgType,
-          },
-        );
+        const result = await clientFor(credentials).sendMessageWake(token.fcmToken, {
+          from: message.from,
+          ts: message.ts,
+          msgId: message.msgId,
+          msgType: message.msgType,
+        });
         if (result.outcome !== 'sent') {
           options.log('fcm_refused', {
             kind: 'message',
@@ -214,15 +212,20 @@ export function makeFcmCredentialsLoader(
     // worker's traffic is sparse, so the cold container is the COMMON case,
     // and "no key yet" there drops the one push this wake will ever get.
     settled: (): Promise<void> =>
-      inFlight ? inFlight.then(() => undefined, () => undefined) : Promise.resolve(),
+      inFlight
+        ? inFlight.then(
+            () => undefined,
+            () => undefined,
+          )
+        : Promise.resolve(),
   });
 }
 
 /** Callable — `load(arn)` — with `settled()` alongside, mirroring
  * ApnsCredentialsLoader. */
-export type FcmCredentialsLoader = ((
-  secretArn: string,
-) => FcmCredentials | null | undefined) & { settled(): Promise<void> };
+export type FcmCredentialsLoader = ((secretArn: string) => FcmCredentials | null | undefined) & {
+  settled(): Promise<void>;
+};
 
 /** Module scope, like the APNs loader: the fetched key must outlive a single
  * invocation. */
@@ -243,8 +246,7 @@ export function fcmCredentialsSettled(): Promise<void> {
  */
 export function readFcmCredentials(
   env: NodeJS.ProcessEnv = process.env,
-  loadCredentials: (secretArn: string) => FcmCredentials | null | undefined =
-    loadFcmCredentials,
+  loadCredentials: (secretArn: string) => FcmCredentials | null | undefined = loadFcmCredentials,
 ): FcmCredentials | null {
   const secretArn = env.FCM_SERVICE_ACCOUNT_SECRET_ARN;
   if (!secretArn) return null;
@@ -282,9 +284,7 @@ export function readFcmCredentialsFromPath(
   if (!credentials) {
     // The path, never the contents: the file that failed to parse is a
     // private key.
-    throw new Error(
-      'FCM_SERVICE_ACCOUNT_KEY_PATH names a file that is not a service-account key',
-    );
+    throw new Error('FCM_SERVICE_ACCOUNT_KEY_PATH names a file that is not a service-account key');
   }
   return credentials;
 }

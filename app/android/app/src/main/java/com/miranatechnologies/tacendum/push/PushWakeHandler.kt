@@ -54,7 +54,8 @@ internal object PushWakeHandler {
 
   fun handle(context: Context, wake: PushWake) {
     when (wake) {
-      is PushWake.CallRing -> CallWake.reportIncomingPlaceholder(context, wake.cid, wake.from)
+      is PushWake.CallRing ->
+          CallWake.reportIncomingPlaceholder(context, wake.cid, wake.from, wake.to)
       is PushWake.Message ->
           try {
             MessageNotifier.show(

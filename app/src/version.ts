@@ -37,7 +37,7 @@ export const VERSION = '1.0';
  * both chains and fails if either disagrees, which is the only reason a hand-
  * maintained mirror is safe to have.
  */
-export const BUILD = '31';
+export const BUILD = '32';
 
 /** What Settings shows, and what a bug report should quote. */
 export const VERSION_LABEL = `${VERSION} (${BUILD})`;

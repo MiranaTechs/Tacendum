@@ -93,6 +93,7 @@ afterEach(async () => {
 
 test('the row is absent while App Lock is off — there is nothing to lock', async () => {
   await render();
+  await press('settings-category-privacy');
   expect(has('settings-lock-enable')).toBe(true);
   expect(has('settings-lock-now')).toBe(false);
 });
@@ -100,6 +101,7 @@ test('the row is absent while App Lock is off — there is nothing to lock', asy
 test('with App Lock on the row appears, says what it costs, and calls the handler once', async () => {
   await lock.setup('123456');
   await render();
+  await press('settings-category-privacy');
 
   expect(has('settings-lock-now')).toBe(true);
   expect(JSON.stringify(tree.toJSON())).toContain(
@@ -113,6 +115,7 @@ test('with App Lock on the row appears, says what it costs, and calls the handle
 test('without the handler the row does not exist — never a control that does nothing', async () => {
   await lock.setup('123456');
   await render({ withProp: false });
+  await press('settings-category-privacy');
   expect(has('settings-lock-disable')).toBe(true);
   expect(has('settings-lock-now')).toBe(false);
 });
@@ -120,6 +123,7 @@ test('without the handler the row does not exist — never a control that does n
 test('a duress session renders the row byte-identically (rule 16)', async () => {
   await lock.setup('123456');
   await render();
+  await press('settings-category-privacy');
   const real = subtree('settings-lock-now');
   // The NOTE is a sibling of the row, not a child of it, so the row's own
   // subtree cannot see it — and the note is the half most likely to be
@@ -134,6 +138,7 @@ test('a duress session renders the row byte-identically (rule 16)', async () => 
 
   session.setMode('duress');
   await render();
+  await press('settings-category-privacy');
   expect(subtree('settings-lock-now')).toBe(real);
   expect(subtree('settings-lock-now-note')).toBe(realNote);
   // The second pin is not redundant: the note is genuinely OUTSIDE the row's

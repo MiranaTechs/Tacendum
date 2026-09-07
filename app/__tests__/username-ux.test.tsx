@@ -210,6 +210,7 @@ describe('with USERNAME_UI_ENABLED off (the shipped value), the username surface
     mockUsernameUiEnabled = false;
     const tree = await render(
       <SettingsScreen
+        initialSection="account"
         onBack={jest.fn()}
         onOpenLinkedDevices={jest.fn()}
         onOpenAccountEmail={jest.fn()}
@@ -862,6 +863,7 @@ describe('Settings → ACCOUNT: the username row (pin ON) is labeled from the de
     const onOpenLinkedDevices = jest.fn();
     const tree = await render(
       <SettingsScreen
+        initialSection="account"
         onBack={jest.fn()}
         onOpenLinkedDevices={onOpenLinkedDevices}
         onOpenAccountEmail={onOpenAccountEmail}
@@ -886,7 +888,7 @@ describe('Settings → ACCOUNT: the username row (pin ON) is labeled from the de
       await flush();
     });
     ReactTestRenderer.act(() => {
-      devNav()({ name: 'settings' });
+      devNav()({ name: 'settings', section: 'account' });
     });
     expect(devRoute()).toBe('settings');
     await press(tree, 'settings-account-username');
@@ -906,7 +908,7 @@ describe('Settings → ACCOUNT: the username row (pin ON) is labeled from the de
       await flush();
     });
     ReactTestRenderer.act(() => {
-      devNav()({ name: 'settings' });
+      devNav()({ name: 'settings', section: 'account' });
     });
     expect(devRoute()).toBe('settings');
     expect(has(tree, 'settings-account-username')).toBe(false);
@@ -993,6 +995,14 @@ describe('Settings → ACCOUNT: the username row (pin ON) is labeled from the de
       await press(tree, 'account-username-link-email');
       expect(devRoute()).toBe('accountEmail');
       expect(has(tree, 'account-email-back')).toBe(true);
+      await press(tree, 'account-email-back');
+      expect(devRoute()).toBe('accountUsername');
+      expect(has(tree, 'account-username-link-email')).toBe(true);
+      await press(tree, 'account-username-back');
+      expect(devRoute()).toBe('settings');
+      expect(has(tree, 'settings-account-username')).toBe(true);
+      await press(tree, 'settings-back');
+      expect(has(tree, 'settings-category-account')).toBe(true);
     } finally {
       await ReactTestRenderer.act(async () => {
         tree?.unmount();

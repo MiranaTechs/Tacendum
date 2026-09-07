@@ -22,17 +22,25 @@
  * No device noun in this deck by construction: nothing here names the
  * device, so the per-idiom census (android.copy.divergences) is untouched.
  */
+import { PHONE_UI_ENABLED } from './phoneUi';
+
 export const ACCOUNTS_USERNAME_COPY = {
   /** The Settings row (the phone row's shape; mounted only under the pin). */
   settingsRow: 'Username & discovery',
   title: 'Username',
   /** The lead, before the field: what a username is FOR — one purpose. */
   intro:
-    'A username is optional. It is a name people can type to find your account — nothing more: it never becomes your login, it is never shown in your chats, and it is never proof of who someone is. Your safety number is the only proof.',
+    'A username is optional. People can use it to find you when you allow it.',
+  verificationSummary: PHONE_UI_ENABLED
+    ? 'Verify an email address or phone number to set a username or search for people by username.'
+    : 'Verify an email address to set a username or search for people by username.',
+  withoutVerification:
+    'No verification needed to chat or call using a Tacendum ID or QR code.',
   /** The ⓘ label over the honesty copy: what the disclosure is ABOUT. */
   infoLabel: 'What a username discloses',
   /** THE HONESTY COPY (verbatim — behind the ⓘ). */
   infoLines: [
+    'Your username is not a login and is not shown as your name in chats. It does not verify someone’s identity; compare safety numbers for that.',
     'A username is public by nature — an email address or phone number is private information; a username is not. We store only a scrambled form of your username, never the name itself, so a leak of our records alone does not reveal it.',
     'Usernames are short and guessable, so the real protections are limits, not scrambling: every search and every claim attempt is strictly limited and monitored, no one using the app can find your account by name unless you allow it, and you can change or remove your name at any time.',
     'Treat your username as public information.',
@@ -52,8 +60,9 @@ export const ACCOUNTS_USERNAME_COPY = {
    * The door beside the sentence above: the step it names, one tap away.
    * Opens the email surface — the class every binary can link. */
   needsIdentifierAction: 'Link an email',
-  needsIdentifier:
-    'Link and verify an email address or phone number first. A verified identifier keeps names and searches from being automated at scale.',
+  needsIdentifier: PHONE_UI_ENABLED
+    ? 'Verify an email address or phone number first to set or search usernames. This helps limit automated accounts and bulk searches.'
+    : 'Verify an email address first to set or search usernames. This helps limit automated accounts and bulk searches.',
   eligibilityChecking: 'Checking whether this account can use usernames…',
   eligibilityUnavailable: 'Could not check username access. Check your connection and try again.',
   eligibilityRetry: 'Try again',

@@ -64,11 +64,14 @@ export interface ApnsResult {
   reason?: string;
 }
 
-/** Metadata-minimal payload. Deliberately NO cid: the server cannot
- * know one — it is inside the ciphertext — and the offer itself always
- * arrives over the encrypted WebSocket queue. */
+/** Metadata-minimal payload. `to` is bound to the server-owned token
+ * row so a device that deleted and recreated its account can reject a delayed
+ * wake for the old account. Deliberately NO cid: the server cannot know one —
+ * it is inside the ciphertext — and the offer itself always arrives over the
+ * encrypted WebSocket queue. */
 export interface VoipPayload {
   from: string;
+  to: string;
   ts: number;
 }
 
@@ -166,11 +169,7 @@ const ALERT_EXPIRY_SECONDS = 86_400;
 const ATTEMPT_TIMEOUT_MS = 5_000;
 
 /** Reasons that mean "this token is dead", whatever the status code. */
-const DEAD_TOKEN_REASONS = new Set([
-  'Unregistered',
-  'BadDeviceToken',
-  'DeviceTokenNotForTopic',
-]);
+const DEAD_TOKEN_REASONS = new Set(['Unregistered', 'BadDeviceToken', 'DeviceTokenNotForTopic']);
 
 /**
  * Reasons that mean "this JWT is dead", all carried on a 403: container
@@ -206,8 +205,7 @@ const ALERT_BODY_TRIM_MARGIN = 128;
 function signJwt(credentials: ApnsCredentials, nowMs: number): string {
   const header = { alg: 'ES256', kid: credentials.keyId };
   const payload = { iss: credentials.teamId, iat: Math.floor(nowMs / 1000) };
-  const encode = (value: unknown) =>
-    Buffer.from(JSON.stringify(value)).toString('base64url');
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
   const signingInput = `${encode(header)}.${encode(payload)}`;
   const signature = createSign('SHA256')
     .update(signingInput)
@@ -339,12 +337,10 @@ export function makeApnsClient(options: ApnsClientOptions): ApnsClient {
         ':path': `/3/device/${deviceToken}`,
         authorization: `bearer ${authToken()}`,
         'apns-push-type': kind,
-        'apns-topic':
-          kind === 'voip' ? `${credentials.bundleId}.voip` : credentials.bundleId,
+        'apns-topic': kind === 'voip' ? `${credentials.bundleId}.voip` : credentials.bundleId,
         'apns-priority': '10',
         'apns-expiration': String(
-          Math.floor(now() / 1000) +
-            (kind === 'voip' ? VOIP_EXPIRY_SECONDS : ALERT_EXPIRY_SECONDS),
+          Math.floor(now() / 1000) + (kind === 'voip' ? VOIP_EXPIRY_SECONDS : ALERT_EXPIRY_SECONDS),
         ),
         'content-type': 'application/json',
         'content-length': Buffer.byteLength(body),
@@ -362,9 +358,7 @@ export function makeApnsClient(options: ApnsClientOptions): ApnsClient {
         // replace a ring (the wakeid mint test's two-rings pin, one layer
         // down). Presentation only: wake emission, timing, and every LIMITS
         // number are unchanged.
-        ...(kind === 'alert'
-          ? { 'apns-collapse-id': (payload as AlertPayload).from }
-          : {}),
+        ...(kind === 'alert' ? { 'apns-collapse-id': (payload as AlertPayload).from } : {}),
       });
       let status = 0;
       let received = '';
@@ -378,16 +372,21 @@ export function makeApnsClient(options: ApnsClientOptions): ApnsClient {
         dropSession(live);
         reject(new Error('apns attempt timed out'));
       }, attemptTimeoutMs);
-      const settle = <T>(fn: (value: T) => void) => (value: T) => {
-        clearTimeout(deadline);
-        fn(value);
-      };
+      const settle =
+        <T>(fn: (value: T) => void) =>
+        (value: T) => {
+          clearTimeout(deadline);
+          fn(value);
+        };
       stream.setEncoding('utf8');
-      stream.on('response', headers => {
+      stream.on('response', (headers) => {
         status = Number(headers[':status'] ?? 0);
       });
-      stream.on('data', chunk => (received += chunk));
-      stream.on('end', settle(() => resolve({ status, body: received, trimmed })));
+      stream.on('data', (chunk) => (received += chunk));
+      stream.on(
+        'end',
+        settle(() => resolve({ status, body: received, trimmed })),
+      );
       // A stream-level transport error (a GOAWAY's cancel, a reset from a
       // session that is closing) is evidence against the session too: dial
       // fresh next time rather than find out on the next wake. A fresh dial
@@ -504,7 +503,7 @@ export function makeApnsClient(options: ApnsClientOptions): ApnsClient {
       const current = session;
       session = null;
       if (current && !current.destroyed) {
-        await new Promise<void>(resolve => current.close(() => resolve()));
+        await new Promise<void>((resolve) => current.close(() => resolve()));
       }
     },
   };

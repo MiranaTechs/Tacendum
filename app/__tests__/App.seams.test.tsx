@@ -70,6 +70,7 @@ import {
   setSilenceUnknownCallers,
 } from '../src/call';
 import * as db from '../src/db';
+import * as decoy from '../src/decoy';
 import { FIELD_VALUES } from '../src/fieldMode';
 import { FIELD_MODE_COPY } from '../src/fieldModeCopy';
 import { messaging } from '../src/messaging';
@@ -290,6 +291,51 @@ describe('item 7 — the Field Mode line is a door (the seventh push site)', () 
   });
 });
 
+test('edge swipe respects the Settings flow and cannot escape an App Lock commit', async () => {
+  let release!: () => void;
+  jest.spyOn(decoy, 'setupDecoy').mockImplementation(
+    () => new Promise<void>(resolve => { release = resolve; }),
+  );
+  const tree = await renderApp();
+  await openSettingsFromProfile(tree);
+  await press(pressable(tree, 'settings-category-privacy')[0]!);
+  const transition = () => tree.root.find(node =>
+    typeof node.type === 'function' && node.type.name === 'RouteTransition',
+  );
+  const swipe = async () => {
+    let moved!: boolean;
+    await ReactTestRenderer.act(async () => {
+      moved = transition().props.onGoBack();
+    });
+    return moved;
+  };
+
+  await press(pressable(tree, 'settings-lock-enable')[0]!);
+  await press(pressable(tree, 'pin-key-1')[0]!);
+  // A local flow closes, while the route stays put and its drag resets.
+  expect(await swipe()).toBe(false);
+  expect(pressable(tree, 'settings-lock-enable').length).toBeGreaterThan(0);
+  await press(pressable(tree, 'settings-lock-enable')[0]!);
+  for (let step = 0; step < 2; step++) {
+    for (const digit of '111222') await press(pressable(tree, `pin-key-${digit}`)[0]!);
+    await press(pressable(tree, 'pin-submit')[0]!);
+  }
+  await press(pressable(tree, 'settings-lock-commit')[0]!);
+  try {
+    expect(await swipe()).toBe(false);
+    expect(await swipe()).toBe(false);
+    expect(pressable(tree, 'settings-lock-commit').length).toBeGreaterThan(0);
+    expect(currentRoute()).toBe('settings');
+  } finally {
+    await ReactTestRenderer.act(async () => { release(); });
+  }
+  expect(pressable(tree, 'settings-lock-change').length).toBeGreaterThan(0);
+  expect(await swipe()).toBe(false);
+  expect(pressable(tree, 'settings-category-privacy').length).toBeGreaterThan(0);
+  expect(await swipe()).toBe(true);
+  expect(currentRoute()).toBe('profile');
+});
+
 describe('item 6 — Lock now (the App Lock seam)', () => {
   /**
    * The row lives in the lock section's ENABLED arm, which is the only
@@ -315,6 +361,7 @@ describe('item 6 — Lock now (the App Lock seam)', () => {
   test('the row is on the shipped Settings screen, and it runs the real relock', async () => {
     const tree = await bootUnlocked();
     await openSettingsFromProfile(tree);
+    await press(pressable(tree, 'settings-category-privacy')[0]!);
 
     // SettingsScreen renders this row ONLY when the host passed onLockNow,
     // so its presence here IS the seam. Presence, not a count: `MenuRow`
@@ -350,6 +397,7 @@ describe('item 6 — Lock now (the App Lock seam)', () => {
     // of an app that has no code to come back with.
     const tree = await renderApp();
     await openSettingsFromProfile(tree);
+    await press(pressable(tree, 'settings-category-privacy')[0]!);
     expect(
       tree.root.findAll(n => n.props.testID === 'settings-lock-now'),
     ).toHaveLength(0);

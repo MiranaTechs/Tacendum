@@ -50,10 +50,7 @@ export function makeApnsPushSender(options: ApnsPushSenderOptions): PushSender {
   const clients = new Map<'sandbox' | 'production', ApnsClient>();
   let warned = false;
 
-  function clientFor(
-    env: 'sandbox' | 'production',
-    credentials: ApnsCredentials,
-  ): ApnsClient {
+  function clientFor(env: 'sandbox' | 'production', credentials: ApnsCredentials): ApnsClient {
     const existing = clients.get(env);
     if (existing) return existing;
     // One key serves both hosts only if it was created "Sandbox &
@@ -106,10 +103,7 @@ export function makeApnsPushSender(options: ApnsPushSenderOptions): PushSender {
         return 'failed';
       }
       try {
-        const result = await clientFor(token.env, credentials).sendAlert(
-          token.alertToken,
-          message,
-        );
+        const result = await clientFor(token.env, credentials).sendAlert(token.alertToken, message);
         if (result.outcome !== 'sent') {
           // Status and Apple's reason string, never a token: the one
           // diagnostic APNs offers, and the difference between an actionable
@@ -151,10 +145,11 @@ export function makeApnsPushSender(options: ApnsPushSenderOptions): PushSender {
         return 'failed';
       }
       try {
-        const result = await clientFor(token.env, credentials).sendVoip(
-          token.voipToken,
-          { from: fromUserId, ts: Date.now() },
-        );
+        const result = await clientFor(token.env, credentials).sendVoip(token.voipToken, {
+          from: fromUserId,
+          to: token.userId,
+          ts: Date.now(),
+        });
         if (result.outcome !== 'sent') {
           options.log('apns_refused', {
             kind: 'voip',
@@ -267,15 +262,20 @@ export function makeApnsCredentialsLoader(
     // fetch) and delivering. Never rejects: a failed fetch was already logged
     // loudly by the loader, and the push then degrades exactly as before.
     settled: (): Promise<void> =>
-      inFlight ? inFlight.then(() => undefined, () => undefined) : Promise.resolve(),
+      inFlight
+        ? inFlight.then(
+            () => undefined,
+            () => undefined,
+          )
+        : Promise.resolve(),
   });
 }
 
 /** The loader is callable — `load(arn)` — with a `settled()` alongside so an
  * async caller can wait out the cold-start fetch instead of dropping work. */
-export type ApnsCredentialsLoader = ((
-  secretArn: string,
-) => ApnsCredentials | null | undefined) & { settled(): Promise<void> };
+export type ApnsCredentialsLoader = ((secretArn: string) => ApnsCredentials | null | undefined) & {
+  settled(): Promise<void>;
+};
 
 /** Module scope, like the sender's HTTP/2 client cache: the fetched key must
  * outlive a single invocation, or every wake would pay a Secrets Manager
@@ -296,8 +296,7 @@ export function apnsCredentialsSettled(): Promise<void> {
  */
 export function readApnsCredentials(
   env: NodeJS.ProcessEnv = process.env,
-  loadCredentials: (secretArn: string) => ApnsCredentials | null | undefined =
-    loadApnsCredentials,
+  loadCredentials: (secretArn: string) => ApnsCredentials | null | undefined = loadApnsCredentials,
 ): ApnsCredentials | null {
   const secretArn = env.APNS_AUTH_KEY_SECRET_ARN;
   if (!secretArn) return null;

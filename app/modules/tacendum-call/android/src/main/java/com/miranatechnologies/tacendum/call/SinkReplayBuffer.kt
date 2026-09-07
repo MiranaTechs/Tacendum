@@ -46,6 +46,11 @@ internal class SinkReplayBuffer<T> {
 
   fun size(): Int = entries.size
 
+  /** Account deletion must not replay an old answer/end into a new module. */
+  fun clear() {
+    entries.clear()
+  }
+
   private companion object {
     const val CAPACITY = 32
   }

@@ -76,7 +76,7 @@ export interface PushWakeEvent {
    * carries the default retry count, and a TIMED-OUT invocation is
    * redelivered with nothing left running to notice — the event bytes come
    * back identical. The device cannot absorb it either: the VoIP payload is
-   * `{from, ts}` with no identifier, and a delivered push IS a native ring by
+   * `{from, to, ts}` with no call identifier, and a delivered push IS a native ring by
    * construction, so a duplicate rings until the client's 75-second watchdog.
    *
    * NOT derived from `msgId`, deliberately. A msgId is client-chosen and a
@@ -154,10 +154,7 @@ async function alreadyRang(deps: Pick<Deps, 'db'>, wakeId: string): Promise<bool
 
 async function claimRang(deps: Pick<Deps, 'db'>, wakeId: string): Promise<void> {
   try {
-    await deps.db.markWakeRang(
-      wakeId,
-      Math.floor(Date.now() / 1000) + WAKE_CLAIM_TTL_SECONDS,
-    );
+    await deps.db.markWakeRang(wakeId, Math.floor(Date.now() / 1000) + WAKE_CLAIM_TTL_SECONDS);
   } catch {
     // An unclaimed wake rings again if the platform ever redelivers it. That
     // is the safe direction, and the only one.
@@ -177,7 +174,7 @@ export async function deliverPushWake(
   try {
     if (event.kind !== 'message' && event.verify) {
       const { msgId, ackGraceMs } = event.verify;
-      await new Promise<void>(resolve => setTimeout(resolve, ackGraceMs));
+      await new Promise<void>((resolve) => setTimeout(resolve, ackGraceMs));
       if (!(await deps.db.getQueuedMessage(event.recipientId, msgId))) {
         // Acked: the recipient decrypted this frame and dispatched it, so its
         // own CallKit report is already up — or the frame was a call.end it
@@ -222,6 +219,20 @@ export async function deliverPushWake(
     // on a device that supports push. Not an error, not worth a log line.
     if (!token) return 'no_token';
 
+    // A queued wake can outlive account deletion, and a registration already
+    // admitted before deletion can briefly rewrite the old token row before
+    // its own post-write cleanup runs. The token is therefore a routing hint,
+    // never proof that its owner still exists. This strongly consistent read
+    // is the final gate before either push network sees a request. Reuse the
+    // ordinary no-token outcome: in both cases there is no live registration
+    // the worker may use, and adding an outcome would widen the published
+    // metric enum for no operational benefit.
+    const recipientState = await deps.db.userAccountState(token.userId);
+    if (recipientState !== 'live') {
+      deps.log('push_suppressed_recipient_gone', { state: recipientState });
+      return 'no_token';
+    }
+
     const outcome =
       event.kind === 'message' && event.message
         ? await deps.push.notify(token, {
@@ -253,11 +264,7 @@ export async function deliverPushWake(
             ? ({ field: 'alertToken', value: token.alertToken } as const)
             : ({ field: 'voipToken', value: token.voipToken } as const);
       if (failed.value) {
-        await deps.db.removePushTokenField(
-          event.recipientId,
-          failed.field,
-          failed.value,
-        );
+        await deps.db.removePushTokenField(event.recipientId, failed.field, failed.value);
       }
       deps.log('push_token_pruned', { field: failed.field });
       return 'token_invalid';

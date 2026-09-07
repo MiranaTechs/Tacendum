@@ -47,4 +47,15 @@ class SinkReplayBufferTest {
     // the events most likely to describe the call on screen — survive.
     assertEquals((9..40).toList(), sink)
   }
+
+  @Test
+  fun accountClearDropsEventsCapturedBeforeTheModuleExisted() {
+    val buffer = SinkReplayBuffer<MutableList<String>>()
+    buffer.record { it.add("old answer") }
+
+    buffer.clear()
+
+    assertEquals(0, buffer.size())
+    assertEquals(0, buffer.drain().size)
+  }
 }

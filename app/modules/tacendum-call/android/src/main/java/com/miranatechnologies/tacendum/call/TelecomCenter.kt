@@ -118,6 +118,9 @@ internal object TelecomCenter {
   /** cid → what to call when the verdict for its report arrives. */
   private val pendingVerdicts = HashMap<String, (String?) -> Unit>()
 
+  /** Account generation that authorized each requested/live connection. */
+  private val leaseByCid = HashMap<String, AccountCallLease>()
+
   /**
    * CIDS ENDED BEFORE THEIR VERDICT ARRIVED — the Telecom-side twin of the
    * module's tombstone, and it exists for the same reason.
@@ -166,6 +169,7 @@ internal object TelecomCenter {
       val handle: String,
       val displayName: String,
       val hasVideo: Boolean,
+      val lease: AccountCallLease,
       val completion: (String?) -> Unit,
   )
 
@@ -279,14 +283,41 @@ internal object TelecomCenter {
 
   fun onIncomingConnectionCreated(cid: String, connection: TacendumConnection) {
     if (adoptOrAbandon(cid, connection)) return
-    connection.setRinging()
+    if (!activateCreatedConnection(cid, connection) { it.setRinging() }) return
     deliverVerdict(cid, null)
   }
 
   fun onOutgoingConnectionCreated(cid: String, connection: TacendumConnection) {
     if (adoptOrAbandon(cid, connection)) return
-    connection.setDialing()
+    if (!activateCreatedConnection(cid, connection) { it.setDialing() }) return
     deliverVerdict(cid, null)
+  }
+
+  /**
+   * The platform state transition and the final owner check share the same
+   * lock account teardown uses. It therefore happens wholly before teardown
+   * (which then ends it) or wholly after generation invalidation (and is
+   * refused); it cannot set ringing/dialing after teardown removed the call.
+   */
+  private fun activateCreatedConnection(
+      cid: String,
+      connection: TacendumConnection,
+      activate: (TacendumConnection) -> Unit,
+  ): Boolean {
+    val accepted =
+        synchronized(lock) {
+          val lease = leaseByCid[cid]
+          val current =
+              connectionsByCid[cid] === connection &&
+                  lease != null &&
+                  AccountCallOwnership.isCurrent(lease)
+          if (current) activate(connection)
+          current
+        }
+    if (accepted) return true
+    deliverVerdict(cid, REFUSAL_VERDICT)
+    connection.finish(DisconnectCause.CANCELED)
+    return false
   }
 
   /**
@@ -300,7 +331,13 @@ internal object TelecomCenter {
   private fun adoptOrAbandon(cid: String, connection: TacendumConnection): Boolean {
     val abandon =
         synchronized(lock) {
-          if (endedBeforeVerdict.remove(cid)) {
+          val lease = leaseByCid[cid]
+          if (
+              endedBeforeVerdict.remove(cid) ||
+                  lease == null ||
+                  !AccountCallOwnership.isCurrent(lease)
+          ) {
+            leaseByCid.remove(cid)
             true
           } else {
             connectionsByCid[cid] = connection
@@ -334,7 +371,10 @@ internal object TelecomCenter {
     // Taken under the lock and invoked outside it: the completion resolves a
     // JS promise and can re-enter this object, and `lock` guards decisions
     // rather than callbacks.
-    val completion = synchronized(lock) { pendingVerdicts.remove(cid) }
+    val completion = synchronized(lock) {
+      if (refusal != null) leaseByCid.remove(cid)
+      pendingVerdicts.remove(cid)
+    }
     completion?.invoke(refusal)
   }
 
@@ -348,10 +388,18 @@ internal object TelecomCenter {
     // rehydrates no offer under it and ends the call the person just answered.
     // Held across both, the answer sees strictly-before (parked, replayed by
     // the rebind) or strictly-after (the real cid), never the seam.
+    var authorized = false
     val parked =
         synchronized(lock) {
           val cid = connection.cid
-          if (pendingPush?.first == cid) {
+          val lease = leaseByCid[cid]
+          authorized =
+              connectionsByCid[cid] === connection &&
+                  lease != null &&
+                  AccountCallOwnership.isCurrent(lease)
+          if (!authorized) {
+            false
+          } else if (pendingPush?.first == cid) {
             // Answered before the offer decrypted. Park it; the rebind
             // replays it with the real cid. The watchdog stays ARMED on
             // purpose: a parked answer whose offer never arrives is exactly a
@@ -363,6 +411,10 @@ internal object TelecomCenter {
             false
           }
         }
+    if (!authorized) {
+      connection.finish(DisconnectCause.CANCELED)
+      return
+    }
     // Active either way: on Android the app makes the call active, and a
     // placeholder the person has already accepted is a call with audio.
     connection.setActive()
@@ -389,21 +441,35 @@ internal object TelecomCenter {
     // running at all.
     cancelWatchdog(ifGuarding = connection)
     val cid = connection.cid
-    synchronized(lock) {
+    val authorized = synchronized(lock) {
+      val lease = leaseByCid[cid]
+      val current =
+          connectionsByCid[cid] === connection &&
+              lease != null &&
+              AccountCallOwnership.isCurrent(lease)
       if (pendingPush?.first == cid) {
         pendingPush = null
         pendingAnswered = false
         pendingPushConfirmed = false
       }
       connectionsByCid.remove(cid)
+      leaseByCid.remove(cid)
+      current
     }
     CallNotifications.clearRing(appContext)
     connection.finish(cause)
-    emit { it.callKitEnded(cid, reason) }
+    if (authorized) emit { it.callKitEnded(cid, reason) }
   }
 
   fun onMuted(connection: TacendumConnection, muted: Boolean) {
     val cid = connection.cid
+    val authorized = synchronized(lock) {
+      val lease = leaseByCid[cid]
+      connectionsByCid[cid] === connection &&
+          lease != null &&
+          AccountCallOwnership.isCurrent(lease)
+    }
+    if (!authorized) return
     emit { it.callKitMuted(cid, muted) }
   }
 
@@ -420,14 +486,24 @@ internal object TelecomCenter {
     // notification survived as an ONGOING "Incoming call" nothing would ever
     // clear — a blocked caller leaving a persistent mark is exactly what the
     // report-then-end path exists to prevent.
-    val live = synchronized(lock) { connectionsByCid.containsValue(connection) }
+    val live = synchronized(lock) {
+      val lease = leaseByCid[connection.cid]
+      connectionsByCid[connection.cid] === connection &&
+          lease != null &&
+          AccountCallOwnership.isCurrent(lease)
+    }
     if (!live) return
     CallNotifications.showRing(context, connection)
     // The delete-wins recheck, the same discipline armedAndWritable applies
     // to the previews lease: an end landing between the check above and the
     // post must still win, so ask again and take the notification down if
     // the connection vanished mid-post.
-    val stillLive = synchronized(lock) { connectionsByCid.containsValue(connection) }
+    val stillLive = synchronized(lock) {
+      val lease = leaseByCid[connection.cid]
+      connectionsByCid[connection.cid] === connection &&
+          lease != null &&
+          AccountCallOwnership.isCurrent(lease)
+    }
     if (!stillLive) CallNotifications.clearRing(context)
   }
 
@@ -451,14 +527,24 @@ internal object TelecomCenter {
       handle: String,
       displayName: String,
       hasVideo: Boolean,
+      lease: AccountCallLease,
       completion: (String?) -> Unit,
   ) {
+    if (!AccountCallOwnership.isCurrent(lease)) {
+      completion(REFUSAL_VERDICT)
+      return
+    }
     var displaced: ParkedRebind? = null
     var rebindTarget: TacendumConnection? = null
     var replayAnswer = false
     var didPark = false
 
+    var stale = false
     synchronized(lock) {
+      if (!AccountCallOwnership.isCurrent(lease)) {
+        stale = true
+        return@synchronized
+      }
       val pending = pendingPush
       val matches = pending != null && (pending.second == peerId || peerId.isEmpty())
       if (matches && !pendingPushConfirmed) {
@@ -474,12 +560,14 @@ internal object TelecomCenter {
         // forever.
         displaced = parkedRebind
         parkedRebind =
-            ParkedRebind(cid, peerId, handle, displayName, hasVideo, completion)
+            ParkedRebind(cid, peerId, handle, displayName, hasVideo, lease, completion)
         didPark = true
       } else if (matches) {
         val existing = connectionsByCid.remove(pending!!.first)
         if (existing != null) {
           connectionsByCid[cid] = existing
+          leaseByCid.remove(pending.first)
+          leaseByCid[cid] = lease
           existing.cid = cid
           pendingPush = null
           pendingPushConfirmed = false
@@ -488,6 +576,11 @@ internal object TelecomCenter {
           rebindTarget = existing
         }
       }
+    }
+
+    if (stale) {
+      completion(REFUSAL_VERDICT)
+      return
     }
 
     // The displaced promise is resolved OUTSIDE the lock, and the park itself
@@ -499,6 +592,11 @@ internal object TelecomCenter {
     if (didPark) return
     val target = rebindTarget
     if (target != null) {
+      if (!AccountCallOwnership.isCurrent(lease)) {
+        endQuietly(cid)
+        completion(REFUSAL_VERDICT)
+        return
+      }
       // The watchdog exists for the case where JS NEVER RUNS and nothing can
       // ever resolve the ring. The rebind is proof JS is alive — leaving the
       // timer armed meant an IN-APP answer (which performs no Telecom action)
@@ -518,7 +616,7 @@ internal object TelecomCenter {
     // placeholder, never to a raw id, which means nothing to anyone.
     val resolved = displayName.ifEmpty { mirroredName(peerId) ?: "" }
     val effective = resolved.ifEmpty { handle.ifEmpty { "Incoming call" } }
-    reportFresh(cid, effective, hasVideo, completion)
+    reportFresh(cid, effective, hasVideo, lease, completion)
   }
 
   /**
@@ -532,6 +630,7 @@ internal object TelecomCenter {
       cid: String,
       displayName: String,
       hasVideo: Boolean,
+      lease: AccountCallLease,
       completion: (String?) -> Unit,
   ) {
     val context = appContext
@@ -543,12 +642,30 @@ internal object TelecomCenter {
     // self-managed account that never registered — a fact the guard makes
     // unreachable rather than relies on). On the wake path the refusal
     // branch still emits voipPush, so messaging drains regardless.
-    if (context == null || telecom == null || !TelecomGuard.callsPermitted()) {
+    if (
+        context == null ||
+            telecom == null ||
+            !TelecomGuard.callsPermitted() ||
+            !AccountCallOwnership.isCurrent(lease)
+    ) {
       completion(REFUSAL_VERDICT)
       return
     }
     configureAudio(hasVideo)
-    synchronized(lock) { pendingVerdicts[cid] = completion }
+    val authorized =
+        synchronized(lock) {
+          if (!AccountCallOwnership.isCurrent(lease)) {
+            false
+          } else {
+            leaseByCid[cid] = lease
+            pendingVerdicts[cid] = completion
+            true
+          }
+        }
+    if (!authorized) {
+      completion(REFUSAL_VERDICT)
+      return
+    }
     // Silence is a refusal (see VERDICT_TIMEOUT_MS): the completion is
     // resolved exactly once on every path, including the one where Telecom
     // never answers.
@@ -573,8 +690,10 @@ internal object TelecomCenter {
           TelecomExtras.incomingExtras(cid, displayName, hasVideo),
       )
     } catch (denied: SecurityException) {
+      synchronized(lock) { leaseByCid.remove(cid) }
       deliverVerdict(cid, REFUSAL_VERDICT)
     } catch (refused: IllegalArgumentException) {
+      synchronized(lock) { leaseByCid.remove(cid) }
       deliverVerdict(cid, REFUSAL_VERDICT)
     }
   }
@@ -587,7 +706,16 @@ internal object TelecomCenter {
    * against it. Kept here so the wake handler has one entry point rather than a
    * second copy of this reasoning.
    */
-  fun reportIncomingPlaceholder(cid: String, from: String, completion: (String?) -> Unit) {
+  fun reportIncomingPlaceholder(
+      cid: String,
+      from: String,
+      lease: AccountCallLease,
+      completion: (String?) -> Unit,
+  ) {
+    if (!AccountCallOwnership.isCurrent(lease)) {
+      completion(REFUSAL_VERDICT)
+      return
+    }
     val name = mirroredName(from) ?: "Incoming call"
     // THE BLOCKED-CALLER GATE. Without it a BLOCKED person could still ring
     // the victim's locked phone full-screen: the urgency bit is client-set on
@@ -599,6 +727,7 @@ internal object TelecomCenter {
 
     val alreadyRinging =
         synchronized(lock) {
+          if (!AccountCallOwnership.isCurrent(lease)) return@synchronized null
           val ringing = pendingPush != null
           // NEVER OVERWRITE a pending ring, and never let a BLOCKED wake
           // become one: both the rebind and the parked-rebind paths key off
@@ -611,7 +740,17 @@ internal object TelecomCenter {
           ringing
         }
 
-    reportFresh(cid, name, false) { refusal ->
+    if (alreadyRinging == null) {
+      completion(REFUSAL_VERDICT)
+      return
+    }
+
+    reportFresh(cid, name, false, lease) { refusal ->
+      if (!AccountCallOwnership.isCurrent(lease)) {
+        endQuietly(cid)
+        completion(REFUSAL_VERDICT)
+        return@reportFresh
+      }
       if (blocked) {
         // REPORT-THEN-IMMEDIATELY-END. The report satisfied the obligation;
         // this takes the call down before the ring can persist. JS still
@@ -645,6 +784,7 @@ internal object TelecomCenter {
                 pendingPushConfirmed = false
               }
               connectionsByCid.remove(cid)
+              leaseByCid.remove(cid)
               val p = parkedRebind
               parkedRebind = null
               p
@@ -656,6 +796,7 @@ internal object TelecomCenter {
               parked.handle,
               parked.displayName,
               parked.hasVideo,
+              parked.lease,
               parked.completion,
           )
         }
@@ -704,7 +845,8 @@ internal object TelecomCenter {
       parkedRebind = null
       val pending = pendingPush
       val matches =
-          pending != null &&
+          AccountCallOwnership.isCurrent(parked!!.lease) &&
+              pending != null &&
               pendingPushConfirmed &&
               (pending.second == parked!!.peerId || parked!!.peerId.isEmpty())
       val existing = if (matches) connectionsByCid.remove(pending!!.first) else null
@@ -712,6 +854,8 @@ internal object TelecomCenter {
         abandoned = true
       } else {
         connectionsByCid[parked!!.cid] = existing
+        leaseByCid.remove(pending!!.first)
+        leaseByCid[parked!!.cid] = parked!!.lease
         existing.cid = parked!!.cid
         pendingPush = null
         pendingPushConfirmed = false
@@ -727,6 +871,11 @@ internal object TelecomCenter {
       // WITHOUT reporting, because the call this rebind served no longer
       // exists.
       value.completion(null)
+      return
+    }
+    if (!AccountCallOwnership.isCurrent(value.lease)) {
+      endQuietly(value.cid)
+      value.completion(REFUSAL_VERDICT)
       return
     }
     cancelWatchdog()
@@ -758,12 +907,17 @@ internal object TelecomCenter {
     CallNotifications.updateRingName(appContext, connection, displayName)
   }
 
-  fun reportOutgoingCall(cid: String, handle: String, hasVideo: Boolean): Boolean {
+  fun reportOutgoingCall(
+      cid: String,
+      handle: String,
+      hasVideo: Boolean,
+      lease: AccountCallLease,
+  ): Boolean {
     // Fail closed BEFORE touching the platform — same reasoning as
     // reportFresh's guard. `false` reaches JS as the report_failed rejection,
     // which is the machine half of the honest refusal; the human half
     // (the degraded call affordance with its reason) is the JS half.
-    if (!TelecomGuard.callsPermitted()) return false
+    if (!TelecomGuard.callsPermitted() || !AccountCallOwnership.isCurrent(lease)) return false
     val context = appContext ?: return false
     val telecom = context.getSystemService(TelecomManager::class.java) ?: return false
     // `hasVideo` reaches BOTH the Telecom record and the audio configuration.
@@ -774,18 +928,31 @@ internal object TelecomCenter {
     configureAudio(hasVideo)
     val extras = TelecomExtras.outgoingExtras(cid, handle, hasVideo)
     extras.putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle(context))
+    val authorized = synchronized(lock) {
+      if (!AccountCallOwnership.isCurrent(lease)) false
+      else {
+        leaseByCid[cid] = lease
+        true
+      }
+    }
+    if (!authorized) return false
     return try {
       telecom.placeCall(TelecomExtras.address(cid), extras)
       true
     } catch (denied: SecurityException) {
+      synchronized(lock) { leaseByCid.remove(cid) }
       false
     } catch (refused: IllegalArgumentException) {
+      synchronized(lock) { leaseByCid.remove(cid) }
       false
     }
   }
 
   fun reportOutgoingConnected(cid: String) {
-    val connection = synchronized(lock) { connectionsByCid[cid] } ?: return
+    val connection = synchronized(lock) {
+      val lease = leaseByCid[cid]
+      if (lease != null && AccountCallOwnership.isCurrent(lease)) connectionsByCid[cid] else null
+    } ?: return
     // ACTIVE is the activation moment: the audio unit starts from the
     // state change, in `CallAudioGate.onConnectionActive`, and nowhere else.
     connection.setActive()
@@ -800,7 +967,10 @@ internal object TelecomCenter {
    * — JS is the one answering — and a connection that is not ringing (already
    * answered from the notification, or outgoing) is left exactly as it is. */
   fun answerFromApp(cid: String) {
-    val connection = synchronized(lock) { connectionsByCid[cid] } ?: return
+    val connection = synchronized(lock) {
+      val lease = leaseByCid[cid]
+      if (lease != null && AccountCallOwnership.isCurrent(lease)) connectionsByCid[cid] else null
+    } ?: return
     if (connection.state != android.telecom.Connection.STATE_RINGING) return
     cancelWatchdog(ifGuarding = connection)
     connection.setActive()
@@ -814,6 +984,7 @@ internal object TelecomCenter {
     val connection =
         synchronized(lock) {
           val found = connectionsByCid.remove(cid)
+          leaseByCid.remove(cid)
           // The tombstone is laid FIRST and under the same lock as the
           // removal, so a Connection the system is about to hand us cannot
           // slip in between the two.
@@ -837,7 +1008,10 @@ internal object TelecomCenter {
   }
 
   private fun endQuietly(cid: String) {
-    val connection = synchronized(lock) { connectionsByCid.remove(cid) } ?: return
+    val connection = synchronized(lock) {
+      leaseByCid.remove(cid)
+      connectionsByCid.remove(cid)
+    } ?: return
     CallNotifications.clearRing(appContext)
     connection.finish(DisconnectCause.MISSED)
   }
@@ -880,6 +1054,7 @@ internal object TelecomCenter {
       parked = parkedRebind
       parkedRebind = null
       doomed = connectionsByCid.remove(pending.first)
+      leaseByCid.remove(pending.first)
       // Same window as `endCall`: the placeholder may be a report whose
       // Connection the system has not handed us yet, and a dismissal that
       // ended nothing would let it arrive alive and unreachable.
@@ -1048,6 +1223,33 @@ internal object TelecomCenter {
 
   private const val SHARED_DIR = "tacendum-shared"
 
+  /** End and forget the departing account without replaying events to JS. */
+  fun clearForAccountChange() {
+    val connections: List<TacendumConnection>
+    val verdicts: List<(String?) -> Unit>
+    val parked: ParkedRebind?
+    synchronized(lock) {
+      connections = connectionsByCid.values.distinct()
+      connectionsByCid.clear()
+      leaseByCid.clear()
+      verdicts = pendingVerdicts.values.toList()
+      pendingVerdicts.clear()
+      endedBeforeVerdict.clear()
+      pendingPush = null
+      pendingAnswered = false
+      pendingPushConfirmed = false
+      parked = parkedRebind
+      parkedRebind = null
+      cancelWatchdogLocked()
+    }
+    synchronized(sinkLock) { preSink.clear() }
+    synchronized(routeLock) { desiredSpeaker = false }
+    CallNotifications.clearRing(appContext)
+    for (connection in connections) connection.finish(DisconnectCause.CANCELED)
+    for (completion in verdicts) completion(REFUSAL_VERDICT)
+    parked?.completion?.invoke(REFUSAL_VERDICT)
+  }
+
   /**
    * The system tore everything down, or the process is going away. Every call
    * we thought we had is gone.
@@ -1057,6 +1259,8 @@ internal object TelecomCenter {
     synchronized(lock) {
       cids = connectionsByCid.keys.toList()
       connectionsByCid.clear()
+      leaseByCid.clear()
+      pendingVerdicts.clear()
       pendingPush = null
       pendingAnswered = false
       pendingPushConfirmed = false

@@ -89,7 +89,7 @@ const COPY = {
   // honest exit, and the copy owns every consequence.
   // The device is named in the
   // platform's own words via the token, here and twice below.
-  signOutConfirm: `Deleting your account erases your chats, photos, and profile from this ${DEVICE_NOUN}, and retires your Tacendum ID — nobody can reach it again. There is no backup. If you come back, you’ll register fresh with a new ID.`,
+  signOutConfirm: `Deleting your account erases your chats, photos, and profile from this ${DEVICE_NOUN}, and retires your Tacendum ID. Setting up again, even on this same ${DEVICE_NOUN}, creates a new ID with no old chats. There is no backup. Other people keep their copies of your messages, and other linked devices keep their own accounts and data.`,
   confirmSignOut: 'Delete my account',
   keepSignedIn: 'Keep my account',
   editTitle: 'Edit profile',

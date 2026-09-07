@@ -266,6 +266,118 @@ check(FingerprintFault.corrupt(clean) == faulted, "corruption is deterministic")
 let lf = "v=0\na=fingerprint:sha-256 AB:CD\n"
 check(!FingerprintFault.corrupt(lf).contains("\r\n"), "LF-only input stays LF-only")
 
+section("native calls stay bound to one account")
+let missingOwner = AccountCallOwner(initialOwner: "")
+check(missingOwner.lease(for: "new-account") == nil,
+      "an upgraded install fails closed until JS adopts its account")
+check(missingOwner.currentLease() == nil,
+      "direct call/media work is denied without an owner")
+
+let accountOwner = AccountCallOwner(initialOwner: "old-account")
+let oldLease = accountOwner.lease(for: "old-account")
+check(oldLease != nil, "the exact push recipient is accepted")
+check(accountOwner.lease(for: "new-account") == nil,
+      "a push for another account is rejected")
+check(accountOwner.lease(for: "") == nil,
+      "a push without a recipient is rejected")
+
+check(accountOwner.beginChange(to: "old-account") == nil,
+      "adopting the same account is idempotent")
+if let oldLease {
+  check(accountOwner.isCurrent(oldLease),
+        "same-account adoption keeps already-authorized work current")
+}
+
+let clear = accountOwner.beginChange(to: "")
+check(clear != nil && accountOwner.currentOwner.isEmpty,
+      "clearing denies calls before native teardown begins")
+if let oldLease {
+  check(!accountOwner.isCurrent(oldLease),
+        "clearing invalidates asynchronous work captured by the old account")
+}
+if let clear { accountOwner.finishChange(clear) }
+check(accountOwner.currentLease() == nil,
+      "cleared ownership stays denied")
+
+let adoptNew = accountOwner.beginChange(to: "new-account")
+check(adoptNew != nil && accountOwner.currentLease() == nil,
+      "rotation has a denied interval while old calls are cleared")
+if let adoptNew { accountOwner.finishChange(adoptNew) }
+check(accountOwner.currentOwner == "new-account",
+      "the new account is adopted only after teardown")
+check(accountOwner.lease(for: "old-account") == nil,
+      "an old-account push cannot ring after rotation")
+let newLease = accountOwner.lease(for: "new-account")
+check(newLease != nil, "the new account recipient is accepted")
+if let oldLease {
+  check(!accountOwner.isCurrent(oldLease),
+        "an old asynchronous callback cannot bind to the new account")
+}
+if let newLease {
+  check(accountOwner.isCurrent(newLease),
+        "new-account work remains current")
+}
+
+let interrupted = AccountCallOwner(initialOwner: "old-account")
+let staleAdoption = interrupted.beginChange(to: "new-account")
+let clearingRetry = interrupted.beginChange(to: "")
+if let staleAdoption { interrupted.finishChange(staleAdoption) }
+check(interrupted.currentOwner.isEmpty,
+      "a clear superseding an interrupted rotation prevents late adoption")
+check(clearingRetry != nil,
+      "an interrupted durable-clear can be retried while ownership is empty")
+if let clearingRetry { interrupted.finishChange(clearingRetry) }
+check(interrupted.currentLease() == nil,
+      "the clearing retry completes in the denied state")
+
+section("the iOS owner marker is durable and fail closed")
+let ownerTestRoot = FileManager.default.temporaryDirectory
+  .appendingPathComponent("tacendum-owner-\(UUID().uuidString)", isDirectory: true)
+let ownerTestFile = ownerTestRoot.appendingPathComponent("owner")
+let ownerStore = AccountCallOwnerStore(fileURL: ownerTestFile)
+check(ownerStore.read().isEmpty, "a missing marker reads as no owner")
+do {
+  try ownerStore.write("old-account")
+  check(AccountCallOwnerStore(fileURL: ownerTestFile).read() == "old-account",
+        "a new store instance reads the fsynced owner")
+  check(try URL(fileURLWithPath: ownerTestRoot.path)
+    .resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true,
+        "native ownership cannot be backed up without its protocol identity")
+  var restoredDirectory = ownerTestRoot
+  var backupValues = URLResourceValues()
+  backupValues.isExcludedFromBackup = false
+  try restoredDirectory.setResourceValues(backupValues)
+  try ownerStore.write("")
+  check(try URL(fileURLWithPath: ownerTestRoot.path)
+    .resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true,
+        "each owner write reasserts backup exclusion")
+  check(AccountCallOwnerStore(fileURL: ownerTestFile).read().isEmpty,
+        "the durable empty marker survives a new store instance")
+  try ownerStore.write("new-account")
+  check(AccountCallOwnerStore(fileURL: ownerTestFile).read() == "new-account",
+        "a replacement account persists only as the new owner")
+} catch {
+  check(false, "atomic owner writes complete without error")
+}
+try? Data([0xff, 0xfe]).write(to: ownerTestFile, options: .atomic)
+check(AccountCallOwnerStore(fileURL: ownerTestFile).read().isEmpty,
+      "malformed persisted bytes fail closed")
+try? FileManager.default.removeItem(at: ownerTestRoot)
+
+let blockedParent = FileManager.default.temporaryDirectory
+  .appendingPathComponent("tacendum-owner-blocked-\(UUID().uuidString)")
+try? Data("not a directory".utf8).write(to: blockedParent)
+var refusedBrokenStore = false
+do {
+  try AccountCallOwnerStore(
+    fileURL: blockedParent.appendingPathComponent("owner")
+  ).write("account")
+} catch {
+  refusedBrokenStore = true
+}
+check(refusedBrokenStore, "an owner marker that cannot persist reports failure")
+try? FileManager.default.removeItem(at: blockedParent)
+
 print("")
 print("== result: \(passes) passed, \(failures) failed")
 if failures > 0 {

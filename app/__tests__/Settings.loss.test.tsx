@@ -67,16 +67,18 @@ afterEach(async () => {
   });
 });
 
-test('the door sits in ACCOUNT, where the rest of the account lives', async () => {
+test('the door sits in Privacy & security', async () => {
   await render();
+  await press('settings-category-privacy');
   expect(has('settings-loss')).toBe(true);
   expect(rendered()).toContain(LOSS_COPY.row);
-  // Closed: the page's own sentences are not printed down the menu.
+  // Closed: the page's own sentences are not printed down the category.
   expect(rendered()).not.toContain(LOSS_COPY.lines[0]);
 });
 
-test('it opens as a step — all four lines, and the menu is not underneath it', async () => {
+test('it opens as a step — all four lines, and the category is not underneath it', async () => {
   await render();
+  await press('settings-category-privacy');
   await press('settings-loss');
 
   const open = rendered();
@@ -84,13 +86,14 @@ test('it opens as a step — all four lines, and the menu is not underneath it',
   expect(open).toContain(LOSS_COPY.title);
   // A step, not an overlay: the sections it replaced are gone, and nothing
   // navigated anywhere.
-  expect(has('settings-linked-devices')).toBe(false);
-  expect(has('settings-licenses')).toBe(false);
+  expect(has('settings-loss')).toBe(false);
+  expect(has('settings-lock-enable')).toBe(false);
   expect(onBack).not.toHaveBeenCalled();
 });
 
 test('the teaching line sits behind the ⓘ and opens in place', async () => {
   await render();
+  await press('settings-category-privacy');
   await press('settings-loss');
   expect(rendered()).not.toContain(LOSS_COPY.infoLines[0]);
 
@@ -101,6 +104,7 @@ test('the teaching line sits behind the ⓘ and opens in place', async () => {
 
 test('the way out says Done — there is nothing on this page to cancel', async () => {
   await render();
+  await press('settings-category-privacy');
   await press('settings-loss');
   const page = rendered();
 
@@ -115,13 +119,15 @@ test('the way out says Done — there is nothing on this page to cancel', async 
   expect(page).not.toContain('Cancel');
 
   await press('settings-step-done');
-  expect(has('settings-linked-devices')).toBe(true);
+  expect(has('settings-loss')).toBe(true);
+  expect(has('settings-category-account')).toBe(false);
   expect(rendered()).not.toContain(LOSS_COPY.lines[0]);
   expect(onBack).not.toHaveBeenCalled();
 });
 
 test('a duress session reads the same page (rule 16)', async () => {
   await render();
+  await press('settings-category-privacy');
   await press('settings-loss');
   const real = rendered();
   await ReactTestRenderer.act(async () => {
@@ -130,6 +136,7 @@ test('a duress session reads the same page (rule 16)', async () => {
 
   session.setMode('duress');
   await render();
+  await press('settings-category-privacy');
   await press('settings-loss');
   expect(rendered()).toBe(real);
 });

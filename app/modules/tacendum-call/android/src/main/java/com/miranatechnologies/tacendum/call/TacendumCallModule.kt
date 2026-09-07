@@ -181,6 +181,18 @@ class TacendumCallModule(private val reactContext: ReactApplicationContext) :
 
   // MARK: - configuration
 
+  override fun setAccountOwner(userId: String, promise: Promise) {
+    try {
+      AccountCallOwnership.change(reactContext.applicationContext, userId) {
+        TelecomCenter.clearForAccountChange()
+        clearMediaForAccountChange()
+      }
+      promise.resolve(null)
+    } catch (failure: Throwable) {
+      promise.reject("account_owner_failed", "could not change native call account")
+    }
+  }
+
   override fun configure(iceServersJson: String, relayOnly: Boolean, promise: Promise) {
     val servers = ArrayList<PeerConnection.IceServer>()
     try {
@@ -220,6 +232,21 @@ class TacendumCallModule(private val reactContext: ReactApplicationContext) :
   }
 
   private fun call(cid: String): CallPeerConnection? = synchronized(lock) { calls[cid] }
+
+  private fun clearMediaForAccountChange() {
+    val oldCalls =
+        synchronized(lock) {
+          val snapshot = calls.values.toList()
+          for (cid in calls.keys) markClosedLocked(cid)
+          for (cid in inFlightCids.keys) markClosedLocked(cid)
+          calls.clear()
+          buffer.clear()
+          configuration = null
+          snapshot
+        }
+    for (call in oldCalls) call.close()
+    refreshCallPresence()
+  }
 
   // MARK: - the tombstone (cids closed while their connection was being built)
 
@@ -304,7 +331,8 @@ class TacendumCallModule(private val reactContext: ReactApplicationContext) :
     closedCidOrder.addAll(kept)
   }
 
-  private fun makeCall(cid: String): CallPeerConnection {
+  private fun makeCall(cid: String, lease: AccountCallLease): CallPeerConnection {
+    if (!AccountCallOwnership.isCurrent(lease)) throw CallError.Closed()
     val config = synchronized(lock) { configuration } ?: throw CallError.NotConfigured()
     // Refused before the connection is built when the close already landed:
     // constructing one only to throw it away would still have taken the
@@ -332,7 +360,7 @@ class TacendumCallModule(private val reactContext: ReactApplicationContext) :
           // The check above is an optimisation; this one is the correctness
           // argument. A close landing between them would otherwise be
           // overwritten by the very assignment it was racing.
-          if (closedCids.contains(cid)) {
+          if (closedCids.contains(cid) || !AccountCallOwnership.isCurrent(lease)) {
             true
           } else {
             calls[cid] = pc
@@ -345,6 +373,17 @@ class TacendumCallModule(private val reactContext: ReactApplicationContext) :
     }
     refreshCallPresence()
     return pc
+  }
+
+  private fun discardStaleCall(cid: String, pc: CallPeerConnection) {
+    synchronized(lock) {
+      if (calls[cid] === pc) {
+        calls.remove(cid)
+        markClosedLocked(cid)
+      }
+    }
+    pc.close()
+    refreshCallPresence()
   }
 
   /**
@@ -395,13 +434,24 @@ class TacendumCallModule(private val reactContext: ReactApplicationContext) :
   // MARK: - negotiation
 
   override fun createOffer(cid: String, withVideo: Boolean, promise: Promise) {
+    val lease = AccountCallOwnership.currentLease(reactContext.applicationContext)
+    if (lease == null) {
+      promise.reject("offer_failed", "could not create an offer")
+      return
+    }
     // Before the work is queued, never inside it: see `inFlightCids`.
     beginNegotiation(cid)
     negotiation.execute {
       try {
-        val pc = makeCall(cid)
-        pc.createOffer(withVideo, false) { sdp, error ->
+        if (!AccountCallOwnership.isCurrent(lease)) throw CallError.Closed()
+        val pc = makeCall(cid, lease)
+        pc.createOffer(withVideo, false) offerResult@{ sdp, error ->
           endNegotiation(cid)
+          if (!AccountCallOwnership.isCurrent(lease)) {
+            discardStaleCall(cid, pc)
+            promise.reject("offer_failed", "could not create an offer")
+            return@offerResult
+          }
           // The local tracks were born inside the call above; the proximity
           // rule's video input can only be read now.
           CallAudioGate.refreshProximity()
@@ -421,14 +471,25 @@ class TacendumCallModule(private val reactContext: ReactApplicationContext) :
       withVideo: Boolean,
       promise: Promise,
   ) {
+    val lease = AccountCallOwnership.currentLease(reactContext.applicationContext)
+    if (lease == null) {
+      promise.reject("answer_failed", "could not create an answer")
+      return
+    }
     beginNegotiation(cid)
     negotiation.execute {
       try {
+        if (!AccountCallOwnership.isCurrent(lease)) throw CallError.Closed()
         // The offer may already have a peer connection if a restart arrived;
         // reuse it so the ICE credentials continue rather than reset.
-        val pc = call(cid) ?: makeCall(cid)
-        pc.createAnswer(remoteOfferSdp, withVideo) { sdp, error ->
+        val pc = call(cid) ?: makeCall(cid, lease)
+        pc.createAnswer(remoteOfferSdp, withVideo) answerResult@{ sdp, error ->
           endNegotiation(cid)
+          if (!AccountCallOwnership.isCurrent(lease)) {
+            discardStaleCall(cid, pc)
+            promise.reject("answer_failed", "could not create an answer")
+            return@answerResult
+          }
           CallAudioGate.refreshProximity()
           if (sdp != null) promise.resolve(sdp)
           else promise.reject("answer_failed", "could not create an answer")
@@ -574,7 +635,10 @@ class TacendumCallModule(private val reactContext: ReactApplicationContext) :
   // MARK: - Telecom
 
   override fun reportOutgoingCall(cid: String, handle: String, video: Boolean, promise: Promise) {
-    if (TelecomCenter.reportOutgoingCall(cid, handle, video)) promise.resolve(null)
+    val lease = AccountCallOwnership.currentLease(reactContext.applicationContext)
+    if (lease != null && TelecomCenter.reportOutgoingCall(cid, handle, video, lease)) {
+      promise.resolve(null)
+    }
     else promise.reject("report_failed", "notification/Connection creation failed")
   }
 
@@ -591,7 +655,12 @@ class TacendumCallModule(private val reactContext: ReactApplicationContext) :
       hasVideo: Boolean,
       promise: Promise,
   ) {
-    TelecomCenter.reportIncomingCall(cid, peerId, handle, displayName, hasVideo) { refusal ->
+    val lease = AccountCallOwnership.currentLease(reactContext.applicationContext)
+    if (lease == null) {
+      promise.reject("report_failed", "notification/Connection creation failed")
+      return
+    }
+    TelecomCenter.reportIncomingCall(cid, peerId, handle, displayName, hasVideo, lease) { refusal ->
       if (refusal == null) promise.resolve(null)
       else promise.reject("report_failed", "notification/Connection creation failed")
     }

@@ -42,7 +42,6 @@ import {
   nudgePushRegistration,
   quiesceCallMetrics,
   resumeCallMetricDrainAfterTransportResume,
-  uploadPushTokens,
 } from './src/call';
 import { refreshDecoyTimestamps } from './src/decoy';
 import * as db from './src/db';
@@ -88,7 +87,7 @@ import { PhotoViewerScreen } from './src/screens/PhotoViewerScreen';
 import { ProfileScreen } from './src/screens/ProfileScreen';
 import { RegisterScreen } from './src/screens/RegisterScreen';
 import { UpdateRequiredScreen } from './src/screens/UpdateRequiredScreen';
-import { SettingsScreen } from './src/screens/SettingsScreen';
+import { SettingsScreen, type SettingsSection } from './src/screens/SettingsScreen';
 import { StartChatScreen } from './src/screens/StartChatScreen';
 import {
   appearanceChoice,
@@ -240,8 +239,8 @@ export type Route =
   // A FIELD on an existing name, never a new name: `visibleSurface.ts`
   // classifies by route name and its 23-cell matrix must not move.
   | { name: 'profile'; from?: 'chats' | 'calls' }
-  | { name: 'settings'; from?: 'chats' | 'profile' }
-  // Device linking : the roster, the scan side, and the
+  | { name: 'settings'; from?: 'chats' | 'profile'; section?: SettingsSection }
+  // Device linking: the roster, the scan side, and the
   // new-device confirm surface. Joined THROUGH the visible-surface module
   //  — ordinary workspace surfaces to all four consumers.
   // THE SETTINGS ORIGIN RIDES THROUGH. Every surface below is
@@ -258,7 +257,7 @@ export type Route =
   // Start a chat), and the recovery surface (entered from Landing — BESIDE
   // registration, never in it; `from` remembers which door, so back agrees
   // with it).
-  | { name: 'accountEmail'; from?: 'chats' | 'profile' }
+  | { name: 'accountEmail'; from?: 'chats' | 'profile'; via?: 'username' }
   // The phone surface renders nothing while PHONE_UI_ENABLED is false.
   // It has no Settings row and is reachable programmatically only.
   | { name: 'accountPhone'; from?: 'chats' | 'profile' }
@@ -784,6 +783,7 @@ function AppContent() {
   const reduceMotion = useReduceMotion();
   const routeRef = useRef(route);
   routeRef.current = route;
+  const settingsBackHandlerRef = useRef<(() => boolean) | null>(null);
 
   // --- the wide projection's derived facts ---------
   //
@@ -2122,7 +2122,7 @@ function AppContent() {
    * swipe can never disagree with the chevron. Reports whether it navigated:
    * an autolock can land between the touch and the release, and a swipe that
    * resolves to nothing must not leave the surface dragged off-screen. */
-  const goBack = useCallback(() => {
+  const goBack = useCallback((fromSwipe = false) => {
     // A full-screen live call answers Back by MINIMIZING: the
     // call keeps going, the small window appears, and the
     // route underneath — which a call never changed — is what the person
@@ -2159,6 +2159,13 @@ function AppContent() {
     ) {
       return true;
     }
+    if (fromSwipe && routeRef.current.name === 'settings' &&
+        settingsBackHandlerRef.current?.()) {
+      // Settings consumed the gesture locally (or blocked it during a write).
+      // Its route key is unchanged, so reset the drag instead of leaving
+      // the still-mounted page translated off-screen.
+      return false;
+    }
     const destination = backDestination(routeRef.current);
     if (!destination) return false;
     setRoute(destination);
@@ -2194,7 +2201,7 @@ function AppContent() {
     if (Platform.OS !== 'android') return;
     const subscription = BackHandler.addEventListener(
       'hardwareBackPress',
-      goBack,
+      () => goBack(),
     );
     return () => subscription.remove();
   }, [goBack]);
@@ -2232,7 +2239,7 @@ function AppContent() {
         // The App Lock nudge's "Open Settings": the lock
         // lives on the Settings surface, so that is where the door goes —
         // and `from` is what brings the person back HERE afterwards.
-        onOpenAppLock={() => setRoute({ name: 'settings', from: 'chats' })}
+        onOpenAppLock={() => setRoute({ name: 'settings', from: 'chats', section: 'privacy' })}
         // The Field Mode line under the title, and the seventh
         // push site. A setting somebody turned on before walking somewhere
         // and then cannot find is a setting they are carrying blind, so the
@@ -2394,6 +2401,8 @@ function AppContent() {
           <RegisterScreen
             onBack={() => setRoute({ name: 'landing' })}
             onRegistered={p => {
+              if (!openingIsCurrent(surfaceOpeningGeneration) ||
+                  session.mode !== surfaceSessionMode || routeRef.current.name !== 'register') return;
               // Registration is an explicit account-opening event. Background
               // access remains independently denied until its lock verdict.
               if (writingWorkspaceReady.current && session.mode === 'real' &&
@@ -2409,7 +2418,7 @@ function AppContent() {
               // ever try again. Without this line a freshly created account
               // receives no notifications until the app is force-quit and
               // relaunched.
-              void uploadPushTokens();
+              adoptPushRegistration({ real: true });
               void (async () => {
                 // WHO THIS DEVICE IS, told to the call module the same way the
                 // push registration above and `messaging.start` are told. It
@@ -2594,6 +2603,13 @@ function AppContent() {
 
         {route.name === 'settings' && (
           <SettingsScreen
+            backHandlerRef={settingsBackHandlerRef}
+            initialSection={route.section}
+            onSectionChange={section => setRoute(current =>
+              current.name === 'settings'
+                ? { ...current, section: section ?? undefined }
+                : current,
+            )}
             // Same table, same reason: Settings is reached from two doors.
             onBack={() => popRoute(route)}
             // Each row hands the sub-screen the origin THIS surface was
@@ -2672,7 +2688,7 @@ function AppContent() {
           <AccountUsernameScreen
             onBack={() => popRoute(route)}
             onOpenAccountEmail={() =>
-              setRoute({ name: 'accountEmail', from: route.from })
+              setRoute({ name: 'accountEmail', from: route.from, via: 'username' })
             }
           />
         )}
@@ -2827,7 +2843,7 @@ function AppContent() {
                 // and Android's hardware back still pop through the same
                 // backDestination.
                 canGoBack={false}
-                onGoBack={goBack}
+                onGoBack={() => goBack(true)}
                 reduceMotion={reduceMotion}
               >
                 {detailOpen ? routeSurface : <EmptyDetail profile={profile} />}
@@ -2844,7 +2860,7 @@ function AppContent() {
             // photoViewer pops (hardware back, its own close control) but does
             // not SWIPE: the crossfade has no horizontal movement to drag.
             canGoBack={route.name !== 'photoViewer' && backDestination(route) !== null}
-            onGoBack={goBack}
+            onGoBack={() => goBack(true)}
             reduceMotion={reduceMotion}
           >
             {routeSurface}
@@ -3309,6 +3325,7 @@ export function backDestination(route: Route): Route | null {
       // always were.
       return route.from === 'calls' ? { name: 'calls' } : { name: 'chats' };
     case 'settings':
+      if (route.section) return { name: 'settings', from: route.from };
       // Reached through Profile, Back is Profile. Reached through the chat
       // list's App Lock nudge, Back is the chat list — a first-run nudge
       // must not leave a person somewhere they never asked to go.
@@ -3317,7 +3334,7 @@ export function backDestination(route: Route): Route | null {
       // Settings' own origin rides back out with it: a roster opened from
       // the App Lock nudge's Settings pops to a Settings that still knows
       // it came from the chat list.
-      return { name: 'settings', from: route.from };
+      return { name: 'settings', from: route.from, section: 'account' };
     case 'linkDevice':
       return { name: 'linkedDevices', from: route.from };
     case 'linkConfirm':
@@ -3325,11 +3342,13 @@ export function backDestination(route: Route): Route | null {
       // surface can be the one it arrived over.
       return route.from === 'calls' ? { name: 'calls' } : { name: 'chats' };
     case 'accountEmail':
-      return { name: 'settings', from: route.from };
+      return route.via === 'username'
+        ? { name: 'accountUsername', from: route.from }
+        : { name: 'settings', from: route.from, section: 'account' };
     case 'accountPhone':
-      return { name: 'settings', from: route.from };
+      return { name: 'settings', from: route.from, section: 'account' };
     case 'accountUsername':
-      return { name: 'settings', from: route.from };
+      return { name: 'settings', from: route.from, section: 'account' };
     case 'discover':
       return { name: 'newChat' };
     case 'recover':

@@ -74,7 +74,10 @@ afterEach(async () => {
 
 test('the Licenses page is the Licenses page — no APP LOCK heading over it', async () => {
   await render();
+  await press('settings-category-privacy');
   expect(rendered()).toContain('APP LOCK');
+  await press('settings-back');
+  await press('settings-category-about');
   await press('settings-licenses');
 
   expect(rendered()).toContain('Licenses');
@@ -87,20 +90,23 @@ test('a stale confirmation does not paint over the PIN flow or the Licenses view
   const setup = jest.spyOn(decoy, 'setupDecoy').mockResolvedValue(undefined);
   try {
     await render();
+    await press('settings-category-privacy');
     await press('settings-lock-enable');
     await typeCode('111222');
     await typeCode('111222');
     await press('settings-lock-commit');
-    // The notice belongs to the menu it was earned on.
+    // The notice belongs to the Privacy category where it was earned.
     expect(rendered()).toContain('App Lock is on.');
 
     await press('settings-lock-change');
     expect(rendered()).not.toContain('App Lock is on.');
 
     // …and it is gone from the licenses step too, which is reached from the
-    // menu the notice IS allowed to paint on.
+    // category the notice IS allowed to paint on.
     await press('settings-pin-cancel');
     expect(rendered()).toContain('App Lock is on.');
+    await press('settings-back');
+    await press('settings-category-about');
     await press('settings-licenses');
     expect(rendered()).not.toContain('App Lock is on.');
   } finally {
@@ -112,9 +118,12 @@ test('the commit control says it is working while the decoy is being built', asy
   let release!: () => void;
   const setup = jest
     .spyOn(decoy, 'setupDecoy')
-    .mockImplementation(() => new Promise<void>(resolve => (release = resolve)));
+    .mockImplementation(
+      () => new Promise<void>(resolve => (release = resolve)),
+    );
   try {
     await render();
+    await press('settings-category-privacy');
     await press('settings-lock-enable');
     await typeCode('111222');
     await typeCode('111222');

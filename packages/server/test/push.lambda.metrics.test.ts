@@ -55,6 +55,7 @@ beforeEach(async () => {
   cloudWatchSendMock.mockResolvedValue({});
   const db: TestOnlyDataLayer = makeMemoryDb();
   testDeps = makeTestDeps(db);
+  await db.createUser({ userId: EVENT.recipientId, createdAt: testDeps.now() });
   await db.putPushToken({
     userId: EVENT.recipientId,
     voipToken: 'a'.repeat(64),

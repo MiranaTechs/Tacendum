@@ -4,7 +4,10 @@ import ReactTestRenderer from 'react-test-renderer';
 import { setSecret } from 'tacendum-crypto';
 import * as calling from '../src/call';
 import * as db from '../src/db';
-import { FIELD_MODE_SNAPSHOT_KEY, resetFieldModeForTests } from '../src/fieldMode';
+import {
+  FIELD_MODE_SNAPSHOT_KEY,
+  resetFieldModeForTests,
+} from '../src/fieldMode';
 import {
   FIELD_MODE_COPY,
   FIELD_MODE_SCREENSHOT_LINES,
@@ -39,7 +42,10 @@ const SELF = '01HQ5E1F00000000000000000A';
 jest.mock('../src/api', () => ({
   apiDeletePushToken: jest.fn(async () => undefined),
   apiRegisterPushToken: jest.fn(async () => undefined),
-  apiTurnCredentials: jest.fn(async () => ({ iceServers: [], ttlSeconds: 3600 })),
+  apiTurnCredentials: jest.fn(async () => ({
+    iceServers: [],
+    ttlSeconds: 3600,
+  })),
 }));
 
 const crypto = jest.requireMock('tacendum-crypto') as {
@@ -69,7 +75,14 @@ function installTables(): void {
     if (/FROM chats WHERE peerId/.test(text)) {
       return {
         rows: known.has(String(args[0]))
-          ? [{ peerId: args[0], displayName: 'Ana', localName: null, lastMessageAt: 1 }]
+          ? [
+              {
+                peerId: args[0],
+                displayName: 'Ana',
+                localName: null,
+                lastMessageAt: 1,
+              },
+            ]
           : [],
       };
     }
@@ -145,6 +158,7 @@ async function render(): Promise<ReactTestRenderer.ReactTestRenderer> {
     );
     await flush();
   });
+  await press(tree, 'settings-category-privacy');
   return tree;
 }
 
@@ -174,8 +188,19 @@ async function unmount(
   });
 }
 
-function has(tree: ReactTestRenderer.ReactTestRenderer, testID: string): boolean {
+function has(
+  tree: ReactTestRenderer.ReactTestRenderer,
+  testID: string,
+): boolean {
   return tree.root.findAllByProps({ testID }).length > 0;
+}
+
+async function enterSection(
+  tree: ReactTestRenderer.ReactTestRenderer,
+  section: 'privacy' | 'chats' | 'notifications',
+): Promise<void> {
+  await press(tree, 'settings-back');
+  await press(tree, `settings-category-${section}`);
 }
 
 /** Every rendered string, in document order. */
@@ -218,11 +243,13 @@ function fieldModeTexts(tree: ReactTestRenderer.ReactTestRenderer): string[] {
   const row = tree.root
     .findAllByType(ChoiceRow)
     .find(n => n.props.testIDPrefix === 'settings-fieldmode')!;
-  const out = row.findAllByType(Text).map(n =>
-    Array.isArray(n.props.children)
-      ? n.props.children.join('')
-      : String(n.props.children ?? ''),
-  );
+  const out = row
+    .findAllByType(Text)
+    .map(n =>
+      Array.isArray(n.props.children)
+        ? n.props.children.join('')
+        : String(n.props.children ?? ''),
+    );
   for (const n of tree.root.findAllByProps({
     testID: 'settings-fieldmode-needslock',
   })) {
@@ -232,19 +259,23 @@ function fieldModeTexts(tree: ReactTestRenderer.ReactTestRenderer): string[] {
 }
 
 describe('the Field Mode row', () => {
-  it('renders in the chip idiom, Off on a fresh install, in its own section above APP LOCK and ACCOUNT', async () => {
+  it('renders in the chip idiom, Off on a fresh install, above App Lock in Privacy', async () => {
     const tree = await render();
     expect(selected(tree, 'settings-fieldmode-off')).toBe(true);
     expect(selected(tree, 'settings-fieldmode-on')).toBe(false);
-    expect(tree.root.findByProps({ testID: 'settings-fieldmode-on' }).props
-      .accessibilityRole).toBe('button');
+    expect(
+      tree.root.findByProps({ testID: 'settings-fieldmode-on' }).props
+        .accessibilityRole,
+    ).toBe('button');
 
     const order = texts(tree);
-    expect(order.indexOf(FIELD_MODE_COPY.sectionLabel)).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf(FIELD_MODE_COPY.sectionLabel)).toBeGreaterThanOrEqual(
+      0,
+    );
     expect(order.indexOf(FIELD_MODE_COPY.sectionLabel)).toBeLessThan(
       order.indexOf('APP LOCK'),
     );
-    expect(order.indexOf('APP LOCK')).toBeLessThan(order.indexOf('ACCOUNT'));
+    expect(has(tree, 'settings-category-account')).toBe(false);
   });
 
   it('On moves every mapped control, and the individual rows follow', async () => {
@@ -256,11 +287,13 @@ describe('the Field Mode row', () => {
     expect(crypto.__keychain.get('tacendum.silenceUnknownCallers')).toBe('1');
     expect(crypto.__keychain.get('screensec.blank')).toBe('1');
 
-    expect(selected(tree, 'settings-preview-none')).toBe(true);
-    expect(selected(tree, 'settings-relay-on')).toBe(true);
-    expect(selected(tree, 'settings-silence-on')).toBe(true);
     expect(selected(tree, 'settings-screensec-on')).toBe(true);
     expect(selected(tree, 'settings-fieldmode-on')).toBe(true);
+    await enterSection(tree, 'notifications');
+    expect(selected(tree, 'settings-preview-none')).toBe(true);
+    await enterSection(tree, 'chats');
+    expect(selected(tree, 'settings-relay-on')).toBe(true);
+    expect(selected(tree, 'settings-silence-on')).toBe(true);
   });
 
   it('with App Lock on it sets Auto-lock to Right away and shows no "needs App Lock" line', async () => {
@@ -339,7 +372,9 @@ describe('the Field Mode row', () => {
 
     const tree = await render();
     await ReactTestRenderer.act(async () => {
-      tree.root.findByProps({ testID: 'settings-fieldmode-on' }).props.onPress();
+      tree.root
+        .findByProps({ testID: 'settings-fieldmode-on' })
+        .props.onPress();
       await flush();
     });
     // The chips grey out for the duration…
@@ -349,7 +384,9 @@ describe('the Field Mode row', () => {
     ).toBe(true);
     // …and a tap that lands anyway is refused rather than interleaved.
     await ReactTestRenderer.act(async () => {
-      tree.root.findByProps({ testID: 'settings-fieldmode-off' }).props.onPress();
+      tree.root
+        .findByProps({ testID: 'settings-fieldmode-off' })
+        .props.onPress();
       await flush();
     });
     await ReactTestRenderer.act(async () => {
@@ -411,11 +448,13 @@ describe('the Field Mode row', () => {
     expect(crypto.__keychain.get('screensec.blank')).toBe('0');
     expect(crypto.__keychain.has(FIELD_MODE_SNAPSHOT_KEY)).toBe(false);
 
-    expect(selected(tree, 'settings-preview-full')).toBe(true);
-    expect(selected(tree, 'settings-relay-off')).toBe(true);
-    expect(selected(tree, 'settings-silence-off')).toBe(true);
     expect(selected(tree, 'settings-screensec-off')).toBe(true);
     expect(selected(tree, 'settings-fieldmode-off')).toBe(true);
+    await enterSection(tree, 'notifications');
+    expect(selected(tree, 'settings-preview-full')).toBe(true);
+    await enterSection(tree, 'chats');
+    expect(selected(tree, 'settings-relay-off')).toBe(true);
+    expect(selected(tree, 'settings-silence-off')).toBe(true);
   });
 
   it('is DERIVED: changing one mapped row by hand flips the chip back with no extra tap', async () => {
@@ -423,13 +462,17 @@ describe('the Field Mode row', () => {
     await press(tree, 'settings-fieldmode-on');
     expect(selected(tree, 'settings-fieldmode-on')).toBe(true);
 
+    await enterSection(tree, 'notifications');
     await press(tree, 'settings-preview-sender');
+    await enterSection(tree, 'privacy');
     expect(selected(tree, 'settings-fieldmode-off')).toBe(true);
     expect(selected(tree, 'settings-fieldmode-on')).toBe(false);
 
     // Putting it back by hand makes the chip read On again — no stored flag
     // to go stale in either direction.
+    await enterSection(tree, 'notifications');
     await press(tree, 'settings-preview-none');
+    await enterSection(tree, 'privacy');
     expect(selected(tree, 'settings-fieldmode-on')).toBe(true);
   });
 
@@ -438,7 +481,8 @@ describe('the Field Mode row', () => {
     // Visible, from the deck by identity (no App Lock, so no auto-lock
     // clause).
     expect(
-      tree.root.findByProps({ testID: 'settings-fieldmode-note' }).props.children,
+      tree.root.findByProps({ testID: 'settings-fieldmode-note' }).props
+        .children,
     ).toBe(FIELD_MODE_COPY.consent);
     // Closed until opened.
     expect(texts(tree)).not.toContain(FIELD_MODE_COPY.infoLines[0]);
@@ -451,7 +495,8 @@ describe('the Field Mode row', () => {
     await enableAppLock(60);
     const tree = await render();
     expect(
-      tree.root.findByProps({ testID: 'settings-fieldmode-note' }).props.children,
+      tree.root.findByProps({ testID: 'settings-fieldmode-note' }).props
+        .children,
     ).toBe(`${FIELD_MODE_COPY.consent} ${FIELD_MODE_COPY.consentAutolock}`);
   });
 
@@ -493,9 +538,9 @@ describe('the Field Mode row', () => {
     for (const arm of Object.values(FIELD_MODE_SCREENSHOT_LINES)) {
       expect(arm).toContain('always true, with Field Mode on or off');
     }
-    expect(FIELD_MODE_COPY.infoLines[FIELD_MODE_COPY.infoLines.length - 1]).toBe(
-      FIELD_MODE_SCREENSHOT_LINES.ios,
-    );
+    expect(
+      FIELD_MODE_COPY.infoLines[FIELD_MODE_COPY.infoLines.length - 1],
+    ).toBe(FIELD_MODE_SCREENSHOT_LINES.ios);
   });
 
   it('says what a notification actually shows, rather than that none appears', async () => {
@@ -551,28 +596,35 @@ describe('the Field Mode row', () => {
     // The decoy shows the DEFAULT — and now for the honest reason: because
     // its own rows say so, the same predicate the owner's screen uses.
     expect(selected(decoy, 'settings-fieldmode-off')).toBe(true);
+    await enterSection(decoy, 'notifications');
     expect(selected(decoy, 'settings-preview-sender')).toBe(true);
+    await enterSection(decoy, 'chats');
     expect(selected(decoy, 'settings-relay-off')).toBe(true);
+    await enterSection(decoy, 'privacy');
 
     // A coercer's tap moves ALL FOUR mapped chips, exactly as a real tap
     // does. Anything less is a discriminator, and the consent line printed
     // under the chip is the instructions for using it.
     await press(decoy, 'settings-fieldmode-on');
     expect(selected(decoy, 'settings-fieldmode-on')).toBe(true);
+    expect(selected(decoy, 'settings-screensec-on')).toBe(true);
+    await enterSection(decoy, 'notifications');
     expect(selected(decoy, 'settings-preview-none')).toBe(true);
+    await enterSection(decoy, 'chats');
     expect(selected(decoy, 'settings-relay-on')).toBe(true);
     expect(selected(decoy, 'settings-silence-on')).toBe(true);
-    expect(selected(decoy, 'settings-screensec-on')).toBe(true);
     await unmount(decoy);
 
     // …and every one of them is still moved when they come back to the
     // screen, which is what a real session gets from its four stores.
     const again = await render();
     expect(selected(again, 'settings-fieldmode-on')).toBe(true);
+    expect(selected(again, 'settings-screensec-on')).toBe(true);
+    await enterSection(again, 'notifications');
     expect(selected(again, 'settings-preview-none')).toBe(true);
+    await enterSection(again, 'chats');
     expect(selected(again, 'settings-relay-on')).toBe(true);
     expect(selected(again, 'settings-silence-on')).toBe(true);
-    expect(selected(again, 'settings-screensec-on')).toBe(true);
 
     // Not one byte moved, in either store, snapshot key included.
     expect([...crypto.__keychain.entries()].sort()).toEqual(keychainBefore);
@@ -585,14 +637,19 @@ describe('the Field Mode row', () => {
     await press(decoy, 'settings-fieldmode-on');
     // The coercer changes one of the four back by hand: derived, so the chip
     // flips…
+    await enterSection(decoy, 'notifications');
     await press(decoy, 'settings-preview-sender');
+    await enterSection(decoy, 'privacy');
     expect(selected(decoy, 'settings-fieldmode-off')).toBe(true);
     await unmount(decoy);
 
     // …and the remount must not resurrect the Field Mode tap's value over it.
     const again = await render();
+    await enterSection(again, 'notifications');
     expect(selected(again, 'settings-preview-sender')).toBe(true);
+    await enterSection(again, 'chats');
     expect(selected(again, 'settings-relay-on')).toBe(true);
+    await enterSection(again, 'privacy');
     expect(selected(again, 'settings-fieldmode-off')).toBe(true);
   });
 
@@ -604,9 +661,11 @@ describe('the Field Mode row', () => {
     const decoy = await render();
     await press(decoy, 'settings-fieldmode-on');
     await press(decoy, 'settings-fieldmode-off');
-    expect(selected(decoy, 'settings-preview-sender')).toBe(true);
-    expect(selected(decoy, 'settings-relay-off')).toBe(true);
     expect(selected(decoy, 'settings-fieldmode-off')).toBe(true);
+    await enterSection(decoy, 'notifications');
+    expect(selected(decoy, 'settings-preview-sender')).toBe(true);
+    await enterSection(decoy, 'chats');
+    expect(selected(decoy, 'settings-relay-off')).toBe(true);
 
     expect([...crypto.__keychain.entries()].sort()).toEqual(keychainBefore);
     expect([...crypto.__sharedState.entries()].sort()).toEqual(sharedBefore);
@@ -621,8 +680,10 @@ describe('the Field Mode row', () => {
     await press(tree, 'settings-fieldmode-on');
 
     expect(selected(tree, 'settings-fieldmode-off')).toBe(true);
-    expect(selected(tree, 'settings-preview-sender')).toBe(true);
-    expect(selected(tree, 'settings-relay-off')).toBe(true);
     expect(has(tree, 'settings-fieldmode-error')).toBe(true);
+    await enterSection(tree, 'notifications');
+    expect(selected(tree, 'settings-preview-sender')).toBe(true);
+    await enterSection(tree, 'chats');
+    expect(selected(tree, 'settings-relay-off')).toBe(true);
   });
 });

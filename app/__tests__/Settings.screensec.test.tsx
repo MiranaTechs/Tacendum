@@ -27,13 +27,20 @@ afterEach(async () => {
 async function renderSettings(): Promise<ReactTestRenderer.ReactTestRenderer> {
   let tree!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(() => {
-    tree = ReactTestRenderer.create(<SettingsScreen
-      onBack={jest.fn()}
-      onOpenLinkedDevices={jest.fn()}
-      onOpenAccountEmail={jest.fn()}
-    />);
+    tree = ReactTestRenderer.create(
+      <SettingsScreen
+        onBack={jest.fn()}
+        onOpenLinkedDevices={jest.fn()}
+        onOpenAccountEmail={jest.fn()}
+      />,
+    );
   });
   await ReactTestRenderer.act(async () => {});
+  await ReactTestRenderer.act(async () => {
+    tree.root
+      .findByProps({ testID: 'settings-category-privacy' })
+      .props.onPress();
+  });
   return tree;
 }
 
@@ -60,9 +67,9 @@ test('blanking is on by default and the chips flip and persist it', async () => 
   });
   expect(screenSecurity.blankEnabled).toBe(false);
   expect(crypto.__keychain.get('screensec.blank')).toBe('0');
-  expect(
-    chip(tree, 'settings-screensec-off').props.accessibilityState,
-  ).toEqual({ selected: true });
+  expect(chip(tree, 'settings-screensec-off').props.accessibilityState).toEqual(
+    { selected: true },
+  );
 
   await ReactTestRenderer.act(async () => {
     chip(tree, 'settings-screensec-on').props.onPress();
@@ -81,7 +88,11 @@ test('the section tells the truth about screenshots', async () => {
   // under the sheet.
   await ReactTestRenderer.act(async () => {
     tree.root
-      .findAll(n => n.props.testID === 'settings-shot-info' && n.props.onPress !== undefined)[0]
+      .findAll(
+        n =>
+          n.props.testID === 'settings-shot-info' &&
+          n.props.onPress !== undefined,
+      )[0]
       .props.onPress();
   });
   const texts = tree.root

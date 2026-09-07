@@ -65,7 +65,7 @@ describe('sending', () => {
     await sender.wake(TOKEN, 'user-caller');
     await sender.wake(TOKEN, 'user-caller');
     await sender.wake(TOKEN, 'user-caller');
-    expect(logs.filter(l => l.event === 'apns_unconfigured')).toHaveLength(1);
+    expect(logs.filter((l) => l.event === 'apns_unconfigured')).toHaveLength(1);
   });
 
   it('never logs the key material or the device token', async () => {
@@ -138,6 +138,19 @@ describe('sending', () => {
     },
   );
 
+  it('binds a call wake to the recipient from the server-owned token row', async () => {
+    sendVoipMock.mockResolvedValue({ outcome: 'sent' });
+    const sender = makeApnsPushSender({ credentials: CREDENTIALS, log });
+
+    await sender.wake(TOKEN, 'user-caller');
+
+    expect(sendVoipMock).toHaveBeenCalledWith(TOKEN.voipToken, {
+      from: 'user-caller',
+      to: TOKEN.userId,
+      ts: expect.any(Number),
+    });
+  });
+
   it('returns `failed` when APNs throws', async () => {
     sendVoipMock.mockRejectedValue(new Error('transport unavailable'));
     const sender = makeApnsPushSender({ credentials: CREDENTIALS, log });
@@ -165,7 +178,7 @@ describe('sending', () => {
       }),
     ).resolves.toBe('failed');
 
-    expect(logs.filter(l => l.event === 'apns_row_missing_env')).toHaveLength(2);
+    expect(logs.filter((l) => l.event === 'apns_row_missing_env')).toHaveLength(2);
     expect(sendVoipMock).not.toHaveBeenCalled();
     expect(sendAlertMock).not.toHaveBeenCalled();
   });

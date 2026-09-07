@@ -505,6 +505,7 @@ describe('SettingsScreen', () => {
     const tree = await render();
     expect(await pressBack()).toBe(false);
 
+    await press(tree, 'settings-category-privacy');
     await press(tree, 'settings-lock-enable');
     await press(tree, 'pin-key-1');
     expect(has(tree, 'settings-pin-cancel')).toBe(true);
@@ -512,12 +513,15 @@ describe('SettingsScreen', () => {
     expect(await pressBack()).toBe(true);
     expect(has(tree, 'settings-pin-cancel')).toBe(false);
     expect(has(tree, 'settings-lock-enable')).toBe(true);
+    expect(await pressBack()).toBe(true);
+    expect(has(tree, 'settings-category-privacy')).toBe(true);
     expect(await pressBack()).toBe(false);
     await unmount(tree);
   });
 
   it('returns the licences page to the menu, the way its own Done does', async () => {
     const tree = await render();
+    await press(tree, 'settings-category-about');
     await press(tree, 'settings-licenses');
     expect(has(tree, 'settings-licenses-body')).toBe(true);
     expect(await pressBack()).toBe(true);

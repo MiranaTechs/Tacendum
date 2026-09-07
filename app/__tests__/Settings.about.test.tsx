@@ -39,11 +39,13 @@ const openURL = jest.spyOn(Linking, 'openURL').mockResolvedValue(true);
 async function render(): Promise<ReactTestRenderer.ReactTestRenderer> {
   let tree!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(async () => {
-    tree = ReactTestRenderer.create(<SettingsScreen
-      onBack={() => {}}
-      onOpenLinkedDevices={() => {}}
-      onOpenAccountEmail={() => {}}
-    />);
+    tree = ReactTestRenderer.create(
+      <SettingsScreen
+        onBack={() => {}}
+        onOpenLinkedDevices={() => {}}
+        onOpenAccountEmail={() => {}}
+      />,
+    );
   });
   return tree;
 }
@@ -55,6 +57,12 @@ async function press(
   await ReactTestRenderer.act(async () => {
     tree.root.findByProps({ testID }).props.onPress();
   });
+}
+
+async function enterAbout(
+  tree: ReactTestRenderer.ReactTestRenderer,
+): Promise<void> {
+  await press(tree, 'settings-category-about');
 }
 
 beforeEach(() => {
@@ -69,6 +77,7 @@ describe('Settings → ABOUT', () => {
     ['settings-source', SOURCE_URL],
   ])('%s opens %s', async (testID, url) => {
     const tree = await render();
+    await enterAbout(tree);
     await press(tree, testID);
     expect(openURL).toHaveBeenCalledWith(url);
   });
@@ -78,12 +87,14 @@ describe('Settings → ABOUT', () => {
     // the same constant SOURCE_URL is built from, so a version bump cannot
     // move one without the other.
     const tree = await render();
+    await enterAbout(tree);
     const line = tree.root.findByProps({ testID: 'settings-version' });
     expect(String(line.props.children.join(''))).toContain(VERSION_LABEL);
   });
 
   it('carries the licence notice offline, with the libsignal limit intact', async () => {
     const tree = await render();
+    await enterAbout(tree);
     await press(tree, 'settings-licenses');
 
     const body = tree.root.findByProps({ testID: 'settings-licenses-body' })
@@ -102,8 +113,9 @@ describe('Settings → ABOUT', () => {
     expect(openURL).not.toHaveBeenCalled();
   });
 
-  it('returns to the menu from the licence screen', async () => {
+  it('returns to the About category from the licence screen', async () => {
     const tree = await render();
+    await enterAbout(tree);
     await press(tree, 'settings-licenses');
     expect(
       tree.root.findAllByProps({ testID: 'settings-licenses-body' }).length,
@@ -121,7 +133,7 @@ describe('Settings → ABOUT', () => {
       tree.root.findAllByProps({ testID: 'settings-licenses-body' }),
     ).toHaveLength(0);
     expect(
-      tree.root.findAllByProps({ testID: 'settings-privacy' }).length,
+      tree.root.findAllByProps({ testID: 'settings-licenses' }).length,
     ).toBeGreaterThan(0);
   });
 
@@ -131,6 +143,7 @@ describe('Settings → ABOUT', () => {
     // read a licence helps nobody.
     openURL.mockRejectedValueOnce(new Error('no handler'));
     const tree = await render();
+    await enterAbout(tree);
 
     await expect(press(tree, 'settings-privacy')).resolves.toBeUndefined();
     expect(

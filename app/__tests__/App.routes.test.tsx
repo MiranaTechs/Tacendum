@@ -136,6 +136,16 @@ describe('origins: Back returns to the surface a person actually came from', () 
     expect(backDestination({ name: 'settings' })).toEqual({ name: 'profile' });
   });
 
+  test('Account pages return to their Settings category and email verification returns to Username', () => {
+    expect(backDestination({ name: 'accountUsername', from: 'profile' })).toEqual({
+      name: 'settings', from: 'profile', section: 'account',
+    });
+    // The old router skipped the form the person was trying to complete.
+    expect(backDestination({ name: 'accountEmail', from: 'profile', via: 'username' })).toEqual({
+      name: 'accountUsername', from: 'profile',
+    });
+  });
+
   test('the link-offer confirm pops to the home surface it arrived over', () => {
     expect(backDestination({ name: 'linkConfirm', from: 'calls' })).toEqual({
       name: 'calls',
@@ -146,29 +156,24 @@ describe('origins: Back returns to the surface a person actually came from', () 
     expect(backDestination({ name: 'linkConfirm' })).toEqual({ name: 'chats' });
   });
 
-  test('the Settings origin rides THROUGH its sub-screens, so the second Back agrees with the first', () => {
-    // The path the fix was one level too shallow for: chat list -> App Lock
-    // nudge -> Settings -> Linked devices -> Back -> Settings -> Back. While
-    // the sub-screens popped to a bare `{ name: 'settings' }`, that second
-    // Back dropped the person on a Profile screen they never asked for --
-    // the exact sentence the settings case exists to prevent, one level
-    // down, and inconsistent within a single session rather than uniformly
-    // wrong.
+  test('Account returns through Settings home and preserves where Settings was opened', () => {
     const devices = backDestination({ name: 'linkedDevices', from: 'chats' });
-    expect(devices).toEqual({ name: 'settings', from: 'chats' });
-    expect(backDestination(devices!)).toEqual({ name: 'chats' });
+    expect(devices).toEqual({ name: 'settings', from: 'chats', section: 'account' });
+    const settingsHome = backDestination(devices!);
+    expect(settingsHome).toEqual({ name: 'settings', from: 'chats' });
+    expect(backDestination(settingsHome!)).toEqual({ name: 'chats' });
 
-    // Reached the ordinary way, the same two hops land on Profile.
+    // The Account category and Settings home unwind before Profile.
     const viaProfile = backDestination({
       name: 'linkedDevices',
       from: 'profile',
     });
-    expect(viaProfile).toEqual({ name: 'settings', from: 'profile' });
-    expect(backDestination(viaProfile!)).toEqual({ name: 'profile' });
+    expect(viaProfile).toEqual({ name: 'settings', from: 'profile', section: 'account' });
+    expect(backDestination(backDestination(viaProfile!)!)).toEqual({ name: 'profile' });
 
-    // Unmarked behaves exactly as it shipped: Settings, then Profile.
+    // An unmarked account page still returns to the Account category.
     expect(backDestination({ name: 'linkedDevices' })).toEqual({
-      name: 'settings',
+      name: 'settings', section: 'account',
     });
   });
 
@@ -184,7 +189,7 @@ describe('origins: Back returns to the surface a person actually came from', () 
     for (const name of subScreens) {
       expect([name, backDestination({ name, from: 'chats' })]).toEqual([
         name,
-        { name: 'settings', from: 'chats' },
+        { name: 'settings', from: 'chats', section: 'account' },
       ]);
     }
     // Linking a device sits one deeper again: it pops to the roster, and the

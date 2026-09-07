@@ -106,6 +106,19 @@ RCT_EXPORT_MODULE()
 
 #pragma mark - lifecycle
 
+- (void)setAccountOwner:(NSString *)userId
+                 resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject
+{
+  [[CallKitCenter shared] setAccountOwnerWithUserId:userId completion:^(NSError *error) {
+    if (error != nil) {
+      reject(@"account_owner_failed", @"could not change native call account", error);
+    } else {
+      resolve(nil);
+    }
+  }];
+}
+
 - (void)configure:(NSString *)iceServersJson
         relayOnly:(BOOL)relayOnly
           resolve:(RCTPromiseResolveBlock)resolve

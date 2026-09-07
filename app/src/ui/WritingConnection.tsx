@@ -40,6 +40,8 @@ export interface WritingConnectionProps {
   onChanged?: () => void;
   /** Settings has a local Done action; an enclosing assistant already has Close. */
   showDone?: boolean;
+  /** An enclosing Settings screen already supplies the visible page heading. */
+  showHeading?: boolean;
 }
 
 type Mutation = 'save' | 'select' | 'remove' | 'external';
@@ -63,6 +65,7 @@ export function WritingConnection({
   onDone,
   onChanged,
   showDone = true,
+  showHeading = true,
 }: WritingConnectionProps) {
   const t = useTheme();
   const mountedRef = useRef(true);
@@ -74,8 +77,6 @@ export function WritingConnection({
   const [connections, setConnections] =
     useState<AiWritingConnectionState | null>(null);
   const [mode, setMode] = useState<AiWritingMode>('external');
-  const [externalProvider, setExternalProvider] =
-    useState<AiWritingExternalProvider>('chatgpt');
   const [provider, setProvider] = useState<AiWritingProvider>('openai');
   const [key, setKey] = useState('');
   const [showKeyEntry, setShowKeyEntry] = useState(true);
@@ -108,7 +109,6 @@ export function WritingConnection({
       }
       setConnections(result.state);
       setMode(result.state.mode);
-      setExternalProvider(result.state.externalProvider);
       const initial = result.state.selected ?? 'openai';
       setProvider(initial);
       setShowKeyEntry(!result.state.providers[initial].configured);
@@ -180,8 +180,8 @@ export function WritingConnection({
           mutation === 'save'
             ? await saveWritingConnection(target, trimmedKey)
             : mutation === 'select'
-            ? await selectWritingProvider(target)
-            : await removeWritingConnection(target);
+              ? await selectWritingProvider(target)
+              : await removeWritingConnection(target);
         if (mutationOwnerRef.current === owner) mutationOwnerRef.current = null;
         if (!mountedRef.current || generationRef.current !== owner) return;
         setBusy(null);
@@ -192,11 +192,10 @@ export function WritingConnection({
 
         setConnections(result.state);
         setMode('api');
-        setExternalProvider(result.state.externalProvider);
         setKey('');
         const nextProvider = result.state.providers[target].configured
           ? target
-          : result.state.selected ?? target;
+          : (result.state.selected ?? target);
         setProvider(nextProvider);
         setShowKeyEntry(!result.state.providers[nextProvider].configured);
         callbacksRef.current.onChanged?.();
@@ -229,7 +228,6 @@ export function WritingConnection({
         }
         setConnections(result.state);
         setMode('external');
-        setExternalProvider(result.state.externalProvider);
         setKey('');
         callbacksRef.current.onChanged?.();
         callbacksRef.current.onDone?.();
@@ -262,12 +260,14 @@ export function WritingConnection({
   if (!connections) {
     return (
       <View testID="writing-connection" style={styles.container}>
-        <Text
-          accessibilityRole="header"
-          style={[t.type.sectionTitle, { color: t.color.inkStrong }]}
-        >
-          Writing assistant
-        </Text>
+        {showHeading ? (
+          <Text
+            accessibilityRole="header"
+            style={[t.type.sectionTitle, { color: t.color.inkStrong }]}
+          >
+            Writing assistant
+          </Text>
+        ) : null}
         <InlineError
           message={error ?? 'Couldn’t access secure storage. Try again.'}
           testID="writing-connection-error"
@@ -297,17 +297,19 @@ export function WritingConnection({
 
   return (
     <View testID="writing-connection" style={styles.container}>
-      <Text
-        accessibilityRole="header"
-        style={[t.type.sectionTitle, { color: t.color.inkStrong }]}
-      >
-        Writing assistant
-      </Text>
+      {showHeading ? (
+        <Text
+          accessibilityRole="header"
+          style={[t.type.sectionTitle, { color: t.color.inkStrong }]}
+        >
+          Writing assistant
+        </Text>
+      ) : null}
       <View accessibilityRole="radiogroup" style={styles.modeGrid}>
         <Pressable
           testID="writing-mode-external"
           accessibilityRole="radio"
-          accessibilityLabel="Use ChatGPT or Claude"
+          accessibilityLabel="Manual copy and paste with ChatGPT or Claude"
           accessibilityState={{
             selected: mode === 'external',
             disabled: !!busy,
@@ -325,16 +327,16 @@ export function WritingConnection({
                 mode === 'external'
                   ? t.color.pineWash
                   : pressed
-                  ? t.color.paperInset
-                  : t.color.paperSheet,
+                    ? t.color.paperInset
+                    : t.color.paperSheet,
             },
           ]}
         >
           <Text style={[t.type.buttonCompact, { color: t.color.inkStrong }]}>
-            Use ChatGPT or Claude
+            Manual copy &amp; paste
           </Text>
           <Text style={[t.type.timeStatus, { color: t.color.inkMuted }]}>
-            Your app and account
+            ChatGPT or Claude website
           </Text>
         </Pressable>
         <Pressable
@@ -354,8 +356,8 @@ export function WritingConnection({
                 mode === 'api'
                   ? t.color.pineWash
                   : pressed
-                  ? t.color.paperInset
-                  : t.color.paperSheet,
+                    ? t.color.paperInset
+                    : t.color.paperSheet,
             },
           ]}
         >
@@ -377,17 +379,17 @@ export function WritingConnection({
               { color: t.color.inkBody },
             ]}
           >
-            Tacendum copies a request only when you choose an action. You switch
-            apps, use the account there, and paste the reply back for review.
-            Tacendum does not make a paid API request.
+            Signing in on the ChatGPT or Claude website does not connect either
+            account to Tacendum. Tacendum copies a request only when you choose
+            an action. You decide when to open the website and paste its reply
+            back for review. Tacendum does not make a paid API request.
           </Text>
           <Text style={[t.type.utilityLabel, { color: t.color.inkMuted }]}>
-            OPEN WITH
+            CHOOSE WEBSITE
           </Text>
           <View accessibilityRole="radiogroup" style={styles.providerGrid}>
             {AI_WRITING_EXTERNAL_PROVIDERS.map(item => {
-              const selected = externalProvider === item;
-              const inUse =
+              const selected =
                 connections.mode === 'external' &&
                 connections.externalProvider === item;
               const label = AI_WRITING_EXTERNAL_PROVIDER_LABELS[item];
@@ -396,7 +398,9 @@ export function WritingConnection({
                   key={item}
                   testID={'writing-external-' + item}
                   accessibilityRole="radio"
-                  accessibilityLabel={label + (inUse ? ', in use' : '')}
+                  accessibilityLabel={`${label}, ${
+                    selected ? 'selected' : 'choose'
+                  }`}
                   accessibilityState={{ selected, disabled: !!busy }}
                   disabled={!!busy}
                   onPress={() => void chooseExternalProvider(item)}
@@ -405,22 +409,17 @@ export function WritingConnection({
                     {
                       minHeight: t.layout.touchTarget,
                       borderRadius: t.radius.button,
-                      borderColor: selected
-                        ? t.color.pine
-                        : t.color.lineSoft,
+                      borderColor: selected ? t.color.pine : t.color.lineSoft,
                       backgroundColor: selected
                         ? t.color.pineWash
                         : pressed
-                        ? t.color.paperInset
-                        : t.color.paperSheet,
+                          ? t.color.paperInset
+                          : t.color.paperSheet,
                     },
                   ]}
                 >
                   <Text
-                    style={[
-                      t.type.buttonCompact,
-                      { color: t.color.inkStrong },
-                    ]}
+                    style={[t.type.buttonCompact, { color: t.color.inkStrong }]}
                   >
                     {label}
                   </Text>
@@ -429,9 +428,9 @@ export function WritingConnection({
                   >
                     {busy?.mutation === 'external' && busy.provider === item
                       ? 'Saving…'
-                      : inUse
-                      ? 'In use'
-                      : 'Use this app'}
+                      : selected
+                        ? 'Selected'
+                        : 'Choose'}
                   </Text>
                 </Pressable>
               );
@@ -440,150 +439,153 @@ export function WritingConnection({
         </View>
       ) : (
         <View style={styles.section}>
-      <Text
-        style={[
-          t.type.compactBody,
-          styles.explainer,
-          { color: t.color.inkBody },
-        ]}
-      >
-        Your draft goes directly to OpenAI or Claude from Tacendum. Your API key
-        is stored securely on this device. API billing is separate from ChatGPT
-        and Claude subscriptions.
-      </Text>
-
-      <View accessibilityRole="radiogroup" style={styles.providerGrid}>
-        {AI_WRITING_PROVIDERS.map(item => {
-          const configured = connections.providers[item].configured;
-          const inUse =
-            connections.mode === 'api' && connections.selected === item;
-          const label = AI_WRITING_PROVIDER_LABELS[item];
-          const selected = provider === item;
-          return (
-            <Pressable
-              key={item}
-              testID={`writing-provider-${item}`}
-              accessibilityRole="radio"
-              accessibilityLabel={`${label}, ${
-                configured ? 'Saved' : 'Not saved'
-              }${inUse ? ', in use' : ''}`}
-              accessibilityState={{ selected, disabled: !!busy }}
-              disabled={!!busy}
-              onPress={() => chooseProvider(item)}
-              style={({ pressed }) => [
-                styles.provider,
-                {
-                  minHeight: t.layout.touchTarget,
-                  borderRadius: t.radius.button,
-                  borderColor: selected ? t.color.pine : t.color.lineSoft,
-                  backgroundColor: selected
-                    ? t.color.pineWash
-                    : pressed
-                    ? t.color.paperInset
-                    : t.color.paperSheet,
-                },
-              ]}
-            >
-              <Text
-                style={[t.type.buttonCompact, { color: t.color.inkStrong }]}
-              >
-                {label}
-              </Text>
-              <Text style={[t.type.timeStatus, { color: t.color.inkMuted }]}>
-                {configured ? 'Saved' : 'Not saved'}
-                {inUse ? ' · In use' : ''}
-              </Text>
-            </Pressable>
-          );
-        })}
-      </View>
-
-      {selectedConfigured && !showKeyEntry ? (
-        <View style={styles.savedActions}>
-          {connections.mode !== 'api' || connections.selected !== provider ? (
-            <OutlineButton
-              size="compact"
-              label={`Use ${selectedLabel}`}
-              testID={`writing-use-${provider}`}
-              disabled={!!busy}
-              onPress={() => void runMutation('select', provider)}
-            />
-          ) : null}
-          <TextAction
-            label="Replace key"
-            testID="writing-replace-key"
-            disabled={!!busy}
-            onPress={() => {
-              generationRef.current += 1;
-              setKey('');
-              setError(null);
-              setShowKeyEntry(true);
-            }}
-          />
-          <TextAction
-            label={`Remove ${selectedLabel} key`}
-            testID={`writing-remove-${provider}`}
-            tone="danger"
-            disabled={!!busy}
-            onPress={() => void runMutation('remove', provider)}
-          />
-        </View>
-      ) : (
-        <View style={styles.keyArea}>
-          <Text style={[t.type.utilityLabel, { color: t.color.inkMuted }]}>
-            {selectedLabel.toUpperCase()} API KEY
-          </Text>
-          <TextInput
-            testID="writing-key-input"
-            value={key}
-            onChangeText={next => {
-              setKey(next);
-              setError(null);
-            }}
-            placeholder="Paste API key"
-            placeholderTextColor={t.color.inkMuted}
-            keyboardAppearance={t.scheme}
-            selectionColor={t.color.pine}
-            accessibilityLabel={`${selectedLabel} API key`}
-            secureTextEntry
-            autoCapitalize="none"
-            autoCorrect={false}
-            importantForAutofill="no"
-            editable={!busy}
+          <Text
             style={[
-              styles.input,
-              t.type.input,
-              {
-                minHeight: t.layout.buttonHeight,
-                borderRadius: t.radius.button,
-                borderColor: t.color.lineStrong,
-                backgroundColor: t.color.paperSheet,
-                color: t.color.inkStrong,
-              },
+              t.type.compactBody,
+              styles.explainer,
+              { color: t.color.inkBody },
             ]}
-          />
-          <PrimaryButton
-            label={`Save ${selectedLabel} key`}
-            busy={busy?.mutation === 'save' && busy.provider === provider}
-            busyLabel="Saving key…"
-            disabled={key.trim().length === 0 || !!busy}
-            testID="writing-key-save"
-            onPress={() => void runMutation('save', provider)}
-          />
-          {selectedConfigured ? (
-            <TextAction
-              label="Cancel replacement"
-              disabled={!!busy}
-              onPress={() => {
-                generationRef.current += 1;
-                setKey('');
-                setError(null);
-                setShowKeyEntry(false);
-              }}
-            />
-          ) : null}
-        </View>
-      )}
+          >
+            Your draft goes directly to OpenAI or Claude from Tacendum. Your API
+            key is stored securely on this device. API billing is separate from
+            ChatGPT and Claude subscriptions.
+          </Text>
+
+          <View accessibilityRole="radiogroup" style={styles.providerGrid}>
+            {AI_WRITING_PROVIDERS.map(item => {
+              const configured = connections.providers[item].configured;
+              const inUse =
+                connections.mode === 'api' && connections.selected === item;
+              const label = AI_WRITING_PROVIDER_LABELS[item];
+              const selected = provider === item;
+              return (
+                <Pressable
+                  key={item}
+                  testID={`writing-provider-${item}`}
+                  accessibilityRole="radio"
+                  accessibilityLabel={`${label}, ${
+                    configured ? 'Saved' : 'Not saved'
+                  }${inUse ? ', in use' : ''}`}
+                  accessibilityState={{ selected, disabled: !!busy }}
+                  disabled={!!busy}
+                  onPress={() => chooseProvider(item)}
+                  style={({ pressed }) => [
+                    styles.provider,
+                    {
+                      minHeight: t.layout.touchTarget,
+                      borderRadius: t.radius.button,
+                      borderColor: selected ? t.color.pine : t.color.lineSoft,
+                      backgroundColor: selected
+                        ? t.color.pineWash
+                        : pressed
+                          ? t.color.paperInset
+                          : t.color.paperSheet,
+                    },
+                  ]}
+                >
+                  <Text
+                    style={[t.type.buttonCompact, { color: t.color.inkStrong }]}
+                  >
+                    {label}
+                  </Text>
+                  <Text
+                    style={[t.type.timeStatus, { color: t.color.inkMuted }]}
+                  >
+                    {configured ? 'Saved' : 'Not saved'}
+                    {inUse ? ' · In use' : ''}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+
+          {selectedConfigured && !showKeyEntry ? (
+            <View style={styles.savedActions}>
+              {connections.mode !== 'api' ||
+              connections.selected !== provider ? (
+                <OutlineButton
+                  size="compact"
+                  label={`Use ${selectedLabel}`}
+                  testID={`writing-use-${provider}`}
+                  disabled={!!busy}
+                  onPress={() => void runMutation('select', provider)}
+                />
+              ) : null}
+              <TextAction
+                label="Replace key"
+                testID="writing-replace-key"
+                disabled={!!busy}
+                onPress={() => {
+                  generationRef.current += 1;
+                  setKey('');
+                  setError(null);
+                  setShowKeyEntry(true);
+                }}
+              />
+              <TextAction
+                label={`Remove ${selectedLabel} key`}
+                testID={`writing-remove-${provider}`}
+                tone="danger"
+                disabled={!!busy}
+                onPress={() => void runMutation('remove', provider)}
+              />
+            </View>
+          ) : (
+            <View style={styles.keyArea}>
+              <Text style={[t.type.utilityLabel, { color: t.color.inkMuted }]}>
+                {selectedLabel.toUpperCase()} API KEY
+              </Text>
+              <TextInput
+                testID="writing-key-input"
+                value={key}
+                onChangeText={next => {
+                  setKey(next);
+                  setError(null);
+                }}
+                placeholder="Paste API key"
+                placeholderTextColor={t.color.inkMuted}
+                keyboardAppearance={t.scheme}
+                selectionColor={t.color.pine}
+                accessibilityLabel={`${selectedLabel} API key`}
+                secureTextEntry
+                autoCapitalize="none"
+                autoCorrect={false}
+                importantForAutofill="no"
+                editable={!busy}
+                style={[
+                  styles.input,
+                  t.type.input,
+                  {
+                    minHeight: t.layout.buttonHeight,
+                    borderRadius: t.radius.button,
+                    borderColor: t.color.lineStrong,
+                    backgroundColor: t.color.paperSheet,
+                    color: t.color.inkStrong,
+                  },
+                ]}
+              />
+              <PrimaryButton
+                label={`Save ${selectedLabel} key`}
+                busy={busy?.mutation === 'save' && busy.provider === provider}
+                busyLabel="Saving key…"
+                disabled={key.trim().length === 0 || !!busy}
+                testID="writing-key-save"
+                onPress={() => void runMutation('save', provider)}
+              />
+              {selectedConfigured ? (
+                <TextAction
+                  label="Cancel replacement"
+                  disabled={!!busy}
+                  onPress={() => {
+                    generationRef.current += 1;
+                    setKey('');
+                    setError(null);
+                    setShowKeyEntry(false);
+                  }}
+                />
+              ) : null}
+            </View>
+          )}
         </View>
       )}
 

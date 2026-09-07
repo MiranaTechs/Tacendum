@@ -69,6 +69,7 @@ afterEach(async () => {
 test('the difference between the address shown and the address opened is disclosed, not discovered', async () => {
   await render();
   expect(rendered()).not.toContain(CLAIM_SEEN);
+  await press('settings-category-privacy');
   await press('settings-links-info');
   const open = rendered();
   expect(open).toContain('tracking tags off a link before it opens');

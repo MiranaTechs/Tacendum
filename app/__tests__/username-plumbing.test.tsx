@@ -341,13 +341,13 @@ describe('the copy gate (honesty, display posture, refusal render)', () => {
   const deck = JSON.stringify(ACCOUNTS_USERNAME_COPY);
 
   it('ships the three honesty sentences verbatim, behind the info affordance', () => {
-    expect(ACCOUNTS_USERNAME_COPY.infoLines[0]).toBe(
+    expect(ACCOUNTS_USERNAME_COPY.infoLines).toContain(
       'A username is public by nature — an email address or phone number is private information; a username is not. We store only a scrambled form of your username, never the name itself, so a leak of our records alone does not reveal it.',
     );
-    expect(ACCOUNTS_USERNAME_COPY.infoLines[1]).toBe(
+    expect(ACCOUNTS_USERNAME_COPY.infoLines).toContain(
       'Usernames are short and guessable, so the real protections are limits, not scrambling: every search and every claim attempt is strictly limited and monitored, no one using the app can find your account by name unless you allow it, and you can change or remove your name at any time.',
     );
-    expect(ACCOUNTS_USERNAME_COPY.infoLines[2]).toBe('Treat your username as public information.');
+    expect(ACCOUNTS_USERNAME_COPY.infoLines).toContain('Treat your username as public information.');
   });
 
   it('nothing near the class claims the server is blind to the name — deck values AND both source files', () => {
