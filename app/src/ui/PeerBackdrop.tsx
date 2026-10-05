@@ -18,12 +18,13 @@ import { useTheme } from '../theme';
  * over LIVE video with nothing between them, and theme.ts rules scrims out of
  * the product outright.
  *
- * With NO photo, the fill is `CallTile`'s treatment inflated to the surface:
- * the pine wash the app puts behind every photo-less person on the media
- * surface, carrying the chat's monogram — via `tileName`, so a "name" that is
- * really `personName`'s id fallback letters as `?`, never as id characters
- * (rule 2 of the group tiles, kept here for the same reason). Either way the
- * surface is never bare black.
+ * With NO photo, the fill is mediaWash behind every photo-less person on a
+ * video surface, carrying the chat's monogram — via `tileName`, so a "name"
+ * that is really `personName`'s id fallback letters as `?`, never as id
+ * characters (rule 2 of the group tiles, kept here for the same reason).
+ * Either way the surface is never bare black. This is a VIDEO surface's
+ * fill only: a voice call is an app screen and draws the person with the
+ * app's own face instead.
  *
  * Pointer-transparent and hidden from accessibility: the Pressable it sits
  * inside already announces whose video this is, and the tap on that surface
@@ -82,8 +83,8 @@ export function PeerBackdrop({
 function makeStyles(theme: ReturnType<typeof useTheme>) {
   return StyleSheet.create({
     /** The person at SURFACE size. The wrapper carries the no-photo ground —
-     * pineWash, the CallTile disc inflated to the whole surface — so no state
-     * of the backdrop leaves bare black behind it. Edge-pinned to its
+     * mediaWash behind every photo-less person on a video surface — so no
+     * state of the backdrop leaves bare black behind it. Edge-pinned to its
      * surface, full screen or 110pt corner alike. */
     backdrop: {
       position: 'absolute',
@@ -91,7 +92,7 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       left: 0,
       right: 0,
       bottom: 0,
-      backgroundColor: theme.color.pineWash,
+      backgroundColor: theme.color.mediaWash,
       alignItems: 'center',
       justifyContent: 'center',
     },

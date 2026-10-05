@@ -10,9 +10,12 @@
  *
  *  2. "Where is find-by-username?": the Start a chat door said "Find by
  *     email", the room it opens defaulted to the Email chip, and the held
- *     name never said how anyone reaches it. Under the pin the door names
+ *     name never said how anyone reaches it. Under the pin the door named
  *     both classes, a bare handle typed with no chip chosen runs the
  *     username lookup with the chip lit, and the held state names the door.
+ *     Build 33 replaced the door with Start a chat's one smart field: under
+ *     the pin its placeholder and ⓘ name both classes; pin OFF they name
+ *     neither.
  *
  * Pin OFF stays byte-identical on every surface touched here.
  */
@@ -271,7 +274,9 @@ describe('the held state says HOW others reach the name', () => {
     const findable = await render(<AccountUsernameScreen onBack={jest.fn()} />);
     expect(has(findable, 'account-username-how-found')).toBe(true);
     expect(rendered(findable)).toContain(ACCOUNTS_USERNAME_COPY.howFound);
-    expect(rendered(findable)).toContain('Find by email or username');
+    // Reworded for build 33: the door is gone, the field itself finds names.
+    expect(ACCOUNTS_USERNAME_COPY.howFound).toContain('open a room');
+    expect(ACCOUNTS_USERNAME_COPY.howFound).not.toContain('→');
     findable.unmount();
     jest.restoreAllMocks();
     jest.spyOn(Date, 'now').mockReturnValue(NOW_MS);
@@ -283,9 +288,12 @@ describe('the held state says HOW others reach the name', () => {
   });
 });
 
-/* ── 4. the Start a chat door ───────────────────────────────────────── */
+/* ── 4. the Start a chat field ──────────────────────────────────────── */
 
-describe('the Start a chat door names the class the room offers', () => {
+// Rewritten for build 33: the "Find by email or username" door is replaced
+// by the smart field. Its words come from the deck under the pin, and the
+// pin-OFF byte guarantee is kept with a positive control.
+describe('the Start a chat field names the classes this binary can find', () => {
   const PROFILE: db.ProfileRow = {
     userId: '01KYDBSSDJSPC9J0E5N2AWMJ5Y',
     registrationId: 7,
@@ -295,28 +303,59 @@ describe('the Start a chat door names the class the room offers', () => {
     profileVersion: 0,
   };
   const screen = () => (
-    <StartChatScreen profile={PROFILE} onBack={jest.fn()} onOpenChat={jest.fn()} onFindByEmail={jest.fn()} />
+    <StartChatScreen
+      profile={PROFILE}
+      onBack={jest.fn()}
+      onOpenChat={jest.fn()}
+      onOpenAccountEmail={jest.fn()}
+    />
   );
+  const field = (tree: ReactTestRenderer.ReactTestRenderer) =>
+    tree.root
+      .findAllByProps({ testID: 'new-peer-input' })
+      .find(n => n.props.onChangeText !== undefined)!;
 
-  it('pin ON: the row, its helper and the no-directory sentence come from the deck; the door and its wiring are unchanged', async () => {
+  it('pin ON: the placeholder and the field’s name come from the deck; the ⓘ names both classes; there is no door', async () => {
     const tree = await render(screen());
+    expect(field(tree).props.placeholder).toBe('Paste their ID, username or email');
+    expect(field(tree).props.placeholder).toBe(ACCOUNTS_USERNAME_COPY.startChatFieldPlaceholder);
+    expect(field(tree).props.accessibilityLabel).toBe(ACCOUNTS_USERNAME_COPY.startChatFieldLabel);
+    expect(has(tree, 'find-by-email')).toBe(false);
+
+    await press(tree, 'start-chat-info');
     const text = rendered(tree);
-    expect(text).toContain(ACCOUNTS_USERNAME_COPY.startChatFind);
-    expect(text).toContain(ACCOUNTS_USERNAME_COPY.startChatFindHelper);
     expect(text).toContain(ACCOUNTS_USERNAME_COPY.startChatNoDirectory);
+    expect(text).toContain(ACCOUNTS_USERNAME_COPY.startChatFindScope);
     expect(text).toContain('no public directory');
-    expect(text.includes('"Find by email"')).toBe(false);
-    const door = tree.root.findAllByProps({ testID: 'find-by-email' }).find(n => n.props.onPress !== undefined)!;
-    expect(door.props.accessibilityLabel).toBe(ACCOUNTS_USERNAME_COPY.startChatFind);
     tree.unmount();
   });
 
-  it('pin OFF: the landed sentences, and no username wording anywhere on the glass', async () => {
+  it('pin OFF: the email-only sentences, and no username wording anywhere — the ⓘ open, after typing and blurring, and after the go key', async () => {
     mockUsernameUiEnabled = false;
     const tree = await render(screen());
-    const text = rendered(tree);
-    expect(text).toContain('Find by email');
-    expect(text).toContain('Works only for someone who verified an email and turned findability on.');
+    expect(field(tree).props.placeholder).toBe('Paste their ID or email');
+
+    await press(tree, 'start-chat-info');
+    let text = rendered(tree);
+    expect(text).toContain('Tacendum has no public directory. A room starts with a Tacendum ID one person hands the other — or with the email of someone who chose to be found.');
+    expect(text).toContain('An email finds only someone who verified it and chose to be found. Searches are limited each day.');
+    expect(text.toLowerCase().includes('username')).toBe(false);
+
+    await type(tree, 'new-peer-input', 'alice_7');
+    await ReactTestRenderer.act(async () => {
+      field(tree).props.onBlur();
+    });
+    text = rendered(tree);
+    // The positive control: the pin-OFF hint IS on screen, so the absence
+    // below is about a sentence that rendered, not one that never did.
+    expect(text).toContain('Not an ID or email yet');
+    expect(text.toLowerCase().includes('username')).toBe(false);
+
+    await ReactTestRenderer.act(async () => {
+      field(tree).props.onSubmitEditing();
+    });
+    text = rendered(tree);
+    expect(text).toContain('That isn’t an ID or an email. Check what they sent you.');
     expect(text.toLowerCase().includes('username')).toBe(false);
     tree.unmount();
   });
@@ -347,7 +386,7 @@ describe('the find flow: a bare handle typed with no chip chosen runs the userna
     expect(chipSelected(tree, 'discovery-class-email')).toBe(false);
     const text = rendered(tree);
     expect(text).toContain(ACCOUNTS_USERNAME_COPY.findTitle);
-    expect(text).toContain('Start a chat with Alice_7?');
+    expect(text).toContain('Open a room with Alice_7?');
     expect(text).toContain(ACCOUNTS_USERNAME_COPY.findTofu);
     // Still no chip tapped: an email-shaped edit moves it back.
     await type(tree, 'discovery-input', 'bob@example.com');

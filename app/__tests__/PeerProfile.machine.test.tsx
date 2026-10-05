@@ -16,7 +16,7 @@
 
 import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
-import { Text } from 'react-native';
+import { StyleSheet, Text } from 'react-native';
 import * as db from '../src/db';
 import {
   AI_DISCLOSURE_SENTENCE,
@@ -24,6 +24,7 @@ import {
   machineFailureCopy,
 } from '../src/machine';
 import { PeerProfileScreen } from '../src/screens/PeerProfileScreen';
+import { themeTokens } from '../src/theme';
 
 jest.mock('../src/api', () => {
   const actual = jest.requireActual('../src/api');
@@ -134,6 +135,10 @@ describe('the machine section, server-answered', () => {
     await press(tree, 'peer-machine-adopt-confirm');
     expect(adoptMock).toHaveBeenCalledWith('tok-owner', PEER);
     expect(textOf(tree, 'peer-machine-ok')).toBe(MACHINE.adopted);
+    // A confirmation is charcoal text; forest marks an action.
+    expect(StyleSheet.flatten(byId(tree, 'peer-machine-ok').props.style).color).toBe(
+      themeTokens().color.inkBody,
+    );
   });
 
   it('cancel is a real exit: no call, no note', async () => {

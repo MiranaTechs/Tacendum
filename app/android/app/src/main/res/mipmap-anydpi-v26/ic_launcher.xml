@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The adaptive launcher icon (every supported device: minSdk is 26). A
+     white background layer, the mark in forest as the foreground, and a
+     monochrome layer the launcher tints for themed icons (Android 13+).
+     The mipmap PNGs beside this directory are fallbacks rendered from
+     the same square and round icon art. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background"/>
+    <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+    <monochrome android:drawable="@drawable/ic_launcher_monochrome"/>
+</adaptive-icon>

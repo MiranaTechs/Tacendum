@@ -2,13 +2,16 @@ import React, { createContext, useContext } from 'react';
 import { Platform, StyleSheet, type TextStyle } from 'react-native';
 
 /**
- * Tacendum design tokens (the security-paper direction).
+ * Tacendum design tokens (palette v2: forest / white / charcoal).
  *
- * The app is one cool porcelain ground with a faint green cast — the field of
- * a banknote or a passport page — printed in one deep pine ink. Depth is
- * expressed with surface color, outlines, and shared seams — there are no
- * shadows, gradients, or blurs. Live-call controls use a translucent media
- * backing to stay legible over video.
+ * Every surface is pure white; one forest, #0E6B45, is the brand and the
+ * action colour and appears only at full strength; charcoal and gray, never
+ * green-cast, carry text, lines and secondary icons. Depth on white is the
+ * hairline, never a fill: white surfaces are separated by lineSoft /
+ * lineStrong seams; paperInset is the one gray fill, for pressed, off and
+ * disabled. The token names are historical: paper* means surface, pine*
+ * means forest, and pineWash, pineWashFaint and dangerWash are the one
+ * neutral highlight.
  */
 
 /** Monospace utility face: brand marks, ids, times, state, safety numbers. */
@@ -21,34 +24,42 @@ export const mono = Platform.select({
 export const hairline = StyleSheet.hairlineWidth;
 
 const color = {
-  /** Every screen background. */
-  paperGround: '#EFF2EB',
-  /** Attached panels, drawers, safety surfaces. */
-  paperLayer: '#E4E9E0',
-  /** Pressed, disabled, recessed. */
-  paperInset: '#D8DFD3',
-  /** Raised: inputs, incoming bubbles, composer, rows. */
-  paperSheet: '#FAFCF7',
+  /** Every screen; bars sit on it with a seam. */
+  paperGround: '#FFFFFF',
+  /** Attached panels, trays, sheets, notices (edged by a hairline or rule). */
+  paperLayer: '#FFFFFF',
+  /** The one gray fill: pressed, disabled, switch-off, tracks. */
+  paperInset: '#E4E4E4',
+  /** Fields, composer pill, chips, cards, keys, incoming bubbles, QR zone. */
+  paperSheet: '#FFFFFF',
 
-  /** Titles, names, primary values. */
-  inkStrong: '#121A15',
-  /** Body and message text. */
-  inkBody: '#313B34',
-  /** Secondary text (dark enough to hold 4.5:1 on inset). */
-  inkMuted: '#525D55',
+  /** Titles, names, message text, QR modules, primary glyphs. */
+  inkStrong: '#181818',
+  /** Body text and author labels (monograms are MONOGRAM_FACE in ui/Avatar.tsx: white on forest). */
+  inkBody: '#404040',
+  /** Secondary text, placeholders, secondary glyphs (4.5:1 even on inset). */
+  inkMuted: '#606060',
 
-  /** Primary action, links, outgoing bubbles. */
+  /** Forest: the brand and every action, at full strength only. */
   pine: '#0E6B45',
   pinePressed: '#0A5738',
-  pineWash: 'rgba(14,107,69,0.10)',
-  pineWashFaint: 'rgba(14,107,69,0.05)',
-  pineLine: 'rgba(14,107,69,0.32)',
+  /** The one neutral highlight (historical name): press, selection, @you. */
+  pineWash: 'rgba(24,24,24,0.05)',
+  /** The same highlight; a historical alias, so add no new uses. */
+  pineWashFaint: 'rgba(24,24,24,0.05)',
+  /** The forest outline: selection, outlined actions, brand strokes. */
+  pineLine: '#0E6B45',
 
-  lineSoft: 'rgba(18,26,21,0.14)',
-  lineStrong: 'rgba(18,26,21,0.28)',
+  /** Dividers, seams, card and chip borders, the incoming bubble's edge. */
+  lineSoft: 'rgba(24,24,24,0.16)',
+  /** Drawer borders, the pressed bubble border, a photo avatar's ring. */
+  lineStrong: 'rgba(24,24,24,0.30)',
+  /** Text-field and composer-pill rest border (3:1 on white). */
+  lineField: 'rgba(24,24,24,0.55)',
 
   danger: '#A82E24',
-  dangerWash: 'rgba(168,46,36,0.08)',
+  /** The same neutral highlight, on a pressed destructive control. */
+  dangerWash: 'rgba(24,24,24,0.05)',
   /**
    * Pending and attention states (connecting, unchecked safety number) in the
    * slate of a security thread — attention without alarm, and never brown.
@@ -56,86 +67,107 @@ const color = {
    */
   warningMark: '#5A7A94',
   warningInk: '#41586B',
+  /** Delivered tick off the bubble (jumbo, photo rows); read is pine. */
+  tickMuted: '#8C8C8C',
 
-  /** Text and glyphs on a pine fill. */
-  onPine: '#FAFCF7',
+  /** Text and glyphs on a pine or danger fill. */
+  onPine: '#FFFFFF',
 
   /**
-   * Message bubbles, as their own axis: in light your voice is a pine slab
-   * with pale words; in dark the slab goes quiet and the WORDS carry the
-   * green (the site's relay view), so the two modes may not share pine's
-   * mapping. Everything inside an outgoing bubble inks with onBubbleOut.
+   * Message bubbles, as their own axis, with one mapping in both modes: your
+   * words are the forest slab with white words. Inside an outgoing bubble
+   * onBubbleOut carries the words and the read tick, onBubbleOutMuted the
+   * secondary lines and onBubbleOutTick the sent and delivered ticks, both
+   * pure gray. Off the bubble (jumbo emoji, photo rows) the delivered tick
+   * is tickMuted, apart from the pine read tick by luminance, not hue.
    */
   bubbleOut: '#0E6B45',
   bubbleOutPressed: '#0A5738',
-  onBubbleOut: '#FAFCF7',
+  onBubbleOut: '#FFFFFF',
+  /** Secondary lines, edited mark and quote text in an outgoing bubble. */
+  onBubbleOutMuted: '#DCDCDC',
+  /** Sent and delivered ticks in an outgoing bubble; read is onBubbleOut. */
+  onBubbleOutTick: '#B6B6B6',
   bubbleOutLine: '#0E6B45',
   bubbleOutLinePressed: '#0A5738',
 
-  /** Photo viewer only. This is not a dark mode. */
-  mediaBlack: '#060807',
-  // Photo-viewer surface only. Derived neutrals of the existing family; this
-  // is not a dark mode.
-  mediaInk: '#FAFCF7',
-  mediaInkMuted: '#95A098',
-  mediaLine: 'rgba(250,252,247,0.18)',
+  /**
+   * Media: neutral and mode-invariant, for the surfaces that carry or await
+   * video (the photo viewer, a video call, the minimized video window),
+   * because video is dark. A voice call is an app screen and uses this
+   * palette. This is not a dark mode.
+   */
+  mediaBlack: '#000000',
+  mediaInk: '#FFFFFF',
+  mediaInkMuted: '#A3A3A3',
+  mediaLine: 'rgba(255,255,255,0.18)',
   /** Call controls over live video, including an entirely white frame. */
-  mediaHud: 'rgba(6,8,7,0.88)',
-  dangerOnMedia: '#E2726A',
+  mediaHud: 'rgba(0,0,0,0.88)',
+  dangerOnMedia: '#F5725E',
+  /** No-photo backdrop and pre-connect ground inside a video surface. */
+  mediaWash: 'rgba(255,255,255,0.10)',
+  /** The answer disc on every call surface, under a mediaInk label. */
+  mediaAccent: '#0E6B45',
+  /** End-call and decline discs on every call surface, mediaInk glyph. */
+  mediaDanger: '#A82E24',
 } as const;
 
-/**
- * Security paper at night — the dark option, drawn from the site's server
- * view: a near-black ground with the same green cast, phosphor green where
- * light mode uses pine, porcelain inks inverted to pale. Depth logic is
- * unchanged (raised is lighter, recessed is darker); every text pairing
- * holds 4.5:1 on the surfaces it appears on.
- */
 /** Both palettes carry exactly the same token names. */
 type ColorTokens = Record<keyof typeof color, string>;
 
+/**
+ * Charcoal: the dark option. A neutral ladder, raised is lighter and the
+ * pressed fill is the furthest from the page; forest lifted only as far as
+ * text contrast needs, found by a contrast search; every resting text
+ * pairing holds 4.5:1.
+ */
 const darkColor: ColorTokens = {
-  paperGround: '#0C0F0D',
-  paperLayer: '#151A17',
-  paperInset: '#090B0A',
-  paperSheet: '#1C221E',
+  paperGround: '#141414',
+  paperLayer: '#1C1C1C',
+  paperInset: '#2E2E2E',
+  paperSheet: '#232323',
 
-  inkStrong: '#E9EFE9',
-  inkBody: '#C6D0C7',
-  inkMuted: '#8A968C',
+  inkStrong: '#EDEDED',
+  inkBody: '#C3C3C3',
+  inkMuted: '#9A9A9A',
 
-  pine: '#35C57F',
-  pinePressed: '#2AA96A',
-  pineWash: 'rgba(53,197,127,0.15)',
-  pineWashFaint: 'rgba(53,197,127,0.08)',
-  pineLine: 'rgba(53,197,127,0.42)',
+  pine: '#57AA7F',
+  pinePressed: '#72B892',
+  pineWash: 'rgba(237,237,237,0.06)',
+  pineWashFaint: 'rgba(237,237,237,0.06)',
+  pineLine: 'rgba(87,170,127,0.65)',
 
-  lineSoft: 'rgba(233,239,233,0.13)',
-  lineStrong: 'rgba(233,239,233,0.28)',
+  lineSoft: 'rgba(237,237,237,0.13)',
+  lineStrong: 'rgba(237,237,237,0.28)',
+  lineField: 'rgba(237,237,237,0.45)',
 
-  danger: '#E0685E',
-  dangerWash: 'rgba(224,104,94,0.14)',
+  danger: '#F5725E',
+  dangerWash: 'rgba(237,237,237,0.06)',
   warningMark: '#6E89A3',
   warningInk: '#93ACC2',
+  tickMuted: '#6B6B6B',
 
-  /** Dark glyphs on a phosphor fill — the fill is the bright thing now. */
-  onPine: '#0A130D',
+  /** A charcoal label on the lifted forest fill: here the fill is bright. */
+  onPine: '#141414',
 
-  /** The relay view: a sent message is a dark slab whose WORDS are phosphor —
-   * never a highlighted bubble. A faint green-tinted fill and hairline keep
-   * direction readable beside the neutral incoming sheet. */
-  bubbleOut: '#1D2921',
-  bubbleOutPressed: '#28362C',
-  onBubbleOut: '#35C57F',
-  bubbleOutLine: 'rgba(53,197,127,0.30)',
-  bubbleOutLinePressed: 'rgba(53,197,127,0.48)',
-  /** The photo viewer is already the app's one dark surface; unchanged. */
-  mediaBlack: '#060807',
-  mediaInk: '#FAFCF7',
-  mediaInkMuted: '#95A098',
-  mediaLine: 'rgba(250,252,247,0.18)',
-  mediaHud: 'rgba(6,8,7,0.88)',
-  dangerOnMedia: '#E2726A',
+  /** Your words: the same forest slab with white words as in light. */
+  bubbleOut: '#0E6B45',
+  bubbleOutPressed: '#0A5738',
+  onBubbleOut: '#FFFFFF',
+  onBubbleOutMuted: '#DCDCDC',
+  onBubbleOutTick: '#B6B6B6',
+  bubbleOutLine: '#0E6B45',
+  bubbleOutLinePressed: '#0A5738',
+  /** Media is mode-invariant: the same values as light. */
+  mediaBlack: '#000000',
+  mediaInk: '#FFFFFF',
+  mediaInkMuted: '#A3A3A3',
+  mediaLine: 'rgba(255,255,255,0.18)',
+  mediaHud: 'rgba(0,0,0,0.88)',
+  dangerOnMedia: '#F5725E',
+  mediaWash: 'rgba(255,255,255,0.10)',
+  mediaAccent: '#0E6B45',
+  mediaDanger: '#A82E24',
 };
 
 /**

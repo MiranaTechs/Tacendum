@@ -204,7 +204,7 @@ function makeStyles(t: Theme) {
       paddingHorizontal: t.space.s3,
       borderWidth: t.hairline,
       borderRadius: t.radius.small,
-      backgroundColor: t.color.dangerWash,
+      backgroundColor: 'transparent',
     },
     stackedMark: {
       alignSelf: 'flex-start',

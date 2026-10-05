@@ -67,7 +67,6 @@ import { makeMemoryDb, makeTestDeps, type TestDeps } from './helpers.js';
  */
 
 const REQUIRE = process.env.TACENDUM_REQUIRE_DDB === '1';
-const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
 
 // Digits only (valid Crockford base32); '74' is this file's discriminator.

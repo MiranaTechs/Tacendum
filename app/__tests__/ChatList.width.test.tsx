@@ -122,7 +122,7 @@ test('the + glyph does not scale: a 93pt plus in a 56pt disc is a clip', async (
   );
   // The label is what carries the meaning at any text size — the rule every
   // other frozen glyph in this file follows.
-  expect(fab.props.accessibilityLabel).toBe('Start a chat');
+  expect(fab.props.accessibilityLabel).toBe('Open a room');
 
   const glyph = fab.findAllByProps({ allowFontScaling: false });
   expect(glyph.length).toBeGreaterThan(0);

@@ -120,11 +120,14 @@ function makeStyles(t: Theme) {
      * 0, so without this a maximal bubble would push the fixed arrow box
      * toward the edge instead of letting its own text reflow. */
     bubbleShrink: { flexShrink: 1 },
+    /** The reply arrow's disc. White on the white thread, so a hairline ring
+     * is its edge; the colour is set where it is drawn. */
     replyArrow: {
       width: 28,
       height: 28,
       marginLeft: space.s3,
       marginBottom: 1,
+      borderWidth: StyleSheet.hairlineWidth,
       alignItems: 'center',
       justifyContent: 'center',
       flexShrink: 0,
@@ -139,9 +142,9 @@ function makeStyles(t: Theme) {
       marginBottom: space.s4,
     },
     /** Secondary text at FULL alpha: the palette owns the colour (inkMuted on
-     * paper, onBubbleOut on pine) and the type role owns the emphasis. The
-     * 0.75 opacity these carried put the inbound quote at ≈3.1:1 and the edited
-     * mark at ≈3.7:1, under the 4.5:1 AA floor. */
+     * white, onBubbleOutMuted on forest) and the type role owns the emphasis.
+     * The 0.75 opacity these carried put the inbound quote at ≈3.1:1 and the
+     * edited mark at ≈3.7:1, under the 4.5:1 AA floor. */
     quoteText: {},
     /** The quoted author's name over their words. */
     quoteAuthor: { marginBottom: 0 },
@@ -318,11 +321,15 @@ function makeStyles(t: Theme) {
       alignItems: 'center',
       gap: space.s6,
     },
+    /** "Preparing photo…": a white row on the white thread, edged top and
+     * bottom by hairlines the way offlineRow is. */
     progressRow: {
       flexDirection: 'row',
       alignItems: 'center',
       gap: space.s4,
       paddingVertical: space.s4,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderBottomWidth: StyleSheet.hairlineWidth,
     },
     offlineRow: {
       flexDirection: 'row',

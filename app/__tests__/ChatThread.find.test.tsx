@@ -1,5 +1,5 @@
 /**
- * Find in this conversation.
+ * Find in this room.
  *
  * The hole this closes was the top row of the gap matrix: a messenger whose
  * whole history lives on one device, with no way to find a message in it.
@@ -356,7 +356,7 @@ test('the magnifier sits before the call glyphs and does not scale', async () =>
   const tree = await renderThread();
   const control = byId(tree, 'thread-find').find(n => n.props.onPress);
   expect(control).toBeDefined();
-  expect(control!.props.accessibilityLabel).toBe('Find in this conversation');
+  expect(control!.props.accessibilityLabel).toBe('Find in this room');
 
   // DRAWN, at a fixed size — house line art like the call glyphs beside it,
   // not a character in the mono face. `⌕` (U+2315) is absent from Roboto

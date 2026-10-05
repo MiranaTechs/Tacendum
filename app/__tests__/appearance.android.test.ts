@@ -254,11 +254,11 @@ test('a missing accessor degrades to in-memory, never a crash', async () => {
  *
  * Before the bundle runs there is no JS palette at all: the window is
  * whatever the Android theme says, and AppCompat's default is white. iOS
- * cold-launches into the porcelain ground from LaunchScreen.storyboard and
- * its LaunchGround colorset; Android had no `android:windowBackground` and
- * no `values-night/` directory existed at all, so a dark-mode launch went
- * white → light → dark. The constant above removes the second jump; these
- * resources remove the first.
+ * cold-launches into the light ground from the colour literal in
+ * LaunchScreen.storyboard (no colour asset is involved); Android had no
+ * `android:windowBackground` and no `values-night/` directory existed at
+ * all, so a dark-mode launch went white → light → dark. The constant above
+ * removes the second jump; these resources remove the first.
  *
  * Read from the shipped XML because a stylesheet is not reachable from jest
  * any other way, and compared against theme.ts so the two grounds cannot

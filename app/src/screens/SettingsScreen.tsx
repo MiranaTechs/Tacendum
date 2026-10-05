@@ -120,7 +120,7 @@ const COPY = {
     },
     {
       id: 'chats',
-      title: 'Chats & calls',
+      title: 'Rooms & calls',
       summary: 'Receipts, typing indicators and call privacy',
     },
     {
@@ -159,7 +159,7 @@ const COPY = {
   retry: 'Retry',
   enableRow: 'Turn on App Lock',
   changeRow: 'Change code',
-  resetDecoysRow: 'Rebuild decoy conversations',
+  resetDecoysRow: 'Rebuild decoy rooms',
   /** Lock now. Not destructive, so it sits above the irreversible
    * row and needs no confirmation — but it DOES end a call, and a control
    * that takes something away without saying so is the defect this deck
@@ -199,7 +199,7 @@ const COPY = {
   // only here), so a forgotten code means delete-and-reinstall, which also
   // loses this identity. The old sentence promised a door that does not
   // exist.
-  explain: `Unlock with your code and Tacendum opens your conversations. Enter the same code backwards and it opens a decoy instead — invented people, unreadable messages — while your real conversations stay sealed.\n\nThere is no way to recover a forgotten code. You would have to delete and reinstall Tacendum on this ${DEVICE_NOUN}, which also loses this identity — nobody can restore it.`,
+  explain: `Unlock with your code and Tacendum opens your rooms. Enter the same code backwards and it opens a decoy instead — invented people, unreadable messages — while your real rooms stay sealed.\n\nThere is no way to recover a forgotten code. You would have to delete and reinstall Tacendum on this ${DEVICE_NOUN}, which also loses this identity — nobody can restore it.`,
   confirmEnable: 'Turn on App Lock',
   confirmChange: 'Use this code',
   /** What the commit control says while `setupDecoy()` fabricates the whole
@@ -209,7 +209,7 @@ const COPY = {
   enabled: 'App Lock is on.',
   changed: 'Code changed.',
   disabled: 'App Lock is off.',
-  decoysRebuilt: 'Decoy conversations rebuilt.',
+  decoysRebuilt: 'Decoy rooms rebuilt.',
   cancel: 'Cancel',
   /** The way out of a step you only READ. 'Cancel' is right on the PIN
    * steps, where a person started something that can be abandoned; on the
@@ -321,7 +321,7 @@ const COPY = {
     '• SQLite — public domain\n\n' +
     'Full texts ship in the source tree.',
   receiptsLabel: 'Read receipts',
-  chatsSection: 'CHATS',
+  chatsSection: 'ROOMS',
   receiptOptions: [
     { label: 'On', value: true },
     { label: 'Off', value: false },
@@ -359,8 +359,8 @@ const COPY = {
   // me", when the truth is that nobody can.
   shotNote:
     Platform.OS === 'android'
-      ? `Screenshots and screen recordings are blocked on this ${DEVICE_NOUN}. The system refuses them, and anything that captures the screen anyway records a blank. Nothing is announced in the conversation, because there is nothing to announce — prevented, not disclosed.`
-      : `Screenshots can’t be blocked on ${DEVICE_NOUN}. When one is taken in a conversation, the conversation says so — on both sides.`,
+      ? `Screenshots and screen recordings are blocked on this ${DEVICE_NOUN}. The system refuses them, and anything that captures the screen anyway records a blank. Nothing is announced in the room, because there is nothing to announce — prevented, not disclosed.`
+      : `Screenshots can’t be blocked on ${DEVICE_NOUN}. When one is taken in a room, the room says so — on both sides.`,
   callsSection: 'CALLS',
   // "Every call", not "always relay": the switch is about what happens to
   // calls, and the word "relay" only means something to someone who has read
@@ -476,13 +476,13 @@ const COPY = {
   soundNote:
     Platform.OS === 'android'
       ? 'A short tone when a message arrives while Tacendum is open — not ' +
-        'for the conversation you are reading, and never during a call. ' +
+        'for the room you have open, and never during a call. ' +
         `Sounds for messages that arrive while Tacendum is closed follow this ${DEVICE_NOUN}’s ` +
         'notification settings for Tacendum, which this switch does not change. ' +
         'Calls ring on their own.'
       : 'A short tone when a message arrives while Tacendum is open, and the ' +
         'sound on its notifications while it is closed — not for the ' +
-        'conversation you are reading, and never during a call. Your ' +
+        'room you have open, and never during a call. Your ' +
         `${DEVICE_NOUN}’s notification settings and its silent switch decide first: ` +
         'Off here only takes a sound away. Calls ring on their own.',
   /**

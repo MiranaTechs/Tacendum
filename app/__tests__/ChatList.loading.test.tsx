@@ -22,6 +22,7 @@ import { Text, StyleSheet } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import * as db from '../src/db';
 import { ChatListScreen } from '../src/screens/ChatListScreen';
+import { themeTokens } from '../src/theme';
 
 interface FakeDb {
   name: string;
@@ -214,6 +215,21 @@ describe('the chat list before its first answer', () => {
     expect(texts(tree)).toContain('Nobody else is here yet');
     expect(has(tree, 'empty-copy-id')).toBe(true);
 
+    await ReactTestRenderer.act(() => tree.unmount());
+  });
+
+  // Added for build 33: the step numerals are ordinal marks, not an
+  // action, so they are gray; forest stays for what can be pressed.
+  test('the empty state numbers its steps in gray, never forest', async () => {
+    const tree = await mount();
+    await answer([]);
+    const numerals = tree.root.findAll(
+      n => typeof n.type === 'string' && (n.props.children === '1.' || n.props.children === '2.'),
+    );
+    expect(numerals).toHaveLength(2);
+    for (const numeral of numerals) {
+      expect(StyleSheet.flatten(numeral.props.style).color).toBe(themeTokens().color.inkMuted);
+    }
     await ReactTestRenderer.act(() => tree.unmount());
   });
 

@@ -88,13 +88,13 @@
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>NSCameraUsageDescription</key>
-	<string>Tacendum uses your camera for video calls and to take photos. Both are end-to-end encrypted and never leave your device unencrypted.</string>
+	<string>Tacendum uses your camera for video calls, to take photos, and to scan someone's QR code to open a room with them. Calls and photos are end-to-end encrypted and never leave your device unencrypted.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Your location is read once, only when you choose to share it in a conversation, and is sent end-to-end encrypted to that person only.</string>
+	<string>Your location is read once, only when you choose to share it in a room, and is sent end-to-end encrypted to the people in that room only.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Tacendum uses your microphone for calls. Audio is end-to-end encrypted and never leaves your device unencrypted.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>Choose a photo to send end-to-end encrypted in your chat, or to read a Tacendum ID from a QR code.</string>
+	<string>Choose a photo to send end-to-end encrypted in a room, or to read a Tacendum ID from a QR code.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>voip</string>

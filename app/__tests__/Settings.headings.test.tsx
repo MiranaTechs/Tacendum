@@ -85,7 +85,7 @@ function headings(): string[] {
 const CATEGORY_SECTIONS: ReadonlyArray<readonly [string, readonly string[]]> = [
   ['settings-category-account', []],
   ['settings-category-privacy', ['FIELD MODE', 'APP LOCK', 'SCREEN']],
-  ['settings-category-chats', ['CHATS', 'CALLS']],
+  ['settings-category-chats', ['ROOMS', 'CALLS']],
   ['settings-category-notifications', []],
   ['settings-category-appearance', []],
   ['settings-category-writing', []],

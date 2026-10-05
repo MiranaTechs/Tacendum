@@ -9,6 +9,7 @@ import { TacendumVideoView } from 'tacendum-call';
 import {
   durationAnnouncementFrom,
   durationFrom,
+  PressShade,
 } from '../components/CallControls';
 import { Avatar } from '../ui/Avatar';
 import { EndCallGlyph } from '../ui/CallControlGlyphs';
@@ -45,10 +46,11 @@ import { useVideoReadiness } from '../ui/videoReadiness';
  *    same box the self-view has always been, so the two pictures read as one
  *    family — with their face standing in whenever their video is not
  *    flowing, and an independent End target beside it;
- *  - an AUDIO call is a compact pill on the paper surface: their picture,
- *    their name, the running time, and an End control. Paper, not the media
- *    black: this window sits over the chat, and a black rectangle on
- *    porcelain would read as a hole in the page.
+ *  - an AUDIO call is a compact pill on the app's own surface: their
+ *    picture, their name, the running time, and an End control. The app's
+ *    surface, not the media black: this window sits over the chat, and a
+ *    black rectangle on the white page would read as a hole in it. The full
+ *    screen of an audio call is an app screen for the same reason.
  *
  * It renders `CallState` and calls back; it holds no call state of its own,
  * and it is never on glass without the call it shows: App.tsx mounts it in
@@ -276,7 +278,7 @@ export function CallOverlay(props: CallOverlayProps): React.JSX.Element | null {
               peerId={call.peerId}
               peerName={peerName}
               // Withheld until there is media for it to stand in for; the
-              // pine ground and the monogram stay either way, so the window
+              // wash ground and the monogram stay either way, so the window
               // is never the bare black of a track-less surface.
               photoB64={mediaEstablished ? peerAvatarB64 : null}
               compact
@@ -294,16 +296,22 @@ export function CallOverlay(props: CallOverlayProps): React.JSX.Element | null {
         </Pressable>
         {onHangup && (
           <Pressable
-            style={({ pressed }) => [
-              styles.videoEnd,
-              pressed && styles.pillEndPressed,
-            ]}
+            style={styles.videoEnd}
             onPress={onHangup}
             accessibilityRole="button"
             accessibilityLabel="End call"
             testID="call-overlay-end"
           >
-            <EndCallGlyph size={18} color={theme.color.mediaInk} />
+            {({ pressed }) => (
+              <>
+                {/* The disc sits on the chat, not on the video: a press
+                    darkens it rather than letting the page through. */}
+                {pressed ? (
+                  <PressShade radius={OVERLAY_VIDEO_END_SIZE / 2} theme={theme} />
+                ) : null}
+                <EndCallGlyph size={18} color={theme.color.mediaInk} />
+              </>
+            )}
           </Pressable>
         )}
       </Animated.View>
@@ -344,16 +352,18 @@ export function CallOverlay(props: CallOverlayProps): React.JSX.Element | null {
           starts on End never ends the call. */}
       {onHangup && (
         <Pressable
-          style={({ pressed }) => [
-            styles.pillEnd,
-            pressed && styles.pillEndPressed,
-          ]}
+          style={styles.pillEnd}
           onPress={onHangup}
           accessibilityRole="button"
           accessibilityLabel="End call"
           testID="call-overlay-end"
         >
-          <EndCallGlyph size={18} color={theme.color.mediaInk} />
+          {({ pressed }) => (
+            <>
+              {pressed ? <PressShade radius={22} theme={theme} /> : null}
+              <EndCallGlyph size={18} color={theme.color.mediaInk} />
+            </>
+          )}
         </Pressable>
       )}
     </Animated.View>
@@ -382,13 +392,15 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       borderColor: theme.color.mediaLine,
       backgroundColor: theme.color.mediaBlack,
     },
+    /** The end disc every call surface uses: one red under a white glyph,
+     * in both appearances. */
     videoEnd: {
       width: OVERLAY_VIDEO_END_SIZE,
       height: OVERLAY_VIDEO_END_SIZE,
       borderRadius: OVERLAY_VIDEO_END_SIZE / 2,
       alignItems: 'center',
       justifyContent: 'center',
-      backgroundColor: theme.color.danger,
+      backgroundColor: theme.color.mediaDanger,
     },
     videoLine: {
       position: 'absolute',
@@ -403,16 +415,16 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       fontWeight: '600',
       fontVariant: ['tabular-nums'],
     },
-    /** The audio pill: a raised paper sheet with the app's own outline —
-     * porcelain and pine, the security-paper surface, over the chat it
-     * floats on. */
+    /** The audio pill: the app's own sheet, over the chat it floats on. In
+     * light the sheet is the page's own white, so its outline is its only
+     * edge: the solid forest, never a tint of it. */
     pill: {
       position: 'absolute',
       width: OVERLAY_AUDIO_BOX.width,
       height: OVERLAY_AUDIO_BOX.height,
       borderRadius: theme.radius.circle,
       borderWidth: 1,
-      borderColor: theme.color.pineLine,
+      borderColor: theme.color.pine,
       backgroundColor: theme.color.paperSheet,
       flexDirection: 'row',
       alignItems: 'center',
@@ -445,8 +457,7 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       borderRadius: 22,
       alignItems: 'center',
       justifyContent: 'center',
-      backgroundColor: theme.color.danger,
+      backgroundColor: theme.color.mediaDanger,
     },
-    pillEndPressed: { opacity: 0.7 },
   });
 }

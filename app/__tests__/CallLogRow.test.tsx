@@ -1,4 +1,5 @@
 import React from 'react';
+import { StatusBar, StyleSheet, Text } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import {
   CallLogRow,
@@ -9,6 +10,7 @@ import {
 } from '../src/components/CallLogRow';
 import { IncomingCallScreen } from '../src/screens/IncomingCallScreen';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { ThemeProvider, themeTokens } from '../src/theme';
 
 /**
  * Call log rows and the incoming-call screen.
@@ -176,6 +178,17 @@ describe('the row does not rely on colour alone', () => {
     });
     expect(onRedial).toHaveBeenCalledWith('video');
   });
+
+  it('is a pill with a hairline edge: on the white thread its edge is all it has', () => {
+    const t = themeTokens('light');
+    const { tree } = mount(<CallLogRow row={row()} onRedial={jest.fn()} />);
+    const press = tree.root.findAll(n => typeof n.props.style === 'function')[0]!;
+    expect(StyleSheet.flatten(press.props.style({ pressed: false }))).toMatchObject({
+      backgroundColor: t.color.paperLayer,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: t.color.lineSoft,
+    });
+  });
 });
 
 describe('answering a call in the foreground', () => {
@@ -240,5 +253,169 @@ describe('answering a call in the foreground', () => {
   it('labels the whole screen for a screen reader', () => {
     const { byLabel } = incoming({ withVideo: true });
     expect(byLabel('Incoming video call from Dana')).toBeTruthy();
+  });
+});
+
+/**
+ * THE INCOMING-CALL SCREEN IS AN APP SCREEN (the white palette,
+ * 2026-10-04). It never shows video, so it sits on the app's
+ * own ground — white in light, charcoal in dark — with the status bar
+ * following it; the answer and decline discs are the forest and red every
+ * call surface uses, under white labels, in both appearances.
+ *
+ * FALSIFYING CASE, run at authoring time: before the change the root was
+ * media black under light status glyphs, the name white, the neutral answer a
+ * translucent white pill with a white label (invisible on a white app), and
+ * in dark both discs took the lifted text colours.
+ */
+describe('the incoming-call screen is drawn on the app ground', () => {
+  function screen(mode: 'light' | 'dark') {
+    return mount(
+      <ThemeProvider mode={mode}>
+        <IncomingCallScreen
+          peerId="01HQBBBB00000000000000000A"
+          peerName="Dana"
+          withVideo
+          cameraAvailable
+          onAccept={jest.fn()}
+          onAcceptAudioOnly={jest.fn()}
+          onDecline={jest.fn()}
+        />
+      </ThemeProvider>,
+    );
+  }
+
+  const answerButton = (tree: ReactTestRenderer.ReactTestRenderer, label: string) => {
+    const press = tree.root.findAll(
+      n => n.props.accessibilityLabel === label && typeof n.props.style === 'function',
+    )[0]!;
+    const words = press.findAll(
+      n => n.type === Text && [n.props.children].flat().join('') === label,
+    )[0]!;
+    return {
+      disc: StyleSheet.flatten(press.props.style({ pressed: false })) as {
+        backgroundColor?: string;
+        borderWidth?: number;
+        borderColor?: string;
+      },
+      label: StyleSheet.flatten(words.props.style).color,
+    };
+  };
+
+  const textColour = (tree: ReactTestRenderer.ReactTestRenderer, body: string) =>
+    StyleSheet.flatten(
+      tree.root.findAll(
+        n => n.type === Text && [n.props.children].flat().join('') === body,
+      )[0]!.props.style,
+    ).color;
+
+  it('sits on the app’s ground under dark status glyphs, with charcoal type', () => {
+    const t = themeTokens('light');
+    const { tree, byLabel } = screen('light');
+    const root = byLabel('Incoming video call from Dana');
+    expect(StyleSheet.flatten(root.props.style).backgroundColor).toBe(
+      t.color.paperGround,
+    );
+    const bars = tree.root.findAllByType(StatusBar);
+    expect(bars).toHaveLength(1);
+    expect(bars[0]!.props.barStyle).toBe('dark-content');
+    expect(bars[0]!.props.backgroundColor).toBe(t.color.paperGround);
+    expect(textColour(tree, 'Dana')).toBe(t.color.inkStrong);
+    expect(textColour(tree, 'Incoming video call')).toBe(t.color.inkMuted);
+    // The avatar's placement box draws nothing of its own: the Avatar inside
+    // owns the disc and the ring.
+    const box = tree.root
+      .findAll(n => typeof n.type === 'string')
+      .map(n => StyleSheet.flatten(n.props.style) as Record<string, unknown> | undefined)
+      .find(s => s?.width === 112 && s?.height === 112)!;
+    expect(box).toBeDefined();
+    expect(box.backgroundColor).toBeUndefined();
+    expect(box.borderWidth).toBeUndefined();
+  });
+
+  it('answers on the forest disc, declines on the red, and offers the neutral answer as a white disc in a gray ring', () => {
+    const t = themeTokens('light');
+    const { tree } = screen('light');
+    expect(answerButton(tree, 'Answer with video')).toEqual({
+      disc: expect.objectContaining({ backgroundColor: t.color.mediaAccent }),
+      label: t.color.mediaInk,
+    });
+    expect(answerButton(tree, 'Decline')).toEqual({
+      disc: expect.objectContaining({ backgroundColor: t.color.mediaDanger }),
+      label: t.color.mediaInk,
+    });
+    expect(answerButton(tree, 'Answer without video')).toEqual({
+      disc: expect.objectContaining({
+        backgroundColor: t.color.paperSheet,
+        borderWidth: 1,
+        borderColor: t.color.lineStrong,
+      }),
+      label: t.color.inkStrong,
+    });
+  });
+
+  it('in dark is charcoal under light status glyphs, and both discs keep their colours', () => {
+    const d = themeTokens('dark');
+    const { tree, byLabel } = screen('dark');
+    expect(
+      StyleSheet.flatten(byLabel('Incoming video call from Dana').props.style)
+        .backgroundColor,
+    ).toBe(d.color.paperGround);
+    const bars = tree.root.findAllByType(StatusBar);
+    expect(bars[0]!.props.barStyle).toBe('light-content');
+    expect(bars[0]!.props.backgroundColor).toBe(d.color.paperGround);
+    // The theme's dark forest and red lift for text and would need a
+    // charcoal label; the call discs stay the one forest and the one red.
+    expect(answerButton(tree, 'Answer with video').disc.backgroundColor).toBe(
+      d.color.mediaAccent,
+    );
+    expect(answerButton(tree, 'Decline').disc.backgroundColor).toBe(
+      d.color.mediaDanger,
+    );
+    expect(d.color.mediaAccent).not.toBe(d.color.pine);
+    expect(answerButton(tree, 'Answer without video').label).toBe(
+      d.color.inkStrong,
+    );
+  });
+
+  /**
+   * The caller's face (2026-10-05, superseding the earlier white disc in
+   * a gray ring): with no photo, the forest disc with white letters, in both
+   * appearances — the same face the chat list and the thread draw for them.
+   * An unnamed caller letters "?" on it, never id characters.
+   */
+  it('draws a caller with no photo as the forest face with white letters, in both appearances', () => {
+    for (const mode of ['light', 'dark'] as const) {
+      const t = themeTokens(mode);
+      const { tree } = screen(mode);
+      const discs = tree.root
+        .findAll(n => typeof n.type === 'string')
+        .map(n => StyleSheet.flatten(n.props.style) as Record<string, unknown> | undefined)
+        .filter(s => s?.width === 120 && s?.height === 120);
+      expect(discs).toHaveLength(1);
+      expect(discs[0]!.backgroundColor).toBe('#0E6B45');
+      expect(discs[0]!.borderWidth ? discs[0]!.borderColor : '#0E6B45').toBe('#0E6B45');
+      expect(discs[0]!.borderColor).not.toBe(t.color.lineStrong);
+      expect(textColour(tree, 'DA')).toBe('#FFFFFF');
+    }
+
+    const unnamed = mount(
+      <ThemeProvider mode="dark">
+        <IncomingCallScreen
+          peerId="01HQBBBB00000000000000000A"
+          peerName="01HQBBBB00000000000000000A"
+          withVideo={false}
+          onAccept={jest.fn()}
+          onAcceptAudioOnly={jest.fn()}
+          onDecline={jest.fn()}
+        />
+      </ThemeProvider>,
+    );
+    expect(textColour(unnamed.tree, '?')).toBe('#FFFFFF');
+    expect(
+      unnamed.tree.root.findAll(
+        n => n.type === Text && [n.props.children].flat().join('') === '0A',
+      ),
+    ).toHaveLength(0);
   });
 });

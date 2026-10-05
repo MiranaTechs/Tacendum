@@ -27,7 +27,7 @@ export const LINKING_COPY = {
    * link-ceremony suite; do not reword casually. */
   historyStance: 'This device shows messages from today forward.',
   /** New-device side, refused because this install is lived-in (client half). */
-  notPristine: `This ${DEVICE_NOUN} already has a life of its own — conversations, machines, or consent decisions. Only a fresh install can be linked, so nothing it holds can leak into another account's devices.`,
+  notPristine: `This ${DEVICE_NOUN} already has a life of its own — rooms, machines, or consent decisions. Only a fresh install can be linked, so nothing it holds can leak into another account's devices.`,
   /** Roster screen: the amicable removal. */
   unlinkConfirm: (name: string) =>
     `Unlink ${name}? It keeps what it already received and continues as its own account. Your other devices stop sending to it.`,

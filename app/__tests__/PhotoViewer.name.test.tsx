@@ -145,3 +145,27 @@ it('a 1:1 photo still names the peer, my label outranking their card', async () 
   expect(rendered).toContain('Mum');
   expect(rendered).not.toContain('Helen R.');
 });
+
+it('keeps the status bar on the viewer’s black: light glyphs, and a black bar where Android paints one', async () => {
+  // A photo is media, and media is black in both appearances. The app's own
+  // bar is white now (with dark glyphs), so without its own fill the viewer
+  // showed a white strip on Android above a black photo. FALSIFYING CASE:
+  // the old bar named `barStyle` only and fails the colour assertion.
+  const { StatusBar } = require('react-native') as typeof import('react-native');
+  const { themeTokens } = require('../src/theme') as typeof import('../src/theme');
+  getMessage.mockResolvedValue(messageRow({ peerId: PEER, authorId: null }));
+  let tree!: ReactTestRenderer.ReactTestRenderer;
+  await ReactTestRenderer.act(() => {
+    tree = ReactTestRenderer.create(
+      <PhotoViewerScreen msgId={MSG} direction="in" peerId={PEER} onClose={jest.fn()} />,
+    );
+  });
+  await ReactTestRenderer.act(async () => {});
+  const bars = tree.root.findAllByType(StatusBar);
+  expect(bars).toHaveLength(1);
+  expect(bars[0]!.props.barStyle).toBe('light-content');
+  expect(bars[0]!.props.backgroundColor).toBe(themeTokens('light').color.mediaBlack);
+  await ReactTestRenderer.act(() => {
+    tree.unmount();
+  });
+});

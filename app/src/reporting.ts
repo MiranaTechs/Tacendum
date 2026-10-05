@@ -140,7 +140,7 @@ export const REPORT_COPY = {
   /** Confirms the process, not an outcome. */
   sentTitle: 'Report sent.',
   sentBody:
-    'A person will read it. We will not tell them you reported them, and nothing about this appears in your conversation.',
+    'A person will read it. We will not tell them you reported them, and nothing about this appears in your room with them.',
   sentReference: (id: string) => `Reference ${id}`,
   sentBlockHint:
     'Reporting does not block them. If you want their messages discarded as they arrive, block them too.',

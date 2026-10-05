@@ -211,7 +211,7 @@ describe('mute and unmute are different drawings, not a re-tint', () => {
     ].map(Icon => {
       let t!: ReactTestRenderer.ReactTestRenderer;
       ReactTestRenderer.act(() => {
-        t = ReactTestRenderer.create(<Icon size={22} color="#FAFCF7" />);
+        t = ReactTestRenderer.create(<Icon size={22} color="#FFFFFF" />);
       });
       mounted.push(t);
       return JSON.stringify(t.toJSON());

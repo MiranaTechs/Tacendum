@@ -146,6 +146,24 @@ describe('origins: Back returns to the surface a person actually came from', () 
     });
   });
 
+  // Added for build 33: "Link an email" from Start a chat returns to Start a
+  // chat, with the typed text back in the field.
+  test('email verification opened from Start a chat returns to Start a chat, carrying the typed text', () => {
+    expect(backDestination({ name: 'accountEmail', via: 'newChat' })).toEqual({
+      name: 'newChat',
+    });
+    expect(
+      backDestination({ name: 'accountEmail', via: 'newChat', draft: 'lena@studio.co' }),
+    ).toEqual({ name: 'newChat', draft: 'lena@studio.co' });
+    // The other two doors are unchanged.
+    expect(backDestination({ name: 'accountEmail', from: 'profile', via: 'username' })).toEqual({
+      name: 'accountUsername', from: 'profile',
+    });
+    expect(backDestination({ name: 'accountEmail', from: 'chats' })).toEqual({
+      name: 'settings', from: 'chats', section: 'account',
+    });
+  });
+
   test('the link-offer confirm pops to the home surface it arrived over', () => {
     expect(backDestination({ name: 'linkConfirm', from: 'calls' })).toEqual({
       name: 'calls',

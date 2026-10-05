@@ -101,7 +101,7 @@ const ID = '01HZX8K3QW9YB2N4M5PRTVJ7CD';
 /** A third account, for the ambiguity case. */
 const OTHER_ID = '01HZY9M4RX0ZC3P5N6QSTVK8DE';
 
-const INK = { darkHex: '#121A15', lightHex: '#FAFCF7' };
+const INK = { darkHex: '#181818', lightHex: '#FFFFFF' };
 const FILE = 'file:///tmp/photo.heic';
 
 describe('selfPayload', () => {

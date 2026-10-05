@@ -268,7 +268,7 @@ describe('the transcript agrees with envelope.ts, row by row', () => {
     // app really does preview, or "the extension shows less" proves nothing.
     expect(previewFor(grpMsg('see you at nine'))).toBe('see you at nine');
     expect(previewFor(JSON.stringify({ tcm: 'grp.new', g: G, nm: 'Kitchen', ms: [M], n: 1 }))).toBe(
-      'New room',
+      'New group',
     );
     expect(previewFor(JSON.stringify({ tcm: 'grp.roster', g: G, m: M, s: 'in', n: 1 }))).toBe(
       'Members changed',

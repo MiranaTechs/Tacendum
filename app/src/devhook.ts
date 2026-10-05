@@ -800,8 +800,8 @@ if (__DEV__) {
       const id = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
       const notMe = '01BX5ZZKBKACTAV9WEVGEMMVRZ';
       const drawn = await qr.encodeSelfQr(id, {
-        darkHex: '#121A15',
-        lightHex: '#FAFCF7',
+        darkHex: '#181818',
+        lightHex: '#FFFFFF',
       });
       const fileUri = await qr.writeShareImage(drawn.pngB64);
       try {

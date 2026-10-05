@@ -60,7 +60,7 @@ test('groups by authenticated source while preserving deadline order', () => {
     expect.objectContaining({
       peerId: 'agent-a-87654321',
       title: 'Build Mac',
-      sourceLabel: 'Conversation',
+      sourceLabel: 'Room',
       data: [rows[1]],
     }),
   ]);

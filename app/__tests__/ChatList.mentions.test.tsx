@@ -265,7 +265,7 @@ test('a room that mentioned YOU wears the @ badge, and the row’s label says so
   expect(byId(tree, `mention-badge-${groupId}`).length).toBeGreaterThan(0);
   const label = byId(tree, `chat-${groupId}`)[0]!.props
     .accessibilityLabel as string;
-  expect(label).toContain('Kitchen, room');
+  expect(label).toContain('Kitchen, group');
   expect(label).toContain('you were mentioned');
 
   await ReactTestRenderer.act(() => {

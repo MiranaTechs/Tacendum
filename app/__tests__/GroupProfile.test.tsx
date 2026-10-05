@@ -269,7 +269,7 @@ test('a non-owner has NO Add, NO Remove, NO Delete for everyone — and the ⓘ 
 test('the members surface says rooms send no read receipts, verbatim', async () => {
   installRoomDb();
   const tree = await renderProfile(BEN);
-  expect(renderedText(tree)).toContain('Rooms don’t send read receipts.');
+  expect(renderedText(tree)).toContain('Groups don’t send read receipts.');
 });
 
 test('a member row opens that member’s own profile — where their safety number lives', async () => {
@@ -687,10 +687,10 @@ test('after leaving, the timer chips are disabled for VoiceOver and the eye, and
     const c = chip(tree, `room-timer-${option.seconds}`);
     expect(c.props.disabled).toBe(true);
     expect(c.props.accessibilityState.disabled).toBe(true);
-    // A recessed surface with muted ink — never opacity, never a chip that
-    // looks live and does nothing.
+    // White with its gray edge and muted ink, and the line below says why —
+    // never opacity, and never a fill: a chip is white like a row.
     const style = StyleSheet.flatten(c.props.style({ pressed: false }));
-    expect(style.backgroundColor).toBe(theme.color.paperInset);
+    expect(style.backgroundColor).toBe(theme.color.paperSheet);
     expect(style.borderColor).toBe(theme.color.lineSoft);
     const label = c.findByType(Text);
     expect(StyleSheet.flatten(label.props.style).color).toBe(theme.color.inkMuted);

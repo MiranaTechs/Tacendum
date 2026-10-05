@@ -35,7 +35,7 @@ export interface AttentionSection {
   title: string;
   spokenTitle: string;
   /** Historical server-confirmed class, not an online/connected claim. */
-  sourceLabel: 'AI agent' | 'Conversation';
+  sourceLabel: 'AI agent' | 'Room';
   data: PendingApprovalSummaryRow[];
 }
 
@@ -75,7 +75,7 @@ export function buildAttentionSections(
           row.displayName,
           row.localName,
         ),
-        sourceLabel: row.machine ? 'AI agent' : 'Conversation',
+        sourceLabel: row.machine ? 'AI agent' : 'Room',
         data: [],
       };
       byPeer.set(row.peerId, section);

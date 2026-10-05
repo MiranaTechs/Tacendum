@@ -8,8 +8,10 @@ import React from 'react';
 import { AppState, Keyboard, StatusBar } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import App from '../App';
+import { setAppearanceChoice } from '../src/appearance';
 import { messaging } from '../src/messaging';
 import { screenSecurity } from '../src/screenSecurity';
+import { themeTokens } from '../src/theme';
 
 const native = jest.requireMock('tacendum-screen-security') as {
   __screensec: {
@@ -118,12 +120,52 @@ test('the cover is modal to VoiceOver, keeps dark status glyphs, and dismisses t
     .findAllByType(StatusBar)
     .filter(n => n.props.barStyle === 'dark-content');
   expect(darkBars.length).toBeGreaterThanOrEqual(2);
+  // The root bar and the cover's both paint the app's own ground, so on
+  // Android the strip behind the glyphs matches the cover under it.
+  const ground = themeTokens('light').color.paperGround;
+  expect(darkBars.map(n => n.props.backgroundColor)).toEqual(
+    darkBars.map(() => ground),
+  );
   expect(dismiss).toHaveBeenCalled();
 
   dismiss.mockRestore();
   await ReactTestRenderer.act(() => {
     tree.unmount();
   });
+});
+
+test('the status bar takes the in-app ground, so it follows Settings › Appearance, not the system', async () => {
+  // Android paints the bar from StatusBar's backgroundColor (iOS ignores it):
+  // without it, Android 14 and below frame a white app in the platform's gray
+  // strip. Every bar on screen follows the choice, light and dark alike.
+  const tree = await renderApp();
+  const grounds = () =>
+    tree.root.findAllByType(StatusBar).map(n => n.props.backgroundColor);
+  try {
+    expect(grounds().length).toBeGreaterThan(0);
+    expect(new Set(grounds())).toEqual(
+      new Set([themeTokens('light').color.paperGround]),
+    );
+
+    await ReactTestRenderer.act(async () => {
+      setAppearanceChoice('dark');
+    });
+    expect(new Set(grounds())).toEqual(
+      new Set([themeTokens('dark').color.paperGround]),
+    );
+    expect(
+      tree.root
+        .findAllByType(StatusBar)
+        .every(n => n.props.barStyle === 'light-content'),
+    ).toBe(true);
+  } finally {
+    await ReactTestRenderer.act(async () => {
+      setAppearanceChoice('light');
+    });
+    await ReactTestRenderer.act(() => {
+      tree.unmount();
+    });
+  }
 });
 
 test('the lock screen is never blanked — a person must be able to unlock', async () => {

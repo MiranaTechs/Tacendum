@@ -293,7 +293,7 @@ describe('chat list — row actions are discoverable', () => {
     const row = byId(tree, `chat-${SAM}`)[0]!;
     expect(typeof row.props.onLongPress).toBe('function');
     expect(row.props.accessibilityActions).toEqual([
-      { name: 'actions', label: 'Conversation actions' },
+      { name: 'actions', label: 'Room actions' },
     ]);
     // The rotor action still opens the drawer.
     await ReactTestRenderer.act(async () => {
@@ -308,7 +308,7 @@ describe('chat list — row actions are discoverable', () => {
     chatRows.rows = [];
     const tree = await renderList();
     expect(has(tree, 'empty-actions-hint')).toBe(true);
-    expect(texts(tree)).toContain('… beside a chat');
+    expect(texts(tree)).toContain('… beside a room');
 
     await unmount(tree);
   });

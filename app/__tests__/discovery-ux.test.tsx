@@ -304,7 +304,7 @@ describe('the find flow renders the typed email and never a ULID', () => {
     // TYPED means typed: the label is the finder's
     // own text, capitalization included — normalization is the WIRE's
     // concern and never rewrites what the person wrote.
-    expect(rendered).toContain('Start a chat with Alice@Example.com?');
+    expect(rendered).toContain('Open a room with Alice@Example.com?');
     expect(rendered).toContain('This account answers on 2 devices.');
     // THE PHASE'S CENTRAL ASSERTION: no 26-char ULID anywhere in the tree.
     expect(ULID_RE.test(rendered)).toBe(false);

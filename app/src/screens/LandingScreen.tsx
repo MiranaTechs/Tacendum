@@ -20,7 +20,7 @@ interface Props {
    * is doing.
    */
   checkingUpdate?: boolean;
-  /** "Recover my account grouping" (item 3) — BESIDE
+  /** "Recover my account" (item 3) — BESIDE
    * registration, never in it: its own door on this surface, its own
    * screen, and the register flow stays identifier-free. */
   onRecover: () => void;
@@ -73,7 +73,9 @@ export function LandingScreen({
               steps down where the gutters leave it no room. */}
           <BrandLockup size={width <= t.layout.narrowWidth ? 30 : 36} animate />
           <Text style={[t.type.body, styles.blurb, { color: t.color.inkBody }]}>
-            Message the people who matter — one chat at a time.
+            {/* A no-break space ties the last word to the one before it,
+                so it never sits alone on a line at any width or text size. */}
+            {'Message the people who matter — one room at a\u00A0time.'}
           </Text>
           <Text
             style={[
@@ -101,7 +103,7 @@ export function LandingScreen({
             before it asks for anything. */}
         <View style={styles.recover}>
           <TextAction
-            label="Recover my account grouping"
+            label="Recover my account"
             onPress={onRecover}
             testID="landing-recover"
           />

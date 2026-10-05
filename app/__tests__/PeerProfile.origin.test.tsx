@@ -142,13 +142,13 @@ async function lineFor(by: string | null): Promise<string | null> {
 
 test('a code you scanned says so', async () => {
   expect(await lineFor('qr')).toBe(
-    'You started this chat by scanning their code.',
+    'You started this room by scanning their code.',
   );
 });
 
 test('an ID you typed says so', async () => {
   expect(await lineFor('manual')).toBe(
-    'You started this chat by typing their ID.',
+    'You started this room by typing their ID.',
   );
 });
 
@@ -158,7 +158,7 @@ test('the bare discovery mark says the SERVER introduced them, never which class
   // passes it for everything that is not the username class. So a sentence
   // naming email would tell a person they found someone by email when they
   // found them by a phone number — today only prevented by phoneUi.ts's pin,
-  // which flips on ACP4's own train. The family sentence is true of all of
+  // which flips on its own train. The family sentence is true of all of
   // them, so the bare mark falls to it like any other lookup class.
   expect(await lineFor('discovery')).toBe('You found them by looking them up.');
 });
@@ -193,7 +193,7 @@ test('it is one line above the safety section, not a section of its own', async 
   const tree = await renderProfile();
   const all = texts(tree);
 
-  const origin_i = all.indexOf('You started this chat by scanning their code.');
+  const origin_i = all.indexOf('You started this room by scanning their code.');
   const safety_i = all.indexOf('Safety number');
   expect(origin_i).toBeGreaterThanOrEqual(0);
   expect(safety_i).toBeGreaterThanOrEqual(0);
@@ -205,7 +205,7 @@ test('it is one line above the safety section, not a section of its own', async 
   const headings = tree.root
     .findAll(n => n.props.accessibilityRole === 'header')
     .map(n => String(n.props.children ?? ''));
-  expect(headings).not.toContain('You started this chat by scanning their code.');
+  expect(headings).not.toContain('You started this room by scanning their code.');
 
   await ReactTestRenderer.act(() => tree.unmount());
 });

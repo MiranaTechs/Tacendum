@@ -790,6 +790,9 @@ jest.mock('tacendum-qr', () => {
         state.pngB64 = 'iVBORw0KGgo=';
         state.shareUri = 'file:///Caches/tacendum-qr/tacendum-id.png';
         state.payloads = [];
+        // The live scanner's failure too, so a camera-failure test cannot
+        // leak a broken scanner into the next one.
+        state.failScan = null;
         state.failEncode = null;
         state.failDecode = null;
         state.failWrite = null;

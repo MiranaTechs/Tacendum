@@ -62,7 +62,7 @@ describe('the blocking deck speaks Android', () => {
 
   it('omits "no screenshot notices" — on Android there is no such notice to withhold', () => {
     expect(BLOCK_EXPLAINER[2]).toBe(
-      'While they are blocked, this phone sends them nothing: no replies, no delivery or read marks, no reactions, no calls. To them the chat looks like one where you stopped replying.',
+      'While they are blocked, this phone sends them nothing: no replies, no delivery or read marks, no reactions, no calls. To them the room looks like one where you stopped replying.',
     );
     expect(BLOCK_EXPLAINER[2]).not.toContain('screenshot');
   });

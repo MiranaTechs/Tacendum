@@ -1,12 +1,12 @@
 /**
- * Start a chat: the scanner leads, typing stays available, and success
- * leaves one thing to do.
+ * Start a chat: one smart field leads, Scan sits under it, and success leaves
+ * one thing to do (build 33; the scanner-first layout before it).
  *
- *  - The QR hand-off is the lead rail (§4), so the scanner is the first
- *    thing on the page; the field — no longer focused on entry
- *    — is the second way in and says so; the find door follows; your own
- *    ID, which this screen is not about, waits behind "Show my ID".
- *  - On success the ID panel and the rails give way to the naming step, so
+ *  - The field that understands an ID, a username or an email is the first
+ *    control; Scan their QR code sits under it behind an "or" rule, the photo
+ *    link under that, then the ⓘ, then My ID — collapsed. No button shows
+ *    until there is something a press can act on.
+ *  - On success the field and the rails give way to the naming step, so
  *    there is nothing left above it to re-submit.
  *
  * Harness follows StartChat.field.test.tsx: the fake op-sqlite stub records
@@ -74,7 +74,7 @@ async function render(): Promise<ReactTestRenderer.ReactTestRenderer> {
         profile={PROFILE}
         onBack={jest.fn()}
         onOpenChat={jest.fn()}
-        onFindByEmail={jest.fn()}
+        onOpenAccountEmail={jest.fn()}
       />,
     );
   });
@@ -131,47 +131,54 @@ async function unmount(tree: ReactTestRenderer.ReactTestRenderer) {
   });
 }
 
-test('the scanner leads; then the typed field, then the find door, then the collapsed own ID', async () => {
+// Rewritten for build 33: one smart field leads, no button shows until
+// there is something to act on, and the find door is gone (find runs
+// inline from the same field).
+test('one smart field leads; then Scan, the photo link, the ⓘ and the collapsed My ID — and no button while empty', async () => {
   const tree = await render();
   expect(
     order(tree, [
+      'new-peer-input',
       'scan-qr-camera',
       'scan-qr-photo',
-      'new-peer-input',
-      'start-chat',
-      'find-by-email',
+      'start-chat-info',
       'show-self-id',
     ]),
   ).toEqual([
+    'new-peer-input',
     'scan-qr-camera',
     'scan-qr-photo',
-    'new-peer-input',
-    'start-chat',
-    'find-by-email',
+    'start-chat-info',
     'show-self-id',
   ]);
+  expect(has(tree, 'start-chat')).toBe(false);
+  expect(has(tree, 'discovery-search')).toBe(false);
+  expect(has(tree, 'find-by-email')).toBe(false);
   await unmount(tree);
 });
 
-test('your own ID waits behind "Show my ID", and the door says which way it is', async () => {
+// Rewritten for build 33: one disclosure for the ID and the QR, so
+// `show-self-qr` is gone and the QR image joins the list once it is open.
+test('your own ID waits behind My ID, and the door says which way it is', async () => {
   const tree = await render();
-  for (const id of ['self-user-id', 'copy-self-id', 'share-self-id', 'show-self-qr']) {
+  for (const id of ['self-user-id', 'copy-self-id', 'share-self-id', 'self-qr-image']) {
     expect(has(tree, id)).toBe(false);
   }
   expect(control(tree, 'show-self-id').props.accessibilityState.expanded).toBe(false);
 
   await press(tree, 'show-self-id');
-  for (const id of ['self-user-id', 'copy-self-id', 'share-self-id', 'show-self-qr']) {
+  for (const id of ['self-user-id', 'copy-self-id', 'share-self-id', 'self-qr-image']) {
     expect(has(tree, id)).toBe(true);
   }
   expect(control(tree, 'show-self-id').props.accessibilityState.expanded).toBe(true);
 
   await press(tree, 'show-self-id');
   expect(has(tree, 'self-user-id')).toBe(false);
+  expect(has(tree, 'self-qr-image')).toBe(false);
   await unmount(tree);
 });
 
-test('on success the ID panel and the rails give way to the naming step — nothing left to re-submit', async () => {
+test('on success the field and the rails give way to the naming step — nothing left to re-submit', async () => {
   const tree = await render();
   await type(tree, PEER_ID);
   await press(tree, 'start-chat');
@@ -181,13 +188,15 @@ test('on success the ID panel and the rails give way to the naming step — noth
   // One thing to do: name them.
   expect(has(tree, 'peer-nickname-input')).toBe(true);
   expect(has(tree, 'peer-nickname-save')).toBe(true);
-  // And nothing above it that could start the same chat again.
+  // And nothing above it that could start the same chat again. (The list
+  // moved with build 33: the find door is gone, Find and the ⓘ joined it.)
   for (const id of [
     'new-peer-input',
     'start-chat',
+    'discovery-search',
     'scan-qr-camera',
     'scan-qr-photo',
-    'find-by-email',
+    'start-chat-info',
     'show-self-id',
   ]) {
     expect(has(tree, id)).toBe(false);

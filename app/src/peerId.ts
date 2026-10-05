@@ -119,7 +119,7 @@ export function idAttempt(raw: string): string {
  * message look like a link worth tapping.
  */
 export function shareIdMessage(id: string): string {
-  return `My Tacendum ID:\n${id}\nAdd me in Tacendum → Start a chat.`;
+  return `My Tacendum ID:\n${id}\nAdd me in Tacendum → Open a room.`;
 }
 
 export interface PastedIds {

@@ -370,7 +370,7 @@ describe('failure, in the sheet where the attempt was made', () => {
     await press('register-sheet-confirm');
 
     expect(propOf('register-error', 'message')).toBe(
-      'This iPhone no longer has the identity key these conversations belong to. ' +
+      'This iPhone no longer has the identity key these rooms belong to. ' +
         'The key never leaves the iPhone it was made on and can’t be restored — ' +
         'not from a backup, and not by us. Your messages here are safe to read, ' +
         'but this identity can’t send or receive. To keep talking, you’d start a ' +
@@ -628,8 +628,13 @@ describe('motion honours Reduce Motion', () => {
   it('breathes the halo only when motion is welcome', async () => {
     await render();
     const halo = StyleSheet.flatten(propOf('register-hero-halo', 'style'));
-    // Live: the opacity is an animated node, not a resting number.
-    expect(typeof halo.opacity).not.toBe('number');
+    // Live: the ring breathes by size, so its scale is an animated node,
+    // while the opacity stays the literal 1 — forest never dims to a tint.
+    expect(halo.opacity).toBe(1);
+    const breath = (halo.transform as Array<{ scale?: unknown }> | undefined)?.[0]
+      ?.scale;
+    expect(breath).toBeDefined();
+    expect(typeof breath).not.toBe('number');
   });
 
   it('stills the halo and swaps the sheet slide for a fade under Reduce Motion', async () => {
@@ -645,6 +650,7 @@ describe('motion honours Reduce Motion', () => {
 
       const halo = StyleSheet.flatten(propOf('register-hero-halo', 'style'));
       expect(halo.opacity).toBe(1);
+      expect(halo.transform).toBeUndefined();
 
       await openSheet();
       const sheet = StyleSheet.flatten(propOf('register-sheet', 'style'));
@@ -731,5 +737,62 @@ describe('hardware back while the create call is in flight', () => {
       reject(new Error('offline'));
     });
     expect(onRegistered).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Forest at full strength only, and a 3:1 edge on every consent box. The
+ * diagrams are SVG drawings no rendered assertion above reads into, the
+ * halo's loop runs on the native driver, and two of the three checkboxes live
+ * on screens this suite does not mount, so these pins read the SOURCE. Each
+ * predicate is stated once and proven against the shape it replaced.
+ */
+describe('no faded forest, and every consent box has a field edge (source pins)', () => {
+  // The app's tsconfig types only jest (App.scrim.test.ts's precedent).
+  const { readFileSync } = require('fs') as {
+    readFileSync: (path: string, encoding: string) => string;
+  };
+  const source = (rel: string) =>
+    readFileSync(`${__dirname}/../${rel}`, 'utf8');
+
+  /** A shape or group drawn at partial opacity: how forest became a tint. */
+  const fadesByOpacity = (src: string) => /opacity=\{0\./.test(src);
+  /** The halo's style, from its declaration to the next one. */
+  const haloBlock = (src: string) => {
+    const start = src.indexOf('const haloStyle');
+    const end = src.indexOf('const rise', start);
+    if (start < 0 || end < 0) throw new Error('haloStyle block not found');
+    return src.slice(start, end);
+  };
+  const interpolatesOpacity = (block: string) =>
+    /opacity:\s*halo\.interpolate/.test(block);
+
+  it('the diagrams draw nothing at partial opacity: a gone key is gray, not faded forest', () => {
+    expect(fadesByOpacity(source('src/ui/IdentityDiagrams.tsx'))).toBe(false);
+    // Falsifier: the wrapper this replaced is caught.
+    expect(fadesByOpacity('<G opacity={0.35}>')).toBe(true);
+  });
+
+  it("the hero's halo breathes by scale and never interpolates its opacity", () => {
+    const block = haloBlock(source('src/ui/IdentityHero.tsx'));
+    expect(interpolatesOpacity(block)).toBe(false);
+    expect(block).toContain('scale: halo.interpolate');
+    // Falsifier: the loop this replaced is caught.
+    expect(
+      interpolatesOpacity('opacity: halo.interpolate({ inputRange: [0, 1] })'),
+    ).toBe(true);
+  });
+
+  it('the three consent boxes rest on the field edge and turn forest when ticked', () => {
+    const boxes: Array<[string, string]> = [
+      ['src/screens/RegisterScreen.tsx', 'agreed'],
+      ['src/screens/AccountPhoneScreen.tsx', 'smsConsent'],
+      ['src/screens/AccountUsernameScreen.tsx', 'consent'],
+    ];
+    for (const [file, checked] of boxes) {
+      expect(source(file)).toContain(
+        `borderColor: ${checked} ? t.color.pine : t.color.lineField,`,
+      );
+    }
   });
 });

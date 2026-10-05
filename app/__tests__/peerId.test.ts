@@ -107,7 +107,7 @@ describe('shareIdMessage', () => {
     expect(lines).toHaveLength(3);
     expect(lines[1]).toBe(ID);
     expect(lines[0]).toBe('My Tacendum ID:');
-    expect(lines[2]).toBe('Add me in Tacendum → Start a chat.');
+    expect(lines[2]).toBe('Add me in Tacendum → Open a room.');
   });
 
   it('is the same text on every surface — the id is the only variable', () => {
@@ -143,7 +143,7 @@ describe('idsInPastedText', () => {
   const OTHER = '01BX5ZZKBKACTAV9WEVGEMMVRZ';
 
   it('finds the one id in a message', () => {
-    expect(idsInPastedText(`My Tacendum ID:\n${ID}\nAdd me in Tacendum → Start a chat.`)).toEqual({
+    expect(idsInPastedText(`My Tacendum ID:\n${ID}\nAdd me in Tacendum → Open a room.`)).toEqual({
       ids: [ID],
       inUriOnly: false,
     });

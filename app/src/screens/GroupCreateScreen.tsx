@@ -28,11 +28,11 @@ interface Props {
 }
 
 const COPY = {
-  title: 'New room',
+  title: 'New group',
   intro:
-    'A room is one conversation for the people you choose. Everyone in it sees everything said in it.',
+    'A group is one room for the people you choose. Everyone in it sees everything said in it.',
 
-  nameLabel: 'Room name',
+  nameLabel: 'Group name',
   namePlaceholder: 'What to call it',
 
   membersLabel: 'Members',
@@ -40,9 +40,9 @@ const COPY = {
    * says so rather than letting 11 read as a full room of 11. */
   seatCount: (taken: number) =>
     `${taken} of ${GROUP_MAX_MEMBERS}, including you`,
-  capReached: `A room holds ${GROUP_MAX_MEMBERS} people, including you.`,
+  capReached: `A group holds ${GROUP_MAX_MEMBERS} people, including you.`,
   identityChanged:
-    'Safety number changed — review it in their chat before adding them.',
+    'Safety number changed — review it in your room with them before adding them.',
   /** The group the identity-changed rows sit under, at the bottom of the
    * list: a seat that cannot be taken yet is not shuffled in among the
    * ones that can. */
@@ -53,35 +53,35 @@ const COPY = {
   /** The chip's VoiceOver name: the chip IS the un-pick. */
   removePick: (name: string) => `Remove ${name}`,
   noContacts:
-    'A room is made from people you already talk to. Start a chat first — the + on the chat list.',
+    'A group is made from people you already talk to. Open a room with someone first — the + in Rooms.',
 
-  create: 'Create room',
+  create: 'Create group',
   creating: 'Creating…',
 
-  aboutToggle: 'About rooms',
+  aboutToggle: 'About groups',
   // What the UI says must be exactly what the
   // design does. Two facts, behind the ⓘ, in the vault tone.
   aboutAuthority:
-    'Only you will ever be able to add or remove people here — a room stays ' +
+    'Only you will ever be able to add or remove people here — a group stays ' +
     'with its maker. Anyone can leave whenever they like.',
   // The framing, which must not be softened: the room — name, roster,
   // contents — is hidden from the server; the fan-out is not, and an
   // operator who wants the member list gets it. Never claim more or less.
   aboutServer:
-    'A room hides its name, its member list and everything said in it from ' +
+    'A group hides its name, its member list and everything said in it from ' +
     'Tacendum’s server — each message travels encrypted, one copy to each ' +
     'member. It does not hide the sending itself: the server sees who each ' +
     'copy goes to, so a server operator who wants the member list gets it.',
 
-  nameNeeded: 'Give the room a name first.',
+  nameNeeded: 'Give the group a name first.',
   memberNeeded: 'Pick at least one person.',
   /** Under a Create button that is off for both reasons at once. The
    * single-reason lines above serve when only one is missing. */
-  createHint: 'Name the room and pick at least one person.',
-  createFailed: 'Tacendum couldn’t create this room. Try again.',
+  createHint: 'Name the group and pick at least one person.',
+  createFailed: 'Tacendum couldn’t create this group. Try again.',
   inviteFailed: (names: string) =>
-    `The room was made, but the invitation to ${names} couldn’t be sent.`,
-  openAnyway: 'Open the room',
+    `The group was made, but the invitation to ${names} couldn’t be sent.`,
+  openAnyway: 'Open the group',
 } as const;
 
 /** One picked-or-pickable person, resolved once at load. */
@@ -119,7 +119,7 @@ export interface RoomCreateResult {
  *    `messaging.sendText` per member — was honest but wrong in exactly the
  *    way its own comment predicted: each invitation was a 1:1-scoped
  *    envelope, so every member's PRIVATE thread on this phone grew an
- *    out-row and a "New room" preview, and those legs survived
+ *    out-row and a "New group" preview, and those legs survived
  *    `deleteGroup` because nothing tied them to the room. The room-scoped
  *    fan-out leaves no row in any 1:1 thread, its legs die with the room,
  *    and the legs share the pacing budget instead of bursting.
@@ -449,6 +449,7 @@ export function GroupCreateScreen({ profile, onBack, onOpenRoom }: Props) {
           placeholderTextColor={t.color.inkMuted}
           keyboardAppearance={t.scheme}
           selectionColor={t.color.pine}
+          cursorColor={t.color.pine}
           accessibilityLabel={COPY.nameLabel}
           autoCorrect={false}
           // The wire bound (group-envelope's name schema), enforced where
@@ -465,7 +466,7 @@ export function GroupCreateScreen({ profile, onBack, onOpenRoom }: Props) {
               backgroundColor: t.color.paperSheet,
               color: t.color.inkStrong,
               borderWidth: focused ? 2 : 1,
-              borderColor: focused ? t.color.pine : t.color.lineStrong,
+              borderColor: focused ? t.color.pine : t.color.lineField,
             },
           ]}
         />
@@ -524,7 +525,7 @@ export function GroupCreateScreen({ profile, onBack, onOpenRoom }: Props) {
                     borderColor: t.color.pineLine,
                     backgroundColor: pressed
                       ? t.color.paperInset
-                      : t.color.pineWash,
+                      : t.color.paperSheet,
                   },
                 ]}
               >
@@ -682,10 +683,8 @@ export function GroupCreateScreen({ profile, onBack, onOpenRoom }: Props) {
                       borderRadius: t.radius.circle,
                       borderColor: selected
                         ? t.color.pine
-                        : t.color.pineLine,
-                      backgroundColor: selected
-                        ? t.color.pineWash
-                        : 'transparent',
+                        : t.color.lineStrong,
+                      backgroundColor: 'transparent',
                     },
                   ]}
                   {...(selected

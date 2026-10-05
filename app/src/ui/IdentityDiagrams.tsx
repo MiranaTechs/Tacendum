@@ -1,6 +1,6 @@
 import React from 'react';
 import { StyleSheet, View } from 'react-native';
-import Svg, { Circle, G, Path, Rect, Text as SvgText } from 'react-native-svg';
+import Svg, { Circle, Path, Rect, Text as SvgText } from 'react-native-svg';
 import { DEVICE_NOUN } from '../deviceNoun';
 import { useTheme, type Theme } from '../theme';
 
@@ -11,7 +11,8 @@ import { useTheme, type Theme } from '../theme';
  * every color is an app token.
  *
  * Key grammar, echoing the brand mark's outlined/solid bars: solid = private,
- * it stays · outlined = public, it travels · dashed = gone. The split-key
+ * it stays · outlined = public, it travels · dashed = gone, and a gone key is
+ * drawn in gray, at full opacity, never as faded forest. The split-key
  * glyph joins a solid private half to an outlined public bit over a short
  * dotted travel line — and it keeps its key-tooth, and the
  * travel line NEVER animates. Nothing in this file animates at all.
@@ -142,8 +143,8 @@ export function SplitKeyGlyph() {
   );
 }
 
-/** Sheet row 1: the phone gone dashed (dashed = gone), its key fading with
- * it. 22×22. */
+/** Sheet row 1: the phone gone dashed (dashed = gone), its key gone gray
+ * with it. 22×22. */
 export function DashedPhoneGlyph() {
   const t = useTheme();
   return (
@@ -159,28 +160,26 @@ export function DashedPhoneGlyph() {
         strokeWidth={1.8}
         strokeDasharray="3 2.2"
       />
-      <G opacity={0.35}>
-        <Circle
-          cx={11}
-          cy={8.5}
-          r={1.8}
-          fill="none"
-          stroke={t.color.pine}
-          strokeWidth={1.6}
-        />
-        <Path
-          d="M11 10.3 L11 14"
-          stroke={t.color.pine}
-          strokeWidth={1.6}
-          strokeLinecap="round"
-        />
-        <Path
-          d="M11 12.7 L12.8 12.7"
-          stroke={t.color.pine}
-          strokeWidth={1.6}
-          strokeLinecap="round"
-        />
-      </G>
+      <Circle
+        cx={11}
+        cy={8.5}
+        r={1.8}
+        fill="none"
+        stroke={t.color.inkMuted}
+        strokeWidth={1.6}
+      />
+      <Path
+        d="M11 10.3 L11 14"
+        stroke={t.color.inkMuted}
+        strokeWidth={1.6}
+        strokeLinecap="round"
+      />
+      <Path
+        d="M11 12.7 L12.8 12.7"
+        stroke={t.color.inkMuted}
+        strokeWidth={1.6}
+        strokeLinecap="round"
+      />
     </Svg>
   );
 }
@@ -369,31 +368,29 @@ export function IfLostDiagram() {
   const cap = caption(t);
   return (
     <Frame>
-      <G opacity={0.45}>
-        <Circle
-          cx={46}
-          cy={26}
-          r={8}
-          fill="none"
-          stroke={t.color.pine}
-          strokeWidth={2.5}
-          strokeDasharray="3 3"
-        />
-        <Path
-          d="M46 34 L46 56"
-          stroke={t.color.pine}
-          strokeWidth={2.5}
-          strokeLinecap="round"
-          strokeDasharray="3 3"
-        />
-        <Path
-          d="M46 50 L54 50"
-          stroke={t.color.pine}
-          strokeWidth={2.5}
-          strokeLinecap="round"
-          strokeDasharray="3 3"
-        />
-      </G>
+      <Circle
+        cx={46}
+        cy={26}
+        r={8}
+        fill="none"
+        stroke={t.color.inkMuted}
+        strokeWidth={2.5}
+        strokeDasharray="3 3"
+      />
+      <Path
+        d="M46 34 L46 56"
+        stroke={t.color.inkMuted}
+        strokeWidth={2.5}
+        strokeLinecap="round"
+        strokeDasharray="3 3"
+      />
+      <Path
+        d="M46 50 L54 50"
+        stroke={t.color.inkMuted}
+        strokeWidth={2.5}
+        strokeLinecap="round"
+        strokeDasharray="3 3"
+      />
       <Path d="M84 40 L156 40" stroke={t.color.inkMuted} strokeWidth={1.5} />
       <Path
         d="M150 35 L158 40 L150 45"

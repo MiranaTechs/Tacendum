@@ -38,8 +38,8 @@
  *  - A LINE THAT CANNOT BE VERIFIED IS CUT, NEVER SOFTENED. One clause was
  *    cut on exactly that rule: the draft's line 3 named a THIRD thing an
  *    email brings back — the reserved handle the accounts program owns —
- *    and `recoverScope` says "two things only: your account grouping, and
- *    your findability by email". A third thing this page promised and the
+ *    and `recoverScope` says "two things only: which devices are yours,
+ *    and your findability by email". A third thing this page promised and the
  *    server does not return would be discovered on the worst day of
  *    somebody's year. (The handle's own noun is deliberately not spelled
  *    anywhere in this file either: the plumbing suite runs a two-way word
@@ -47,7 +47,7 @@
  *    allowlist row it has no business owning.)
  *
  *  - NO DEVICE NOUN. `DEVICE_NOUN` is deliberately absent and the sentences
- *    are written round the noun ("made here", "every conversation here", "a
+ *    are written round the noun ("made here", "every room here", "a
  *    second linked device"), so the copy works on phones and tablets alike,
  *    following the same technique as `fieldModeCopy.ts`.
  *
@@ -66,8 +66,8 @@ export const LOSS_COPY = {
   title: 'If this is lost or taken',
   lines: [
     'Your identity is a key that was made here and has never left. If it is gone, it is gone — nobody at Tacendum can bring it back, because we never had it.',
-    'What goes with it: your Tacendum ID, every conversation here, and the trust each person has pinned to you. To reach them again you would be someone new, and they would add you again.',
-    'What an email brings back, if you have linked one: your account grouping, and being findable by that email. Never the key, never the messages, never the trust — everyone sees a fresh safety number.',
+    'What goes with it: your Tacendum ID, every room here, and the trust each person has pinned to you. To reach them again you would be someone new, and they would add you again.',
+    'What an email brings back, if you have linked one: which devices are yours, and being findable by that email. Never the key, never the messages, never the trust — everyone sees a fresh safety number.',
     'What helps today: a second linked device keeps its own copy of what it has seen since you linked it. It is not a backup — it starts empty and fills from there.',
   ],
   /** The ⓘ says what the disclosure is ABOUT, the house rule for every ⓘ in

@@ -72,7 +72,7 @@ describe('previews say the right thing', () => {
 
   it('the four announced kinds carry their own line, without names', () => {
     expect(previewFor(JSON.stringify({ tcm: 'grp.new', g: G, nm: 'Kitchen', ms: [M], n: 1 }))).toBe(
-      'New room',
+      'New group',
     );
     // The room name is the chat row's own title; repeating it in the preview
     // would leak it into a notification for nothing.

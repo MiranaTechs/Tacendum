@@ -100,6 +100,27 @@ describe('copy deck', () => {
     );
   });
 
+  it('the interception warnings name the threat, never a place', () => {
+    // Since every conversation became a "room" (2026-10-05), "nobody is in
+    // the middle of this room" read as a place and "trying to read this
+    // room" as the idiom. Both now say what the comparison guards against,
+    // in the explainer's own words.
+    expect(SAFETY_COPY.unchecked.body('Maya')).toBe(
+      'Compare these numbers with Maya in person or on a phone call. If every group matches, nobody is sitting between you.',
+    );
+    expect(SAFETY_COPY.changed.body('Maya')).toContain(
+      'Someone may be trying to read your messages to each other.',
+    );
+    expect(SAFETY_EXPLAINER[2]).toContain('someone may be sitting between you');
+    for (const state of Object.keys(
+      SAFETY_COPY,
+    ) as (keyof typeof SAFETY_COPY)[]) {
+      expect(SAFETY_COPY[state].body('Maya', 'Today')).not.toMatch(
+        /in the middle of this|read this room/,
+      );
+    }
+  });
+
   it('offers an action in every state that has something to do', () => {
     expect(SAFETY_COPY.none.action).toBeNull();
     expect(SAFETY_COPY.unchecked.action).toBe('They match');

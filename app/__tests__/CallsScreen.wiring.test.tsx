@@ -314,3 +314,38 @@ test('a call that is allowed to happen says nothing at all', async () => {
   // this harness's stubbed socket, and is what proves the dispatch ran.)
   expect(native.createOffer).toHaveBeenCalled();
 });
+
+test("a thread opened from a Calls row says Back to Calls, and goes there", async () => {
+  // The other half of the Calls origin: App.tsx hands the thread its route's
+  // `from`, so the chevron's spoken name matches where backDestination pops.
+  // Before, a call row's thread announced "Back to Rooms" and landed here.
+  const tree = await renderApp();
+  await ReactTestRenderer.act(async () => {
+    renderedTabBar(tree).props.onSelect('calls');
+  });
+  await ReactTestRenderer.act(async () => {});
+  expect(currentRoute()).toBe('calls');
+
+  const row = tree.root.find(
+    n =>
+      typeof n.type !== 'string' &&
+      typeof n.props.onPress === 'function' &&
+      typeof n.props.accessibilityLabel === 'string' &&
+      n.props.accessibilityLabel.startsWith('Dawit, '),
+  );
+  await ReactTestRenderer.act(async () => {
+    row.props.onPress();
+  });
+  await ReactTestRenderer.act(async () => {});
+  expect(currentRoute()).toBe('thread');
+
+  const back = tree.root.find(
+    n => n.props.testID === 'thread-back' && typeof n.props.onPress === 'function',
+  );
+  expect(back.props.accessibilityLabel).toBe('Back to Calls');
+  await ReactTestRenderer.act(async () => {
+    back.props.onPress();
+  });
+  await ReactTestRenderer.act(async () => {});
+  expect(currentRoute()).toBe('calls');
+});

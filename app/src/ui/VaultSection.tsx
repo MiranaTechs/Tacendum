@@ -909,6 +909,7 @@ export function VaultSection({ peerId, meUserId, who, blockedAt }: Props) {
             placeholderTextColor={t.color.inkMuted}
             keyboardAppearance={t.scheme}
             selectionColor={t.color.pine}
+            cursorColor={t.color.pine}
             accessibilityLabel={VAULT.nameLabel}
             testID="peer-vault-name-input"
             style={[
@@ -922,7 +923,7 @@ export function VaultSection({ peerId, meUserId, who, blockedAt }: Props) {
                   ? t.color.danger
                   : nameFocused
                     ? t.color.pine
-                    : t.color.lineStrong,
+                    : t.color.lineField,
                 borderWidth: nameError || nameFocused ? 2 : 1,
               },
             ]}
@@ -957,6 +958,7 @@ export function VaultSection({ peerId, meUserId, who, blockedAt }: Props) {
             placeholderTextColor={t.color.inkMuted}
             keyboardAppearance={t.scheme}
             selectionColor={t.color.pine}
+            cursorColor={t.color.pine}
             accessibilityLabel={VAULT.valueLabel}
             testID="peer-vault-value-input"
             style={[
@@ -971,7 +973,7 @@ export function VaultSection({ peerId, meUserId, who, blockedAt }: Props) {
                   ? t.color.danger
                   : valueFocused
                     ? t.color.pine
-                    : t.color.lineStrong,
+                    : t.color.lineField,
                 borderWidth: valueError || valueFocused ? 2 : 1,
               },
             ]}

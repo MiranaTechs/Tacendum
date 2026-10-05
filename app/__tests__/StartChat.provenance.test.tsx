@@ -10,7 +10,9 @@
  *    edit would vouch for characters nobody scanned.
  *
  * Neither rail is a server introduction, so neither ever earns the
- * discovery reminder — that is the whole point of telling them apart.
+ * discovery reminder — that is the whole point of telling them apart. And
+ * the build-33 tidy-up that regroups a typed ID on blur is display only: it
+ * never launders a provenance in either direction.
  *
  * Harness follows StartChat.qr.test.tsx: the fake op-sqlite records
  * statements; the recorded INSERT is the only honest evidence of a write.
@@ -82,6 +84,8 @@ const PROFILE: db.ProfileRow = {
 };
 
 const PEER_ID = '01BX5ZZKBKACTAV9WEVGEMMVRZ';
+/** The field's value once a picture or a paste fills it (build 33). */
+const PEER_GROUPED = '01BX 5ZZK BKAC TAV9 WEVG EMMV RZ';
 const PHOTO = 'file:///tmp/picked/IMG_0042.HEIC';
 
 beforeEach(async () => {
@@ -119,11 +123,13 @@ function byId(tree: ReactTestRenderer.ReactTestRenderer, id: string) {
   );
 }
 
-/** The control itself: a Pressable's host View carries no `onPress`. */
+/** The control itself. Harness change for build 33: PrimaryButton,
+ * OutlineButton and TextAction put testID and onPress on the composite AND
+ * its Pressable, so the first match is taken rather than a `find`. */
 function control(tree: ReactTestRenderer.ReactTestRenderer, id: string) {
-  return tree.root.find(
+  return tree.root.findAll(
     n => n.props.testID === id && typeof n.props.onPress === 'function',
-  );
+  )[0]!;
 }
 
 function press(tree: ReactTestRenderer.ReactTestRenderer, id: string) {
@@ -138,13 +144,26 @@ function type(tree: ReactTestRenderer.ReactTestRenderer, text: string) {
   });
 }
 
+/** Keystrokes: one character per change, so nothing reads as a paste. */
+async function typeEach(tree: ReactTestRenderer.ReactTestRenderer, text: string) {
+  for (const ch of text) {
+    await type(tree, `${byId(tree, 'new-peer-input')[0]!.props.value ?? ''}${ch}`);
+  }
+}
+
+function blur(tree: ReactTestRenderer.ReactTestRenderer) {
+  return ReactTestRenderer.act(async () => {
+    byId(tree, 'new-peer-input')[0]!.props.onBlur();
+  });
+}
+
 function screen() {
   return (
     <StartChatScreen
       profile={PROFILE}
       onBack={jest.fn()}
       onOpenChat={jest.fn()}
-      onFindByEmail={jest.fn()}
+      onOpenAccountEmail={jest.fn()}
     />
   );
 }
@@ -209,8 +228,9 @@ test('an id read by the live camera is recorded as qr', async () => {
 test('an id pasted out of a message is recorded as manual — nobody scanned it', async () => {
   const tree = await render(screen());
   await type(tree, `My Tacendum ID:\n${PEER_ID}\nAdd me in Tacendum → Start a chat.`);
-  // The paste collapsed to the bare id; the person still presses the button.
-  expect(byId(tree, 'new-peer-input')[0]!.props.value).toBe(PEER_ID);
+  // The paste collapsed to the id, grouped since build 33; the person
+  // still presses the button.
+  expect(byId(tree, 'new-peer-input')[0]!.props.value).toBe(PEER_GROUPED);
   await press(tree, 'start-chat');
   await ReactTestRenderer.act(async () => {});
 
@@ -235,11 +255,38 @@ test('a scanned id that the person then edits is recorded as manual — the code
   await readPhoto(tree, [PEER_ID]);
   // Delete the last character and retype it: the field ends up spelling the
   // same id, but the person, not the code, put the final character there.
-  await type(tree, PEER_ID.slice(0, -1));
-  await type(tree, PEER_ID);
+  // (The fill is grouped since build 33, so the edit is on the grouped text.)
+  await type(tree, PEER_GROUPED.slice(0, -1));
+  await type(tree, PEER_GROUPED);
   await press(tree, 'start-chat');
   await ReactTestRenderer.act(async () => {});
 
   expect(recordedProvenance()).toBe('manual');
+  await unmount(tree);
+});
+
+// Added for build 33: the blur regroup is display only, and must not
+// launder provenance in either direction.
+test('a typed id regrouped on blur is still recorded as manual', async () => {
+  const tree = await render(screen());
+  await typeEach(tree, PEER_ID);
+  await blur(tree);
+  expect(byId(tree, 'new-peer-input')[0]!.props.value).toBe(PEER_GROUPED);
+  await press(tree, 'start-chat');
+  await ReactTestRenderer.act(async () => {});
+
+  expect(recordedProvenance()).toBe('manual');
+  await unmount(tree);
+});
+
+test('a scanned id stays qr through a blur, until the person edits it', async () => {
+  const tree = await render(screen());
+  await scanCamera(tree, [PEER_ID]);
+  expect(byId(tree, 'new-peer-input')[0]!.props.value).toBe(PEER_GROUPED);
+  await blur(tree);
+  await press(tree, 'start-chat');
+  await ReactTestRenderer.act(async () => {});
+
+  expect(recordedProvenance()).toBe('qr');
   await unmount(tree);
 });

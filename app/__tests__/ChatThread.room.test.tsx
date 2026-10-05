@@ -364,7 +364,7 @@ test('the header names the room, opens the room profile, and no rendered text co
   const text = renderedText(tree);
 
   expect(text).toContain('Kitchen');
-  expect(text).toContain('Room');
+  expect(text).toContain('Group');
   // The two-seat commitment may not appear over a roster.
   expect(text).not.toContain('Just you two');
   // No screen renders a room's id.
@@ -399,13 +399,13 @@ test('the room header wears the RoomMark and counts its people from the FOLD —
 
   // The count, in the header's own words — and NOT the unfolded 4 or 5.
   const text = renderedText(tree);
-  expect(text).toContain('Room · 3 people');
+  expect(text).toContain('Group · 3 people');
   expect(text).not.toContain('4 people');
   expect(text).not.toContain('5 people');
 
   // VoiceOver: the name, the word, the count; the action moves to the hint.
-  expect(header.props.accessibilityLabel).toBe('Kitchen, room, 3 people');
-  expect(header.props.accessibilityHint).toBe('Opens room details');
+  expect(header.props.accessibilityLabel).toBe('Kitchen, group, 3 people');
+  expect(header.props.accessibilityHint).toBe('Opens group details');
 });
 
 test('a 1:1 header is unchanged: the circle, "Just you two", and no room vocabulary anywhere', async () => {
@@ -422,10 +422,11 @@ test('a 1:1 header is unchanged: the circle, "Just you two", and no room vocabul
   expect(header.findAllByType(Avatar).length).toBe(1);
   expect(tree.root.findAllByType(RoomMark).length).toBe(0);
 
-  // The two-seat commitment stands, and the room's word appears nowhere.
+  // The two-seat commitment stands, and the group's word appears nowhere.
   const text = renderedText(tree);
   expect(text).toContain('Just you two');
   expect(text).not.toMatch(/\bRoom\b/);
+  expect(text).not.toMatch(/\bGroup\b/);
   expect(text).not.toMatch(/\d+ (person|people)/);
 
   // The label is today's exactly; the room hint does not leak across.

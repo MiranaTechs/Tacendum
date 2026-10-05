@@ -1,8 +1,8 @@
 /**
  * App.tsx carries no hard-coded colour.
  *
- * The in-call Add picker used to sit under a translucent `rgba(6,8,7,0.72)`
- * scrim — the one colour literal in the file, and the one translucent scrim
+ * The in-call Add picker used to sit under a translucent scrim literal —
+ * the one colour literal in the file, and the one translucent scrim
  * in the app (the project rule: no translucent scrims anywhere; the emoji
  * rail is the precedent). It now sits on an opaque paper sheet from the
  * theme's tokens with a hairline seam above it. No suite mounts the group-add

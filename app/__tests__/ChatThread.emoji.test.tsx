@@ -187,18 +187,23 @@ test('the delivery tick still rides an outbound jumbo row', async () => {
 
 /**
  * THE GATE'S DEFECT. The jumbo surface goes transparent, but the tick and
- * the "edited" mark kept their ON-PINE inks: near-white on the off-white
+ * the "edited" mark kept their ON-PINE inks: near-white on the white
  * thread ground in light mode, and the READ tick — the one state the glyph
  * exists to distinguish — invisible in both. The photo status already
  * solves exactly this for a paper-coloured surface; a jumbo row is the same
- * problem. */
+ * problem.
+ *
+ * Off the bubble, read is forest and delivered is tickMuted: a gray that
+ * differs from the forest in luminance, so the read state is never told by
+ * hue alone (inkMuted sat at the forest's own lightness).
+ */
 test('an outbound jumbo row inks its tick for paper, not for pine', async () => {
   const tree = await renderThread();
   const status = tree.root
     .findAll(n => n.props.testID === 'status-01MINE-delivered')
     .find(n => typeof n.type !== 'string')!;
   const tick = status.findByType(TickGlyph);
-  expect(tick.props.color).toBe(t.color.inkMuted);
+  expect(tick.props.color).toBe(t.color.tickMuted);
   expect(tick.props.readColor).toBe(t.color.pine);
 
   // The ordinary pine bubble is untouched: on pine the inks must stay on-pine.
@@ -224,11 +229,14 @@ test('an ordinary outbound bubble still inks its tick and mark for pine', async 
     .findAll(n => n.props.testID === 'status-01MINEWORDS-sent')
     .find(n => typeof n.type !== 'string')!;
   const tick = status.findByType(TickGlyph);
-  expect(tick.props.color).toBe(t.color.onBubbleOut);
-  expect(tick.props.readColor).toBe(t.color.onPine);
+  // On the forest slab: sent and delivered in the in-bubble tick gray, read
+  // in the bubble's own white words, so the two states differ in luminance.
+  expect(tick.props.color).toBe(t.color.onBubbleOutTick);
+  expect(tick.props.readColor).toBe(t.color.onBubbleOut);
+  expect(tick.props.color).not.toBe(tick.props.readColor);
   const mark = tree.root
     .findAll(n => n.props.testID === 'edited-01MINEWORDS')
     .find(n => typeof n.type === 'string')!;
-  expect(StyleSheet.flatten(mark.props.style).color).toBe(t.color.onBubbleOut);
+  expect(StyleSheet.flatten(mark.props.style).color).toBe(t.color.onBubbleOutMuted);
   await ReactTestRenderer.act(() => tree.unmount());
 });

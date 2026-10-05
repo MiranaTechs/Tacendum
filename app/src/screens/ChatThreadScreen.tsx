@@ -296,10 +296,20 @@ interface Props {
    * header offers no call button rather than one that does nothing.
    */
   onStartRoomCall?: (others: readonly string[], kind: 'audio' | 'video') => void;
+  /**
+   * The list this thread was opened from, which is where Back returns
+   * (App.tsx `backDestination` reads the same route field). Only the back
+   * control's spoken name reads it. Absent means the Rooms list.
+   */
+  from?: 'chats' | 'calls' | 'attention';
 }
 
 /** People-facing copy. A raw exception must never reach the screen. */
 const COPY = {
+  /** The back control names the list it returns to, by that list's title. */
+  backToRooms: 'Back to Rooms',
+  backToCalls: 'Back to Calls',
+  backToAttention: 'Back to Needs attention',
   /** The composer's "+" opens photos, the camera, documents and location —
    * it is not a photo button. */
   attach: 'Attach',
@@ -477,7 +487,7 @@ const COPY = {
    * no-directory story is worth more than the familiar verb. "No message
    * *here*" is the honest scope. No device noun in any of these.
    */
-  find: 'Find in this conversation',
+  find: 'Find in this room',
   findPlaceholder: 'Find a message',
   findClose: 'Close find',
   findNext: 'Next match',
@@ -526,7 +536,7 @@ function FileContent({
       ? Math.floor((attachment.b64len * 3) / 4)
       : size;
   const ink = out ? t.color.onBubbleOut : t.color.inkStrong;
-  const sub = out ? t.color.onBubbleOut : t.color.inkMuted;
+  const sub = out ? t.color.onBubbleOutMuted : t.color.inkMuted;
   const open = () => {
     if (state === 'failed') return onRetry();
     if (state !== 'ready') return;
@@ -600,7 +610,7 @@ function VoiceContent({
   const styles = stylesFor(t);
   const state = attachment?.state ?? 'pending';
   const ink = out ? t.color.onBubbleOut : t.color.inkStrong;
-  const sub = out ? t.color.onBubbleOut : t.color.inkMuted;
+  const sub = out ? t.color.onBubbleOutMuted : t.color.inkMuted;
   const Glyph = playing ? PauseGlyph : PlayGlyph;
   return (
     <Pressable
@@ -633,7 +643,7 @@ function VoiceContent({
           style={[
             styles.voiceTrack,
             {
-              backgroundColor: out ? t.color.bubbleOutLine : t.color.pineWashFaint,
+              backgroundColor: out ? t.color.bubbleOutPressed : t.color.paperInset,
             },
           ]}
         >
@@ -692,7 +702,7 @@ function LocationContent({
   out: boolean;
 }): React.JSX.Element {
   const ink = out ? t.color.onBubbleOut : t.color.inkStrong;
-  const sub = out ? t.color.onBubbleOut : t.color.inkMuted;
+  const sub = out ? t.color.onBubbleOutMuted : t.color.inkMuted;
   return (
     <Pressable
       onPress={() =>
@@ -871,9 +881,18 @@ export function ChatThreadScreen({
   onStartCall,
   onOpenGroupProfile,
   onStartRoomCall,
+  from: openedFrom,
 }: Props) {
   const t = useTheme();
   const styles = stylesFor(t);
+  // Back goes where the thread came from (a Calls row, the Needs attention
+  // inbox, or the Rooms list), so the chevron's spoken name says which.
+  const threadBackLabel =
+    openedFrom === 'calls'
+      ? COPY.backToCalls
+      : openedFrom === 'attention'
+        ? COPY.backToAttention
+        : COPY.backToRooms;
   // The window's HEIGHT is still the right vertical bound for the panels'
   // maxHeight caps below: every pane spans the window's full height under
   // this shell, so "a banner may take a third of the glass" is a fact about
@@ -1924,11 +1943,11 @@ export function ChatThreadScreen({
   const roomName = isRoom
     ? sanitizeDisplayName(chat?.localName) ||
       sanitizeDisplayName(group.name) ||
-      'This room'
+      'This group'
     : null;
   /**
    * The folded head count as words ("3 people"), or null while the roster
-   * read is in flight. The header says "Room" alone rather than a number it
+   * read is in flight. The header says "Group" alone rather than a number it
    * has not folded — a guessed count over a roster would be the tell.
    */
   const roomPeople =
@@ -2647,9 +2666,10 @@ export function ChatThreadScreen({
 
   /**
    * A tapped quote goes to the message it quotes: scroll it to the middle of
-   * the view and wash it pine for a moment. Resolved by the row's composite
-   * key, so a peer's reply pointing at MY row lands on my row and never on
-   * an inbound row sharing the id. */
+   * the view and give it the neutral highlight for a moment (your own words
+   * flash the pressed slab). Resolved by the row's composite key, so a peer's
+   * reply pointing at MY row lands on my row and never on an inbound row
+   * sharing the id. */
   const revealQuoted = useCallback(
     (target: db.MessageRow) => {
       const key = `${target.msgId}:${target.direction}`;
@@ -4238,7 +4258,7 @@ export function ChatThreadScreen({
                   sanitizeDisplayName(chat?.displayName),
                 photoB64: chat?.avatarB64,
               }}
-              accessibilityLabel={`A private chat between you and ${peerRef}`}
+              accessibilityLabel={`A private room for you and ${peerRef}`}
             />
             <Text
               accessibilityRole="header"
@@ -4620,7 +4640,7 @@ export function ChatThreadScreen({
       ) : (
       <ScreenHeader
         onBack={onBack}
-        backLabel="Back to chats"
+        backLabel={threadBackLabel}
         testIDBack="thread-back"
         title={
           <Pressable
@@ -4639,12 +4659,12 @@ export function ChatThreadScreen({
             // 1:1 label is unchanged.
             accessibilityLabel={
               isRoom
-                ? `${roomName}, room${roomPeople ? `, ${roomPeople}` : ''}`
+                ? `${roomName}, group${roomPeople ? `, ${roomPeople}` : ''}`
                 : named
                   ? `Open ${name}’s profile`
                   : 'Open their profile'
             }
-            {...(isRoom ? { accessibilityHint: 'Opens room details' } : {})}
+            {...(isRoom ? { accessibilityHint: 'Opens group details' } : {})}
             testID={isRoom ? 'thread-room-header' : 'thread-peer-header'}
             style={({ pressed }) => [
               styles.peerControl,
@@ -4696,8 +4716,8 @@ export function ChatThreadScreen({
                 {typingLabel ??
                   (isRoom
                     ? roomPeople
-                      ? `Room · ${roomPeople}`
-                      : 'Room'
+                      ? `Group · ${roomPeople}`
+                      : 'Group'
                     : 'Just you two')}
               </Text>
             </View>
@@ -4722,7 +4742,7 @@ export function ChatThreadScreen({
                 pressed && { backgroundColor: t.color.pineWash },
               ]}
             >
-              <FindGlyph color={t.color.pine} />
+              <FindGlyph color={t.color.inkStrong} />
             </Pressable>
             {/* Two buttons, not one with a hidden long-press. A long-press
                 that is the ONLY way to reach audio is a feature most people
@@ -4816,7 +4836,7 @@ export function ChatThreadScreen({
                   >
                     <Glyph
                       size={24}
-                      color={stopped ? t.color.inkMuted : t.color.pine}
+                      color={stopped ? t.color.inkMuted : t.color.inkStrong}
                     />
                   </Pressable>
                   );
@@ -4944,7 +4964,7 @@ export function ChatThreadScreen({
         >
           <Text
             allowFontScaling={false}
-            style={[t.type.iconGlyph, { color: t.color.pine }]}
+            style={[t.type.iconGlyph, { color: t.color.inkStrong }]}
           >
             ↓
           </Text>
@@ -5015,7 +5035,7 @@ export function ChatThreadScreen({
               style={[
                 styles.errorActions,
                 {
-                  backgroundColor: t.color.dangerWash,
+                  backgroundColor: t.color.paperLayer,
                   borderLeftColor: t.color.danger,
                   paddingHorizontal: t.layout.gutter,
                 },
@@ -5064,12 +5084,14 @@ export function ChatThreadScreen({
             styles.progressRow,
             {
               backgroundColor: t.color.paperLayer,
+              borderTopColor: t.color.lineSoft,
+              borderBottomColor: t.color.lineSoft,
               paddingHorizontal: t.layout.gutter,
             },
           ]}
         >
           {reduceMotion ? null : (
-            <ActivityIndicator size="small" color={t.color.pine} />
+            <ActivityIndicator size="small" color={t.color.inkMuted} />
           )}
           <Text style={[t.type.compactBody, { color: t.color.inkBody }]}>
             Preparing photo…
@@ -5293,12 +5315,16 @@ export function ChatThreadScreen({
             // tall it draws under it, so a wide, short picture gives the
             // space back to the size line and the two controls — which is
             // why 200 was chosen over the bubble's 320 in the first place.
+            // The letterbox is white on a white panel, so a hairline frame
+            // shows where the picture's box ends.
             style={{
               width: '100%',
               maxHeight: PHOTO_REVIEW_MAX_HEIGHT,
               aspectRatio: photoAspect(photoReview.picked),
               borderRadius: t.radius.bubble,
               backgroundColor: t.color.paperSheet,
+              borderWidth: t.hairline,
+              borderColor: t.color.lineSoft,
             }}
             // `contain`, not `cover`: this is the picture being checked, so
             // it must not be cropped to fit the frame doing the checking.
@@ -5402,7 +5428,7 @@ export function ChatThreadScreen({
           secondOpinion={
             secondOpinionReview
               ? {
-                  room: roomName ?? 'This room',
+                  room: roomName ?? 'This group',
                   agents: liveChips.map(chip => chip.name),
                   onCancel: cancelSecondOpinion,
                 }
@@ -5561,7 +5587,8 @@ function SafetyPanel({
                 style={[
                   t.type.safetyNumber,
                   styles.safetyCell,
-                  { color: t.color.pine },
+                  // Charcoal: digits are text, and forest marks an action.
+                  { color: t.color.inkStrong },
                 ]}
                 // No adjustsFontSizeToFit: shrinking digits to fit a fixed
                 // cell is the wrong trade for the one number in the app two
@@ -5840,7 +5867,7 @@ function IdentityBanner({
       style={[
         styles.banner,
         {
-          backgroundColor: t.color.dangerWash,
+          backgroundColor: t.color.paperLayer,
           borderTopColor: t.color.danger,
           borderLeftColor: t.color.danger,
           paddingHorizontal: t.layout.gutter,
@@ -6110,7 +6137,7 @@ function Composer({
               Second opinion draft
             </Text>
             <Text style={[t.type.timeStatus, { color: t.color.inkMuted }]}>
-              {`Room · ${secondOpinion.room}`}
+              {`Group · ${secondOpinion.room}`}
             </Text>
             <Text style={[t.type.timeStatus, { color: t.color.inkMuted }]}>
               {secondOpinion.agents.length === 0
@@ -6331,7 +6358,7 @@ function Composer({
               {/* The level is a fact about the microphone, so it is drawn
                   rather than described: a bar that does not move is how a
                   person learns the mic is not hearing them. */}
-              <View style={[styles.voiceLevelTrack, { backgroundColor: t.color.pineWashFaint }]}>
+              <View style={[styles.voiceLevelTrack, { backgroundColor: t.color.paperInset }]}>
                 <View
                   style={[
                     styles.voiceLevelFill,
@@ -6352,7 +6379,7 @@ function Composer({
                 testID="voice-stop"
                 style={styles.composerIcon}
               >
-                <PauseGlyph size={20} color={t.color.pine} />
+                <PauseGlyph size={20} color={t.color.inkStrong} />
               </Pressable>
             </>
           ) : (
@@ -6376,9 +6403,9 @@ function Composer({
                 style={styles.composerIcon}
               >
                 {voice.previewing ? (
-                  <PauseGlyph size={20} color={t.color.pine} />
+                  <PauseGlyph size={20} color={t.color.inkStrong} />
                 ) : (
-                  <PlayGlyph size={20} color={t.color.pine} />
+                  <PlayGlyph size={20} color={t.color.inkStrong} />
                 )}
               </Pressable>
               {/* Said plainly, because the whole point of this state is that
@@ -6396,24 +6423,33 @@ function Composer({
                 testID="voice-send"
                 style={styles.composerIcon}
               >
-                <View
-                  style={[
-                    styles.sendDisc,
-                    {
-                      width: t.layout.sendDisc,
-                      height: t.layout.sendDisc,
-                      borderRadius: t.layout.sendDisc / 2,
-                      borderColor: t.color.pineLine,
-                    },
-                  ]}
-                >
-                  <Text
-                    allowFontScaling={false}
-                    style={[t.type.iconGlyph, { color: t.color.pine }]}
+                {/* The composer's own send, filled: a take waiting here is
+                    always ready to go. */}
+                {({ pressed }) => (
+                  <View
+                    style={[
+                      styles.sendDisc,
+                      {
+                        width: t.layout.sendDisc,
+                        height: t.layout.sendDisc,
+                        borderRadius: t.layout.sendDisc / 2,
+                        backgroundColor: pressed
+                          ? t.color.pinePressed
+                          : t.color.pine,
+                        borderColor: pressed
+                          ? t.color.pinePressed
+                          : t.color.pine,
+                      },
+                    ]}
                   >
-                    ↑
-                  </Text>
-                </View>
+                    <Text
+                      allowFontScaling={false}
+                      style={[t.type.iconGlyph, { color: t.color.onPine }]}
+                    >
+                      ↑
+                    </Text>
+                  </View>
+                )}
               </Pressable>
             </>
           )}
@@ -6490,7 +6526,7 @@ function Composer({
               style={[
                 styles.mentionChip,
                 {
-                  backgroundColor: t.color.pineWash,
+                  backgroundColor: t.color.paperSheet,
                   borderColor: t.color.pineLine,
                   borderRadius: t.radius.button,
                 },
@@ -6522,7 +6558,10 @@ function Composer({
           styles.composer,
           {
             backgroundColor: t.color.paperSheet,
-            borderColor: t.color.lineStrong,
+            // In light the pill is white on a white bar and has only its edge,
+            // so the edge is the field boundary ink (3:1 against the ground),
+            // not a soft line.
+            borderColor: t.color.lineField,
             borderRadius: t.radius.composer,
             borderTopLeftRadius: open ? 0 : t.radius.composer,
             borderTopRightRadius: open ? 0 : t.radius.composer,
@@ -6544,7 +6583,7 @@ function Composer({
         >
           <Text
             allowFontScaling={false}
-            style={[t.type.iconGlyph, { color: t.color.pine }]}
+            style={[t.type.iconGlyph, { color: t.color.inkMuted }]}
           >
             +
           </Text>
@@ -6561,9 +6600,12 @@ function Composer({
           // The system keyboard follows the palette: with nothing said here
           // iOS raised a light keyboard over the dark thread. `scheme` is
           // the token set's own name for itself — the one place a platform
-          // appearance must be named.
+          // appearance must be named. The caret is named beside the
+          // selection: left alone, Android draws it from the system's day or
+          // night accent, not the app's palette.
           keyboardAppearance={t.scheme}
           selectionColor={t.color.pine}
+          cursorColor={t.color.pine}
           value={draft}
           onChangeText={onChangeDraft}
           onSelectionChange={e => {
@@ -6592,7 +6634,7 @@ function Composer({
         >
           <Text
             allowFontScaling={false}
-            style={[t.type.iconGlyph, { color: t.color.pine }]}
+            style={[t.type.iconGlyph, { color: t.color.inkMuted }]}
           >
             ☺
           </Text>
@@ -6639,9 +6681,11 @@ function Composer({
           testID="composer-send"
           style={styles.composerIcon}
         >
-          {/* An outlined ring with a green arrow, not a filled disc — the
-              send control matches the site's phone and relay views in both
-              palettes, and disabled recedes to a soft line. */}
+          {/* A filled forest disc with a white arrow once there is something
+              to send. The mic that holds this slot while there is nothing to
+              send is an outlined forest ring, so outlined turning filled is
+              what says "ready to send"; a disabled send recedes to a soft
+              ring and a muted arrow. */}
           {({ pressed }) => (
             <View
               style={[
@@ -6653,9 +6697,13 @@ function Composer({
                   backgroundColor: !canSend
                     ? 'transparent'
                     : pressed
-                      ? t.color.pineWash
-                      : 'transparent',
-                  borderColor: !canSend ? t.color.lineSoft : t.color.pineLine,
+                      ? t.color.pinePressed
+                      : t.color.pine,
+                  borderColor: !canSend
+                    ? t.color.lineSoft
+                    : pressed
+                      ? t.color.pinePressed
+                      : t.color.pine,
                 },
               ]}
             >
@@ -6663,7 +6711,7 @@ function Composer({
                 allowFontScaling={false}
                 style={[
                   t.type.iconGlyph,
-                  { color: canSend ? t.color.pine : t.color.inkMuted },
+                  { color: canSend ? t.color.onPine : t.color.inkMuted },
                 ]}
               >
                 ↑
@@ -6712,16 +6760,18 @@ function DrawerAction({
     >
       {({ pressed }) => (
         <>
+          {/* A secondary choice, so charcoal line art on a white disc with
+              a gray ring; the press darkens the disc. */}
           <View
             style={[
               styles.drawerDisc,
               {
-                backgroundColor: pressed ? t.color.pineLine : t.color.pineWash,
-                borderColor: t.color.pineLine,
+                backgroundColor: pressed ? t.color.paperInset : t.color.paperSheet,
+                borderColor: t.color.lineSoft,
               },
             ]}
           >
-            <Icon size={22} color={t.color.pine} />
+            <Icon size={22} color={t.color.inkStrong} />
           </View>
           <Text
             numberOfLines={1}
@@ -6806,7 +6856,9 @@ interface MessageRowProps {
   /** Tapping the quote: scroll to and flash the quoted row. */
   onReveal: (row: db.MessageRow) => void;
   onRevealApproval: (approval: ApprovalQuote) => void;
-  /** This row was just revealed by a tapped quote: wash it pine. */
+  /** This row was just revealed by a tapped quote: the neutral highlight
+   * over its own surface for a moment; your own words flash the pressed
+   * slab. */
   flashed: boolean;
   /** The stream snapshot painted over this inbound bubble while the
    * reply is still being written — undefined when the bubble shows durable
@@ -7623,6 +7675,9 @@ function MessageRowInner({
    * each of those needs the surface. */
   const jumbo =
     envelope === null && overlay === undefined && isEmojiOnly(displayText(row.body));
+  /** A tapped quote led to YOUR words on the slab: they flash the pressed
+   * slab; every other flashed row takes the highlight layer instead. */
+  const flashOwnWords = flashed && out && !isPhoto && !jumbo;
   const bubbleMax = Math.min(
     t.layout.bubbleMaxWidth,
     viewportWidth * t.layout.bubbleMaxRatio,
@@ -7653,6 +7708,19 @@ function MessageRowInner({
     borderTopRightRadius: inset(corners.borderTopRightRadius),
     borderBottomLeftRadius: inset(corners.borderBottomLeftRadius),
     borderBottomRightRadius: inset(corners.borderBottomRightRadius),
+  };
+  /** The quote-jump flash's layer: the whole bubble inside its 1pt border,
+   * so each corner is one point tighter than the bubble's own. */
+  const flashLayer = {
+    position: 'absolute' as const,
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    borderTopLeftRadius: Math.max(0, corners.borderTopLeftRadius - 1),
+    borderTopRightRadius: Math.max(0, corners.borderTopRightRadius - 1),
+    borderBottomLeftRadius: Math.max(0, corners.borderBottomLeftRadius - 1),
+    borderBottomRightRadius: Math.max(0, corners.borderBottomRightRadius - 1),
   };
 
   const clock = clockLabel(row.ts);
@@ -7841,7 +7909,7 @@ function MessageRowInner({
               accessibilityElementsHidden
               importantForAccessibility="no-hide-descendants"
               numberOfLines={1}
-              style={[t.type.utilityLabel, styles.authorLabel, { color: t.color.pine }]}
+              style={[t.type.utilityLabel, styles.authorLabel, { color: t.color.inkBody }]}
             >
               {nameFor(row.authorId)}
             </Text>
@@ -7924,11 +7992,28 @@ function MessageRowInner({
             backgroundColor: pressed ? t.color.pineWash : 'transparent',
             borderColor: 'transparent',
           },
-          // The row a tapped quote just led here: a pine wash for a
-          // moment, so the eye finds it after the scroll.
-          flashed && { backgroundColor: t.color.pineWash },
+          // The row a tapped quote just led here: your own words flash the
+          // pressed slab, because the neutral highlight under white words
+          // would all but erase them. Every other row flashes the highlight
+          // OVER its own surface (the layer below).
+          out && !isPhoto && !jumbo && flashed && {
+            backgroundColor: t.color.bubbleOutPressed,
+          },
         ]}
       >
+        {/* The neutral highlight for a moment, so the eye finds the row after
+            the scroll. Drawn over the bubble's own fill, never in place of
+            it: in place, the translucent highlight sat on the thread's ground,
+            and a dark incoming bubble went DARKER (#232323 to #212121,
+            1.02:1) for the very moment it was meant to stand out. Over the
+            sheet it is a step up in dark and the same faint gray in light. */}
+        {flashed && !flashOwnWords ? (
+          <View
+            testID={`msg-flash-${row.msgId}`}
+            pointerEvents="none"
+            style={[flashLayer, { backgroundColor: t.color.pineWash }]}
+          />
+        ) : null}
         {isPhoto && envelope?.tcm === 'image' ? (
           <PhotoContent
             theme={t}
@@ -8033,7 +8118,7 @@ function MessageRowInner({
                   style={[
                     t.type.compactBody,
                     styles.quoteText,
-                    { color: out ? t.color.onBubbleOut : t.color.inkMuted },
+                    { color: out ? t.color.onBubbleOutMuted : t.color.inkMuted },
                   ]}
                 >
                   {/* WITH the resolver, like every sibling surface (the
@@ -8148,11 +8233,10 @@ function MessageRowInner({
                   styles.editedMark,
                   {
                     // Same switch as the tick below: on the transparent
-                    // jumbo surface the on-pine ink is near-white on an
-                    // off-white ground, so a jumbo row takes the paper
-                    // ink.
+                    // jumbo surface the in-bubble gray is near-white on the
+                    // white ground, so a jumbo row takes the muted ink.
                     color:
-                      out && !jumbo ? t.color.onBubbleOut : t.color.inkMuted,
+                      out && !jumbo ? t.color.onBubbleOutMuted : t.color.inkMuted,
                   },
                 ]}
               >
@@ -8183,20 +8267,23 @@ function MessageRowInner({
             importantForAccessibility="no-hide-descendants"
             style={styles.statusGlyph}
           >
-            {/* On a pine bubble the accent cannot be pine — it would vanish.
-                Read is the BRIGHT ink and the other states are the muted one,
-                which is the same "this one is different" the light-bubble
-                convention gets from turning blue.
+            {/* On the forest bubble the accent cannot be forest — it would
+                vanish. Read is the white ink and sent and delivered are a pure
+                gray, onBubbleOutTick: the two differ in LUMINANCE, so the
+                read tick never rests on colour alone, which is the same "this
+                one is different" the light-bubble convention gets from turning
+                blue.
 
-                A JUMBO row has no pine under it: the surface went
-                transparent, so the on-pine pair would be near-white on the
-                off-white thread ground, and the read tick invisible in both
-                themes. It takes the same paper pair the photo status below
-                already uses, for the same reason. */}
+                A JUMBO row has no forest under it: the surface went
+                transparent, so the in-bubble pair would be white on the white
+                thread ground, and the read tick invisible. It takes the
+                off-bubble pair the photo status below uses, for the same
+                reason: read in forest, delivered in tickMuted, a gray set apart
+                from the forest by luminance, not only by hue. */}
             <TickGlyph
               status={tickStatusOf(row.status)}
-              color={jumbo ? t.color.inkMuted : t.color.onBubbleOut}
-              readColor={jumbo ? t.color.pine : t.color.onPine}
+              color={jumbo ? t.color.tickMuted : t.color.onBubbleOutTick}
+              readColor={jumbo ? t.color.pine : t.color.onBubbleOut}
               size={13}
             />
           </View>
@@ -8215,6 +8302,7 @@ function MessageRowInner({
             {
               borderRadius: t.radius.circle,
               backgroundColor: pressed ? t.color.pineWash : t.color.paperLayer,
+              borderColor: t.color.lineSoft,
             },
           ]}
         >
@@ -8234,7 +8322,7 @@ function MessageRowInner({
         >
           <TickGlyph
             status={tickStatusOf(row.status)}
-            color={t.color.inkMuted}
+            color={t.color.tickMuted}
             readColor={t.color.pine}
           />
         </View>
@@ -8281,7 +8369,9 @@ function MessageRowInner({
                   styles.reactionChip,
                   {
                     borderRadius: t.radius.small,
-                    backgroundColor: group.includesMine ? t.color.pineWash : t.color.paperSheet,
+                    // White either way: one of mine is told by the forest
+                    // outline (and the spoken "including you"), not a fill.
+                    backgroundColor: t.color.paperSheet,
                     borderColor: group.includesMine ? t.color.pineLine : t.color.lineSoft,
                   },
                 ]}
@@ -8325,7 +8415,6 @@ function MessageRowInner({
                   style={({ pressed }) => [
                     styles.railChoice,
                     chosen && {
-                      backgroundColor: t.color.pineWash,
                       borderBottomWidth: 2,
                       borderBottomColor: t.color.pine,
                     },
@@ -8720,8 +8809,10 @@ function PhotoContent({
           styles.photoFallback,
           inner,
           // minHeight: the block is all scaling text plus a 24pt square, so a
-          // fixed 120 clips the retry action at large text sizes.
-          { width, minHeight: 120, backgroundColor: t.color.dangerWash },
+          // fixed 120 clips the retry action at large text sizes. No fill:
+          // the photo frame's own border edges it, and the red square and
+          // words carry the failure.
+          { width, minHeight: 120, backgroundColor: 'transparent' },
         ]}
       >
         <View
@@ -8780,7 +8871,7 @@ function PhotoContent({
           Loading photo…
         </Text>
       ) : (
-        <ActivityIndicator size="small" color={t.color.pine} />
+        <ActivityIndicator size="small" color={t.color.inkMuted} />
       )}
     </View>
   );

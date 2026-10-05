@@ -369,15 +369,20 @@ function makeStyles(t: Theme) {
      * here, not the 1 a reader coming from CSS expects, and the time giving
      * up width to the name column would be the wrong trade. */
     when: { color: t.color.inkMuted, flexShrink: 0 },
+    /** The row's one action: a white disc with a hairline edge, so it stands
+     * off the white row, and the forest glyph inside it says it acts. A
+     * press moves the disc to the gray fill, away from the page. */
     redial: {
       width: t.layout.touchTarget,
       height: t.layout.touchTarget,
       borderRadius: t.radius.circle,
       alignItems: 'center',
       justifyContent: 'center',
-      backgroundColor: t.color.pineWash,
+      backgroundColor: t.color.paperSheet,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: t.color.lineSoft,
     },
-    redialPressed: { backgroundColor: t.color.pineLine },
+    redialPressed: { backgroundColor: t.color.paperInset },
     empty: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 32, gap: t.space.s4 },
     emptyTitle: { color: t.color.inkStrong },
     emptyBody: { color: t.color.inkMuted, textAlign: 'center' },

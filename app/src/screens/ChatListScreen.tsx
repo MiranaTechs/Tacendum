@@ -93,16 +93,16 @@ interface Props {
 }
 
 const COPY = {
-  title: 'Chats',
+  title: 'Rooms',
   profileAction: 'Open your profile',
 
-  startTitle: 'Start a chat',
+  startTitle: 'Open a room',
   // The share text itself is `shareIdMessage` (peerId.ts): one helper, so
   // every surface sends the id on a line of its own.
 
-  listLabel: 'Your chats',
-  filterLabel: 'Filter conversations',
-  noMatch: 'No conversation matches that.',
+  listLabel: 'Your rooms',
+  filterLabel: 'Filter rooms',
+  noMatch: 'No room matches that.',
   previewNone: 'No messages yet',
   previewUnreadable: 'Message couldn’t be opened',
   unread: (label: string, preview: string) =>
@@ -113,7 +113,7 @@ const COPY = {
   unreadMention: (label: string, preview: string) =>
     `${label}, new messages, you were mentioned, ${preview}`,
 
-  rowActions: 'Conversation actions',
+  rowActions: 'Room actions',
 
   // The two reversible row actions (tablestakes-8). Both are local, neither
   // is ever sent, and neither names a device.
@@ -129,10 +129,10 @@ const COPY = {
   draftPrefix: 'Draft',
   draftSpoken: (label: string, text: string) => `${label}, draft, ${text}`,
 
-  deleteChat: 'Delete conversation',
+  deleteChat: 'Delete room',
   // The device is named in the
   // platform's own words via the token, here and in the room copy below.
-  deleteConfirm: `Delete this conversation? The messages are only on this ${DEVICE_NOUN} — Tacendum has no copy to restore.`,
+  deleteConfirm: `Delete this room? The messages are only on this ${DEVICE_NOUN} — Tacendum has no copy to restore.`,
   /**
    * Deleting a conversation also deletes its 1:1 call log. State that
    * consequence explicitly so a user does not expect calls to remain in
@@ -142,15 +142,15 @@ const COPY = {
   deleteAlsoCalls: 'Your calls with them go too.',
   keep: 'Keep',
   delete: 'Delete',
-  deleted: 'Conversation deleted.',
-  deleteFailed: 'Tacendum couldn’t delete this chat. Try again.',
+  deleted: 'Room deleted.',
+  deleteFailed: 'Tacendum couldn’t delete this room. Try again.',
 
   // Rooms. Deleting a room is LOCAL — the
   // room lives on for its other members — and the recreate rule is said
   // rather than hidden: the copy must not imply more was removed
   // than was.
-  newRoom: 'New room',
-  roomFallbackName: 'Room',
+  newRoom: 'New group',
+  roomFallbackName: 'Group',
   deleteRoom: 'Delete room',
   roomDeleteConfirm:
     `Delete this room from this ${DEVICE_NOUN}? Its messages here are only on this ` +
@@ -165,7 +165,7 @@ const COPY = {
   /** What VoiceOver hears for a room row. The walled-square mark is visual
    * only, so the WORD travels in the label — a distinction that exists only
    * visually is not a distinction for everyone. */
-  roomSpoken: (label: string) => `${label}, room`,
+  roomSpoken: (label: string) => `${label}, group`,
 
   // No seat count: a conversation here is one other person or a room full
   // of them, and the empty state may not promise either.
@@ -178,7 +178,7 @@ const COPY = {
   stepTwo: 'Tap + to scan their code, or type their ID.',
   /** Conversation actions live behind a long press or the row's ellipsis.
    * Name the location without listing a subset of a drawer that can vary. */
-  actionsHint: 'The … beside a chat holds what you can do with it.',
+  actionsHint: 'The … beside a room holds what you can do with it.',
   copyId: 'Copy ID',
   shareId: 'Share ID',
   // Byte-identical to StartChatScreen.tsx — the same copy action must never
@@ -588,15 +588,16 @@ const ConversationRow = React.memo(function ConversationRowBody({
             /* The pinned mark, in the column the unread dot already owns —
                so the name never shifts, and the two can never collide. News
                outranks placement: an arrival is about somebody else, a pin
-               is my own filing. Frozen against Dynamic Type and hidden from
-               assistive tech, the "…" precedent below: the row is ONE
-               element and the WORD rides its label. */
+               is my own filing, so it is drawn in the muted ink: forest in
+               this column means unread. Frozen against Dynamic Type and
+               hidden from assistive tech, the "…" precedent below: the row
+               is ONE element and the WORD rides its label. */
             <Text
               allowFontScaling={false}
               accessibilityElementsHidden
               importantForAccessibility="no-hide-descendants"
               testID={`pin-mark-${chat.peerId}`}
-              style={[styles.pinMark, { color: t.color.pine }]}
+              style={[styles.pinMark, { color: t.color.inkMuted }]}
             >
               ▲
             </Text>
@@ -683,7 +684,7 @@ const ConversationRow = React.memo(function ConversationRowBody({
                 style={[
                   styles.mentionBadge,
                   {
-                    backgroundColor: t.color.pineWash,
+                    backgroundColor: 'transparent',
                     borderColor: t.color.pineLine,
                     borderRadius: t.radius.tail,
                   },
@@ -953,7 +954,7 @@ const ConversationRow = React.memo(function ConversationRowBody({
       ) : null}
 
       {menu === 'blockConfirm' ? (
-        // Paper and a slate rule, never the danger wash: this is the person's
+        // Paper and a slate rule, never the danger rule: this is the person's
         // own settled decision, not an alarm about something gone wrong.
         <View
           accessibilityRole="alert"
@@ -1005,7 +1006,7 @@ const ConversationRow = React.memo(function ConversationRowBody({
             <InlineError
               message={BLOCK.failed}
               testID={`chat-block-error-${chat.peerId}`}
-              // Paper layer under a danger wash measures under AA.
+              // A sheet on the panel, like every nested error in this row.
               surface={t.color.paperSheet}
             />
           ) : null}
@@ -1017,7 +1018,7 @@ const ConversationRow = React.memo(function ConversationRowBody({
           style={[
             styles.rowConfirm,
             {
-              backgroundColor: t.color.dangerWash,
+              backgroundColor: t.color.paperLayer,
               borderLeftColor: t.color.danger,
             },
           ]}
@@ -1064,7 +1065,7 @@ const ConversationRow = React.memo(function ConversationRowBody({
             <InlineError
               message={COPY.deleteFailed}
               testID={`chat-delete-error-${chat.peerId}`}
-              // Danger wash on danger wash measures under AA.
+              // A sheet on the panel, like every nested error in this row.
               surface={t.color.paperSheet}
             />
           ) : null}
@@ -1095,6 +1096,7 @@ function FilterField({
         placeholderTextColor={t.color.inkMuted}
         keyboardAppearance={t.scheme}
         selectionColor={t.color.pine}
+        cursorColor={t.color.pine}
         accessibilityLabel={COPY.filterLabel}
         autoCapitalize="none"
         autoCorrect={false}
@@ -1109,7 +1111,7 @@ function FilterField({
             backgroundColor: t.color.paperSheet,
             color: t.color.inkStrong,
             borderWidth: focused ? 2 : 1,
-            borderColor: focused ? t.color.pine : t.color.lineStrong,
+            borderColor: focused ? t.color.pine : t.color.lineField,
           },
         ]}
       />
@@ -1188,7 +1190,7 @@ function EmptyChats({
             style={[
               t.type.utilityLabel,
               styles.stepNumeral,
-              { color: t.color.pine },
+              { color: t.color.inkMuted },
             ]}
           >
             1.
@@ -1224,7 +1226,7 @@ function EmptyChats({
             style={[
               t.type.utilityLabel,
               styles.stepNumeral,
-              { color: t.color.pine },
+              { color: t.color.inkMuted },
             ]}
           >
             2.
@@ -1337,7 +1339,7 @@ function NamingNudge({
  * Never in a duress session: one exists only under a lock that is on. */
 const LOCK_NUDGE_COPY = {
   title: 'Add a lock code',
-  body: `Your chats are only as private as this ${DEVICE_NOUN}’s lock. A lock code of your own is asked for whenever Tacendum opens.`,
+  body: `Your rooms are only as private as this ${DEVICE_NOUN}’s lock. A lock code of your own is asked for whenever Tacendum opens.`,
   where: 'Turn it on in Settings → App Lock, whenever you like.',
   open: 'Open Settings',
   skip: 'Not now',
@@ -2457,7 +2459,7 @@ export function ChatListScreen({
               allowFontScaling={false}
               accessibilityElementsHidden
               importantForAccessibility="no"
-              style={[t.type.iconGlyph, { color: t.color.pine }]}
+              style={[t.type.iconGlyph, { color: t.color.inkMuted }]}
             >
               ›
             </Text>

@@ -14,6 +14,16 @@
  * PERSON-shaped row over a room — the shape `ChatListScreen` already routes
  * around when it deletes, because it "would strand queued fan-out legs".
  *
+ * Since build 33 the screen says so BEFORE the press: a full ID of someone
+ * you named shows "You already have a room with …" and its button is spoken
+ * "Open room with …"; a group's shows "Your group “…”". (Since the
+ * 2026-10-05 vocabulary ruling every one of these buttons reads "Open room",
+ * a new ID's included, so the name is what tells them apart.) The hint and
+ * the spoken name come from a local read that is keyed to the ID it
+ * answers, so an edit can never leave a stale name over a different ID —
+ * and the commit path reads again anyway, so a label can never change what
+ * the press does.
+ *
  * Harness: the real `db` over the recorded op-sqlite fake (so an INSERT is
  * evidence and its absence is evidence too), with the two READS this feature
  * turns on stubbed, because the fake answers every SELECT with no rows.
@@ -62,6 +72,8 @@ const PROFILE: db.ProfileRow = {
 };
 
 const PEER_ID = '01BX5ZZKBKACTAV9WEVGEMMVRZ';
+/** PEER_ID with a different, still valid, last character: somebody else. */
+const OTHER_ID = '01BX5ZZKBKACTAV9WEVGEMMVRY';
 const ROOM_ID = '01JQZ8N4H3KDEKTSV4RRFFQ69G';
 
 /** Every `INSERT INTO chats` the screen issued — the only honest evidence of
@@ -108,7 +120,7 @@ async function render(
         profile={PROFILE}
         onBack={jest.fn()}
         onOpenChat={onOpenChat}
-        onFindByEmail={jest.fn()}
+        onOpenAccountEmail={jest.fn()}
       />,
     );
   });
@@ -122,10 +134,44 @@ function byId(tree: ReactTestRenderer.ReactTestRenderer, id: string) {
   );
 }
 
+/** The control itself. Harness change for build 33: PrimaryButton puts
+ * testID and onPress on the composite AND its Pressable, so the first match
+ * is taken rather than a `find`. */
 function control(tree: ReactTestRenderer.ReactTestRenderer, id: string) {
-  return tree.root.find(
+  return tree.root.findAll(
     n => n.props.testID === id && typeof n.props.onPress === 'function',
-  );
+  )[0]!;
+}
+
+/** Every string child under a node, in order. */
+function textIn(node: ReactTestRenderer.ReactTestInstance): string {
+  return node
+    .findAll(n => typeof n.type === 'string')
+    .flatMap(n => React.Children.toArray(n.props.children))
+    .filter((c): c is string => typeof c === 'string')
+    .join(' ');
+}
+
+/** Type a whole value in one change. */
+async function type(tree: ReactTestRenderer.ReactTestRenderer, text: string): Promise<void> {
+  await ReactTestRenderer.act(async () => {
+    byId(tree, 'new-peer-input')[0]!.props.onChangeText(text);
+  });
+}
+
+/** The action button's visible label and its spoken one, or null. */
+function action(tree: ReactTestRenderer.ReactTestRenderer): { label: string; spoken: string } | null {
+  const host = byId(tree, 'start-chat')[0];
+  return host ? { label: textIn(host), spoken: host.props.accessibilityLabel } : null;
+}
+
+/** A promise this test settles by hand: a slow local read. */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(r => {
+    resolve = r;
+  });
+  return { promise, resolve };
 }
 
 /** Type an id and press the button — the whole commit path. */
@@ -263,5 +309,90 @@ test('someone new is still a new chat: the row is written and the name is asked 
   expect(chatInserts()).toBe(1);
   expect(asking(tree)).toBe(true);
   expect(onOpenChat).not.toHaveBeenCalled();
+  await unmount(tree);
+});
+
+/* ── build 33: the label tells the truth before the press ─────────────── */
+
+// Added for build 33: the label tells the truth before the press.
+test('a named friend’s full ID reads "Open room", spoken with their name, before any press, with no write', async () => {
+  dbMock.getChat.mockResolvedValue({ peerId: PEER_ID, localName: 'Mum', displayName: null });
+  const tree = await render(jest.fn());
+  await type(tree, PEER_ID);
+
+  expect(action(tree)).toEqual({ label: 'Open room', spoken: 'Open room with Mum' });
+  expect(textIn(byId(tree, 'reach-status')[0]!)).toBe('You already have a room with Mum');
+  expect(chatInserts()).toBe(0);
+  await unmount(tree);
+});
+
+test('a group’s ID reads "Open room", and the hint names the group; a nameless group says One of your groups', async () => {
+  dbMock.getGroup.mockResolvedValue({ groupId: ROOM_ID, ownerId: PROFILE.userId, name: 'Kitchen' });
+  const tree = await render(jest.fn());
+  await type(tree, ROOM_ID);
+
+  // The name opens with the visible label, unbroken (WCAG 2.5.3 Label in
+  // Name): "Tap Open room" reaches it by voice. It said "Open the room …".
+  expect(action(tree)).toEqual({ label: 'Open room', spoken: 'Open room Kitchen' });
+  expect(textIn(byId(tree, 'reach-status')[0]!)).toBe('Your group “Kitchen”');
+  await unmount(tree);
+
+  dbMock.getGroup.mockResolvedValue({ groupId: ROOM_ID, ownerId: PROFILE.userId, name: null });
+  const nameless = await render(jest.fn());
+  await type(nameless, ROOM_ID);
+  expect(action(nameless)).toEqual({ label: 'Open room', spoken: 'Open room' });
+  expect(textIn(byId(nameless, 'reach-status')[0]!)).toBe('One of your groups');
+  expect(chatInserts()).toBe(0);
+  await unmount(nameless);
+});
+
+// Added for build 33: the hint and the spoken name are keyed to the ID they
+// answer, so a stale name can never sit over a different ID, not even for one
+// render. (Every button reads "Open room" now, so the name is the tell.)
+test('stale label: replacing the last character of a named ID drops the name in that same render; a 27th character shows no button', async () => {
+  const slow = deferred<null>();
+  dbMock.getChat.mockImplementation(async (id: string) =>
+    id === PEER_ID ? { peerId: PEER_ID, localName: 'Mum', displayName: null } : slow.promise,
+  );
+  const tree = await render(jest.fn());
+  await type(tree, PEER_ID);
+  expect(action(tree)).toEqual({ label: 'Open room', spoken: 'Open room with Mum' });
+
+  // A different complete ID whose own read has not answered yet.
+  await type(tree, OTHER_ID);
+  expect(action(tree)).toEqual({ label: 'Open room', spoken: 'Open room' });
+  expect(textIn(tree.root)).not.toContain('Mum');
+
+  await type(tree, `${OTHER_ID}X`);
+  expect(action(tree)).toBeNull();
+  expect(textIn(tree.root)).not.toContain('Mum');
+  expect(textIn(tree.root)).not.toContain('Open room');
+
+  await ReactTestRenderer.act(async () => {
+    slow.resolve(null);
+  });
+  await unmount(tree);
+});
+
+// Added for build 33: the local read is sequence-guarded, so a slow answer
+// for an earlier visit to the same ID can never paint over the latest one.
+test('an edit after a slow read never paints a stale label (sequence guard)', async () => {
+  const first = deferred<unknown>();
+  dbMock.getChat
+    .mockReturnValueOnce(first.promise)
+    .mockResolvedValueOnce(null)
+    .mockResolvedValueOnce(null);
+  const tree = await render(jest.fn());
+  await type(tree, PEER_ID);
+  await type(tree, OTHER_ID);
+  await type(tree, PEER_ID);
+  expect(action(tree)).toEqual({ label: 'Open room', spoken: 'Open room' });
+
+  // The FIRST read for PEER_ID answers last, with a name it no longer has.
+  await ReactTestRenderer.act(async () => {
+    first.resolve({ peerId: PEER_ID, localName: 'Mum', displayName: null });
+  });
+  expect(action(tree)).toEqual({ label: 'Open room', spoken: 'Open room' });
+  expect(textIn(tree.root)).not.toContain('Mum');
   await unmount(tree);
 });

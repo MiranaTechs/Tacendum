@@ -74,11 +74,11 @@ const NOTICE_MS = 3000;
 const COPY = {
   title: 'Profile',
   sourceNote: (who: string) =>
-    `This is the profile ${who} shared with you in this chat.`,
+    `This is the profile ${who} shared with you in this room.`,
   noProfile: 'They haven’t shared a profile yet.',
   noAbout: 'They haven’t written anything about themselves yet.',
   sharedAs: (name: string) => `Shared with you as “${name}”.`,
-  roomLabel: (ref: string) => `A private chat between you and ${ref}`,
+  roomLabel: (ref: string) => `A private room for you and ${ref}`,
   photoLabel: (name: string) => `Photo of ${name}`,
   idLabel: 'Tacendum ID',
 
@@ -99,7 +99,7 @@ const COPY = {
   idCopied: (who: string) => `Copied ${who}’s ID.`,
 
   /**
-   * How this chat started — one flat line, because it is CONTEXT and not a
+   * How this room started — one flat line, because it is CONTEXT and not a
    * warning. The warning shape for a server introduction is already taken by
    * the thread's provenance notice, and a second alarm for one fact teaches
    * people to ignore both.
@@ -108,8 +108,8 @@ const COPY = {
    * row and a row that predates the column are both null here, and the
    * profile cannot tell them apart.
    */
-  originQr: 'You started this chat by scanning their code.',
-  originManual: 'You started this chat by typing their ID.',
+  originQr: 'You started this room by scanning their code.',
+  originManual: 'You started this room by typing their ID.',
   /** All discovery classes, including the bare `discovery` mark, use generic
    * server-introduction copy. The mark may represent email, phone, or another
    * lookup class, so naming a specific identifier would claim information
@@ -894,6 +894,7 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
               placeholderTextColor={t.color.inkMuted}
               keyboardAppearance={t.scheme}
               selectionColor={t.color.pine}
+              cursorColor={t.color.pine}
               accessibilityLabel={COPY.nicknameLabel}
               testID="peer-nickname-input"
               style={[
@@ -903,7 +904,7 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
                   borderRadius: t.radius.button,
                   color: t.color.inkStrong,
                   backgroundColor: t.color.paperSheet,
-                  borderColor: nickFocused ? t.color.pine : t.color.lineStrong,
+                  borderColor: nickFocused ? t.color.pine : t.color.lineField,
                   borderWidth: nickFocused ? 2 : 1,
                 },
               ]}
@@ -1010,7 +1011,7 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
                 style={[
                   styles.panel,
                   {
-                    backgroundColor: t.color.dangerWash,
+                    backgroundColor: t.color.paperLayer,
                     borderLeftColor: t.color.danger,
                   },
                 ]}
@@ -1322,10 +1323,10 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
               {DISAPPEAR_OPTIONS_PEER.map(option => {
                 const active = option.seconds === disappearSec;
                 // Off while they are blocked: the chips say so to
-                // VoiceOver AND to the eye — a recessed surface with muted
-                // ink, never opacity — and a line beneath says why. `busy`
-                // disables the tap but keeps the live look: a write in
-                // flight is not a reason the person needs telling.
+                // VoiceOver AND to the eye — white with a gray edge and
+                // muted ink, never opacity or a fill — and a line beneath
+                // says why. `busy` disables the tap but keeps the live look:
+                // a write in flight is not a reason the person needs telling.
                 const locked = blockedAt != null;
                 const disabled = busy || locked;
                 return (
@@ -1355,13 +1356,12 @@ export function PeerProfileScreen({ peerId, me, onBack }: Props) {
                       {
                         minHeight: t.layout.touchTarget,
                         borderRadius: t.radius.button,
-                        backgroundColor: locked
-                          ? t.color.paperInset
-                          : active
-                            ? t.color.pineWash
-                            : pressed
-                              ? t.color.paperInset
-                              : t.color.paperSheet,
+                        // White at rest, selected or locked: the edge and
+                        // the label carry the state; only a press fills it.
+                        backgroundColor:
+                          pressed && !active
+                            ? t.color.paperInset
+                            : t.color.paperSheet,
                         borderColor:
                           active && !locked ? t.color.pineLine : t.color.lineSoft,
                       },
@@ -1629,7 +1629,8 @@ function SafetyGrid({
           importantForAccessibility="no-hide-descendants"
           adjustsFontSizeToFit
           numberOfLines={1}
-          style={[t.type.safetyNumber, styles.cell, { color: t.color.pine }]}
+          // Charcoal: digits are text, and forest marks an action.
+          style={[t.type.safetyNumber, styles.cell, { color: t.color.inkStrong }]}
         >
           {group}
         </Text>
@@ -1818,9 +1819,8 @@ function ReportSection({
                     {
                       minHeight: t.layout.touchTarget,
                       borderRadius: t.radius.button,
-                      backgroundColor: active
-                        ? t.color.pineWash
-                        : pressed
+                      backgroundColor:
+                        pressed && !active
                           ? t.color.paperInset
                           : t.color.paperSheet,
                       borderColor: active ? t.color.pineLine : t.color.lineSoft,
@@ -2008,9 +2008,8 @@ function RelaySection({
                 {
                   minHeight: t.layout.touchTarget,
                   borderRadius: t.radius.button,
-                  backgroundColor: active
-                    ? t.color.pineWash
-                    : pressed
+                  backgroundColor:
+                    pressed && !active
                       ? t.color.paperInset
                       : t.color.paperSheet,
                   borderColor: active ? t.color.pineLine : t.color.lineSoft,
@@ -2194,7 +2193,7 @@ function MachineSection({
           <InlineError message={note.text} testID="peer-machine-error" />
         ) : (
           <Text
-            style={[t.type.compactBody, { color: t.color.pine }]}
+            style={[t.type.compactBody, { color: t.color.inkBody }]}
             testID="peer-machine-ok"
           >
             {note.text}

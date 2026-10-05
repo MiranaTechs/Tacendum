@@ -1,4 +1,4 @@
-<resources>
+<resources xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Base application theme. -->
     <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
@@ -8,12 +8,38 @@
           The frame before JS exists. AppCompat's default window background is
           white, so a launch went white, then light, then dark: two visible
           jumps on a dark-mode device. This is theme.ts's light `paperGround`,
-          the same ground iOS cold-launches into from LaunchScreen.storyboard's
-          LaunchGround colorset. The DayNight parent resolves values-night/ for
-          the dark twin. Kept in sync with theme.ts by
-          app/__tests__/appearance.android.test.ts.
+          the same ground iOS cold-launches into from the colour literal in
+          LaunchScreen.storyboard. The DayNight parent resolves values-night/
+          for the dark twin. Kept in sync with theme.ts by
+          app/__tests__/appearance.android.test.ts and
+          app/__tests__/native.palette.test.ts.
         -->
-        <item name="android:windowBackground">#EFF2EB</item>
+        <item name="android:windowBackground">#FFFFFF</item>
+        <!--
+          theme.ts's light `pine`, so native widgets (the caret, the text
+          selection handles, AppCompat controls) draw in forest, never in
+          AppCompat's default teal.
+        -->
+        <item name="colorAccent">#0E6B45</item>
+        <!--
+          The system bars are the app's ground, with dark icons. Nothing set
+          them before: with edge-to-edge off, Android 14 and below painted the
+          status bar AppCompat's gray colorPrimaryDark and the navigation bar
+          black, framing a white app in a gray strip and a black one. These
+          items paint the launch window, which can only follow the system's
+          day or night; the in-app appearance choice takes over once the app
+          starts. MainActivity repaints the navigation bar from the stored
+          choice (AppearancePrefsModule.applyNavigationBar), and once the
+          bundle runs the JS StatusBar repaints the status bar. The light
+          navigation-bar flag exists from API 27, and minSdk is 26, hence
+          tools:targetApi on that item: on API 26 the dark buttons come from
+          MainActivity alone, so the launch window there shows this white bar
+          with the platform's white buttons until the activity starts.
+        -->
+        <item name="android:statusBarColor">#FFFFFF</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:navigationBarColor">#FFFFFF</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="27">true</item>
     </style>
 
 </resources>

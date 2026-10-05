@@ -138,7 +138,7 @@ test('the Settings home is seven accessible category rows, without mounted detai
     CATEGORY_IDS.map(testID => button(tree, testID).props.accessibilityRole),
   ).toEqual(Array(7).fill('button'));
   expect(copy(tree)).toContain('Privacy & security');
-  expect(copy(tree)).toContain('Chats & calls');
+  expect(copy(tree)).toContain('Rooms & calls');
   expect(
     button(tree, 'settings-category-account').props.accessibilityHint,
   ).toMatch(/email|username/i);

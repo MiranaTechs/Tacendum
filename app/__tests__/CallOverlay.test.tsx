@@ -11,10 +11,12 @@ import {
   Dimensions,
   Keyboard,
   StyleSheet,
+  View,
 } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import type { CallState } from '@tacendum/shared';
+import { PRESS_SHADE } from '../src/components/CallControls';
 import {
   CallOverlay,
   OVERLAY_AUDIO_BOX,
@@ -35,6 +37,7 @@ import {
   type PipBox,
 } from '../src/ui/pipDrag';
 import { Avatar } from '../src/ui/Avatar';
+import { ThemeProvider, themeTokens } from '../src/theme';
 
 /**
  * The minimized 1:1 call window ("go back to
@@ -181,7 +184,7 @@ describe('an audio call is a pill', () => {
   it('is the paper surface, not the media black — it floats over the chat', () => {
     const { wrapper } = render();
     const flat = StyleSheet.flatten(wrapper()!.props.style);
-    expect(flat.backgroundColor).toBe('#FAFCF7');
+    expect(flat.backgroundColor).toBe(themeTokens('light').color.paperSheet);
     expect(flat.width).toBe(OVERLAY_AUDIO_BOX.width);
     expect(flat.height).toBe(OVERLAY_AUDIO_BOX.height);
   });
@@ -588,5 +591,112 @@ describe('lifecycle', () => {
     expect(
       tree.root.findAll(n => n.props.testID === 'call-overlay'),
     ).toHaveLength(0);
+  });
+});
+
+/**
+ * THE ACTIONS LOOK THE SAME EVERYWHERE (the white palette, 2026-10-04). The
+ * End disc is the one red every call surface uses, under a white glyph, in
+ * both appearances, and the audio pill's outline is the solid forest: on the
+ * white chat a white sheet has only its outline to stand off the page.
+ *
+ * Asserted in DARK, where the two pairs differ: the dark theme lifts `danger`
+ * for text (a white glyph on it would be 2.8:1) and draws `pineLine` as
+ * forest at 65%. FALSIFYING CASE: the old `danger` discs and `pineLine` ring
+ * fail every assertion below.
+ */
+describe('the end disc and the pill outline', () => {
+  function renderDark(over: Partial<React.ComponentProps<typeof CallOverlay>> = {}) {
+    let tree!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      tree = ReactTestRenderer.create(
+        <SafeAreaProvider
+          initialMetrics={{
+            frame: { x: 0, y: 0, width: 390, height: 844 },
+            insets: { top: 47, left: 0, right: 0, bottom: 34 },
+          }}
+        >
+          <ThemeProvider mode="dark">
+            <CallOverlay
+              state={state()}
+              peerName="Dana"
+              onRestore={jest.fn()}
+              onHangup={jest.fn()}
+              now={() => T}
+              {...over}
+            />
+          </ThemeProvider>
+        </SafeAreaProvider>,
+      );
+    });
+    mounted.push(tree);
+    return tree;
+  }
+
+  /** The End control itself (the Pressable: testID and onPress). Its style
+   * is a plain object since a press stopped changing it (the press is the
+   * shade its children draw), so a function style is still read unpressed. */
+  const endControl = (tree: ReactTestRenderer.ReactTestRenderer) =>
+    tree.root.findAll(
+      n => n.props.testID === 'call-overlay-end' && typeof n.props.onPress === 'function',
+    )[0]!;
+  const endDisc = (tree: ReactTestRenderer.ReactTestRenderer) => {
+    const style = endControl(tree).props.style;
+    return StyleSheet.flatten(
+      typeof style === 'function' ? style({ pressed: false }) : style,
+    ).backgroundColor;
+  };
+  /** The shade the End control's children draw under a finger, or null. */
+  const shadeWhenPressed = (tree: ReactTestRenderer.ReactTestRenderer) => {
+    let inner!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      inner = ReactTestRenderer.create(
+        <View>{endControl(tree).props.children({ pressed: true, hovered: false })}</View>,
+      );
+    });
+    mounted.push(inner);
+    const shade = inner.root.findAll(
+      n => n.props.testID === 'call-press-shade' && typeof n.type === 'string',
+    )[0];
+    return shade ? StyleSheet.flatten(shade.props.style) : null;
+  };
+
+  // Added for build 33: both End discs sit on the chat, not on video,
+  // and pressed they dimmed to 0.7 and let the page through (pink under the
+  // white glyph). A press now darkens them with the shade, never opacity.
+  it('a finger on either End darkens it with the shade, never a dim', () => {
+    for (const over of [{}, { state: state({ video: true, peerVideo: true }) }]) {
+      const d = themeTokens('dark');
+      const tree = renderDark(over);
+      const style = endControl(tree).props.style;
+      expect(typeof style).not.toBe('function');
+      expect(StyleSheet.flatten(style).opacity).toBeUndefined();
+      expect(shadeWhenPressed(tree)).toMatchObject({
+        position: 'absolute',
+        borderRadius: 22,
+        backgroundColor: d.color.mediaBlack,
+        opacity: PRESS_SHADE,
+      });
+    }
+  });
+
+  it('draws the audio pill’s End on the shared red and its outline in solid forest', () => {
+    const d = themeTokens('dark');
+    const tree = renderDark();
+    expect(endDisc(tree)).toBe(d.color.mediaDanger);
+    const pill = tree.root.findAll(
+      n =>
+        typeof n.type === 'string' &&
+        typeof n.props.onMoveShouldSetResponder === 'function',
+    )[0]!;
+    expect(StyleSheet.flatten(pill.props.style).borderColor).toBe(d.color.pine);
+    expect(d.color.pine).not.toBe(d.color.pineLine);
+  });
+
+  it('draws the video window’s End on the same red', () => {
+    const d = themeTokens('dark');
+    const tree = renderDark({ state: state({ video: true, peerVideo: true }) });
+    expect(endDisc(tree)).toBe(d.color.mediaDanger);
+    expect(d.color.mediaDanger).not.toBe(d.color.danger);
   });
 });

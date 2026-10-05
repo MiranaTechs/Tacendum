@@ -160,7 +160,7 @@ const COPY = {
   // the key — and nothing can bring it back, so the copy says what is true
   // instead of pointing at the connection.
   identityLost:
-    `This ${DEVICE_NOUN} no longer has the identity key these conversations belong to. ` +
+    `This ${DEVICE_NOUN} no longer has the identity key these rooms belong to. ` +
     `The key never leaves the ${DEVICE_NOUN} it was made on and can’t be restored — ` +
     'not from a backup, and not by us. Your messages here are safe to read, ' +
     'but this identity can’t send or receive. To keep talking, you’d start a ' +
@@ -498,7 +498,7 @@ export function RegisterScreen({ onRegistered, onBack }: Props) {
                 style={[
                   styles.checkbox,
                   {
-                    borderColor: agreed ? t.color.pine : t.color.lineStrong,
+                    borderColor: agreed ? t.color.pine : t.color.lineField,
                     backgroundColor: t.color.paperSheet,
                   },
                 ]}
@@ -739,7 +739,7 @@ function ConfirmSheet({
 
   // Ink at 32% dims the page while keeping the modal sheet distinct.
   const scrim =
-    t.scheme === 'dark' ? 'rgba(0,0,0,0.32)' : 'rgba(18,26,21,0.32)';
+    t.scheme === 'dark' ? 'rgba(0,0,0,0.32)' : 'rgba(24,24,24,0.32)';
 
   const motionStyle = reduceMotion
     ? { opacity: present }

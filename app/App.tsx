@@ -160,7 +160,7 @@ import { clearWritingConnections, invalidateWritingSession, setWritingAccess, se
 import { screenSecurity } from './src/screenSecurity';
 import { session } from './src/session';
 import { type CheckReason, storeUrl, updateGate } from './src/updateGate';
-import { ThemeProvider, useTheme } from './src/theme';
+import { ThemeProvider, themeTokens, useTheme } from './src/theme';
 import { useReduceMotion } from './src/useReduceMotion';
 import {
   compactVisibleSurface,
@@ -224,7 +224,10 @@ export type Route =
   | { name: 'chats' }
   | { name: 'calls' }
   | { name: 'attention' }
-  | { name: 'newChat' }
+  // Start a chat. `draft` is the field's text coming back from the
+  // Link-an-email detour (in memory only; it seeds the field once and looks
+  // nothing up).
+  | { name: 'newChat'; draft?: string }
   | { name: 'newRoom' }
   | {
       name: 'thread';
@@ -257,7 +260,15 @@ export type Route =
   // Start a chat), and the recovery surface (entered from Landing — BESIDE
   // registration, never in it; `from` remembers which door, so back agrees
   // with it).
-  | { name: 'accountEmail'; from?: 'chats' | 'profile'; via?: 'username' }
+  // `via: 'newChat'` is Start a chat's "Link an email", and `draft` the text
+  // that was in its field: Back returns there with it (fields on an existing
+  // name, so the visible-surface matrix does not move).
+  | {
+      name: 'accountEmail';
+      from?: 'chats' | 'profile';
+      via?: 'username' | 'newChat';
+      draft?: string;
+    }
   // The phone surface renders nothing while PHONE_UI_ENABLED is false.
   // It has no Settings row and is reachable programmatically only.
   | { name: 'accountPhone'; from?: 'chats' | 'profile' }
@@ -425,9 +436,12 @@ function App() {
   return (
     <SafeAreaProvider>
       <ThemeProvider mode={mode}>
-        {/* Paper ground wants dark ink in the bar; the night ground, light. */}
+        {/* The white ground wants dark ink in the bar; the charcoal ground,
+            light. On Android the bar also takes the ground's colour, so it
+            follows the in-app choice rather than the system's. */}
         <StatusBar
           barStyle={mode === 'dark' ? 'light-content' : 'dark-content'}
+          backgroundColor={themeTokens(mode).color.paperGround}
         />
         {/* The window-class shell:
             mounted ONCE, at the shell root, never per screen. It
@@ -2483,13 +2497,18 @@ function AppContent() {
             profile={profile}
             onBack={() => setRoute({ name: 'chats' })}
             onOpenChat={peerId => setRoute({ name: 'thread', peerId })}
-            onFindByEmail={() => setRoute({ name: 'discover' })}
+            onOpenAccountEmail={draft =>
+              setRoute({ name: 'accountEmail', via: 'newChat', draft })
+            }
+            initialDraft={route.draft}
           />
         )}
 
         {/* Find by email: the typed-single-
-            identifier flow, under Start a chat. The result card opens the
-            ordinary thread — TOFU unchanged. */}
+            identifier flow. Since build 33 Start a chat finds inline and no
+            longer opens this route; the mount stays until the follow-up that
+            deletes the screen. The result card opens the ordinary thread —
+            TOFU unchanged. */}
         {route.name === 'discover' && profile && (
           <DiscoveryScreen
             onOpenAccountEmail={() => setRoute({ name: 'accountEmail', from: 'chats' })}
@@ -2520,6 +2539,10 @@ function AppContent() {
             peerId={route.peerId}
             focusedApprovalQ={route.focusedApprovalQ}
             onBack={() => popRoute(route)}
+            // The origin `backDestination` pops to, so the chevron's
+            // spoken name says where it goes (Rooms, Calls or Needs
+            // attention).
+            from={route.from}
             onOpenPeerProfile={() =>
               setRoute({
                 name: 'peerProfile',
@@ -3125,11 +3148,11 @@ function AppContent() {
             ]}
           >
             {freshStartConfirm
-              ? 'Starting fresh does not confirm server deletion. The old account may still exist. It permanently erases the chats and credentials on this device. Your next setup gets a new Tacendum ID. Other linked devices keep their accounts.'
+              ? 'Starting fresh does not confirm server deletion. The old account may still exist. It permanently erases the rooms and credentials on this device. Your next setup gets a new Tacendum ID. Other linked devices keep their accounts.'
               : deletionPending
                 ? 'Tacendum could not finish confirming deletion and clearing this device. Try again when you’re online. Setup can continue once this is complete.'
                 : identityMissing
-                  ? 'The private identity key is no longer on this device, so these credentials cannot restore it. You can start fresh, then recover a linked account grouping if one is available.'
+                  ? 'The private identity key is no longer on this device, so these credentials cannot restore it. You can start fresh, then recover a linked account if one is available.'
                   : COPY_GONE.line}
           </Text>
           <PrimaryButton
@@ -3178,6 +3201,7 @@ function AppContent() {
               whichever ink the current ground needs. */}
           <StatusBar
             barStyle={t.scheme === 'dark' ? 'light-content' : 'dark-content'}
+            backgroundColor={t.color.paperGround}
           />
           <CoverBrand />
           <Text
@@ -3208,6 +3232,7 @@ function AppContent() {
               not show mismatched glyphs when leaving the photo viewer. */}
           <StatusBar
             barStyle={t.scheme === 'dark' ? 'light-content' : 'dark-content'}
+            backgroundColor={t.color.paperGround}
           />
           <CoverBrand />
         </View>
@@ -3342,9 +3367,15 @@ export function backDestination(route: Route): Route | null {
       // surface can be the one it arrived over.
       return route.from === 'calls' ? { name: 'calls' } : { name: 'chats' };
     case 'accountEmail':
-      return route.via === 'username'
-        ? { name: 'accountUsername', from: route.from }
-        : { name: 'settings', from: route.from, section: 'account' };
+      // Back agrees with the door: the username form it was opened from,
+      // Start a chat with its text back in the field, or Settings.
+      if (route.via === 'username') return { name: 'accountUsername', from: route.from };
+      if (route.via === 'newChat') {
+        return route.draft === undefined
+          ? { name: 'newChat' }
+          : { name: 'newChat', draft: route.draft };
+      }
+      return { name: 'settings', from: route.from, section: 'account' };
     case 'accountPhone':
       return { name: 'settings', from: route.from, section: 'account' };
     case 'accountUsername':

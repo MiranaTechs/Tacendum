@@ -4,8 +4,10 @@ import type { LegPhase } from '@tacendum/shared/call-session';
 import { monogram, shortId } from '../person';
 // The app's ONE answer to "what does this person look like": the same
 // component the chat list, the thread header and the peer profile draw, so a
-// tile and the thread beside it cannot disagree about a face.
-import { Avatar } from './Avatar';
+// tile and the thread beside it cannot disagree about a face. Its no-photo
+// face (MONOGRAM_FACE) colours this tile's own monogram disc too.
+import { Avatar, MONOGRAM_FACE } from './Avatar';
+import { callSurface } from '../components/CallControls';
 import { useTheme, type Theme } from '../theme';
 
 /**
@@ -32,9 +34,10 @@ import { useTheme, type Theme } from '../theme';
  * each remote tile to `TacendumVideoView(cid: legCid)`, and the group layer's
  * `GroupLegView` publishes a peer and a phase but not the leg's cid. Mesh
  * video comes later, gated on a hardware measurement — so until a cid
- * reaches the view, every tile is the avatar-on-pineWash treatment the design names
- * for the audio and camera-off cases, and there is no place a black rectangle
- * could claim a picture that is not arriving.
+ * reaches the view, every tile is a card on the app's own ground carrying
+ * the app's own face (the photo, or white letters on the solid forest disc),
+ * the treatment for the audio and camera-off cases, and there is no place a
+ * black rectangle could claim a picture that is not arriving.
  *
  * WHICH MAKES THE FACE THE WHOLE OF WHAT A PARTICIPANT LOOKS LIKE — and it
  * was a monogram even for people whose photo the thread beside it was already
@@ -227,6 +230,9 @@ export function CallTile({
 }
 
 function makeStyles(t: Theme) {
+  // A tile lives on the group call, which is audio and so an app screen:
+  // a card on the app's ground with a hairline edge (see `callSurface`).
+  const surface = callSurface(t, false);
   return StyleSheet.create({
     tile: {
       flexGrow: 1,
@@ -238,8 +244,8 @@ function makeStyles(t: Theme) {
       gap: t.space.s3,
       borderRadius: t.radius.button,
       borderWidth: 1,
-      borderColor: t.color.mediaLine,
-      backgroundColor: t.color.mediaBlack,
+      borderColor: surface.line,
+      backgroundColor: surface.tile,
     },
     /**
      * A leg that will not change again reads quieter than a live one — in
@@ -252,24 +258,29 @@ function makeStyles(t: Theme) {
      * — "Disabled is a recessed surface, never opacity" — and dimming the
      * whole tile also dimmed the person's photo, which is not a state.
      *
-     * The tile keeps its `mediaLine` edge; the NAME takes muted ink, and the
+     * The tile keeps its hairline edge; the NAME takes muted ink, and the
      * distinction is still never colour alone: the status line below says
      * the word ("Declined", "Left", "Ended").
      */
     settled: {},
-    nameSettled: { color: t.color.mediaInkMuted },
+    nameSettled: { color: surface.inkMuted },
+    /** The no-photo face, drawn as `Avatar` draws one (2026-10-05):
+     * white letters on the solid forest disc, its 1pt edge the same forest,
+     * in both appearances. Read from `MONOGRAM_FACE`, not from a call-surface
+     * role, so the tile cannot drift from the face the thread beside it
+     * draws. */
     disc: {
       width: 64,
       height: 64,
       borderRadius: 32,
-      backgroundColor: t.color.pineWash,
+      backgroundColor: MONOGRAM_FACE.fill,
       borderWidth: 1,
-      borderColor: t.color.pineLine,
+      borderColor: MONOGRAM_FACE.fill,
       alignItems: 'center',
       justifyContent: 'center',
     },
-    monogram: { color: t.color.mediaInk, fontSize: 22, fontWeight: '600' },
-    name: { color: t.color.mediaInk, fontSize: 15, fontWeight: '600', textAlign: 'center' },
-    status: { color: t.color.mediaInkMuted, fontSize: 13, textAlign: 'center' },
+    monogram: { color: MONOGRAM_FACE.ink, fontSize: 22, fontWeight: '600' },
+    name: { color: surface.ink, fontSize: 15, fontWeight: '600', textAlign: 'center' },
+    status: { color: surface.inkMuted, fontSize: 13, textAlign: 'center' },
   });
 }

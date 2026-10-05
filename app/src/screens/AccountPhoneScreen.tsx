@@ -271,6 +271,7 @@ export function AccountPhoneScreen({ onBack }: Props) {
               placeholderTextColor={t.color.inkMuted}
               keyboardAppearance={t.scheme}
               selectionColor={t.color.pine}
+              cursorColor={t.color.pine}
               accessibilityLabel={ACCOUNTS_PHONE_COPY.numberTitle}
               autoCapitalize="none"
               autoCorrect={false}
@@ -285,7 +286,7 @@ export function AccountPhoneScreen({ onBack }: Props) {
                   backgroundColor: t.color.paperSheet,
                   color: t.color.inkStrong,
                   borderWidth: 1,
-                  borderColor: t.color.lineStrong,
+                  borderColor: t.color.lineField,
                 },
               ]}
             />
@@ -306,7 +307,7 @@ export function AccountPhoneScreen({ onBack }: Props) {
                 style={[
                   styles.checkbox,
                   {
-                    borderColor: smsConsent ? t.color.pine : t.color.lineStrong,
+                    borderColor: smsConsent ? t.color.pine : t.color.lineField,
                     backgroundColor: smsConsent ? t.color.pine : t.color.paperSheet,
                   },
                 ]}
@@ -377,6 +378,7 @@ export function AccountPhoneScreen({ onBack }: Props) {
                   placeholderTextColor={t.color.inkMuted}
                   keyboardAppearance={t.scheme}
                   selectionColor={t.color.pine}
+                  cursorColor={t.color.pine}
                   accessibilityLabel={ACCOUNTS_PHONE_COPY.codePlaceholder}
                   keyboardType="number-pad"
                   maxLength={6}
@@ -392,7 +394,7 @@ export function AccountPhoneScreen({ onBack }: Props) {
                       backgroundColor: t.color.paperSheet,
                       color: t.color.inkStrong,
                       borderWidth: 1,
-                      borderColor: t.color.lineStrong,
+                      borderColor: t.color.lineField,
                     },
                   ]}
                 />
@@ -438,8 +440,8 @@ export function AccountPhoneScreen({ onBack }: Props) {
                 disabled={busy}
                 accessibilityLabel={ACCOUNTS_PHONE_COPY.discoverableLabel}
                 // Explicit theme colors keep the switch consistent on iOS.
-                // Pine against inset paper gives on/off contrast of 4.8:1 in
-                // light mode and 8.9:1 in dark mode, so state remains visible
+                // Pine against inset paper gives on/off contrast of 5.2:1 in
+                // light mode and 4.8:1 in dark mode, so state remains visible
                 // without relying only on knob position. The ink knob is
                 // legible on both tracks; pineWash would give only 1.05:1
                 // contrast and make the on track lighter than the off track.

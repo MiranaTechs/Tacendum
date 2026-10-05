@@ -126,7 +126,11 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       marginVertical: 4,
       borderRadius: 999,
       minHeight: 44,
+      // A white pill in a white thread has only its edge: the hairline is
+      // what makes it a pill rather than loose words.
       backgroundColor: theme.color.paperLayer,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: theme.color.lineSoft,
     },
     glyph: { fontSize: 14 },
     label: { fontSize: 13 },

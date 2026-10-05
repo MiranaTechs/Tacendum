@@ -106,7 +106,7 @@ export const ROOM_SAFETY_SUMMARY: Record<SafetyState, string> = {
  * sentence says "phone" for a device this copy cannot see, the device-noun
  * pass renders "device"; the substance is verbatim. */
 export const ROOM_COPY = {
-  title: 'Room',
+  title: 'Group',
   people: (n: number) => (n === 1 ? 'Just you' : `${n} people`),
   runBy: (name: string) => `${name} runs this room.`,
   youRunIt: 'You run this room.',
@@ -137,11 +137,11 @@ export const ROOM_COPY = {
     'Only the person who runs this room can add or remove people. Anyone can leave whenever they like.',
   honestLimitInfo:
     'Removing someone tells everyone’s device to stop sending to them. It can’t stop their device from sending to yours — blocking is what does that.',
-  noReadReceipts: 'Rooms don’t send read receipts.',
+  noReadReceipts: 'Groups don’t send read receipts.',
 
-  safetyInfoLabel: 'Why there is no room number',
+  safetyInfoLabel: 'Why there is no group number',
   safetyInfo:
-    'A safety number is between two people, so a room can never have one and there is no such thing as a room that checks out as a whole. Open each person to compare yours with theirs.',
+    'A safety number is between two people, so a group can never have one and there is no such thing as a group that checks out as a whole. Open each person to compare yours with theirs.',
 
   add: 'Add someone',
   addNobody: 'Everyone you talk to is already here.',
@@ -218,7 +218,7 @@ export const ROOM_COPY = {
    * told" are the two facts the rule turns on. */
   consentTitle: 'Sharing with agents',
   consentLead:
-    'An agent in a room only hears the people who choose to share with it. This is your choice, and every person here can see it.',
+    'An agent in a group only hears the people who choose to share with it. This is your choice, and every person here can see it.',
   /** The disclosure sentence, QUOTED — the surface this
    * screen gained. The original wording assumed adoption was the only permission-first moment;
    * a non-owner human never adopts anything, so THIS is theirs: the instant
@@ -594,7 +594,7 @@ export function GroupProfileScreen({
   const roomName =
     sanitizeDisplayName(chat?.localName) ||
     sanitizeDisplayName(group?.name) ||
-    'This room';
+    'This group';
   const ownerName = group ? nameFor(group.ownerId) : '';
 
   /** A destructive or roster write must fail loudly, never silently — the
@@ -894,7 +894,7 @@ export function GroupProfileScreen({
                 list row and the thread header draw, so the identity does
                 not flip between the list and the one screen that is about
                 the room. Hidden from VoiceOver like the disc it replaces:
-                the name beneath it, and the header's "Room", carry the
+                the name beneath it, and the header's "Group", carry the
                 words. */}
             <RoomMark
               roomId={groupId}
@@ -1032,8 +1032,8 @@ export function GroupProfileScreen({
                               t.type.utilityLabel,
                               styles.ownerBadge,
                               {
-                                color: t.color.pine,
-                                borderColor: t.color.pineLine,
+                                color: t.color.inkBody,
+                                borderColor: t.color.lineStrong,
                                 borderRadius: t.radius.small,
                               },
                             ]}
@@ -1374,10 +1374,10 @@ export function GroupProfileScreen({
               {DISAPPEAR_OPTIONS_ROOM.map(option => {
                 const active = option.seconds === mySlotSeconds;
                 // Off for good once I have left: the chips say so to
-                // VoiceOver AND to the eye — a recessed surface with muted
-                // ink, never opacity — and a line beneath says why. `busy`
-                // disables the tap but keeps the live look: a write in
-                // flight is not a reason the person needs telling.
+                // VoiceOver AND to the eye — white with a gray edge and
+                // muted ink, never opacity or a fill — and a line beneath
+                // says why. `busy` disables the tap but keeps the live look:
+                // a write in flight is not a reason the person needs telling.
                 const locked = !amIn;
                 const disabled = busy || locked;
                 return (
@@ -1394,13 +1394,12 @@ export function GroupProfileScreen({
                       {
                         minHeight: t.layout.touchTarget,
                         borderRadius: t.radius.button,
-                        backgroundColor: locked
-                          ? t.color.paperInset
-                          : active
-                            ? t.color.pineWash
-                            : pressed
-                              ? t.color.paperInset
-                              : t.color.paperSheet,
+                        // White at rest, selected or locked: the edge and
+                        // the label carry the state; only a press fills it.
+                        backgroundColor:
+                          pressed && !active
+                            ? t.color.paperInset
+                            : t.color.paperSheet,
                         borderColor:
                           active && !locked ? t.color.pineLine : t.color.lineSoft,
                       },

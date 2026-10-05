@@ -22,7 +22,7 @@
  * Matches MARKETING_VERSION in app/ios/Tacendum.xcodeproj/project.pbxproj —
  * and VERSION_NAME in app/android/version.properties.
  */
-export const VERSION = '1.0';
+export const VERSION = '1.1';
 
 /**
  * Matches CURRENT_PROJECT_VERSION. Increments on every upload, including
@@ -37,7 +37,7 @@ export const VERSION = '1.0';
  * both chains and fails if either disagrees, which is the only reason a hand-
  * maintained mirror is safe to have.
  */
-export const BUILD = '32';
+export const BUILD = '33';
 
 /** What Settings shows, and what a bug report should quote. */
 export const VERSION_LABEL = `${VERSION} (${BUILD})`;

@@ -40,7 +40,7 @@ export const ACCOUNTS_USERNAME_COPY = {
   infoLabel: 'What a username discloses',
   /** THE HONESTY COPY (verbatim — behind the ⓘ). */
   infoLines: [
-    'Your username is not a login and is not shown as your name in chats. It does not verify someone’s identity; compare safety numbers for that.',
+    'Your username is not a login and is not shown as your name in rooms. It does not verify someone’s identity; compare safety numbers for that.',
     'A username is public by nature — an email address or phone number is private information; a username is not. We store only a scrambled form of your username, never the name itself, so a leak of our records alone does not reveal it.',
     'Usernames are short and guessable, so the real protections are limits, not scrambling: every search and every claim attempt is strictly limited and monitored, no one using the app can find your account by name unless you allow it, and you can change or remove your name at any time.',
     'Treat your username as public information.',
@@ -80,18 +80,47 @@ export const ACCOUNTS_USERNAME_COPY = {
       ? 'You removed your username within the last 30 days, so a different name has to wait — a username can change once every 30 days. Only the exact name you removed can be taken back right away.'
       : `You removed ${name} within the last 30 days, so a different name has to wait — a username can change once every 30 days. ${name} itself can be taken back right away.`,
   /** The held state's one line on HOW others reach this name (build 24 —
-   * testers could not find find-by-username): the finder's door, named. */
-  howFound:
-    'Others can find you by typing this name in Start a chat → Find by email or username.',
-  /* ── the Start a chat door, under the pin (build 24) ── */
-  /** The StartChatScreen row, helper and no-directory sentence with the
-   * username class live: the door must name what the room offers. A pin-OFF
-   * binary renders that screen's own landed literals byte-for-byte. */
-  startChatFind: 'Find by email or username',
-  startChatFindHelper:
-    'Works only for someone who verified an email — or claimed a username — and turned findability on.',
+   * testers could not find find-by-username). Since build 33 the name is
+   * typed straight into Open a room's one field: there is no door to name. */
+  howFound: 'Others can find you by typing this name when they open a room.',
+  /* ── Open a room's smart field, under the pin (build 33) ── */
+  /** The no-directory sentence with the username class live (line 1 of the
+   * screen's ⓘ). A pin-OFF binary renders that screen's own email-only
+   * sentence byte-for-byte. */
   startChatNoDirectory:
-    'Tacendum has no public directory. A chat starts with a Tacendum ID one person hands the other — or with the email or username of someone who chose to be found.',
+    'Tacendum has no public directory. A room starts with a Tacendum ID one person hands the other — or with the email or username of someone who chose to be found.',
+  /** The field's placeholder and accessible name: the three things it reads. */
+  startChatFieldPlaceholder: 'Paste their ID, username or email',
+  startChatFieldLabel: 'Their Tacendum ID, username or email',
+  /** "That’s you" for your own claimed name, and the go key's answer. */
+  startChatSelfStatus: 'Your username',
+  startChatSelfError: 'That’s your own username. Ask them for theirs.',
+  /** Text that is none of the three, after the pause or a blur. */
+  startChatUnknown: 'Not an ID, username or email yet',
+  startChatErrorUnknown: 'That isn’t an ID, a username or an email. Check what they sent you.',
+  /** The shape, said under a malformed name of three characters or more
+   * (refused on the device, so it never spends a search). */
+  startChatHandleRule:
+    'A username is 3 to 32 letters, digits or underscores, starting with a letter.',
+  startChatFindA11y: 'Find this username',
+  /** Line 4 of the screen's ⓘ: who can be found, and the daily limit. */
+  startChatFindScope:
+    'A username or email finds only someone who verified an email — or claimed a username — and chose to be found. Searches are limited each day.',
+  /** The found card's ⓘ "Is this really them?" for this class. The second
+   * line is the email card's, word for word (one condition, one sentence). */
+  startChatFoundInfo: [
+    'Anyone can claim a username, so finding one doesn’t prove who is behind it.',
+    'To be sure it’s them, compare safety numbers in person or on a call. Being found changes who you can reach, never how much they are trusted.',
+  ],
+  /** Line 1 of the miss ⓘ for this class; `findExplain` follows it. */
+  startChatMissInfoLead:
+    'A miss can mean the username isn’t on Tacendum or its owner hasn’t chosen to be found — or your searches for today are used up.',
+  /** The needs-verification door on Open a room. The reason that follows
+   * it in `needsIdentifier` sits behind the ⓘ beside it instead. */
+  startChatNeedsIdentifier: 'Verify an email first to search usernames.',
+  startChatVerifyWhyLabel: 'Why verify first',
+  /** Byte-equal to the second sentence of `needsIdentifier`. */
+  startChatVerifyWhy: 'This helps limit automated accounts and bulk searches.',
   /** The consent-at-claim checkbox, default CHECKED. */
   consentLabel: 'Let people who type this name find my account',
   /** The per-class toggle, after the claim (never implied by the
@@ -144,7 +173,7 @@ export const ACCOUNTS_USERNAME_COPY = {
    * consequence said where it bites: the name found someone, it proves
    * nothing about them. */
   findTofu:
-    'The first message sets up keys exactly like any new chat — being found by username changes who you can reach, never how much they are trusted. A username is not proof of who someone is; the safety number is.',
+    'The first message sets up keys exactly like any new room — being found by username changes who you can reach, never how much they are trusted. A username is not proof of who someone is; the safety number is.',
   /** The why-every-miss explainer for this class: the
    * caller-gate line says the POSSESSION-class gate honestly (a
    * username never buys search rights — only a verified email or phone
@@ -159,6 +188,6 @@ export const ACCOUNTS_USERNAME_COPY = {
    * never a reason, because none travels. */
   revokedTitle: 'Your username was removed',
   revokedBody:
-    'Tacendum removed the username from your account. Your account, your messages, your chats and any email or phone number you linked are unchanged; only the name is gone, and no one can find you by it any more. You can claim a different name.',
+    'Tacendum removed the username from your account. Your account, your messages, your rooms and any email or phone number you linked are unchanged; only the name is gone, and no one can find you by it any more. You can claim a different name.',
   revokedDismiss: 'OK',
 } as const;

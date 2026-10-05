@@ -25,12 +25,12 @@ import { useCallback, useEffect, useRef, useState } from 'react';
  * `InlineNotice` already carries:
  *
  * The example strings here are the shipped ones, deliberately: this docstring
- * is what the next notice gets copied from, so it says `conversation` — the
- * body noun the chat list's own deck uses ("Conversation deleted.", "Delete
- * conversation") — and not `chat`.
+ * is what the next notice gets copied from, so it says `room` — the noun
+ * the Rooms list's own deck uses for every conversation ("Room deleted.",
+ * "Delete room") — and not `chat`.
  *
  * ```ts
- * notice.show('Conversation deleted.');
+ * notice.show('Room deleted.');
  * <InlineNotice
  *   message={notice.notice}
  *   seq={notice.seq}

@@ -6,7 +6,7 @@ import { useTheme } from '../theme';
  * The compact AI marker (the Art. 50 in-conversation
  * marker). One anatomy for both surfaces — the thread's per-message tag and
  * the roster's attribution — copied from the roster's owner badge
- * (GroupProfileScreen `ownerBadge`): utilityLabel face, pine ink, pineLine
+ * (GroupProfileScreen `ownerBadge`): utilityLabel face, body ink, lineStrong
  * outline, the small radius. Outlined, never filled: a filled pill would sit
  * heavier than the owner badge beside it and start reading as a status.
  *
@@ -40,8 +40,8 @@ export function AgentBadge({
         t.type.utilityLabel,
         styles.badge,
         {
-          color: t.color.pine,
-          borderColor: t.color.pineLine,
+          color: t.color.inkBody,
+          borderColor: t.color.lineStrong,
           borderRadius: t.radius.small,
         },
       ]}

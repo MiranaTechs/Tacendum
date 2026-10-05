@@ -1,9 +1,11 @@
 import React from 'react';
-import { Text, TextInput } from 'react-native';
+import { StyleSheet, Text, TextInput } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import * as db from '../src/db';
 import { messaging } from '../src/messaging';
+import { themeTokens } from '../src/theme';
 import { AiAgentSection } from '../src/ui/AiAgentSection';
+import { CHIP_SELECTED_EDGE } from '../src/ui/ChoiceRow';
 
 const PEER = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
 const NOW = 1_800_000_000_000;
@@ -137,7 +139,7 @@ test('a quick task opens an editable review and sends only after confirmation', 
     PEER,
     'Review only the authentication changes.',
   );
-  expect(copy(tree)).toContain('Request queued in this conversation.');
+  expect(copy(tree)).toContain('Request queued in this room.');
 });
 
 test('a saved request stays local until its editable review is confirmed', async () => {
@@ -752,7 +754,7 @@ test('task choices and cancel cannot replace an in-flight reviewed request', asy
     sending.resolve();
     await sending.promise;
   });
-  expect(copy(tree)).toContain('Request queued in this conversation.');
+  expect(copy(tree)).toContain('Request queued in this room.');
 });
 
 test('a target read completing after peer switch cannot send or paint old status', async () => {
@@ -783,7 +785,7 @@ test('a target read completing after peer switch cannot send or paint old status
   });
 
   expect(messaging.sendText).not.toHaveBeenCalled();
-  expect(copy(tree)).not.toContain('Request queued in this conversation.');
+  expect(copy(tree)).not.toContain('Request queued in this room.');
   expect(tree.root.findAllByProps({ testID: 'peer-ai-task-review' })).toEqual([]);
 });
 
@@ -795,4 +797,72 @@ test('a state row for another peer cannot render controls under this profile', a
 test('no source-backed integration state renders no agent controls', async () => {
   const tree = await render(null);
   expect(tree.toJSON()).toBeNull();
+});
+
+/* ── cues that are not hue, and text that is not forest ── */
+
+/** One host node's flattened style, a function style read unpressed. */
+function hostStyle(
+  tree: ReactTestRenderer.ReactTestRenderer,
+  testID: string,
+): Record<string, unknown> {
+  const host = tree.root.findAll(
+    node => node.props.testID === testID && typeof node.type === 'string',
+  )[0]!;
+  const style = host.props.style;
+  return StyleSheet.flatten(typeof style === 'function' ? style({ pressed: false }) : style);
+}
+
+function hasHost(tree: ReactTestRenderer.ReactTestRenderer, testID: string): boolean {
+  return tree.root.findAll(
+    node => node.props.testID === testID && typeof node.type === 'string',
+  ).length > 0;
+}
+
+test('a row that cannot act draws no ›: enabled and disabled rows differ by more than the label’s hue', async () => {
+  (db.listAiTaskTemplates as jest.Mock).mockResolvedValueOnce([TEMPLATE]);
+  const ready = await render();
+  expect(hasHost(ready, 'peer-ai-task-review-changes-chevron')).toBe(true);
+  expect(hasHost(ready, `peer-ai-saved-${TEMPLATE.id}-chevron`)).toBe(true);
+  await ReactTestRenderer.act(() => ready.unmount());
+
+  // Tasks not configured: every task and saved row is disabled. Both stay
+  // white with their gray edge (a row is never the gray button fill), and
+  // they lose the › that says "this opens". Forest against the muted gray
+  // is 1.04:1, so the label's colour alone could not tell them apart.
+  (db.listAiTaskTemplates as jest.Mock).mockResolvedValueOnce([TEMPLATE]);
+  const off = await render({
+    ...STATE,
+    capabilities: { notifications: true, approvals: false, tasks: false },
+  });
+  expect(controlState(off, 'peer-ai-task-review-changes')).toEqual({ disabled: true });
+  expect(hasHost(off, 'peer-ai-task-review-changes-chevron')).toBe(false);
+  expect(hasHost(off, `peer-ai-saved-${TEMPLATE.id}-chevron`)).toBe(false);
+  expect(hostStyle(off, 'peer-ai-task-review-changes').backgroundColor).toBe(
+    themeTokens().color.paperSheet,
+  );
+});
+
+test('the chosen notification mode carries the heavier forest edge, its neighbour a hairline, and neither moves', async () => {
+  const tree = await render();
+  const t = themeTokens();
+  const on = hostStyle(tree, 'peer-ai-notify-all') as {
+    borderWidth: number;
+    borderColor: string;
+    paddingHorizontal: number;
+  };
+  const off = hostStyle(tree, 'peer-ai-notify-quiet') as typeof on;
+  expect(on.borderWidth).toBe(CHIP_SELECTED_EDGE);
+  expect(on.borderColor).toBe(t.color.pineLine);
+  expect(off.borderWidth).toBe(StyleSheet.hairlineWidth);
+  expect(off.borderColor).toBe(t.color.lineSoft);
+  expect(on.paddingHorizontal + on.borderWidth).toBeCloseTo(
+    off.paddingHorizontal + off.borderWidth,
+  );
+});
+
+test('a confirmation is charcoal text, not forest: "Applied by agent" reads in the body ink', async () => {
+  const tree = await render(STATE, { ...PREFERENCE, acknowledgedAt: NOW });
+  expect(copy(tree)).toContain('Applied by agent');
+  expect(hostStyle(tree, 'peer-ai-notify-applied').color).toBe(themeTokens().color.inkBody);
 });

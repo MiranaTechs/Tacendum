@@ -116,7 +116,7 @@ describe('QrPanel draws the id', () => {
     const tree = await render(<QrPanel id={ID} />);
 
     const [text, , darkHex, lightHex] = nativeQr.encodePng.mock.calls[0];
-    // Asserted against the tokens rather than '#121A15'/'#FAFCF7' so a theme
+    // Asserted against the tokens rather than a literal hex pair so a theme
     // edit moves the QR with it instead of silently passing.
     //
     // Re-cut 2026-09-05: this pinned a theme-DERIVED pair, read from whatever

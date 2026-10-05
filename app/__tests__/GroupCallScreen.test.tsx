@@ -28,7 +28,7 @@
  */
 
 import React, { useState } from 'react';
-import { Text, View, StyleSheet } from 'react-native';
+import { StatusBar, Text, View, StyleSheet } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import {
@@ -59,11 +59,13 @@ import {
   tileName,
 } from '../src/ui/CallTile';
 import { CallPicker } from '../src/ui/CallPicker';
+import { PhoneGlyph } from '../src/ui/CallGlyph';
 // The chat's own avatar component, asserted by type: "the same picture the
 // thread shows" is a claim about the SOURCE, and the only way to keep it true
 // is for both surfaces to be the same component reading the same column.
 import { Avatar } from '../src/ui/Avatar';
 import { shortId } from '../src/person';
+import { ThemeProvider, themeTokens } from '../src/theme';
 import * as calling from '../src/call';
 import * as db from '../src/db';
 // THE APP GRAPH LOADS HERE, AT SUITE SETUP — NEVER INSIDE A TEST'S CLOCK.
@@ -1440,13 +1442,117 @@ describe('layout and copy', () => {
     expect(tree.root.findAll(n => n.props.testID === `group-call-tile-${ME}`)).toHaveLength(0);
   });
 
-  it('stays on the media surface — no cream, no new colour', () => {
+  it('an audio call is an app screen — the app’s own ground, no new colour', () => {
+    // RE-CUT (the white palette, 2026-10-04). Every v1 group call is audio,
+    // and only a surface that carries or awaits video stays media black, so
+    // this screen sits on the app's ground — white in light — like a 1:1
+    // audio call and the incoming-call screen. FALSIFYING CASE: the old
+    // ground, `mediaBlack`, fails the first assertion.
     const { tree } = render();
     const root = tree.root.findByProps({ accessibilityLabel: 'Group call' });
     const flat = StyleSheet.flatten(root.props.style) as { backgroundColor?: string };
-    // The one dark surface this app has (theme.ts `mediaBlack`), the same one
-    // CallScreen and the photo viewer use.
-    expect(flat.backgroundColor).toBe('#060807');
+    const t = themeTokens('light');
+    expect(flat.backgroundColor).toBe(t.color.paperGround);
+    expect(flat.backgroundColor).not.toBe(t.color.mediaBlack);
+    // The status bar follows the surface: dark glyphs on white, and on
+    // Android the bar takes the same ground.
+    const bars = tree.root.findAllByType(StatusBar);
+    expect(bars).toHaveLength(1);
+    expect(bars[0]!.props.barStyle).toBe('dark-content');
+    expect(bars[0]!.props.backgroundColor).toBe(t.color.paperGround);
+  });
+
+  it('draws charcoal type, white control discs in a gray ring, and the shared end disc', () => {
+    const t = themeTokens('light');
+    const { tree } = render();
+    const colour = (body: string) =>
+      StyleSheet.flatten(
+        tree.root.findAll(
+          n => n.type === Text && [n.props.children].flat().join('') === body,
+        )[0]!.props.style,
+      ).color;
+    expect(colour('Ana and Ben')).toBe(t.color.inkStrong);
+    expect(colour('Connected')).toBe(t.color.inkMuted);
+    const resting = (label: string) =>
+      StyleSheet.flatten(
+        tree.root
+          .findAll(
+            n =>
+              n.props.accessibilityLabel === label &&
+              typeof n.props.style === 'function',
+          )[0]!
+          .props.style({ pressed: false }),
+      );
+    expect(resting('Mute')).toMatchObject({
+      backgroundColor: t.color.paperSheet,
+      borderWidth: 1,
+      borderColor: t.color.lineStrong,
+    });
+    expect(resting('End call').backgroundColor).toBe(t.color.mediaDanger);
+    // A tile is a white card with a hairline edge, never a black box.
+    // The tile's own View: the first node carrying both its testID and a
+    // style (the CallTile element above it takes the testID, not a style).
+    const tile = tree.root.findAll(
+      n => n.props.testID === `group-call-tile-${ANA}` && n.props.style !== undefined,
+    )[0]!;
+    const tileFlat = StyleSheet.flatten(tile.props.style) as {
+      backgroundColor?: string;
+      borderColor?: string;
+    };
+    expect(tileFlat.backgroundColor).toBe(t.color.paperSheet);
+    expect(tileFlat.borderColor).toBe(t.color.lineSoft);
+  });
+
+  it('answers with the same forest disc the incoming-call screen offers', () => {
+    // A call action looks the same on every call surface: the answer is
+    // the forest disc under a white handset, in both appearances, beside the
+    // shared red decline. It stays `selected` for VoiceOver as it was.
+    for (const mode of ['light', 'dark'] as const) {
+      const t = themeTokens(mode);
+      let tree!: ReactTestRenderer.ReactTestRenderer;
+      ReactTestRenderer.act(() => {
+        tree = ReactTestRenderer.create(
+          <SafeAreaProvider
+            initialMetrics={{
+              frame: { x: 0, y: 0, width: 390, height: 844 },
+              insets: { top: 47, left: 0, right: 0, bottom: 34 },
+            }}
+          >
+            <ThemeProvider mode={mode}>
+              <GroupCallScreen
+                view={view({ phase: 'ringing', starterId: ANA, connectedAt: null })}
+                nameFor={id => NAMES[id] ?? null}
+                onToggleMute={jest.fn()}
+                onToggleSpeaker={jest.fn()}
+                onEnd={jest.fn()}
+                onAnswer={jest.fn()}
+                onDecline={jest.fn()}
+                now={() => T}
+              />
+            </ThemeProvider>
+          </SafeAreaProvider>,
+        );
+      });
+      mounted.push(tree);
+      const button = (label: string) =>
+        tree.root.findAll(
+          n => n.props.accessibilityLabel === label && typeof n.props.style === 'function',
+        )[0]!;
+      const answer = button('Answer');
+      const answerFlat = StyleSheet.flatten(answer.props.style({ pressed: false }));
+      expect(answerFlat.backgroundColor).toBe(t.color.mediaAccent);
+      expect(answer.findAllByType(PhoneGlyph)[0]!.props.color).toBe(t.color.mediaInk);
+      expect(answer.props.accessibilityState.selected).toBe(true);
+      expect(
+        StyleSheet.flatten(button('Decline').props.style({ pressed: false }))
+          .backgroundColor,
+      ).toBe(t.color.mediaDanger);
+      // The ground is the mode's own: charcoal in dark, never media black.
+      const root = tree.root.findByProps({ accessibilityLabel: 'Group call' });
+      expect(StyleSheet.flatten(root.props.style).backgroundColor).toBe(
+        t.color.paperGround,
+      );
+    }
   });
 });
 

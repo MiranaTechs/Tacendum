@@ -268,7 +268,8 @@ describe('the screens that replaced KeyboardAvoidingView lift by the inset', () 
         profile={PROFILE}
         onBack={jest.fn()}
         onOpenChat={jest.fn()}
-        onFindByEmail={jest.fn()}
+        // The find door's prop retired with build 33 (find runs inline).
+        onOpenAccountEmail={jest.fn()}
       />,
     );
 

@@ -46,7 +46,7 @@ function completesLabel(completesAtSeconds: number): string {
 }
 
 /**
- * "Recover my account grouping" — BESIDE
+ * "Recover my account" — BESIDE
  * registration, never inside it (registration stays
  * identifier-free, structurally; this screen is a different route with its
  * own door on the landing surface).
@@ -304,7 +304,7 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
               message={ACCOUNTS_COPY.recoverDone}
               testID="recovery-done"
             />
-            <PrimaryButton label="Open my chats" onPress={onDone} testID="recovery-open-chats" />
+            <PrimaryButton label="Open my rooms" onPress={onDone} testID="recovery-open-chats" />
           </>
         ) : null}
 
@@ -348,9 +348,7 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
                           borderRadius: t.radius.button,
                           borderWidth: 1,
                           borderColor: selected ? t.color.pine : t.color.lineStrong,
-                          backgroundColor: selected
-                            ? t.color.pineWash
-                            : t.color.paperSheet,
+                          backgroundColor: t.color.paperSheet,
                         },
                       ]}
                     >
@@ -383,6 +381,7 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
               placeholderTextColor={t.color.inkMuted}
               keyboardAppearance={t.scheme}
               selectionColor={t.color.pine}
+              cursorColor={t.color.pine}
               accessibilityLabel={
                 byNumber
                   ? ACCOUNTS_PHONE_COPY.recoverNumberLabel
@@ -401,7 +400,7 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
                   backgroundColor: t.color.paperSheet,
                   color: t.color.inkStrong,
                   borderWidth: 1,
-                  borderColor: t.color.lineStrong,
+                  borderColor: t.color.lineField,
                 },
               ]}
             />
@@ -438,6 +437,7 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
                   placeholderTextColor={t.color.inkMuted}
                   keyboardAppearance={t.scheme}
                   selectionColor={t.color.pine}
+                  cursorColor={t.color.pine}
                   accessibilityLabel={ACCOUNTS_COPY.codePlaceholder}
                   keyboardType="number-pad"
                   maxLength={6}
@@ -453,7 +453,7 @@ export function RecoveryScreen({ profile, onBack, onCreateIdentity, onDone }: Pr
                       backgroundColor: t.color.paperSheet,
                       color: t.color.inkStrong,
                       borderWidth: 1,
-                      borderColor: t.color.lineStrong,
+                      borderColor: t.color.lineField,
                     },
                   ]}
                 />

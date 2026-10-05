@@ -20,10 +20,11 @@
 
 import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
-import { Text } from 'react-native';
+import { StyleSheet, Text } from 'react-native';
 import * as db from '../src/db';
 import { messaging } from '../src/messaging';
 import { ChatThreadScreen } from '../src/screens/ChatThreadScreen';
+import { themeTokens } from '../src/theme';
 
 interface FakeDb {
   name: string;
@@ -192,6 +193,15 @@ describe('a chat the server introduced', () => {
     // control the person would press.
     await press(tree, 'provenance-compare');
     expect(has(tree, 'safety-number')).toBe(true);
+    // The digits are text two people read aloud: charcoal, never forest
+    // (forest marks an action).
+    const digits = tree.root
+      .findAll(n => n.props.testID === 'safety-number' && typeof n.type === 'string')[0]!
+      .findAll(n => typeof n.type === 'string' && /^[0-9 ]+$/.test(String(n.props.children)));
+    expect(digits.length).toBeGreaterThan(0);
+    for (const group of digits) {
+      expect(StyleSheet.flatten(group.props.style).color).toBe(themeTokens().color.inkStrong);
+    }
     await press(tree, 'safety-primary');
     await press(tree, 'safety-match');
     await ReactTestRenderer.act(async () => {});

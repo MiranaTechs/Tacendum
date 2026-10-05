@@ -40,7 +40,7 @@ interface Props {
  * THE TWO RULES OF THIS GLASS:
  *
  *  1. NO ACCOUNT ID IS EVER RENDERED. The result card is labeled with the
- *     email the finder TYPED ("Start a chat with alice@example.com?"); the
+ *     email the finder TYPED ("Open a room with alice@example.com?"); the
  *     ULID the lookup resolved is an API fact that flows into the ordinary
  *     chat-open path and never reaches the tree — no testID carries it, no
  *     sentence includes it (the discovery-ux suite regexes the rendered
@@ -317,7 +317,7 @@ export function DiscoveryScreen({ onBack, onOpenChat, onOpenAccountEmail }: Prop
                       borderRadius: t.radius.button,
                       borderWidth: 1,
                       borderColor: selected ? t.color.pine : t.color.lineStrong,
-                      backgroundColor: selected ? t.color.pineWash : t.color.paperSheet,
+                      backgroundColor: t.color.paperSheet,
                     },
                   ]}
                 >
@@ -394,6 +394,7 @@ export function DiscoveryScreen({ onBack, onOpenChat, onOpenAccountEmail }: Prop
           placeholderTextColor={t.color.inkMuted}
           keyboardAppearance={t.scheme}
           selectionColor={t.color.pine}
+          cursorColor={t.color.pine}
           accessibilityLabel={
             searchingUsername
               ? ACCOUNTS_USERNAME_COPY.findTitle
@@ -418,7 +419,7 @@ export function DiscoveryScreen({ onBack, onOpenChat, onOpenAccountEmail }: Prop
               backgroundColor: t.color.paperSheet,
               color: t.color.inkStrong,
               borderWidth: 1,
-              borderColor: t.color.lineStrong,
+              borderColor: t.color.lineField,
             },
           ]}
         />

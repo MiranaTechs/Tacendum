@@ -22,7 +22,7 @@ import { hairline, useTheme, type Theme } from '../theme';
  * `InfoDisclosure` is documented as deliberately actionless with plain-string
  * teaching lines, and a disclosure that carries a payload someone else wrote
  * has stopped being teaching copy. The BODY is `ApprovalCard`'s payload
- * block instead: a recessed box, selectable monospace-capable runs, and a
+ * block instead: a hairline box, selectable monospace-capable runs, and a
  * height cap that SCROLLS rather than truncating, because a detail that
  * silently lost its tail would be a different answer than the one sent.
  *
@@ -109,9 +109,11 @@ export function DetailDisclosure({
             {
               borderRadius: t.radius.tail,
               borderColor: out ? t.color.onBubbleOut : t.color.lineStrong,
+              // Incoming, the box is white like the bubble around it and its
+              // hairline is the edge; a gray panel would be a second surface.
               backgroundColor: out
                 ? t.color.bubbleOutPressed
-                : t.color.paperInset,
+                : t.color.paperSheet,
             },
           ]}
         >
@@ -150,8 +152,8 @@ function stylesFor(t: Theme) {
       marginHorizontal: -6,
       paddingVertical: 8,
     },
-    /** The payload block: recessed, capped, and scrolling INSIDE — never
-     * truncating (ApprovalCard's `payloadBox`, at a bubble's scale). */
+    /** The payload block: framed by a hairline, capped, and scrolling INSIDE —
+     * never truncating (ApprovalCard's `payloadBox`, at a bubble's scale). */
     box: {
       marginTop: t.space.s3,
       maxHeight: 220,

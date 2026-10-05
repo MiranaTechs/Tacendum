@@ -1,5 +1,6 @@
 package com.miranatechnologies.tacendum
 
+import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
 import android.view.View
@@ -8,6 +9,7 @@ import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
 import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.fabricEnabled
 import com.facebook.react.defaults.DefaultReactActivityDelegate
+import com.miranatechnologies.tacendum.crypto.AppearancePrefsModule
 import com.miranatechnologies.tacendum.screensecurity.ScreenSecurity
 
 class MainActivity : ReactActivity() {
@@ -28,11 +30,32 @@ class MainActivity : ReactActivity() {
    * system refuses screenshots outright, so `onScreenshot` can never fire on
    * Android and the screenshot-DISCLOSURE feature is unreachable. Prevented,
    * not disclosed (Settings says the same sentence).
+   *
+   * The navigation bar takes the person's own appearance choice AFTER
+   * `super.onCreate`, never before: that call builds the window (and, on
+   * Android 15+, makes it edge-to-edge with the bar's icons in the SYSTEM's
+   * tone), so this is the first moment the choice can win, and it is still
+   * before the window is first shown (that happens at resume). Nothing in JS
+   * can reach that bar; the launch theme can only follow the system's day or
+   * night.
    */
   override fun onCreate(savedInstanceState: Bundle?) {
     ScreenSecurity.applySecureFlag(window)
     super.onCreate(savedInstanceState)
     restoreAdjustResizeUnderEnforcedEdgeToEdge()
+    AppearancePrefsModule.applyNavigationBar(this)
+  }
+
+  /**
+   * A system day/night switch arrives HERE rather than relaunching the
+   * activity, because `uiMode` is in its configChanges, so the launch
+   * theme's bar is never re-read. The stored choice decides what the
+   * navigation bar does with it: under "light" or "dark" it repaints the
+   * same bar; under "system" it follows [newConfig].
+   */
+  override fun onConfigurationChanged(newConfig: Configuration) {
+    super.onConfigurationChanged(newConfig)
+    AppearancePrefsModule.applyNavigationBar(this, newConfig)
   }
 
   /**

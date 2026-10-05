@@ -78,7 +78,7 @@ export const MACHINE_COPY = {
   explain: [
     'A machine you set up with the CLI can only ever message you.',
     'Adopting it into your crew also lets it message the other machines you adopt — never anyone else.',
-    `To watch them work together, put your machines in a room with you. Crew machines can also message each other directly, and those messages don’t pass through your ${DEVICE_NOUN}.`,
+    `To watch them work together, put your machines in a group with you. Crew machines can also message each other directly, and those messages don’t pass through your ${DEVICE_NOUN}.`,
     'Revoking retires its key permanently — that machine can never sign in or send again.',
     'Both are checked by the server: they refuse for anyone who is not a machine you paired.',
     // The two honest limits the disclosure would otherwise imply away

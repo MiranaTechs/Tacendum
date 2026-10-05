@@ -103,6 +103,9 @@ class PreviewActivity : Activity() {
               )
         }
     root.addView(buildHeader())
+    // The header is a white sheet on a white ground in the day palette: the
+    // seam is what tells them apart.
+    root.addView(seam())
     val body =
         FrameLayout(this).apply {
           layoutParams =
@@ -112,6 +115,14 @@ class PreviewActivity : Activity() {
     root.addView(body)
     return root
   }
+
+  /** A one-pixel rule in [Palette.line], the app's hairline, across the column. */
+  private fun seam(): View =
+      View(this).apply {
+        setBackgroundColor(palette.line)
+        layoutParams =
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, HAIRLINE_PX)
+      }
 
   private fun buildHeader(): View {
     val header =
@@ -159,13 +170,30 @@ class PreviewActivity : Activity() {
 
   // MARK: - image
 
+  /**
+   * The picture at its own aspect, centred on the ground inside a one-pixel
+   * [Palette.line] frame: drawn edge to edge on a white ground, an image with
+   * white edges had no edge at all.
+   */
   private fun buildImage(file: File): View? {
     val bitmap = decodeBounded(file) ?: return null
-    return ImageView(this).apply {
-      setImageBitmap(bitmap)
-      adjustViewBounds = true
-      scaleType = ImageView.ScaleType.FIT_CENTER
+    val picture =
+        ImageView(this).apply {
+          setImageBitmap(bitmap)
+          adjustViewBounds = true
+          scaleType = ImageView.ScaleType.FIT_CENTER
+          setBackgroundColor(palette.line)
+          setPadding(HAIRLINE_PX, HAIRLINE_PX, HAIRLINE_PX, HAIRLINE_PX)
+          layoutParams =
+              FrameLayout.LayoutParams(
+                  ViewGroup.LayoutParams.WRAP_CONTENT,
+                  ViewGroup.LayoutParams.WRAP_CONTENT,
+                  Gravity.CENTER,
+              )
+        }
+    return FrameLayout(this).apply {
       setBackgroundColor(palette.ground)
+      addView(picture)
       layoutParams =
           FrameLayout.LayoutParams(
               ViewGroup.LayoutParams.MATCH_PARENT,
@@ -223,10 +251,14 @@ class PreviewActivity : Activity() {
                   ViewGroup.LayoutParams.MATCH_PARENT,
               )
         }
+    // A white page on a white ground measures 1.00:1, so the rendered page
+    // sits inside a one-pixel [Palette.line] frame.
     val page =
         ImageView(this).apply {
           adjustViewBounds = true
           scaleType = ImageView.ScaleType.FIT_CENTER
+          setBackgroundColor(palette.line)
+          setPadding(HAIRLINE_PX, HAIRLINE_PX, HAIRLINE_PX, HAIRLINE_PX)
           layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
     pdfPageView = page
@@ -264,7 +296,10 @@ class PreviewActivity : Activity() {
     bar.addView(previous)
     bar.addView(label)
     bar.addView(next)
-    if (renderer.pageCount > 1) column.addView(bar)
+    if (renderer.pageCount > 1) {
+      column.addView(seam())
+      column.addView(bar)
+    }
 
     showPdfPage(0)
     return column
@@ -504,29 +539,33 @@ class PreviewActivity : Activity() {
       val inkMuted: Int,
       val pine: Int,
       val onPine: Int,
+      /** The hairline between white surfaces: seams and the page frame. */
+      val line: Int,
   ) {
     companion object {
-      /** app/src/theme.ts, both palettes, token for token. */
+      /** app/src/theme.ts, both palettes, token for token; line = lineStrong over the ground. */
       fun forNightMode(night: Boolean): Palette =
           if (night) {
             Palette(
-                ground = Color.parseColor("#0C0F0D"),
-                sheet = Color.parseColor("#1C221E"),
-                inkStrong = Color.parseColor("#E9EFE9"),
-                inkBody = Color.parseColor("#C6D0C7"),
-                inkMuted = Color.parseColor("#8A968C"),
-                pine = Color.parseColor("#35C57F"),
-                onPine = Color.parseColor("#0A130D"),
+                ground = Color.parseColor("#141414"),
+                sheet = Color.parseColor("#232323"),
+                inkStrong = Color.parseColor("#EDEDED"),
+                inkBody = Color.parseColor("#C3C3C3"),
+                inkMuted = Color.parseColor("#9A9A9A"),
+                pine = Color.parseColor("#57AA7F"),
+                onPine = Color.parseColor("#141414"),
+                line = Color.parseColor("#515151"),
             )
           } else {
             Palette(
-                ground = Color.parseColor("#EFF2EB"),
-                sheet = Color.parseColor("#FAFCF7"),
-                inkStrong = Color.parseColor("#121A15"),
-                inkBody = Color.parseColor("#313B34"),
-                inkMuted = Color.parseColor("#525D55"),
+                ground = Color.parseColor("#FFFFFF"),
+                sheet = Color.parseColor("#FFFFFF"),
+                inkStrong = Color.parseColor("#181818"),
+                inkBody = Color.parseColor("#404040"),
+                inkMuted = Color.parseColor("#606060"),
                 pine = Color.parseColor("#0E6B45"),
-                onPine = Color.parseColor("#FAFCF7"),
+                onPine = Color.parseColor("#FFFFFF"),
+                line = Color.parseColor("#BABABA"),
             )
           }
     }
@@ -553,6 +592,9 @@ class PreviewActivity : Activity() {
 
     /** Bounded so a decompression bomb cannot OOM the process mid-preview. */
     private const val MAX_IMAGE_EDGE_PX = 4_096
+
+    /** One physical pixel: the app's hairline, for seams and frames. */
+    private const val HAIRLINE_PX = 1
 
     /** A megabyte of text is far past what anyone reads on a phone screen. */
     private const val MAX_TEXT_BYTES = 1 shl 20

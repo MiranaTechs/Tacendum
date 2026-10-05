@@ -552,16 +552,16 @@ describe('the pinned row itself', () => {
     // Visual only: the row is ONE element and the word rides its label.
     expect(mark!.props.accessibilityElementsHidden).toBe(true);
     expect(mark!.props.importantForAccessibility).toBe('no-hide-descendants');
-    // In the pine the rest of the screen's affirmative marks use.
+    // In the muted ink: the forest dot in this column means unread.
     expect(
       byId(tree, `pin-mark-${SAM}`).some(
         n =>
           (n.props.style as { color?: string } | undefined)?.color ===
-            theme.color.pine ||
+            theme.color.inkMuted ||
           (Array.isArray(n.props.style) &&
             n.props.style.some(
               (s: { color?: string } | undefined) =>
-                s?.color === theme.color.pine,
+                s?.color === theme.color.inkMuted,
             )),
       ),
     ).toBe(true);

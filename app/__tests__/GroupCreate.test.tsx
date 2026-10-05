@@ -307,7 +307,7 @@ describe('createRoom — the anchor, the roster, and the fan-out', () => {
     ]);
     expect(
       q(`SELECT lastMessageText FROM chats WHERE peerId = ?`, groupId),
-    ).toEqual([{ lastMessageText: 'New room' }]);
+    ).toEqual([{ lastMessageText: 'New group' }]);
 
     // The wire: one encrypted frame per member; the plaintext grp.new that
     // reached the ratchet names the room, the roster and my seq for BOTH
@@ -708,7 +708,7 @@ describe('GroupCreateScreen — the picks, the disabled button, the review group
     };
 
     // Both missing.
-    expect(hint()).toBe('Name the room and pick at least one person.');
+    expect(hint()).toBe('Name the group and pick at least one person.');
 
     // A name, nobody picked.
     await ReactTestRenderer.act(async () => {
@@ -723,7 +723,7 @@ describe('GroupCreateScreen — the picks, the disabled button, the review group
     await ReactTestRenderer.act(async () => {
       byId(tree, `room-pick-${BEN}`)[0].props.onPress();
     });
-    expect(hint()).toBe('Give the room a name first.');
+    expect(hint()).toBe('Give the group a name first.');
 
     // Both present: the button is live and the line is gone.
     await ReactTestRenderer.act(async () => {

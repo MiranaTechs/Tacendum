@@ -40,7 +40,7 @@ import {
 } from '../ui/primitives';
 import { QrPanel } from '../ui/QrPanel';
 import { shareWithAnchor } from '../ui/shareWithAnchor';
-// The QR's two words come from the Start a chat deck, never from a second
+// The QR's two words come from the Open a room deck, never from a second
 // literal here: it is the same action on two screens, and the same action
 // must never get two different sentences.
 import { COPY as START_CHAT_COPY } from './StartChatScreen';
@@ -89,7 +89,7 @@ const COPY = {
   // honest exit, and the copy owns every consequence.
   // The device is named in the
   // platform's own words via the token, here and twice below.
-  signOutConfirm: `Deleting your account erases your chats, photos, and profile from this ${DEVICE_NOUN}, and retires your Tacendum ID. Setting up again, even on this same ${DEVICE_NOUN}, creates a new ID with no old chats. There is no backup. Other people keep their copies of your messages, and other linked devices keep their own accounts and data.`,
+  signOutConfirm: `Deleting your account erases your rooms, photos, and profile from this ${DEVICE_NOUN}, and retires your Tacendum ID. Setting up again, even on this same ${DEVICE_NOUN}, creates a new ID with no old rooms. There is no backup. Other people keep their copies of your messages, and other linked devices keep their own accounts and data.`,
   confirmSignOut: 'Delete my account',
   keepSignedIn: 'Keep my account',
   editTitle: 'Edit profile',
@@ -104,7 +104,7 @@ const COPY = {
   aboutPlaceholder: 'A short line about you',
   privacy:
     'Tacendum can’t see any of this. When you save, your name, photo, and about go out privately to everyone you already chat with.',
-  saved: 'Saved. Sending it to your chats now.',
+  saved: 'Saved. Sending it to your rooms now.',
   photoUnreadable: 'Tacendum couldn’t read that photo. Choose another one.',
   photosDenied:
     'Tacendum doesn’t have access to your photos. You can turn it on in Settings.',
@@ -113,7 +113,7 @@ const COPY = {
   cameraUnavailable: `This ${DEVICE_NOUN} doesn’t have a camera available.`,
   openSettings: 'Open Settings',
   saveFailed: 'Your profile wasn’t saved. Try again.',
-  savedOffline: `Saved on this ${DEVICE_NOUN}. Your chats get the update when you’re back on.`,
+  savedOffline: `Saved on this ${DEVICE_NOUN}. Your rooms get the update when you’re back on.`,
   // Server-first contract: if the server was never reached, nothing local was
   // destroyed either — the account is exactly as it was.
   signOutFailed:
@@ -458,7 +458,7 @@ export function ProfileScreen({
   /** The design input states, in one place so both fields cannot drift apart. */
   const fieldSurface = (field: 'name' | 'about') => ({
     backgroundColor: t.color.paperSheet,
-    borderColor: focused === field ? t.color.pine : t.color.lineStrong,
+    borderColor: focused === field ? t.color.pine : t.color.lineField,
     borderWidth: focused === field ? 2 : 1,
   });
 
@@ -633,6 +633,7 @@ export function ProfileScreen({
                   placeholderTextColor={t.color.inkMuted}
                   keyboardAppearance={t.scheme}
                   selectionColor={t.color.pine}
+                  cursorColor={t.color.pine}
                   accessibilityLabel={COPY.nameLabel}
                   autoCapitalize="words"
                   autoCorrect={false}
@@ -668,6 +669,7 @@ export function ProfileScreen({
                   placeholderTextColor={t.color.inkMuted}
                   keyboardAppearance={t.scheme}
                   selectionColor={t.color.pine}
+                  cursorColor={t.color.pine}
                   accessibilityLabel={COPY.aboutLabel}
                   testID="profile-about-input"
                   style={[
@@ -922,8 +924,9 @@ export function ProfileScreen({
                     {
                       minHeight: t.layout.buttonHeight,
                       borderRadius: t.radius.button,
-                      // Destructive controls take the danger wash rather than
-                      // the pine one; the press must not read as reassurance.
+                      // A destructive press is the same neutral highlight as
+                      // every press: the red words carry the danger, and no
+                      // press reads as reassurance.
                       backgroundColor: pressed
                         ? t.color.dangerWash
                         : 'transparent',
@@ -940,7 +943,7 @@ export function ProfileScreen({
                     style={[
                       styles.confirm,
                       {
-                        backgroundColor: t.color.dangerWash,
+                        backgroundColor: t.color.paperLayer,
                         borderLeftColor: t.color.danger,
                       },
                     ]}
@@ -1049,7 +1052,7 @@ export function ProfileScreen({
                       <InlineError
                         message={signOutError}
                         testID="sign-out-error"
-                        // Danger wash on danger wash measures 4.33:1, under AA.
+                        // A sheet on the confirm panel.
                         surface={t.color.paperSheet}
                       />
                     ) : null}

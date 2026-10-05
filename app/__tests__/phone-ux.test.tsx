@@ -505,7 +505,7 @@ describe('the find flow renders the TYPED number and never a ULID', () => {
     const rendered = JSON.stringify(tree.toJSON());
     // TYPED means typed (the landed rule, extended): the finder's own
     // formatting survives — normalization is the WIRE's concern.
-    expect(rendered).toContain('Start a chat with +1 (555) 555-0100?');
+    expect(rendered).toContain('Open a room with +1 (555) 555-0100?');
     expect(rendered).toContain('This account answers on 2 devices.');
     // THE PHASE'S CENTRAL ASSERTION: no 26-char ULID anywhere in the tree.
     expect(ULID_RE.test(rendered)).toBe(false);
@@ -852,7 +852,7 @@ describe('with PHONE_UI_ENABLED off, the phone surfaces render NOTHING', () => {
     const rendered = JSON.stringify(tree.toJSON());
     // The LANDED sentence, email-only clause included — the phone-aware
     // variant must not leak into a dark binary's scope copy.
-    expect(rendered).toContain('your account grouping, and your findability by email.');
+    expect(rendered).toContain('which devices are yours, and your findability by email.');
     expect(rendered.includes('email or phone number')).toBe(false);
     tree.unmount();
   });
@@ -874,7 +874,9 @@ describe('with PHONE_UI_ENABLED off, the phone surfaces render NOTHING', () => {
     const rendered = JSON.stringify(tree.toJSON());
     // The scope commitments, unchanged in the widened sentence.
     expect(rendered).toContain('Recovery restores two things only');
-    expect(rendered).toContain('your findability by the email or phone number linked to it');
+    expect(rendered).toContain(
+      'which devices are yours, and your findability by the email or phone number linked to your account',
+    );
     expect(rendered).toContain('Your messages are not here');
     expect(rendered).toContain('a new safety number');
     tree.unmount();

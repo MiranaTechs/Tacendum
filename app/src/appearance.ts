@@ -2,7 +2,7 @@ import { NativeModules, Platform, Settings } from 'react-native';
 
 /**
  * The appearance choice: light (the default the app has always had), dark
- * (security paper at night), or system (follow the phone).
+ * (charcoal), or system (follow the phone).
  *
  * Stored OUTSIDE the workspace database for two reasons: it must be
  * readable before unlock so the lock screen renders in the chosen mode, and

@@ -60,7 +60,7 @@ export function ScreenHeader({
               style={[
                 t.type.iconGlyph,
                 styles.backGlyph,
-                { color: t.color.pine },
+                { color: t.color.inkStrong },
               ]}
               // An icon, not text: its meaning is carried by
               // accessibilityLabel, so scaling it only breaks the 44pt target.
@@ -179,7 +179,11 @@ export function HomeHeader({
  *
  * The ref lands on the Pressable itself — an accessibility element — so a
  * caller restoring VoiceOver focus after a modal dismissal has a real target,
- * not a wrapper the traversal skips. */
+ * not a wrapper the traversal skips.
+ *
+ * `accessibilityLabel` is for a button whose words need their object to make
+ * sense out loud ("Open room" says "Open room with Mira"); it is spoken only
+ * while the button is not busy, so the busy label still announces the wait. */
 export const PrimaryButton = React.forwardRef<
   View,
   {
@@ -191,21 +195,33 @@ export const PrimaryButton = React.forwardRef<
     reduceMotion?: boolean;
     testID?: string;
     style?: StyleProp<ViewStyle>;
+    accessibilityLabel?: string;
   }
 >(function PrimaryButtonInner(
-  { label, onPress, disabled, busy, busyLabel, reduceMotion, testID, style },
+  {
+    label,
+    onPress,
+    disabled,
+    busy,
+    busyLabel,
+    reduceMotion,
+    testID,
+    style,
+    accessibilityLabel,
+  },
   ref,
 ) {
   const t = useTheme();
   const inactive = disabled || busy;
   const shown = busy ? (busyLabel ?? label) : label;
+  const spoken = busy ? shown : (accessibilityLabel ?? shown);
   return (
     <Pressable
       ref={ref}
       onPress={onPress}
       disabled={inactive}
       accessibilityRole="button"
-      accessibilityLabel={shown}
+      accessibilityLabel={spoken}
       accessibilityState={{ disabled: !!inactive, busy: !!busy }}
       {...(testID ? { testID } : {})}
       style={({ pressed }) => [
@@ -369,24 +385,40 @@ export const TextAction = React.forwardRef<
  * each comment insisting locality would stop a third screen using it for
  * something alarming — by which point three screens already had. Disabled
  * is a recessed surface with muted ink (the house rule, never opacity), and
- * the pressed wash never paints on a disabled control. */
-export function OutlineButton({
-  label,
-  tone = 'pine',
-  size = 'regular',
-  onPress,
-  disabled,
-  testID,
-  style,
-}: {
-  label: string;
-  tone?: 'pine' | 'danger' | 'warning';
-  size?: 'regular' | 'compact';
-  onPress: () => void;
-  disabled?: boolean;
-  testID?: string;
-  style?: StyleProp<ViewStyle>;
-}) {
+ * the pressed wash never paints on a disabled control.
+ *
+ * `leading` is an optional glyph before the label (Scan, Copy ID, Share ID).
+ * Only when one is given does the button lay out as a row with a gap and let
+ * the label shrink, so every button without one renders exactly as before.
+ * The ref lands on the Pressable itself (the PrimaryButton pattern), so a
+ * caller can move screen-reader focus to the button that just replaced
+ * another one in place.
+ */
+export const OutlineButton = React.forwardRef<
+  View,
+  {
+    label: string;
+    tone?: 'pine' | 'danger' | 'warning';
+    size?: 'regular' | 'compact';
+    onPress: () => void;
+    disabled?: boolean;
+    testID?: string;
+    style?: StyleProp<ViewStyle>;
+    leading?: React.ReactNode;
+  }
+>(function OutlineButtonInner(
+  {
+    label,
+    tone = 'pine',
+    size = 'regular',
+    onPress,
+    disabled,
+    testID,
+    style,
+    leading,
+  },
+  ref,
+) {
   const t = useTheme();
   const line =
     tone === 'danger'
@@ -407,8 +439,21 @@ export function OutlineButton({
         ? t.color.paperInset
         : t.color.pineWash;
   const compact = size === 'compact';
+  const withLeading = leading !== undefined && leading !== null;
+  const labelText = (
+    <Text
+      style={[
+        compact ? t.type.buttonCompact : t.type.button,
+        ...(withLeading ? [styles.outlineButtonLabelShrink] : []),
+        { color: disabled ? t.color.inkMuted : ink },
+      ]}
+    >
+      {label}
+    </Text>
+  );
   return (
     <Pressable
+      ref={ref}
       onPress={onPress}
       disabled={disabled}
       accessibilityRole="button"
@@ -417,6 +462,9 @@ export function OutlineButton({
       {...(testID ? { testID } : {})}
       style={({ pressed }) => [
         compact ? styles.outlineButtonCompact : styles.outlineButton,
+        // Spread, not `cond && style`: a button with no glyph keeps exactly
+        // the style array it always had.
+        ...(withLeading ? [styles.outlineButtonLeading] : []),
         {
           minHeight: compact ? t.layout.touchTarget : t.layout.buttonHeight,
           borderRadius: t.radius.button,
@@ -431,17 +479,18 @@ export function OutlineButton({
         style,
       ]}
     >
-      <Text
-        style={[
-          compact ? t.type.buttonCompact : t.type.button,
-          { color: disabled ? t.color.inkMuted : ink },
-        ]}
-      >
-        {label}
-      </Text>
+      {/* No glyph: the single label child the button always had. */}
+      {withLeading ? (
+        <>
+          {leading}
+          {labelText}
+        </>
+      ) : (
+        labelText
+      )}
     </Pressable>
   );
-}
+});
 
 /** Inline error that occupies layout space and is announced. Never a toast. */
 export function InlineError({
@@ -459,8 +508,9 @@ export function InlineError({
   /** Bump to re-announce an identical repeated failure. */
   seq?: number;
   /**
-   * Background override. Pass the host panel's own surface when nesting an
-   * error inside dangerWash — wash on wash measures 4.33:1, under AA.
+   * Background override, for an error nested in a panel with its own
+   * surface. The default is paperLayer, white in light: the danger rule and
+   * the danger ink carry the error, never a tinted fill.
    */
   surface?: string;
 }) {
@@ -492,7 +542,7 @@ export function InlineError({
           marginTop,
           paddingHorizontal,
           borderLeftColor: t.color.danger,
-          backgroundColor: surface ?? t.color.dangerWash,
+          backgroundColor: surface ?? t.color.paperLayer,
         },
       ]}
     >
@@ -525,6 +575,7 @@ export function InlineNotice({
   action,
   testID,
   seq,
+  messageRef,
 }: {
   message: string;
   tone?: 'quiet' | 'pine';
@@ -535,6 +586,9 @@ export function InlineNotice({
   testID?: string;
   /** Bump to re-announce an identical repeated notice. */
   seq?: number;
+  /** Lands on the message Text, so a caller can move screen-reader focus to
+   * the sentence when the notice replaces the control that held focus. */
+  messageRef?: React.Ref<Text>;
 }) {
   const t = useTheme();
   // accessibilityLiveRegion is Android-only, so without this every notice in
@@ -564,7 +618,7 @@ export function InlineNotice({
         },
       ]}
     >
-      <Text style={[t.type.compactBody, { color: t.color.inkBody }]}>
+      <Text ref={messageRef} style={[t.type.compactBody, { color: t.color.inkBody }]}>
         {message}
       </Text>
       {action ? (
@@ -768,4 +822,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingHorizontal: 12,
   },
+  // Only for a button given a leading glyph: the glyph beside the label.
+  outlineButtonLeading: { flexDirection: 'row', gap: 8 },
+  outlineButtonLabelShrink: { flexShrink: 1 },
 });

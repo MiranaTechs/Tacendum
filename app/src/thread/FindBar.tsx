@@ -153,7 +153,7 @@ export function FindBar({
             pressed && { backgroundColor: t.color.pineWash },
           ]}
         >
-          <CloseGlyph size={20} color={t.color.pine} />
+          <CloseGlyph size={20} color={t.color.inkStrong} />
         </Pressable>
 
         <TextInput
@@ -175,9 +175,12 @@ export function FindBar({
           autoFocus
           // The system keyboard follows the palette, the selection is pine,
           // and the placeholder is muted ink — the three theming props every
-          // field in this app carries.
+          // field in this app carries. The caret is named too: left alone,
+          // Android draws it from the system's day or night accent rather
+          // than the palette chosen in the app.
           keyboardAppearance={t.scheme}
           selectionColor={t.color.pine}
+          cursorColor={t.color.pine}
           testID="thread-find-field"
           style={[
             t.type.input,
@@ -188,7 +191,7 @@ export function FindBar({
               backgroundColor: t.color.paperSheet,
               color: t.color.inkStrong,
               borderWidth: focused ? 2 : 1,
-              borderColor: focused ? t.color.pine : t.color.lineStrong,
+              borderColor: focused ? t.color.pine : t.color.lineField,
             },
           ]}
         />
@@ -230,7 +233,7 @@ export function FindBar({
             allowFontScaling={false}
             style={[
               t.type.iconGlyph,
-              { color: atOldest ? t.color.inkMuted : t.color.pine },
+              { color: atOldest ? t.color.inkMuted : t.color.inkStrong },
             ]}
           >
             ↑
@@ -257,7 +260,7 @@ export function FindBar({
             allowFontScaling={false}
             style={[
               t.type.iconGlyph,
-              { color: atNewest ? t.color.inkMuted : t.color.pine },
+              { color: atNewest ? t.color.inkMuted : t.color.inkStrong },
             ]}
           >
             ↓

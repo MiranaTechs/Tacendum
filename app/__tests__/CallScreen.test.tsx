@@ -1,5 +1,5 @@
 import React from 'react';
-import { AccessibilityInfo, StyleSheet } from 'react-native';
+import { AccessibilityInfo, StatusBar, StyleSheet, Text } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { RINGING_ACK_GRACE_MS, type CallState } from '@tacendum/shared';
@@ -26,7 +26,14 @@ import {
 // disagreement that produced a bare initial here and a monogram everywhere
 // else.
 import { Avatar } from '../src/ui/Avatar';
+import {
+  EndCallGlyph,
+  MicGlyph,
+  MicMutedGlyph,
+  MinimizeGlyph,
+} from '../src/ui/CallControlGlyphs';
 import { monogram, shortId } from '../src/person';
+import { ThemeProvider, themeTokens } from '../src/theme';
 
 /**
  * The call screen renders `CallState`, keeps only presentation state, and
@@ -661,7 +668,7 @@ describe('the person, when there is no video of them', () => {
     // camera looks like, so the screen read as connected video while the
     // header still said "Ringing…". Before the call connects there is no
     // remote media of any kind to stand in for, so the person is drawn the
-    // way an audio call draws them — one 128pt disc, centred, over the pine
+    // way an audio call draws them — one 128pt disc, centred, over the wash
     // ground — which no one reads as a camera feed.
     const { tree } = renderScreen({
       state: state({
@@ -874,9 +881,8 @@ describe('the person, when there is no video of them', () => {
   });
 
   it('fills the surface for a peer with NO photo too — never bare black', () => {
-    // The no-photo treatment is CallTile's, inflated to the surface: the pine
-    // wash the app puts behind every photo-less person on the media surface,
-    // with the chat's monogram as the subject.
+    // The no-photo treatment on a video surface: mediaWash behind every
+    // photo-less person there, with the chat's monogram as the subject.
     const { byLabel } = renderScreen({
       state: state({ name: 'connected', video: true, peerVideo: false }),
       peerAvatarB64: null,
@@ -888,7 +894,9 @@ describe('the person, when there is no video of them', () => {
     expect([flat.top, flat.left, flat.right, flat.bottom]).toEqual([
       0, 0, 0, 0,
     ]);
-    expect(flat.backgroundColor).toBe('rgba(14,107,69,0.10)');
+    // A video surface: the media wash, not the app's neutral highlight,
+    // which over black measured 1.05:1 and let the person vanish.
+    expect(flat.backgroundColor).toBe(themeTokens('light').color.mediaWash);
     // The chat's monogram — `Dana` → `DA`, never a bare initial — at a size
     // that reads as the surface's subject. Pinned to the number because the
     // mutation audit proved the old sizes could mutate to 73 and 1 unnoticed.
@@ -1002,7 +1010,7 @@ describe('the person, when there is no video of them', () => {
     // The wash behind them fills the box, so the corner is never bare black.
     expect(
       StyleSheet.flatten(backdropWrap(pip)!.props.style).backgroundColor,
-    ).toBe('rgba(14,107,69,0.10)');
+    ).toBe(themeTokens('light').color.mediaWash);
   });
 
   it('shows “?” in the corner for an unnamed peer, never id characters', () => {
@@ -1642,5 +1650,267 @@ describe('the notice restore tap', () => {
     expect(notice).toBeTruthy();
     expect(notice.props.onPress).toBeUndefined();
     expect(notice.props.accessibilityRole).toBeUndefined();
+  });
+});
+
+/**
+ * WHICH SURFACE A CALL IS (the white palette, 2026-10-04). Only a call that
+ * carries or awaits video stays media black, because
+ * video is dark; an audio call has no video m-line and no path to gain one, so
+ * it is an app screen on the app's own ground: white in light, charcoal in
+ * dark, with charcoal type and gray control rings. The status bar follows the
+ * surface, and the end disc is the same red on both, in both appearances.
+ *
+ * FALSIFYING CASE, run at authoring time: before the change every assertion
+ * on the audio call below failed (a `#000000` ground, light status glyphs,
+ * white type and translucent white discs on a white app), and the dark end
+ * disc read the lifted text red, `#F5725E`, under a white glyph (2.8:1).
+ */
+describe('the surface follows the call: video is media, voice is an app screen', () => {
+  function renderIn(
+    mode: 'light' | 'dark',
+    over: Partial<React.ComponentProps<typeof CallScreen>> = {},
+  ) {
+    const props: React.ComponentProps<typeof CallScreen> = {
+      state: state(),
+      peerName: 'Dana',
+      muted: false,
+      videoEnabled: false,
+      speakerOn: false,
+      frontCamera: true,
+      onToggleMute: jest.fn(),
+      onToggleVideo: jest.fn(),
+      onFlipCamera: jest.fn(),
+      onToggleSpeaker: jest.fn(),
+      onHangup: jest.fn(),
+      now: () => T,
+      ...over,
+    };
+    let tree!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      tree = ReactTestRenderer.create(
+        <SafeAreaProvider
+          initialMetrics={{
+            frame: { x: 0, y: 0, width: 390, height: 844 },
+            insets: { top: 47, left: 0, right: 0, bottom: 34 },
+          }}
+        >
+          <ThemeProvider mode={mode}>
+            <CallScreen {...props} />
+          </ThemeProvider>
+        </SafeAreaProvider>,
+      );
+    });
+    mounted.push(tree);
+    return tree;
+  }
+
+  const rootColour = (tree: ReactTestRenderer.ReactTestRenderer) =>
+    StyleSheet.flatten(
+      tree.root.findAll(n => n.props.accessibilityViewIsModal === true)[0]!
+        .props.style,
+    ).backgroundColor;
+
+  const bar = (tree: ReactTestRenderer.ReactTestRenderer) => {
+    const bars = tree.root.findAllByType(StatusBar);
+    expect(bars).toHaveLength(1);
+    return {
+      barStyle: bars[0]!.props.barStyle,
+      backgroundColor: bars[0]!.props.backgroundColor,
+    };
+  };
+
+  /** A control's resting style, read off the Pressable's style function. */
+  const disc = (tree: ReactTestRenderer.ReactTestRenderer, label: string) => {
+    const button = tree.root.findAll(
+      n =>
+        n.props.accessibilityLabel === label &&
+        typeof n.props.style === 'function',
+    )[0]!;
+    return StyleSheet.flatten(button.props.style({ pressed: false })) as {
+      backgroundColor?: string;
+      borderWidth?: number;
+      borderColor?: string;
+    };
+  };
+
+  const glyphColour = (
+    tree: ReactTestRenderer.ReactTestRenderer,
+    label: string,
+    Icon: (props: { color: string }) => React.JSX.Element,
+  ) =>
+    tree.root
+      .findAll(
+        n =>
+          n.props.accessibilityLabel === label && typeof n.type !== 'string',
+      )[0]!
+      .findAllByType(Icon)[0]!.props.color;
+
+  const textColour = (tree: ReactTestRenderer.ReactTestRenderer, body: string) =>
+    StyleSheet.flatten(
+      tree.root.findAll(
+        n => n.type === Text && [n.props.children].flat().join('') === body,
+      )[0]!.props.style,
+    ).color;
+
+  it('a 1:1 audio call is an app screen: white ground, dark status glyphs, charcoal type', () => {
+    const t = themeTokens('light');
+    const tree = renderIn('light', { onMinimize: jest.fn() });
+    expect(rootColour(tree)).toBe(t.color.paperGround);
+    expect(rootColour(tree)).not.toBe(t.color.mediaBlack);
+    expect(bar(tree)).toEqual({
+      barStyle: 'dark-content',
+      backgroundColor: t.color.paperGround,
+    });
+    // No black band behind the header on a white screen.
+    const header = tree.root.findAll(n => n.props.testID === 'call-header')[0]!;
+    expect(StyleSheet.flatten(header.props.style).backgroundColor).toBe(
+      'transparent',
+    );
+    expect(textColour(tree, 'Dana')).toBe(t.color.inkStrong);
+    expect(textColour(tree, 'Connected')).toBe(t.color.inkMuted);
+    // The quality line is secondary text on this ground too.
+    expect(textColour(tree, 'Checking connection…')).toBe(t.color.inkMuted);
+    // The minimize glyph and its press follow the ground.
+    expect(
+      tree.root.findAllByType(MinimizeGlyph)[0]!.props.color,
+    ).toBe(t.color.inkStrong);
+    const minimize = tree.root.findAll(
+      n => n.props.testID === 'call-minimize' && typeof n.props.style === 'function',
+    )[0]!;
+    expect(
+      StyleSheet.flatten(minimize.props.style({ pressed: true })).backgroundColor,
+    ).toBe(t.color.paperInset);
+  });
+
+  it('draws the audio call’s controls as white discs in a gray ring, the end disc red', () => {
+    const t = themeTokens('light');
+    const tree = renderIn('light');
+    expect(disc(tree, 'Mute')).toMatchObject({
+      backgroundColor: t.color.paperSheet,
+      borderWidth: 1,
+      borderColor: t.color.lineStrong,
+    });
+    expect(glyphColour(tree, 'Mute', MicGlyph)).toBe(t.color.inkStrong);
+    expect(disc(tree, 'End call').backgroundColor).toBe(t.color.mediaDanger);
+    expect(glyphColour(tree, 'End call', EndCallGlyph)).toBe(t.color.mediaInk);
+  });
+
+  it('fills an ON control charcoal with a white glyph, and keeps its ring width', () => {
+    const t = themeTokens('light');
+    const tree = renderIn('light', { muted: true });
+    // Filled, and the ring is the fill: toggling mute changes the colour and
+    // never moves the control row by a point.
+    expect(disc(tree, 'Unmute')).toMatchObject({
+      backgroundColor: t.color.inkStrong,
+      borderWidth: 1,
+      borderColor: t.color.inkStrong,
+    });
+    expect(glyphColour(tree, 'Unmute', MicMutedGlyph)).toBe(t.color.paperSheet);
+  });
+
+  it('in dark the same audio call is charcoal with light status glyphs, and the end disc keeps its red', () => {
+    const d = themeTokens('dark');
+    const tree = renderIn('dark');
+    expect(rootColour(tree)).toBe(d.color.paperGround);
+    expect(bar(tree)).toEqual({
+      barStyle: 'light-content',
+      backgroundColor: d.color.paperGround,
+    });
+    expect(textColour(tree, 'Dana')).toBe(d.color.inkStrong);
+    expect(disc(tree, 'Mute')).toMatchObject({
+      backgroundColor: d.color.paperSheet,
+      borderColor: d.color.lineStrong,
+    });
+    // Mode-invariant: the dark text red would sit under the white glyph at
+    // 2.8:1, so the disc is the media red in both appearances.
+    expect(disc(tree, 'End call').backgroundColor).toBe(d.color.mediaDanger);
+    expect(d.color.mediaDanger).not.toBe(d.color.danger);
+  });
+
+  it('a video call stays media: black ground, light status glyphs, the HUD behind the controls', () => {
+    for (const mode of ['light', 'dark'] as const) {
+      const t = themeTokens(mode);
+      const tree = renderIn(mode, {
+        state: state({ video: true, peerVideo: true }),
+        videoEnabled: true,
+      });
+      expect(rootColour(tree)).toBe(t.color.mediaBlack);
+      expect(bar(tree)).toEqual({
+        barStyle: 'light-content',
+        backgroundColor: t.color.mediaBlack,
+      });
+      const header = tree.root.findAll(n => n.props.testID === 'call-header')[0]!;
+      expect(StyleSheet.flatten(header.props.style).backgroundColor).toBe(
+        t.color.mediaHud,
+      );
+      expect(textColour(tree, 'Dana')).toBe(t.color.mediaInk);
+      // The media control at rest is exactly what it always was: the
+      // translucent disc, no ring.
+      const mute = disc(tree, 'Mute');
+      expect(mute.backgroundColor).toBe(t.color.mediaLine);
+      expect(mute.borderWidth).toBeUndefined();
+      expect(glyphColour(tree, 'Mute', MicGlyph)).toBe(t.color.mediaInk);
+      expect(disc(tree, 'End call').backgroundColor).toBe(t.color.mediaDanger);
+    }
+  });
+
+  // Added for build 33: the pre-connect disc on the video surface drew
+  // the app's Avatar, a WHITE 128pt disc on the black surface in light (the
+  // dark sheet in dark), and the same person changed face the moment the
+  // call connected, when the media backdrop took over.
+  it('before a video call connects, its disc is the media face in both appearances', () => {
+    for (const mode of ['light', 'dark'] as const) {
+      const t = themeTokens(mode);
+      const tree = renderIn(mode, {
+        state: state({
+          name: 'outgoing_ringing',
+          video: true,
+          peerVideo: true,
+          connectedAt: null,
+        }),
+        videoEnabled: true,
+        peerAvatarB64: null,
+      });
+      const face = tree.root.findAllByType(Avatar);
+      expect(face).toHaveLength(1);
+      expect(face[0]!.props.tone).toBe('media');
+      const discHost = face[0]!.findAll(
+        n =>
+          typeof n.type === 'string' &&
+          StyleSheet.flatten(n.props.style)?.width === 128,
+      )[0]!;
+      expect(StyleSheet.flatten(discHost.props.style)).toMatchObject({
+        backgroundColor: t.color.mediaWash,
+        borderWidth: 1,
+        borderColor: t.color.mediaLine,
+      });
+      expect(textColour(tree, 'DA')).toBe(t.color.mediaInk);
+      // The same values in both appearances: media is mode-invariant.
+      expect(t.color.mediaWash).toBe(themeTokens('light').color.mediaWash);
+      expect(t.color.mediaInk).toBe(themeTokens('light').color.mediaInk);
+    }
+  });
+
+  // RE-CUT (2026-10-05, superseding the earlier white disc in
+  // a gray ring): the app's own face is white letters on the solid forest
+  // disc, the same in both appearances.
+  it('an audio call keeps the app’s own face: white letters on the forest disc, in both appearances', () => {
+    for (const mode of ['light', 'dark'] as const) {
+      const tree = renderIn(mode, { peerAvatarB64: null });
+      const face = tree.root.findAllByType(Avatar);
+      expect(face).toHaveLength(1);
+      expect(face[0]!.props.tone).toBeUndefined();
+      const discHost = face[0]!.findAll(
+        n =>
+          typeof n.type === 'string' &&
+          StyleSheet.flatten(n.props.style)?.width === 128,
+      )[0]!;
+      expect(StyleSheet.flatten(discHost.props.style)).toMatchObject({
+        backgroundColor: '#0E6B45',
+        borderColor: '#0E6B45',
+      });
+      expect(textColour(tree, 'DA')).toBe('#FFFFFF');
+    }
   });
 });

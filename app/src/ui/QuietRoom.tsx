@@ -109,7 +109,7 @@ function EmptyPlace() {
     <View
       style={[
         styles.emptyPlace,
-        { borderColor: t.color.pineLine, backgroundColor: t.color.pineWash },
+        { borderColor: t.color.pineLine, backgroundColor: 'transparent' },
       ]}
     >
       <View style={[styles.emptyDot, { backgroundColor: t.color.pine }]} />

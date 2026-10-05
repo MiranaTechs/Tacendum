@@ -9,7 +9,7 @@
     </dependencies>
     <scenes>
         <!--View Controller-->
-        <!--A bare paper field, deliberately markless: the JS boot frame
+        <!--A bare white field, deliberately markless: the JS boot frame
             animates the brand mark's arrival (App.tsx, BrandMark animate), and
             a mark already standing here would blink out and re-arrive. The
             launch screen's one job is to put the ground color up first.-->
@@ -19,7 +19,7 @@
                     <view key="view" contentMode="scaleToFill" id="Ze5-6b-2t3">
                         <rect key="frame" x="0.0" y="0.0" width="375" height="667"/>
                         <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
-                        <color key="backgroundColor" red="0.93725490196078431" green="0.94901960784313721" blue="0.92156862745098034" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
+                        <color key="backgroundColor" red="1" green="1" blue="1" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
                         <viewLayoutGuide key="safeArea" id="Bcu-3y-fUS"/>
                     </view>
                 </viewController>

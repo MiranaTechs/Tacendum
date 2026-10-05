@@ -146,7 +146,7 @@ export const VAULT = {
    * opened it (ProfileScreen.tsx:761-763). */
   removeQuestion: (name: string) => `Remove “${name}” from the vault?`,
   removeBody:
-    'It goes from both devices, and the value is cleared from this one. The notice in the chat stays until it is removed there or the timer takes it.',
+    'It goes from both devices, and the value is cleared from this one. The notice in the room stays until it is removed there or the timer takes it.',
   removeConfirm: 'Remove from both devices',
 
   /* ── contested ───────── */
@@ -207,7 +207,7 @@ export const VAULT = {
   failed: 'Tacendum couldn’t save that. Try again.',
   removeFailed: 'Tacendum couldn’t remove that. Try again.',
   blocked:
-    'You blocked this person, so nothing is sent from this chat. The vault stays as it is until you unblock.',
+    'You blocked this person, so nothing is sent from this room. The vault stays as it is until you unblock.',
   /**
    * The one failure that is not the app's fault and not a retry. The send path
    * throws this rather than swallowing it (messaging.ts:1147-1149) precisely
@@ -230,7 +230,7 @@ export const VAULT = {
  * reading, so neither goes behind the toggle.
  */
 export const VAULT_CONSEQUENCE: string[] = [
-  'Anything here is kept until one of you removes it — including when messages in this chat disappear on a timer.',
+  'Anything here is kept until one of you removes it — including when messages in this room disappear on a timer.',
   // Each platform's sentence names its
   // own clipboard and its own leak path — iOS has Universal Clipboard across
   // an iCloud account; Android has no cross-device pasteboard of its own, but
@@ -259,7 +259,7 @@ export const VAULT_LIMITS: string[] = [
   `An item is stored and sent exactly like a message: same encryption, same database, same lock on this ${DEVICE_NOUN}. The vault adds organisation and the mask on this screen — not a stronger lock.`,
   `It is not a password manager. Nothing fills in for you, nothing watches for breaches, and there is no separate password. If this ${DEVICE_NOUN} is lost the vault goes with it; there is no recovery key.`,
   'Anything either of you can read, either of you can keep. They can copy a value out, write it down, or photograph the screen, and nothing here can reach it afterwards.',
-  'Saving or removing an item also leaves a short notice in the chat. That notice still carries the value inside it until it is removed there or a disappearing-message timer takes it.',
+  'Saving or removing an item also leaves a short notice in the room. That notice still carries the value inside it until it is removed there or a disappearing-message timer takes it.',
   // The check-before-clear is the same on both platforms; what differs is the
   // system's own behaviour around the read. iOS can ASK and be refused;
   // Android never asks — it silently withholds another app's clipboard from a

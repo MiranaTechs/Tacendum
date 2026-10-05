@@ -1277,7 +1277,7 @@ export function previewFor(
   // would show — two places that sit outside the thread and are read without
   // opening it. In the chat list the room name is already the row's title, so
   // repeating it buys nothing and leaks it somewhere it need not be.
-  if (envelope?.tcm === 'grp.new') return 'New room';
+  if (envelope?.tcm === 'grp.new') return 'New group';
   // No names: who was added or removed is in the thread's own attributed row,
   // where the reader has already chosen to look.
   if (envelope?.tcm === 'grp.roster') return 'Members changed';

@@ -206,7 +206,7 @@ describe('the empty home teaches the flow that actually ships', () => {
     // By identity — the house COPY-deck rule.
     expect(texts(tree)).toContain('Tap + to scan their code, or type their ID.');
     expect(texts(tree)).toContain(
-      'The … beside a chat holds what you can do with it.',
+      'The … beside a room holds what you can do with it.',
     );
 
     // The two sentences that were wrong are gone, verbatim.

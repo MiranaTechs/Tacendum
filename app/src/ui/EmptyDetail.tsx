@@ -5,7 +5,7 @@ import { useTheme } from '../theme';
 import { QuietRoom } from './QuietRoom';
 
 const COPY = {
-  line: 'Select a conversation',
+  line: 'Select a room',
 };
 
 interface Props {

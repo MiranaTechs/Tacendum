@@ -1,12 +1,15 @@
 import React from 'react';
+import { StyleSheet, Text, View } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import * as native from 'tacendum-call';
 import * as calling from '../src/call';
+import { PRESS_SHADE } from '../src/components/CallControls';
 import * as db from '../src/db';
 import { messaging } from '../src/messaging';
 import { shortId } from '../src/person';
 import { IncomingCallScreen } from '../src/screens/IncomingCallScreen';
+import { ThemeProvider, themeTokens } from '../src/theme';
 
 /**
  * Answering an incoming call (PLAN §7.5).
@@ -333,6 +336,167 @@ describe('the screen reads the camera itself when nobody tells it', () => {
       .map(n => String(n.props.accessibilityLabel));
     expect(labels).toContain('Incoming video call from Someone');
     for (const label of labels) expect(label).not.toContain(unsafeName);
+  });
+});
+
+/** WCAG contrast of two #RRGGBB colours (parseInt, never bitwise). */
+function contrast(a: string, b: string): number {
+  const luminance = (hex: string): number => {
+    const [r, g, bl] = [1, 3, 5].map(i => {
+      const v = parseInt(hex.slice(i, i + 2), 16) / 255;
+      return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+    }) as [number, number, number];
+    return 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+  };
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x) as [number, number];
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/** `top` at `alpha` over the opaque `under`, as #RRGGBB. */
+function composite(top: string, alpha: number, under: string): string {
+  const channel = (hex: string, i: number) => parseInt(hex.slice(i, i + 2), 16);
+  return `#${[1, 3, 5]
+    .map(i =>
+      Math.round(channel(top, i) * alpha + channel(under, i) * (1 - alpha))
+        .toString(16)
+        .padStart(2, '0'),
+    )
+    .join('')
+    .toUpperCase()}`;
+}
+
+// Added for build 33. The incoming-call screen moved from media black
+// to the white app ground, and its buttons still dimmed by opacity: the
+// pending "Checking camera…" answer (every incoming video call opens on it)
+// rendered mint under a white label at 2.52:1, and a pressed Answer or
+// Decline lightened to 3.80:1 and 4.13:1.
+describe('the answer buttons on the white app ground draw no state with opacity', () => {
+  const METRICS = {
+    frame: { x: 0, y: 0, width: 390, height: 844 },
+    insets: { top: 47, left: 0, right: 0, bottom: 34 },
+  };
+  const trees: ReactTestRenderer.ReactTestRenderer[] = [];
+  afterEach(() => {
+    ReactTestRenderer.act(() => {
+      for (const t of trees.splice(0)) t.unmount();
+    });
+  });
+
+  async function mountIn(mode: 'light' | 'dark'): Promise<ReactTestRenderer.ReactTestRenderer> {
+    let tree!: ReactTestRenderer.ReactTestRenderer;
+    await ReactTestRenderer.act(async () => {
+      tree = ReactTestRenderer.create(
+        <SafeAreaProvider initialMetrics={METRICS}>
+          <ThemeProvider mode={mode}>
+            <IncomingCallScreen
+              peerId="01HQBBBB00000000000000000A"
+              peerName="Dana"
+              withVideo
+              onAccept={jest.fn()}
+              onAcceptAudioOnly={jest.fn()}
+              onDecline={jest.fn()}
+            />
+          </ThemeProvider>
+        </SafeAreaProvider>,
+      );
+    });
+    await ReactTestRenderer.act(async () => {
+      await flush();
+    });
+    trees.push(tree);
+    return tree;
+  }
+
+  /** One button, pressed or not: its own style, the label's colour and the
+   * press shade its children draw, read off the Pressable's two functions. */
+  function button(tree: ReactTestRenderer.ReactTestRenderer, label: string, pressed: boolean) {
+    const press = tree.root.findAll(
+      n => n.props.accessibilityLabel === label && typeof n.props.style === 'function',
+    )[0]!;
+    const style = StyleSheet.flatten(press.props.style({ pressed })) as {
+      opacity?: number;
+      backgroundColor?: string;
+      borderWidth?: number;
+      borderColor?: string;
+    };
+    let inner!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      inner = ReactTestRenderer.create(
+        <View>{press.props.children({ pressed, hovered: false })}</View>,
+      );
+    });
+    trees.push(inner);
+    const words = inner.root.findAllByType(Text)[0]!;
+    const shade = inner.root.findAll(
+      n => n.props.testID === 'call-press-shade' && typeof n.type === 'string',
+    )[0];
+    return {
+      style,
+      ink: StyleSheet.flatten(words.props.style).color as string,
+      shade: shade ? StyleSheet.flatten(shade.props.style) : null,
+    };
+  }
+
+  it('the pending answer is the house’s disabled button: the gray inset, a soft ring, a muted label', async () => {
+    (native.cameraPermission as jest.Mock).mockImplementation(() => new Promise(() => undefined));
+    for (const mode of ['light', 'dark'] as const) {
+      const t = themeTokens(mode);
+      const tree = await mountIn(mode);
+      const pending = button(tree, 'Checking camera…', false);
+      expect(pending.style.opacity ?? 1).toBe(1);
+      expect(pending.style).toMatchObject({
+        backgroundColor: t.color.paperInset,
+        borderWidth: 1,
+        borderColor: t.color.lineSoft,
+      });
+      expect(pending.ink).toBe(t.color.inkMuted);
+      expect(contrast(pending.ink, pending.style.backgroundColor!)).toBeGreaterThanOrEqual(4.5);
+      expect(pending.shade).toBeNull();
+    }
+  });
+
+  it('a finger on Answer or Decline darkens the disc with the shade, and the white label stays above 4.5:1', async () => {
+    for (const mode of ['light', 'dark'] as const) {
+      const t = themeTokens(mode);
+      const tree = await mountIn(mode);
+      for (const [label, disc] of [
+        ['Answer with video', t.color.mediaAccent],
+        ['Decline', t.color.mediaDanger],
+      ] as const) {
+        const resting = button(tree, label, false);
+        expect(resting.style.backgroundColor).toBe(disc);
+        expect(resting.shade).toBeNull();
+        const down = button(tree, label, true);
+        expect(down.style.opacity ?? 1).toBe(1);
+        expect(down.style.backgroundColor).toBe(disc);
+        expect(down.shade).toMatchObject({
+          position: 'absolute',
+          borderRadius: 28,
+          backgroundColor: t.color.mediaBlack,
+          opacity: PRESS_SHADE,
+        });
+        expect(down.ink).toBe(t.color.mediaInk);
+        const shaded = composite(t.color.mediaBlack, PRESS_SHADE, disc);
+        expect(contrast(down.ink, shaded)).toBeGreaterThanOrEqual(4.5);
+        // The dip it replaces, over the white page: under 4.5:1.
+        expect(contrast(down.ink, composite(disc, 0.75, '#FFFFFF'))).toBeLessThan(4.5);
+      }
+    }
+  });
+
+  it('a finger on the neutral answer fills it with the gray pressed fill, never a dim', async () => {
+    const t = themeTokens('light');
+    const tree = await mountIn('light');
+    const resting = button(tree, 'Answer without video', false);
+    expect(resting.style).toMatchObject({
+      backgroundColor: t.color.paperSheet,
+      borderColor: t.color.lineStrong,
+    });
+    const down = button(tree, 'Answer without video', true);
+    expect(down.style.opacity ?? 1).toBe(1);
+    expect(down.style.backgroundColor).toBe(t.color.paperInset);
+    expect(down.ink).toBe(t.color.inkStrong);
+    expect(down.shade).toBeNull();
   });
 });
 

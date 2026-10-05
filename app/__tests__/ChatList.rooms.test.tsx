@@ -18,7 +18,7 @@
  *  - A room's drawer offers no Block: blocking a room is not a thing; members are blocked from their own conversations.
  *  - The empty state no longer promises two seats: the old copy is absent
  *    verbatim, the replacement present.
- *  - The 'New room' entry sits with the list and fires its route.
+ *  - The 'New group' entry sits with the list and fires its route.
  */
 
 jest.mock('../src/ws', () => {
@@ -286,7 +286,7 @@ describe('a room row', () => {
     const text = renderedText(tree);
     expect(text).toContain('Kitchen'); // the name
     expect(text).toContain('KI'); // the monogram, from the name
-    expect(text).toContain('New room'); // the preview line
+    expect(text).toContain('New group'); // the preview line
     // The rule, taken literally: no rendered text carries the
     // room's id — not whole, and not shortId's "…" + 8-character tail.
     expect(text).not.toContain(groupId);
@@ -311,7 +311,9 @@ describe('a room row', () => {
 
     expect(byId(tree, `chat-${groupId}`).length).toBeGreaterThan(0);
     const text = renderedText(tree);
-    expect(text).toContain('Room');
+    // The row's own words, not the list header ("Rooms" holds "Room").
+    expect(byId(tree, `chat-${groupId}`)[0].props.accessibilityLabel).toContain('Group, group');
+    expect(text).toContain('Group');
     expect(text).not.toContain(groupId);
     expect(text).not.toContain(groupId.slice(-8));
 
@@ -397,10 +399,10 @@ describe('the room signal (a person is a circle; a room is a walled square)', ()
     expect(personRow).toBeTruthy();
     // Precondition: the fresh room's preview line is on screen, so the
     // label asserted next is built from parts this fixture actually holds.
-    expect(renderedText(tree)).toContain('New room');
+    expect(renderedText(tree)).toContain('New group');
 
     // The mark is visual only; the WORD travels in the label.
-    expect(roomRow.props.accessibilityLabel).toBe('Kitchen, room, New room');
+    expect(roomRow.props.accessibilityLabel).toBe('Kitchen, group, New group');
     // A quiet 1:1 row carries no label at all — its Text children already
     // read correctly — exactly as before rooms existed.
     expect(personRow.props.accessibilityLabel).toBeUndefined();
@@ -410,7 +412,7 @@ describe('the room signal (a person is a circle; a room is a walled square)', ()
     });
   });
 
-  test('an unread room still says room, ahead of the news', async () => {
+  test('an unread group still says group, ahead of the news', async () => {
     const groupId = await mixedList();
     // A room row EXACTLY as the receive path writes one, which is the whole
     // point: the id is the composite `${author}.${m}`, and `seen` holds the
@@ -439,7 +441,7 @@ describe('the room signal (a person is a circle; a room is a walled square)', ()
     const tree = await render(listScreen());
     const label = byId(tree, `chat-${groupId}`)[0].props
       .accessibilityLabel as string;
-    expect(label).toContain('Kitchen, room, new messages');
+    expect(label).toContain('Kitchen, group, new messages');
 
     await ReactTestRenderer.act(() => {
       tree.unmount();
@@ -727,7 +729,7 @@ describe('the empty state and the room entry', () => {
     });
   });
 
-  test('the New room entry sits with the list and fires its route', async () => {
+  test('the New group entry sits with the list and fires its route', async () => {
     await db.upsertChat(BEN, 'Ben');
     const onStartRoom = jest.fn();
     const tree = await render(listScreen({ onStartRoom }));

@@ -1,18 +1,20 @@
 /**
- * The picture path fills the field. It does not start the chat.
+ * The picture path fills the field. It does not open the room.
  *
  * There is no directory, so nothing downstream can catch a wrong ID: it
  * addresses a stranger, or nobody, and either way silently. So a photo is only
  * ever allowed to type 26 characters into the box the person is already
- * looking at — the counter, the enabled button and the spelled-out ID are the
- * confirmation, and they already existed. Every refusal below is a refusal to
- * guess on someone's behalf.
+ * looking at — the counter, the button and the read-back are the
+ * confirmation. Every refusal below is a refusal to guess on someone's
+ * behalf. Since build 33 an ID fills the field in groups of four, the way the
+ * other person's My ID shows it.
  */
 
 import React from 'react';
 import { AccessibilityInfo } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import * as db from '../src/db';
+import { extractId } from '../src/peerId';
 import { StartChatScreen } from '../src/screens/StartChatScreen';
 
 jest.mock('react-native-image-picker', () => ({
@@ -81,6 +83,8 @@ const PROFILE: db.ProfileRow = {
 };
 
 const PEER_ID = '01BX5ZZKBKACTAV9WEVGEMMVRZ';
+/** The field's value once a picture or a paste fills it (build 33). */
+const PEER_GROUPED = '01BX 5ZZK BKAC TAV9 WEVG EMMV RZ';
 const OTHER_ID = '01J0A2B3C4D5E6F7G8H9JKMNPQ';
 const PHOTO = 'file:///tmp/picked/IMG_0042.HEIC';
 
@@ -126,11 +130,13 @@ function byId(tree: ReactTestRenderer.ReactTestRenderer, id: string) {
   );
 }
 
-/** The control itself: a Pressable's host View carries no `onPress`. */
+/** The control itself. Harness change for build 33: PrimaryButton,
+ * OutlineButton and TextAction put testID and onPress on the composite AND
+ * its Pressable, so the first match is taken rather than a `find`. */
 function control(tree: ReactTestRenderer.ReactTestRenderer, id: string) {
-  return tree.root.find(
+  return tree.root.findAll(
     n => n.props.testID === id && typeof n.props.onPress === 'function',
-  );
+  )[0]!;
 }
 
 function press(tree: ReactTestRenderer.ReactTestRenderer, id: string) {
@@ -145,7 +151,7 @@ function screen() {
       profile={PROFILE}
       onBack={jest.fn()}
       onOpenChat={jest.fn()}
-      onFindByEmail={jest.fn()}
+      onOpenAccountEmail={jest.fn()}
     />
   );
 }
@@ -176,18 +182,20 @@ async function readPhoto(
   await press(tree, 'scan-qr-photo');
 }
 
+// Rewritten for build 33: one disclosure, My ID, shows the ID and the QR
+// together, so `show-self-qr` is gone; the lazy encode still holds.
 describe('showing your own code', () => {
   test('the panel is collapsed until asked for, and nothing is drawn before then', async () => {
     const tree = await render(screen());
-    // The own-ID block itself waits behind "Show my ID"; the QR
-    // disclosure sits inside it.
-    await press(tree, 'show-self-id');
 
-    expect(byId(tree, 'show-self-qr').length).toBe(1);
     expect(byId(tree, 'self-qr-image').length).toBe(0);
     // Collapsed by default is a reliability property, not only a visual one:
     // a CoreImage failure cannot degrade the screen every new chat starts from.
     expect(nativeQr.encodePng).not.toHaveBeenCalled();
+
+    await press(tree, 'show-self-id');
+    expect(byId(tree, 'self-qr-image').length).toBe(1);
+    expect(nativeQr.encodePng).toHaveBeenCalledTimes(1);
 
     await ReactTestRenderer.act(() => {
       tree.unmount();
@@ -196,20 +204,19 @@ describe('showing your own code', () => {
 
   test('the disclosure opens, closes, and says which it is', async () => {
     const tree = await render(screen());
-    await press(tree, 'show-self-id');
-    expect(byId(tree, 'show-self-qr')[0].props.accessibilityState.expanded).toBe(
+    expect(byId(tree, 'show-self-id')[0].props.accessibilityState.expanded).toBe(
       false,
     );
 
-    await press(tree, 'show-self-qr');
+    await press(tree, 'show-self-id');
     expect(byId(tree, 'self-qr-image').length).toBe(1);
-    expect(byId(tree, 'show-self-qr')[0].props.accessibilityState.expanded).toBe(
+    expect(byId(tree, 'show-self-id')[0].props.accessibilityState.expanded).toBe(
       true,
     );
 
-    await press(tree, 'show-self-qr');
+    await press(tree, 'show-self-id');
     expect(byId(tree, 'self-qr-image').length).toBe(0);
-    expect(byId(tree, 'show-self-qr')[0].props.accessibilityState.expanded).toBe(
+    expect(byId(tree, 'show-self-id')[0].props.accessibilityState.expanded).toBe(
       false,
     );
 
@@ -218,14 +225,11 @@ describe('showing your own code', () => {
     });
   });
 
-  test('the written ID and its existing actions are untouched by any of this', async () => {
+  test('the written ID and its actions open with it', async () => {
     const tree = await render(screen());
 
-    // The QR is additive. The written id and its actions are exactly what
-    // they were — behind "Show my ID" since this screen is for reaching
-    // THEM, so your own id waits behind one tap rather than a scroll.
-    // (Rewritten deliberately: the earlier version pinned the block open
-    // by default.)
+    // Your own ID is not on screen by default (kept): this screen is for
+    // reaching THEM.
     expect(byId(tree, 'self-user-id').length).toBe(0);
     await press(tree, 'show-self-id');
     expect(byId(tree, 'self-user-id').length).toBe(1);
@@ -243,7 +247,9 @@ describe('reading their code out of a photo', () => {
     const tree = await render(screen());
     await readPhoto(tree, [PEER_ID]);
 
-    expect(byId(tree, 'new-peer-input')[0].props.value).toBe(PEER_ID);
+    // Grouped in fours since build 33; the same 26 characters.
+    expect(byId(tree, 'new-peer-input')[0].props.value).toBe(PEER_GROUPED);
+    expect(extractId(byId(tree, 'new-peer-input')[0].props.value)).toBe(PEER_ID);
     expect(byId(tree, 'start-chat-notice').length).toBe(1);
     // The whole point: no chat row, no navigation, no "hello" on the wire.
     expect(chatWrites()).toEqual([]);
@@ -296,7 +302,8 @@ describe('reading their code out of a photo', () => {
     const tree = await render(screen());
     await readPhoto(tree, [`My Tacendum ID is ${PEER_ID}`]);
 
-    expect(byId(tree, 'new-peer-input')[0].props.value).toBe(PEER_ID);
+    // Grouped in fours since build 33.
+    expect(byId(tree, 'new-peer-input')[0].props.value).toBe(PEER_GROUPED);
     expect(byId(tree, 'start-chat-error').length).toBe(0);
 
     await ReactTestRenderer.act(() => {
@@ -337,9 +344,10 @@ describe('every way a photo can refuse, in our own words', () => {
       'That QR code isn’t a Tacendum ID. It might be a Wi-Fi code or a web link — check you picked the right picture.',
     ],
     [
+      // Reworded for build 33: your own ID is no longer "just below".
       'your own code',
       [PROFILE.userId],
-      'That’s your own QR code. Ask them for theirs — yours is just below.',
+      'That’s your own QR code. Ask them for theirs.',
     ],
   ];
 
@@ -420,7 +428,7 @@ describe('every way a photo can refuse, in our own words', () => {
  * treats reads as a leak surface). No Paste button, for the same reason.
  */
 describe('pasting their ID', () => {
-  const SHARED = `My Tacendum ID:\n${PEER_ID}\nAdd me in Tacendum → Start a chat.`;
+  const SHARED = `My Tacendum ID:\n${PEER_ID}\nAdd me in Tacendum → Open a room.`;
 
   function type(tree: ReactTestRenderer.ReactTestRenderer, text: string) {
     return ReactTestRenderer.act(async () => {
@@ -432,14 +440,15 @@ describe('pasting their ID', () => {
     return byId(tree, 'new-peer-input')[0].props.value;
   }
 
-  test('the shared message collapses to the bare id, and nothing else happens', async () => {
+  test('the shared message collapses to the id in groups, and nothing else happens', async () => {
     const tree = await render(screen());
     await type(tree, SHARED);
 
-    expect(field(tree)).toBe(PEER_ID);
+    // Grouped and reworded for build 33: "above" stopped being true.
+    expect(field(tree)).toBe(PEER_GROUPED);
     expect(byId(tree, 'start-chat-error').length).toBe(0);
     expect(messageOf(tree, 'start-chat-notice')).toBe(
-      'Pasted. Check the ID above, then start the chat.',
+      'Found one ID in what you pasted. Check it with them, then open the room.',
     );
     expect(byId(tree, 'start-chat')[0].props.accessibilityState.disabled).toBe(
       false,
@@ -455,12 +464,13 @@ describe('pasting their ID', () => {
 
   test('an id spaced into fours, or wrapped in a lower-case sentence, lands the same way', async () => {
     const tree = await render(screen());
+    // Grouped in fours since build 33.
     await type(tree, '01BX 5ZZK BKAC TAV9 WEVG EMMV RZ');
-    expect(field(tree)).toBe(PEER_ID);
+    expect(field(tree)).toBe(PEER_GROUPED);
 
     await type(tree, '');
     await type(tree, `here you go: ${PEER_ID.toLowerCase()} — see you`);
-    expect(field(tree)).toBe(PEER_ID);
+    expect(field(tree)).toBe(PEER_GROUPED);
 
     await ReactTestRenderer.act(() => {
       tree.unmount();
@@ -502,8 +512,10 @@ describe('pasting their ID', () => {
     const tree = await render(screen());
     await type(tree, 'see you soon');
 
-    // Folded and stripped like keystrokes — no notice, no error, no guess.
-    expect(field(tree)).toBe('SEE Y0U S00N');
+    // Verbatim since build 33: the field also takes emails and usernames,
+    // so typing is no longer folded or stripped — no notice, no error, no
+    // guess.
+    expect(field(tree)).toBe('see you soon');
     expect(byId(tree, 'start-chat-notice').length).toBe(0);
     expect(byId(tree, 'start-chat-error').length).toBe(0);
 
@@ -530,7 +542,11 @@ describe('pasting their ID', () => {
   test('a short id wrapped in prose is reported by its length, not by the U in Tacendum', async () => {
     const tree = await render(screen());
     await type(tree, `My Tacendum ID is ${PEER_ID.slice(0, 25)}`);
-    await press(tree, 'start-chat');
+    // Reached with the go key since build 33: an incomplete ID shows no
+    // button, and the go key gives the explanation.
+    await ReactTestRenderer.act(async () => {
+      byId(tree, 'new-peer-input')[0].props.onSubmitEditing();
+    });
 
     expect(messageOf(tree, 'start-chat-error')).toContain('25 of 26');
     expect(messageOf(tree, 'start-chat-error')).not.toContain('letter U');

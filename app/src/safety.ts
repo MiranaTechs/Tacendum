@@ -201,7 +201,7 @@ export const SAFETY_COPY: Record<SafetyState, SafetyCopy> = {
     label: 'You haven’t checked this yet',
     title: null,
     body: name =>
-      `Compare these numbers with ${name} in person or on a phone call. If every group matches, nobody is in the middle of this chat.`,
+      `Compare these numbers with ${name} in person or on a phone call. If every group matches, nobody is sitting between you.`,
     disclosure: null,
     blocked: null,
     action: 'They match',
@@ -216,7 +216,7 @@ export const SAFETY_COPY: Record<SafetyState, SafetyCopy> = {
     body: (name, date) =>
       `You checked these and they matched${
         date ? ` on ${date}` : ''
-      }. This number should stay the same for as long as this conversation exists — check again whenever you like.`,
+      }. This number should stay the same for as long as this room exists — check again whenever you like.`,
     disclosure: name =>
       `Only this ${DEVICE_NOUN} remembers this. ${name} isn’t told, and nothing changes about how your messages are sent.`,
     blocked: null,
@@ -251,7 +251,7 @@ export const SAFETY_COPY: Record<SafetyState, SafetyCopy> = {
     label: `Did not match on this ${DEVICE_NOUN}`,
     title: null,
     body: () =>
-      'The numbers you compared were different. That can happen if one of you was looking at the wrong conversation — or if someone is intercepting this one. Compare again in person before you send anything private.',
+      'The numbers you compared were different. That can happen if one of you was looking at the wrong room — or if someone is intercepting this one. Compare again in person before you send anything private.',
     disclosure: null,
     blocked: null,
     action: 'Compare again',
@@ -285,7 +285,7 @@ export const SAFETY_COPY: Record<SafetyState, SafetyCopy> = {
      * stands between the user and an interception.
      */
     body: () =>
-      'This is not supposed to happen. Reinstalling or getting a new device would make them a new contact with a new ID — it would not change the number here. Someone may be trying to read this conversation. Check with them on a call you place yourself, or in person, before you accept.',
+      'This is not supposed to happen. Reinstalling or getting a new device would make them a new contact with a new ID — it would not change the number here. Someone may be trying to read your messages to each other. Check with them on a call you place yourself, or in person, before you accept.',
     disclosure: null,
     blocked: 'Nothing will send until you review this change.',
     action: 'Accept change',
@@ -302,6 +302,6 @@ export const SAFETY_COPY: Record<SafetyState, SafetyCopy> = {
  */
 export const SAFETY_EXPLAINER: string[] = [
   'A safety number is built from both of your devices’ keys. The same pair of devices always shows the same number, and no one else can produce it.',
-  'It does not change on its own. If either of you reinstalls Tacendum or moves to a new device, that person becomes a NEW contact with a new ID — the number on an existing conversation stays the same.',
-  'So if your two devices show different numbers, or the number on an existing conversation changes, someone may be sitting between you. Don’t send anything private until you can compare again in person.',
+  'It does not change on its own. If either of you reinstalls Tacendum or moves to a new device, that person becomes a NEW contact with a new ID — the number in an existing room stays the same.',
+  'So if your two devices show different numbers, or the number in an existing room changes, someone may be sitting between you. Don’t send anything private until you can compare again in person.',
 ];

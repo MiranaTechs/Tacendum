@@ -16,6 +16,7 @@ import type { LegPhase } from '@tacendum/shared/call-session';
 import { EARPIECE_KNOWN_ABSENT } from '../audioRoute';
 import type { GroupCallView, LegFanOutcome } from '../call/group';
 import {
+  callSurface,
   ControlButton,
   durationAnnouncementFrom,
   durationFrom,
@@ -26,9 +27,10 @@ import { useTheme, type Theme } from '../theme';
 /**
  * The small-group call screen.
  *
- * The same product as `CallScreen`, with more tiles: the `mediaBlack` ground,
- * the pine disc, the same control glyphs from the same components. There is
- * no second design language here and no new colour.
+ * The same product as `CallScreen`, with more tiles: the app's own ground,
+ * because every group call is audio, and the same control discs and glyphs
+ * from the same components as an audio 1:1 call. There is no second design
+ * language here and no new colour.
  *
  * IT HOLDS NO SESSION LOGIC. Everything it shows is a function of one
  * `GroupCallView` — the coordinator's published summary — and every control is
@@ -226,6 +228,9 @@ export function GroupCallScreen(props: GroupCallScreenProps): React.JSX.Element 
   // IS the window, in the coordinate system the insets describe.
   const frame = useSafeAreaFrame();
   const [tick, setTick] = useState(() => now());
+  // Every group call is audio, so this screen is always the app's own
+  // ground, never media (see `callSurface`).
+  const surface = callSurface(t, false);
   const styles = useMemo(() => makeStyles(t), [t]);
 
   /**
@@ -371,7 +376,12 @@ export function GroupCallScreen(props: GroupCallScreenProps): React.JSX.Element 
       accessibilityViewIsModal
       accessibilityLabel="Group call"
     >
-      <StatusBar barStyle="light-content" />
+      {/* The app ground's bar: dark glyphs on white, light on charcoal, and
+          on Android the bar takes the same ground. */}
+      <StatusBar
+        barStyle={surface.barStyle}
+        backgroundColor={surface.barBackground}
+      />
 
       <View style={[styles.header, { paddingTop: insets.top + 12 }]}>
         <Text style={styles.title} numberOfLines={1}>
@@ -478,14 +488,19 @@ export function GroupCallScreen(props: GroupCallScreenProps): React.JSX.Element 
                 danger
                 onPress={() => onDecline?.()}
                 theme={t}
+                onMedia={false}
                 testID="group-call-decline"
               />
               <ControlButton
                 label="Answer"
                 glyph="phone"
                 active
+                // The same forest answer disc the incoming-call screen
+                // offers: a call action looks the same on every call surface.
+                accept
                 onPress={() => onAnswer?.()}
                 theme={t}
+                onMedia={false}
                 testID="group-call-answer"
               />
             </>
@@ -500,6 +515,7 @@ export function GroupCallScreen(props: GroupCallScreenProps): React.JSX.Element 
                 active={view.muted}
                 onPress={() => fan(onToggleMute)}
                 theme={t}
+                onMedia={false}
                 testID="group-call-mute"
               />
               {/* The loudspeaker, in the same words as the 1:1 screen because
@@ -529,6 +545,7 @@ export function GroupCallScreen(props: GroupCallScreenProps): React.JSX.Element 
                   active={view.speakerOn}
                   onPress={onToggleSpeaker}
                   theme={t}
+                  onMedia={false}
                   testID="group-call-speaker"
                 />
               )}
@@ -542,6 +559,7 @@ export function GroupCallScreen(props: GroupCallScreenProps): React.JSX.Element 
                   active={!cameraOn}
                   onPress={() => fan(onToggleCamera)}
                   theme={t}
+                  onMedia={false}
                   testID="group-call-camera"
                 />
               )}
@@ -554,6 +572,7 @@ export function GroupCallScreen(props: GroupCallScreenProps): React.JSX.Element 
                   accessibilityHint={atCap ? CALL_CAP_COPY : undefined}
                   onPress={onAdd}
                   theme={t}
+                  onMedia={false}
                   testID="group-call-add"
                 />
               )}
@@ -566,6 +585,7 @@ export function GroupCallScreen(props: GroupCallScreenProps): React.JSX.Element 
                 danger
                 onPress={onEnd}
                 theme={t}
+                onMedia={false}
                 testID="group-call-end"
               />
             </>
@@ -577,6 +597,7 @@ export function GroupCallScreen(props: GroupCallScreenProps): React.JSX.Element 
 }
 
 function makeStyles(t: Theme) {
+  const surface = callSurface(t, false);
   return StyleSheet.create({
     root: {
       position: 'absolute',
@@ -584,20 +605,20 @@ function makeStyles(t: Theme) {
       left: 0,
       right: 0,
       bottom: 0,
-      backgroundColor: t.color.mediaBlack,
+      backgroundColor: surface.ground,
       justifyContent: 'space-between',
     },
     header: { paddingHorizontal: 20 },
-    title: { color: t.color.mediaInk, fontSize: 22, fontWeight: '600' },
+    title: { color: surface.ink, fontSize: 22, fontWeight: '600' },
     statusRow: { flexDirection: 'row', alignItems: 'baseline', gap: 10, marginTop: 4 },
-    status: { color: t.color.mediaInkMuted, fontSize: 15 },
+    status: { color: surface.inkMuted, fontSize: 15 },
     duration: {
-      color: t.color.mediaInkMuted,
+      color: surface.inkMuted,
       fontSize: 15,
       fontVariant: ['tabular-nums'],
     },
-    notice: { color: t.color.mediaInkMuted, fontSize: 13, marginTop: 6 },
-    failure: { color: t.color.dangerOnMedia, fontSize: 13, marginTop: 6 },
+    notice: { color: surface.inkMuted, fontSize: 13, marginTop: 6 },
+    failure: { color: surface.failure, fontSize: 13, marginTop: 6 },
     grid: {
       flexDirection: 'row',
       flexWrap: 'wrap',
@@ -617,7 +638,7 @@ function makeStyles(t: Theme) {
       paddingTop: 16,
     },
     cap: {
-      color: t.color.mediaInkMuted,
+      color: surface.inkMuted,
       fontSize: 13,
       textAlign: 'center',
       paddingHorizontal: 24,

@@ -115,6 +115,7 @@ export function NamingScreen({ profile, onDone }: Props) {
           placeholderTextColor={t.color.inkMuted}
           keyboardAppearance={t.scheme}
           selectionColor={t.color.pine}
+          cursorColor={t.color.pine}
           accessibilityLabel={NAMING_COPY.fieldLabel}
           autoCapitalize="words"
           autoCorrect={false}
@@ -133,7 +134,7 @@ export function NamingScreen({ profile, onDone }: Props) {
               backgroundColor: t.color.paperSheet,
               color: t.color.inkStrong,
               // The design input states, as ProfileScreen draws them.
-              borderColor: focused ? t.color.pine : t.color.lineStrong,
+              borderColor: focused ? t.color.pine : t.color.lineField,
               borderWidth: focused ? 2 : 1,
             },
           ]}

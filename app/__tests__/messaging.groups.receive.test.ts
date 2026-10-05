@@ -1426,7 +1426,7 @@ describe('grp.new', () => {
     )[0]!;
     expect(chat.kind).toBe('group');
     expect(chat.groupName).toBe('Kitchen');
-    expect(chat.lastMessageText).toBe('New room');
+    expect(chat.lastMessageText).toBe('New group');
     const rows = messageRows(ROOM);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.authorId).toBe(ANA);

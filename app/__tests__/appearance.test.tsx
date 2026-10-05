@@ -6,14 +6,15 @@
  */
 
 import React from 'react';
-import { Text } from 'react-native';
+import { StyleSheet, Text } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 import {
   appearanceChoice,
   setAppearanceChoice,
   subscribeAppearance,
 } from '../src/appearance';
-import { ThemeProvider, useTheme } from '../src/theme';
+import { ThemeProvider, themeTokens, useTheme } from '../src/theme';
+import { CHIP_SELECTED_EDGE, ChoiceRow } from '../src/ui/ChoiceRow';
 
 function Ground() {
   const t = useTheme();
@@ -31,7 +32,7 @@ test('the default is light, with and without a provider', async () => {
     tree = ReactTestRenderer.create(<Ground />);
   });
   expect(tree.root.findByProps({ testID: 'ground' }).props.children).toBe(
-    'light:#EFF2EB',
+    `light:${themeTokens('light').color.paperGround}`,
   );
   await ReactTestRenderer.act(() => tree.unmount());
 });
@@ -46,7 +47,7 @@ test('the provider swaps every token consumer to the night palette', async () =>
     );
   });
   expect(tree.root.findByProps({ testID: 'ground' }).props.children).toBe(
-    'dark:#0C0F0D',
+    `dark:${themeTokens('dark').color.paperGround}`,
   );
   await ReactTestRenderer.act(() => tree.unmount());
 });
@@ -65,4 +66,60 @@ test('subscribing replays the current choice, then notifies each change exactly 
   // unchanged replay is a no-op re-render at worst.
   expect(seen).toEqual(['light', 'dark', 'system']);
   expect(appearanceChoice()).toBe('light');
+});
+
+// Added for build 33: the Appearance choice is drawn by ChoiceRow,
+// like every Settings choice. With the selected wash gone, a selected chip
+// differed from its neighbours only by a one-device-pixel forest edge and
+// its label's hue (forest against the muted gray: 1.04:1 in light, 1.00:1
+// in dark). The chosen chip now carries a 1.5pt forest edge.
+test('the chosen appearance chip carries a 1.5pt forest edge, the others a hairline, and no chip moves', async () => {
+  for (const mode of ['light', 'dark'] as const) {
+    const t = themeTokens(mode);
+    let tree!: ReactTestRenderer.ReactTestRenderer;
+    await ReactTestRenderer.act(() => {
+      tree = ReactTestRenderer.create(
+        <ThemeProvider mode={mode}>
+          <ChoiceRow
+            label="Theme"
+            options={[
+              { label: 'Light', value: 'light' },
+              { label: 'Dark', value: 'dark' },
+              { label: 'Match iPhone', value: 'system' },
+            ]}
+            value="dark"
+            onChange={jest.fn()}
+            testIDPrefix="settings-appearance"
+          />
+        </ThemeProvider>,
+      );
+    });
+    const chip = (key: string) =>
+      StyleSheet.flatten(
+        tree.root.findAll(
+          n => n.props.testID === `settings-appearance-${key}` && typeof n.type === 'string',
+        )[0]!.props.style,
+      ) as {
+        borderWidth: number;
+        borderColor: string;
+        paddingHorizontal: number;
+        paddingVertical: number;
+      };
+    const on = chip('dark');
+    expect(on.borderWidth).toBe(CHIP_SELECTED_EDGE);
+    expect(on.borderColor).toBe(t.color.pineLine);
+    for (const key of ['light', 'system']) {
+      const off = chip(key);
+      expect(off.borderWidth).toBe(t.hairline);
+      expect(off.borderColor).toBe(t.color.lineSoft);
+      // The same outer box: the padding gives back what the edge takes.
+      expect(on.paddingHorizontal + on.borderWidth).toBeCloseTo(
+        off.paddingHorizontal + off.borderWidth,
+      );
+      expect(on.paddingVertical + on.borderWidth).toBeCloseTo(
+        off.paddingVertical + off.borderWidth,
+      );
+    }
+    await ReactTestRenderer.act(() => tree.unmount());
+  }
 });

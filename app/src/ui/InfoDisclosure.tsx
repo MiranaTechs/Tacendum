@@ -43,7 +43,7 @@ export function InfoDisclosure({
       >
         <Text
           allowFontScaling={false}
-          style={[t.type.iconGlyph, { color: t.color.pine }]}
+          style={[t.type.iconGlyph, { color: t.color.inkMuted }]}
         >
           ⓘ
         </Text>

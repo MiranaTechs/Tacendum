@@ -205,7 +205,7 @@ test('prepares a visible editable room mention and waits for the ordinary Send t
   await press(tree, `second-opinion-${SOURCE}`);
   expect(fanOut).not.toHaveBeenCalled();
   expect(has(tree, 'second-opinion-review')).toBe(true);
-  expect(renderedText(tree)).toContain('Room · Release room');
+  expect(renderedText(tree)).toContain('Group · Release room');
   expect(renderedText(tree)).toContain('Selected agent · Codex');
   expect(renderedText(tree)).toContain(
     'Rounds must be enabled on the selected agent’s computer. This app cannot confirm that setting.',

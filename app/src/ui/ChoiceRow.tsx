@@ -21,10 +21,11 @@ import { InlineError } from './primitives';
  * → the value itself), `${testIDPrefix}-note`, `${testIDPrefix}-info`
  * (overridable) and `${testIDPrefix}-error`.
  *
- * Every visual is a theme token — the chips carry the pine wash and line,
- * the 44pt effective target comes from hitSlop over the choices' padding
- * (RN hitSlop never extends past the parent view, which is why the choices
- * row pads vertically instead of the row). */
+ * Every visual is a theme token — a selected chip is white with a 1.5pt
+ * forest outline, the others a gray hairline — and the 44pt effective
+ * target comes from hitSlop over the choices' padding (RN hitSlop never
+ * extends past the parent view, which is why the choices row pads
+ * vertically instead of the row). */
 
 export interface ChoiceOption<T> {
   label: string;
@@ -56,6 +57,13 @@ function chipKey(value: string | number | boolean): string {
   return typeof value === 'boolean' ? (value ? 'on' : 'off') : String(value);
 }
 
+/** A selected chip's forest outline. The others keep a hairline: at a
+ * hairline the forest edge all but vanished, and the label's forest and the
+ * muted gray are 1.04:1 apart, so the selection rested on hue alone. */
+export const CHIP_SELECTED_EDGE = 1.5;
+const CHIP_PAD_X = 14;
+const CHIP_PAD_Y = 8;
+
 export function ChoiceRow<T extends string | number | boolean>({
   label,
   options,
@@ -75,6 +83,10 @@ export function ChoiceRow<T extends string | number | boolean>({
         {options.map(option => {
           const selected = value === option.value;
           const key = chipKey(option.value);
+          const edge = selected ? CHIP_SELECTED_EDGE : t.hairline;
+          // The padding gives back what the heavier edge takes, so selecting
+          // a chip never moves it or its neighbours.
+          const giveBack = edge - t.hairline;
           return (
             <Pressable
               key={key}
@@ -91,9 +103,11 @@ export function ChoiceRow<T extends string | number | boolean>({
                 styles.chip,
                 {
                   borderRadius: t.radius.button,
-                  backgroundColor: selected ? t.color.pineWash : 'transparent',
-                  borderWidth: t.hairline,
+                  backgroundColor: 'transparent',
+                  borderWidth: edge,
                   borderColor: selected ? t.color.pineLine : t.color.lineSoft,
+                  paddingHorizontal: CHIP_PAD_X - giveBack,
+                  paddingVertical: CHIP_PAD_Y - giveBack,
                 },
               ]}
             >
@@ -138,10 +152,9 @@ const styles = StyleSheet.create({
   // Vertical padding here (not on the row) so the chips' hitSlop has parent
   // bounds to land in — RN hitSlop never extends past the parent view.
   choices: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, paddingVertical: 5 },
+  // Padding is set per chip (CHIP_PAD_X / CHIP_PAD_Y less the edge).
   chip: {
     maxWidth: '100%',
-    paddingHorizontal: 14,
-    paddingVertical: 8,
     alignItems: 'center',
     justifyContent: 'center',
   },

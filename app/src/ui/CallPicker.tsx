@@ -15,11 +15,12 @@ import { PrimaryButton, TextAction } from './primitives';
  * this device. The sentence is the reason, shown at the moment it starts
  * to bite rather than after a refusal.
  *
- * An inline panel on the paper ground, the SafetyPanel idiom, not a floating
- * sheet: nothing on a security surface should hover. The teaching copy sits
- * behind ⓘ, which is where this app has always put honest limits — and it
- * lives here rather than on the in-call screen because the ⓘ pattern is drawn
- * in pine on porcelain, and the in-call surface is mediaBlack.
+ * An inline panel on the app's own ground, the SafetyPanel idiom, not a
+ * floating sheet: nothing on a security surface should hover. The teaching
+ * copy sits behind ⓘ, which is where this app has always put honest limits —
+ * and it lives here rather than on the in-call screen because this is where
+ * the people are chosen, so the reason is read before the choice; the
+ * in-call screen keeps only the cap sentence, at the moment it bites.
  */
 
 export const CALL_PICKER_COPY = {
@@ -28,7 +29,7 @@ export const CALL_PICKER_COPY = {
    * lesson: "4 of 5" otherwise reads as room for four more. */
   seats: (taken: number, cap: number) => `${taken} of ${cap}, including you`,
   cap: CALL_CAP_COPY,
-  aboutLabel: 'Why a call is smaller than a room',
+  aboutLabel: 'Why a call is smaller than a group',
   aboutLines: [
     CALL_CAP_COPY,
     // Rule 22: what the UI says is what the design does. A mesh is N(N−1)/2

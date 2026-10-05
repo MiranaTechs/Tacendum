@@ -44,7 +44,7 @@ const COPY = {
   caughtUpBody: 'No approval requests are waiting on this device.',
   recentTitle: 'Recent agent reports',
   recentBody:
-    'These are timestamped reports from agents. Open the conversation for the full message.',
+    'These are timestamped reports from agents. Open the room for the full message.',
   setupTitle: 'Set up an AI connection',
   setupBody: 'On the computer that runs your agent, choose a supported setup:',
   setupClaude: 'tacendum setup claude-code --name "Claude Code"',
@@ -230,7 +230,7 @@ export function AttentionScreen({
             allowFontScaling={false}
             importantForAccessibility="no"
             accessibilityElementsHidden
-            style={[t.type.iconGlyph, { color: t.color.pine }]}
+            style={[t.type.iconGlyph, { color: t.color.inkMuted }]}
           >
             ›
           </Text>
@@ -287,7 +287,7 @@ export function AttentionScreen({
                 onPress={() => onOpenConversation(event.peerId)}
                 accessibilityRole="button"
                 accessibilityLabel={`${ATTENTION_EVENT_COPY[event.event]}, from ${section.spokenTitle}, reported ${at}`}
-                accessibilityHint="Opens the source conversation"
+                accessibilityHint="Opens the room it came from"
                 testID={`attention-work-${event.peerId}-${event.eventId}`}
                 style={({ pressed }) => [
                   styles.workRow,
@@ -333,7 +333,7 @@ export function AttentionScreen({
                   allowFontScaling={false}
                   importantForAccessibility="no"
                   accessibilityElementsHidden
-                  style={[t.type.iconGlyph, { color: t.color.pine }]}
+                  style={[t.type.iconGlyph, { color: t.color.inkMuted }]}
                 >
                   ›
                 </Text>
@@ -385,7 +385,7 @@ export function AttentionScreen({
             <View
               style={[
                 styles.commandBlock,
-                { backgroundColor: t.color.paperInset, borderColor: t.color.lineSoft },
+                { backgroundColor: t.color.paperSheet, borderColor: t.color.lineSoft },
               ]}
             >
               <Text selectable style={[t.type.utilityData, { color: t.color.inkBody }]}>
@@ -432,7 +432,7 @@ export function AttentionScreen({
           testID="attention-loading"
           style={styles.center}
         >
-          <ActivityIndicator color={t.color.pine} />
+          <ActivityIndicator color={t.color.inkMuted} />
           <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
             {COPY.loading}
           </Text>

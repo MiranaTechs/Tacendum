@@ -249,7 +249,7 @@ export function WritingConnection({
         accessibilityLabel="Loading writing connections"
         style={styles.loading}
       >
-        <ActivityIndicator color={t.color.pine} />
+        <ActivityIndicator color={t.color.inkMuted} />
         <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
           Loading…
         </Text>
@@ -324,11 +324,9 @@ export function WritingConnection({
               borderColor:
                 mode === 'external' ? t.color.pine : t.color.lineSoft,
               backgroundColor:
-                mode === 'external'
-                  ? t.color.pineWash
-                  : pressed
-                    ? t.color.paperInset
-                    : t.color.paperSheet,
+                pressed && mode !== 'external'
+                  ? t.color.paperInset
+                  : t.color.paperSheet,
             },
           ]}
         >
@@ -353,11 +351,9 @@ export function WritingConnection({
               borderRadius: t.radius.button,
               borderColor: mode === 'api' ? t.color.pine : t.color.lineSoft,
               backgroundColor:
-                mode === 'api'
-                  ? t.color.pineWash
-                  : pressed
-                    ? t.color.paperInset
-                    : t.color.paperSheet,
+                pressed && mode !== 'api'
+                  ? t.color.paperInset
+                  : t.color.paperSheet,
             },
           ]}
         >
@@ -410,9 +406,8 @@ export function WritingConnection({
                       minHeight: t.layout.touchTarget,
                       borderRadius: t.radius.button,
                       borderColor: selected ? t.color.pine : t.color.lineSoft,
-                      backgroundColor: selected
-                        ? t.color.pineWash
-                        : pressed
+                      backgroundColor:
+                        pressed && !selected
                           ? t.color.paperInset
                           : t.color.paperSheet,
                     },
@@ -475,9 +470,8 @@ export function WritingConnection({
                       minHeight: t.layout.touchTarget,
                       borderRadius: t.radius.button,
                       borderColor: selected ? t.color.pine : t.color.lineSoft,
-                      backgroundColor: selected
-                        ? t.color.pineWash
-                        : pressed
+                      backgroundColor:
+                        pressed && !selected
                           ? t.color.paperInset
                           : t.color.paperSheet,
                     },
@@ -546,6 +540,7 @@ export function WritingConnection({
                 placeholderTextColor={t.color.inkMuted}
                 keyboardAppearance={t.scheme}
                 selectionColor={t.color.pine}
+                cursorColor={t.color.pine}
                 accessibilityLabel={`${selectedLabel} API key`}
                 secureTextEntry
                 autoCapitalize="none"
@@ -558,7 +553,7 @@ export function WritingConnection({
                   {
                     minHeight: t.layout.buttonHeight,
                     borderRadius: t.radius.button,
-                    borderColor: t.color.lineStrong,
+                    borderColor: t.color.lineField,
                     backgroundColor: t.color.paperSheet,
                     color: t.color.inkStrong,
                   },

@@ -236,6 +236,30 @@ test('rows take the glyph kit, the row disc and a 44pt redial — no typographic
   expect(StyleSheet.flatten(name.props.style).fontSize).toBe(theme.type.rowTitle.fontSize);
 });
 
+test('the redial is a white disc with a hairline edge and a forest glyph; a press moves it to the gray fill', async () => {
+  // The white palette (2026-10-04): no forest wash behind the row's one
+  // action. The disc is white like the row, so its hairline is its edge, and
+  // the forest glyph is what says it acts. FALSIFYING CASE: the old resting
+  // wash and the forest-outline press fail the first and last assertions.
+  const { PhoneGlyph, VideoGlyph } = require('../src/ui/CallGlyph') as typeof import('../src/ui/CallGlyph');
+  const theme = (require('../src/theme') as typeof import('../src/theme')).themeTokens();
+  const { StyleSheet } = require('react-native') as typeof import('react-native');
+  const tree = await renderCalls();
+  const redial = tree.root.find(
+    n => n.props.accessibilityLabel === 'Video call Dawit' && typeof n.props.style === 'function',
+  );
+  expect(StyleSheet.flatten(redial.props.style({ pressed: false }))).toMatchObject({
+    backgroundColor: theme.color.paperSheet,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: theme.color.lineSoft,
+  });
+  expect(redial.findAllByType(VideoGlyph)[0]!.props.color).toBe(theme.color.pine);
+  expect(tree.root.findAllByType(PhoneGlyph)[0]!.props.color).toBe(theme.color.pine);
+  expect(
+    StyleSheet.flatten(redial.props.style({ pressed: true })).backgroundColor,
+  ).toBe(theme.color.paperInset);
+});
+
 test('the time sits on one line and never gives up width to the name', async () => {
   // The redial moving out of the row made the time a THIRD
   // flex child of `styles.row`, beside a name column that is `flex: 1`. A

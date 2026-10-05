@@ -283,7 +283,7 @@ export function ApprovalCard({
       <View style={styles.header}>
         {fontScale <= 1.5 ? (
           <View
-            style={[styles.mark, { backgroundColor: t.color.pineWash }]}
+            style={styles.mark}
             accessibilityElementsHidden
           >
             <Text
@@ -556,7 +556,7 @@ export function ApprovalCard({
             </View>
             <Text
               allowFontScaling={false}
-              style={[t.type.iconGlyph, { color: t.color.pine }]}
+              style={[t.type.iconGlyph, { color: t.color.inkMuted }]}
             >
               {payloadOpen ? '⌄' : '›'}
             </Text>
@@ -726,6 +726,9 @@ function makeStyles(t: Theme) {
       width: 44,
       height: 44,
       borderRadius: t.radius.button,
+      borderWidth: hairline,
+      borderColor: t.color.lineSoft,
+      backgroundColor: t.color.paperSheet,
       alignItems: 'center',
       justifyContent: 'center',
     },
@@ -741,6 +744,8 @@ function makeStyles(t: Theme) {
       paddingHorizontal: t.space.s3,
       paddingVertical: t.space.s1,
       borderRadius: t.radius.small,
+      borderWidth: hairline,
+      borderColor: t.color.lineSoft,
       backgroundColor: t.color.paperGround,
     },
     clock: { marginLeft: 'auto' },
@@ -768,7 +773,9 @@ function makeStyles(t: Theme) {
       borderRadius: t.radius.small,
       paddingHorizontal: t.space.s5,
       paddingVertical: t.space.s4,
-      backgroundColor: t.color.pineWashFaint,
+      borderWidth: hairline,
+      borderColor: t.color.lineSoft,
+      backgroundColor: 'transparent',
     },
     detailLabels: { flex: 1, gap: t.space.s1 },
     contextBox: {

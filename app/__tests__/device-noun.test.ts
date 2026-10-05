@@ -213,7 +213,7 @@ describe('consent-grade renderings, per idiom', () => {
     );
     // The iOS substance arm keeps its screenshot-notice clause.
     expect(d.BLOCK_EXPLAINER[2]).toBe(
-      'While they are blocked, this iPhone sends them nothing: no replies, no delivery or read marks, no reactions, no screenshot notices, no calls. To them the chat looks like one where you stopped replying.',
+      'While they are blocked, this iPhone sends them nothing: no replies, no delivery or read marks, no reactions, no screenshot notices, no calls. To them the room looks like one where you stopped replying.',
     );
   });
 
@@ -490,7 +490,7 @@ describe('consent-grade renderings, per idiom', () => {
     // The Android substance arm still omits the screenshot-notice clause
     // (prevented, not disclosed) — on tablets exactly as on phones.
     expect(d.BLOCK_EXPLAINER[2]).toBe(
-      'While they are blocked, this tablet sends them nothing: no replies, no delivery or read marks, no reactions, no calls. To them the chat looks like one where you stopped replying.',
+      'While they are blocked, this tablet sends them nothing: no replies, no delivery or read marks, no reactions, no calls. To them the room looks like one where you stopped replying.',
     );
   });
 });

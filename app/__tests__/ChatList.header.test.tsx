@@ -120,14 +120,14 @@ test('the header is the shared HomeHeader: screenTitle role, headerHeight, and a
   const tree = await renderList(onOpenProfile);
 
   const header = tree.root.findByType(HomeHeader);
-  expect(header.props.title).toBe('Chats');
+  expect(header.props.title).toBe('Rooms');
   // The frame itself is the token height — not the bespoke 64 it used to be.
   expect(hostStyle(header).minHeight).toBe(theme.layout.headerHeight);
 
   // The title carries the header role in the screenTitle size.
   const title = header.findAll(
     n =>
-      n.props.accessibilityRole === 'header' && n.props.children === 'Chats',
+      n.props.accessibilityRole === 'header' && n.props.children === 'Rooms',
   )[0]!;
   expect(StyleSheet.flatten(title.props.style).fontSize).toBe(
     theme.type.screenTitle.fontSize,

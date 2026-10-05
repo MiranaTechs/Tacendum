@@ -17,8 +17,8 @@
  * `selectionColor` is one colour and either it is passed or it is not. A
  * switch is different: its two track states are the whole state indicator, so
  * `trackColor` can be present, well-formed and still paint a control whose ON
- * and OFF read as the same colour. (They did, for one commit: `pineWash` is a
- * 10% tint, it composites over the sheet behind it, and the pair measured
+ * and OFF read as the same colour. (They did, for one commit: `pineWash` was
+ * then a 10% tint, it composites over the sheet behind it, and the pair measured
  * 1.05:1 in the light palette — with ON the LIGHTER of the two, inverting
  * `filled = on`. WCAG 2.1 SC 1.4.11 asks 3:1 of the part of a control that
  * identifies its state.) So this file also reads the two track values and
@@ -269,12 +269,12 @@ function missingOn(el: Element): string[] {
 }
 
 /**
- * A token whose name carries `Wash` is a 5-15% tint of another token
- * (`theme.ts`: `pineWash` is `rgba(14,107,69,0.10)`; `pineWashFaint` and
- * `dangerWash` are the others). It is the app's fill for a pressed row on a
- * known ground, and it is the wrong kind of colour for a state: the platform
- * composites it over whatever sits behind the control, so what it measures
- * against depends on the sheet, not on the palette.
+ * A token whose name carries `Wash` is a translucent highlight, not a colour
+ * of its own (`theme.ts`: `pineWash`, `pineWashFaint` and `dangerWash` are one
+ * neutral highlight, charcoal at 5% in light). It is the app's fill for a
+ * pressed row on a known ground, and it is the wrong kind of colour for a
+ * state: the platform composites it over whatever sits behind the control, so
+ * what it measures against depends on the sheet, not on the palette.
  */
 const WASH = /Wash/;
 

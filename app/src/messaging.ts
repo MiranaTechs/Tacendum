@@ -6612,7 +6612,7 @@ class MessagingService {
     if (result === null || this.stale(gen)) return;
     if (result.outcome === 'accepted') {
       // Being added to a room is a thing that happened to you: a real
-      // row, attributed to the claimed owner, previewed as "New room".
+      // row, attributed to the claimed owner, previewed as "New group".
       // Persist BEFORE the ack, like every row-writing branch.
       await db.insertMessage({
         msgId: frame.msgId,

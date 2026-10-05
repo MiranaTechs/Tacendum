@@ -42,8 +42,8 @@ class QrEncodeDeterminismTest {
     /** Two fixed, distinct, canonical-alphabet ULIDs. */
     const val ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
     const val OTHER_ID = "01BX5ZZKBKACTAV9WEVGEMMVRZ"
-    const val DARK = "#121A15"
-    const val LIGHT = "#FAFCF7"
+    const val DARK = "#181818"
+    const val LIGHT = "#FFFFFF"
     const val PIXELS = 768
   }
 
@@ -154,11 +154,11 @@ class QrEncodeDeterminismTest {
 
   @Test
   fun `hex colours are parsed strictly`() {
-    assertEquals(0xFF121A15.toInt(), QrCodec.argb("#121A15"))
-    assertEquals(0xFFFAFCF7.toInt(), QrCodec.argb("#fafcf7"))
-    assertEquals(null, QrCodec.argb("121A15"))
-    assertEquals(null, QrCodec.argb("#121A1"))
-    assertEquals(null, QrCodec.argb("#121A1G"))
+    assertEquals(0xFF181818.toInt(), QrCodec.argb("#181818"))
+    assertEquals(0xFFFFFFFF.toInt(), QrCodec.argb("#ffffff"))
+    assertEquals(null, QrCodec.argb("181818"))
+    assertEquals(null, QrCodec.argb("#18181"))
+    assertEquals(null, QrCodec.argb("#18181G"))
     assertEquals(null, QrCodec.argb(""))
   }
 
@@ -211,7 +211,7 @@ class QrEncodeDeterminismTest {
     }
     refuses("qr_bad_argument") { QrCodec.render(ID, QrCodec.MIN_PIXELS - 1, DARK, LIGHT) }
     refuses("qr_bad_argument") { QrCodec.render(ID, QrCodec.MAX_PIXELS + 1, DARK, LIGHT) }
-    refuses("qr_bad_argument") { QrCodec.render(ID, PIXELS, "121A15", LIGHT) }
+    refuses("qr_bad_argument") { QrCodec.render(ID, PIXELS, "181818", LIGHT) }
     refuses("qr_bad_argument") { QrCodec.render(ID, PIXELS, DARK, "#GGGGGG") }
   }
 

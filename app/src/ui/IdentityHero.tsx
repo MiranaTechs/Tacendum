@@ -6,15 +6,17 @@ import { useTheme } from '../theme';
 /**
  * The key forming inside a phone outline — the register screen's hero
  * (identity-redesign mockup, screen 1). Drawn in app tokens: the phone is a
- * raised paperSheet slab with a lineStrong outline, the key and its glints
- * are pine, the halo is pineWash. No shadows, no gradients — depth is
- * surface color and outline, as everywhere.
+ * white paperSheet slab with a lineStrong outline, the key and its glints
+ * are pine, and the halo is two strokes, a still lineSoft ring and a pine
+ * ring. No fills, no shadows, no gradients — depth is the outline, as
+ * everywhere.
  *
  * Motion, per the designer notes: the arrival plays ONCE — phone hairline
  * fades up, the key rises 6px and fades in a brand beat later, the three
- * glints tick in last. The only loop in the whole app is the halo breathing
- * 5%→10% over ~6s (a 10%-wash circle at 50%→100% opacity). Under Reduce
- * Motion everything stills: full opacity, no rise, no loop.
+ * glints tick in last. The only loop in the whole app is the pine ring
+ * breathing by scale, 96%→100% over ~6s, always at full opacity: forest
+ * never fades to a tint. Under Reduce Motion everything stills: full
+ * opacity, no rise, no loop.
  */
 
 /** The brand's beat between arrivals — the BrandMark pause. */
@@ -32,7 +34,7 @@ export function IdentityHero({ reduceMotion }: { reduceMotion: boolean }) {
   const phone = useRef(new Animated.Value(0)).current;
   const key = useRef(new Animated.Value(0)).current;
   const glints = useRef(new Animated.Value(0)).current;
-  /** 0 = resting (50% of the wash), 1 = full breath (100%). */
+  /** 0 = resting (the ring at 96% scale), 1 = full breath (100%). */
   const halo = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
@@ -89,15 +91,22 @@ export function IdentityHero({ reduceMotion }: { reduceMotion: boolean }) {
     return () => breathe.stop();
   }, [reduceMotion, halo, t.motion]);
 
-  // A literal 1 under Reduce Motion, not a parked Animated.Value: the halo is
-  // genuinely static then, and the style says so.
+  // The opacity is the literal 1 in both branches: the ring is forest at
+  // full strength, and only its size breathes. Under Reduce Motion there is
+  // no transform at all, not a parked Animated.Value: the halo is genuinely
+  // static then, and the style says so.
   const haloStyle = reduceMotion
     ? { opacity: 1 }
     : {
-        opacity: halo.interpolate({
-          inputRange: [0, 1],
-          outputRange: [0.5, 1],
-        }),
+        opacity: 1,
+        transform: [
+          {
+            scale: halo.interpolate({
+              inputRange: [0, 1],
+              outputRange: [0.96, 1],
+            }),
+          },
+        ],
       };
 
   const rise = (v: Animated.Value) => ({
@@ -115,12 +124,19 @@ export function IdentityHero({ reduceMotion }: { reduceMotion: boolean }) {
       accessibilityElementsHidden
       importantForAccessibility="no-hide-descendants"
     >
-      {/* Halo ground: always-on faint wash. */}
+      {/* Halo ground: a still gray ring. */}
       <Svg
         style={StyleSheet.absoluteFill}
         viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
       >
-        <Circle cx={171} cy={105} r={95} fill={t.color.pineWashFaint} />
+        <Circle
+          cx={171}
+          cy={105}
+          r={95}
+          fill="none"
+          stroke={t.color.lineSoft}
+          strokeWidth={1}
+        />
       </Svg>
 
       {/* The one loop in the app. */}
@@ -132,7 +148,14 @@ export function IdentityHero({ reduceMotion }: { reduceMotion: boolean }) {
           style={StyleSheet.absoluteFill}
           viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
         >
-          <Circle cx={171} cy={105} r={66} fill={t.color.pineWash} />
+          <Circle
+            cx={171}
+            cy={105}
+            r={66}
+            fill="none"
+            stroke={t.color.pineLine}
+            strokeWidth={1.5}
+          />
         </Svg>
       </Animated.View>
 

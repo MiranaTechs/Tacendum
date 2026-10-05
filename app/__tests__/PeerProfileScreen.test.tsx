@@ -284,8 +284,9 @@ describe('peer profile — report reasons are selected chips', () => {
     const spam = pressable(tree, 'peer-report-reason-spam');
     expect(spam.props.accessibilityState.selected).toBe(true);
     expect(spam.findByType(Text).props.children).toBe('Spam');
+    // Selected is white with a forest outline, never a tinted fill.
     const style = StyleSheet.flatten(spam.props.style({ pressed: false }));
-    expect(style.backgroundColor).toBe(theme.color.pineWash);
+    expect(style.backgroundColor).toBe(theme.color.paperSheet);
     expect(style.borderColor).toBe(theme.color.pineLine);
     expect(
       pressable(tree, 'peer-report-reason-harassment').props.accessibilityState

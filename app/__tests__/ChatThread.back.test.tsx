@@ -423,3 +423,34 @@ test('closes the call picker first, ahead of a drawer', async () => {
   expect(await pressBack()).toBe(false);
   await unmount(tree);
 });
+
+// ------------------------------------------------- the chevron's spoken name
+
+/** What VoiceOver and TalkBack say for the header's back control. */
+function backLabel(tree: ReactTestRenderer.ReactTestRenderer): string {
+  return tree.root.find(
+    n => n.props.testID === 'thread-back' && typeof n.props.onPress === 'function',
+  ).props.accessibilityLabel as string;
+}
+
+test('the back control names the list it returns to: Rooms, Calls or Needs attention', async () => {
+  // App.tsx `backDestination` pops a thread to its route's `from`. Before
+  // this, the label always said "Back to Rooms", so a thread opened from a
+  // Calls row announced Rooms and then landed on Calls.
+  installPeerDb();
+  const cases: Array<[React.ComponentProps<typeof ChatThreadScreen>['from'], string]> = [
+    [undefined, 'Back to Rooms'],
+    ['chats', 'Back to Rooms'],
+    ['calls', 'Back to Calls'],
+    ['attention', 'Back to Needs attention'],
+  ];
+  for (const [from, expected] of cases) {
+    const onBack = jest.fn();
+    const tree = await renderThread({ from, onBack });
+    expect(backLabel(tree)).toBe(expected);
+    // The label only names the way; the router still decides it.
+    await press(tree, 'thread-back');
+    expect(onBack).toHaveBeenCalledTimes(1);
+    await unmount(tree);
+  }
+});

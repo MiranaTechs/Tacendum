@@ -271,10 +271,12 @@ const USERNAME_WORD_ALLOWLIST: ReadonlyArray<{ file: string; why: string }> = [
   // class a person can now actually be found by — the clause is interpolated
   // only under the pin, so a pin-OFF binary's sentence is byte-unchanged.
   { file: 'src/screens/RegisterScreen.tsx', why: 'the OPTIONAL_HANDLE reach clause (interpolated only under the pin)' },
-  // Build 24: the Start a chat door names the class the room offers — the
-  // row, its helper and the no-directory sentence come from the deck under
-  // the pin (the OPTIONAL_HANDLE pattern), byte-unchanged pin-OFF.
-  { file: 'src/screens/StartChatScreen.tsx', why: 'the FIND_DOOR copy (chosen from the deck only under the pin)' },
+  // Build 33: Start a chat's one smart field (it replaced build 24's find
+  // door) — the username kind, its copy and the find answers are chosen
+  // from the deck only under the pin, byte-unchanged pin-OFF.
+  { file: 'src/screens/StartChatScreen.tsx', why: 'the smart field’s username kind, copy and find answers, chosen from the deck only under the pin' },
+  // Build 33: the inline find that replaced the trip to DiscoveryScreen.
+  { file: 'src/screens/startChat/useReachLookup.ts', why: 'the inline find: username eligibility preflight, lookup and the own-name self key, all under the pin' },
 ];
 
 /** The files that may IMPORT the dark module or the pin (part B's readers,
@@ -286,7 +288,13 @@ const USERNAME_IMPORTER_ALLOWLIST: ReadonlySet<string> = new Set([
   'src/screens/DiscoveryScreen.tsx',
   'src/screens/RegisterScreen.tsx',
   'src/screens/StartChatScreen.tsx',
+  // Build 33: the inline find calls the module and reads the pin.
+  'src/screens/startChat/useReachLookup.ts',
 ]);
+
+/** An import of the module or the pin from ANY depth (build 33 widened it:
+ * the one-level form could not see a file under src/screens/startChat/). */
+const USERNAME_IMPORT_RE = /from '(\.\.?\/)+(accountsUsername|usernameUi)'/;
 
 describe('the word census: "username" lives only in the allowlisted files (two-way)', () => {
   const hits = new Map<string, number[]>();
@@ -318,7 +326,7 @@ describe('the word census: "username" lives only in the allowlisted files (two-w
       if (/api(Claim|Rename|Unlink|SetUsernameDiscoverable|DiscoveryLookup)Username/.test(src) && rel !== 'src/api.ts' && rel !== 'src/accountsUsername.ts') {
         importers.push(rel);
       }
-      if (/from '\.\.?\/(accountsUsername|usernameUi)'/.test(src) && !USERNAME_IMPORTER_ALLOWLIST.has(rel)) {
+      if (USERNAME_IMPORT_RE.test(src) && !USERNAME_IMPORTER_ALLOWLIST.has(rel)) {
         importers.push(`${rel} imports module`);
       }
     }
@@ -330,7 +338,7 @@ describe('the word census: "username" lives only in the allowlisted files (two-w
   it('every importer-allowlist row actually imports the module or the pin — stale rows come off the list', () => {
     for (const rel of USERNAME_IMPORTER_ALLOWLIST) {
       const src = readFileSync(join(APP_ROOT, rel), 'utf8');
-      expect([rel, /from '\.\.?\/(accountsUsername|usernameUi)'/.test(src)]).toEqual([rel, true]);
+      expect([rel, USERNAME_IMPORT_RE.test(src)]).toEqual([rel, true]);
     }
   });
 });

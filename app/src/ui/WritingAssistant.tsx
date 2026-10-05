@@ -611,7 +611,7 @@ export function WritingAssistant({
             accessibilityLabel="Loading writing connection"
             style={styles.working}
           >
-            <ActivityIndicator color={t.color.pine} />
+            <ActivityIndicator color={t.color.inkMuted} />
             <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
               Loading writing connection…
             </Text>
@@ -727,11 +727,10 @@ export function WritingAssistant({
                                 borderColor: selected
                                   ? t.color.pine
                                   : t.color.lineSoft,
-                                backgroundColor: selected
-                                  ? t.color.pineWash
-                                  : pressed
-                                  ? t.color.paperInset
-                                  : t.color.paperSheet,
+                                backgroundColor:
+                                  pressed && !selected
+                                    ? t.color.paperInset
+                                    : t.color.paperSheet,
                               },
                             ]}
                           >
@@ -785,7 +784,7 @@ export function WritingAssistant({
                 style={styles.workingBlock}
               >
                 <View style={styles.working}>
-                  <ActivityIndicator color={t.color.pine} />
+                  <ActivityIndicator color={t.color.inkMuted} />
                   <Text style={[t.type.bodyStrong, { color: t.color.inkBody }]}>
                     {progressCopy(
                       view.action,
@@ -862,6 +861,7 @@ export function WritingAssistant({
                   placeholderTextColor={t.color.inkMuted}
                   keyboardAppearance={t.scheme}
                   selectionColor={t.color.pine}
+                  cursorColor={t.color.pine}
                   accessibilityLabel="AI reply"
                   multiline
                   maxLength={AI_WRITING_OUTPUT_MAX}
@@ -873,7 +873,7 @@ export function WritingAssistant({
                     {
                       minHeight: 92,
                       borderRadius: t.radius.button,
-                      borderColor: t.color.lineStrong,
+                      borderColor: t.color.lineField,
                       backgroundColor: t.color.paperSheet,
                       color: t.color.inkStrong,
                     },

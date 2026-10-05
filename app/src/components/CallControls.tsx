@@ -1,5 +1,5 @@
 import React from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 import {
   AddPersonGlyph,
   EndCallGlyph,
@@ -9,7 +9,7 @@ import {
   SpeakerGlyph,
 } from '../ui/CallControlGlyphs';
 import { PhoneGlyph, VideoGlyph } from '../ui/CallGlyph';
-import { useTheme } from '../theme';
+import { useTheme, type Theme } from '../theme';
 import {
   measuredCallQuality,
   type CallQualityStatus,
@@ -28,7 +28,155 @@ import {
  * screens must also mean the SAME thing by a muted button — a group call's
  * mute glyph that drifts from the 1:1 one teaches two things about one
  * microphone.
+ *
+ * Both take `onMedia` since the white palette (2026-10-04): a call that
+ * carries video draws them on media, a voice call on the app's own ground,
+ * and `callSurface` below is where each colour comes from. It defaults to
+ * media, so a call site that never passes it draws exactly what it drew.
  */
+
+/**
+ * The colours of one call surface, by role, so no call screen picks inks by
+ * hand.
+ *
+ * A surface that carries or awaits video sits on MEDIA: black, white ink and
+ * neutral gray, identical in both appearances, because video is dark. Every
+ * VOICE call (every group call, a 1:1 audio call, the incoming-call screen)
+ * is an app screen on the app's own ground: white in light and charcoal in
+ * dark, with charcoal type and gray control rings, as the minimized audio
+ * pill already was. The answer and end discs are the same forest and red on
+ * both, under a white glyph, so a call action looks the same wherever it
+ * appears.
+ */
+export interface CallSurface {
+  /** The screen's ground. */
+  ground: string;
+  /** Behind the header and the control band. */
+  band: string;
+  /** Names, titles, a control failure, the switch-to-voice label. */
+  ink: string;
+  /** Status, duration, notices, the cap line, the quality label. */
+  inkMuted: string;
+  /** Failure text. */
+  failure: string;
+  /** Pill outlines, a call tile's edge, the unlit quality bars. */
+  line: string;
+  /** A participant tile. */
+  tile: string;
+  /** A control at rest: its disc, its ring and its glyph. */
+  idleDisc: string;
+  idleRing: string;
+  idleGlyph: string;
+  /** A control that is ON (muted, speaker on): a filled disc. */
+  activeDisc: string;
+  activeGlyph: string;
+  /** A control that cannot act: an empty disc inside its ring. */
+  disabledRing: string;
+  disabledGlyph: string;
+  /** End and decline. */
+  endDisc: string;
+  /** Answer. */
+  answerDisc: string;
+  /** The glyph or label on an end, decline or answer disc. */
+  actionGlyph: string;
+  minimizeGlyph: string;
+  minimizePressed: string;
+  /** The status bar's glyphs, and its fill where the platform paints one. */
+  barStyle: 'light-content' | 'dark-content';
+  barBackground: string;
+}
+
+export function callSurface(theme: Theme, onMedia: boolean): CallSurface {
+  const c = theme.color;
+  const shared = {
+    endDisc: c.mediaDanger,
+    answerDisc: c.mediaAccent,
+    actionGlyph: c.mediaInk,
+  };
+  if (onMedia) {
+    return {
+      ...shared,
+      ground: c.mediaBlack,
+      band: c.mediaHud,
+      ink: c.mediaInk,
+      inkMuted: c.mediaInkMuted,
+      failure: c.dangerOnMedia,
+      line: c.mediaLine,
+      tile: c.mediaBlack,
+      idleDisc: c.mediaLine,
+      // No ring at rest on media: the translucent disc is its own edge.
+      idleRing: 'transparent',
+      idleGlyph: c.mediaInk,
+      activeDisc: c.mediaInk,
+      activeGlyph: c.mediaBlack,
+      disabledRing: c.mediaLine,
+      disabledGlyph: c.mediaInkMuted,
+      minimizeGlyph: c.mediaInk,
+      minimizePressed: c.mediaLine,
+      barStyle: 'light-content',
+      barBackground: c.mediaBlack,
+    };
+  }
+  return {
+    ...shared,
+    ground: c.paperGround,
+    band: 'transparent',
+    ink: c.inkStrong,
+    inkMuted: c.inkMuted,
+    failure: c.danger,
+    line: c.lineSoft,
+    tile: c.paperSheet,
+    idleDisc: c.paperSheet,
+    idleRing: c.lineStrong,
+    idleGlyph: c.inkStrong,
+    activeDisc: c.inkStrong,
+    activeGlyph: c.paperSheet,
+    disabledRing: c.lineSoft,
+    disabledGlyph: c.inkMuted,
+    minimizeGlyph: c.inkStrong,
+    minimizePressed: c.paperInset,
+    // The app ground's own rule: dark glyphs on white, light on charcoal.
+    barStyle: theme.scheme === 'dark' ? 'light-content' : 'dark-content',
+    barBackground: c.paperGround,
+  };
+}
+
+/**
+ * How dark a press makes a forest or red call disc: a fifth of black over it,
+ * about the step pinePressed takes from pine.
+ */
+export const PRESS_SHADE = 0.2;
+
+/**
+ * A finger on a forest or red disc: black at PRESS_SHADE over the disc and
+ * under its glyph, so the press darkens the disc on every ground and in both
+ * appearances, the same way the disc itself is the same everywhere. A dip in
+ * opacity lets the ground through instead: over media black that darkened,
+ * but on the white app ground it turned forest into mint and red into pink
+ * under a white label. Render it as the disc's first child.
+ */
+export function PressShade({
+  radius,
+  theme,
+}: {
+  radius: number;
+  theme: ReturnType<typeof useTheme>;
+}): React.JSX.Element {
+  return (
+    <View
+      testID="call-press-shade"
+      pointerEvents="none"
+      style={[
+        StyleSheet.absoluteFill,
+        {
+          borderRadius: radius,
+          backgroundColor: theme.color.mediaBlack,
+          opacity: PRESS_SHADE,
+        },
+      ]}
+    />
+  );
+}
 
 /**
  * Duration, from the moment media actually flowed.
@@ -73,11 +221,15 @@ export function QualityBars({
   level,
   status = measuredCallQuality(level) === null ? 'checking' : 'measured',
   theme,
+  onMedia = true,
 }: {
   level: number;
   status?: CallQualityStatus;
   theme: ReturnType<typeof useTheme>;
+  /** False on a voice call, which is an app screen (see `callSurface`). */
+  onMedia?: boolean;
 }): React.JSX.Element {
+  const surface = callSurface(theme, onMedia);
   const measured = measuredCallQuality(level);
   if (status !== 'measured' || measured === null) {
     const label =
@@ -86,7 +238,7 @@ export function QualityBars({
         : 'Connection quality unavailable';
     return (
       <Text
-        style={{ color: theme.color.mediaInkMuted, fontSize: 13, marginTop: 6 }}
+        style={{ color: surface.inkMuted, fontSize: 13, marginTop: 6 }}
         accessibilityLiveRegion="polite"
       >
         {label}
@@ -116,8 +268,7 @@ export function QualityBars({
             width: 3,
             height: 4 + bar * 3,
             borderRadius: 1,
-            backgroundColor:
-              bar <= measured ? theme.color.mediaInk : theme.color.mediaLine,
+            backgroundColor: bar <= measured ? surface.ink : surface.line,
           }}
         />
       ))}
@@ -168,10 +319,12 @@ export function ControlButton({
   glyph,
   active,
   danger,
+  accept,
   disabled,
   busy = false,
   onPress,
   theme,
+  onMedia = true,
   testID,
   accessibilityHint,
 }: {
@@ -179,16 +332,73 @@ export function ControlButton({
   glyph: string;
   active: boolean;
   danger?: boolean;
+  /** The answer disc: the one forest disc every call surface answers with.
+   * Colour only; `active` still decides what VoiceOver hears. */
+  accept?: boolean;
   disabled?: boolean;
   busy?: boolean;
   onPress(): void;
   theme: ReturnType<typeof useTheme>;
+  /** False on a voice call, which is an app screen (see `callSurface`). */
+  onMedia?: boolean;
   /** Small-group additions. Both are omitted rather than passed as
    * `undefined` below, so the 1:1 screen's props are the props it always
    * had — see the file header on why that matters. */
   testID?: string;
   accessibilityHint?: string;
 }): React.JSX.Element {
+  const surface = callSurface(theme, onMedia);
+  const fill = disabled
+    ? 'transparent'
+    : danger
+      ? surface.endDisc
+      : accept
+        ? surface.answerDisc
+        : active
+          ? surface.activeDisc
+          : surface.idleDisc;
+  // On media a control at rest has no ring (its translucent disc is its
+  // edge), so only a disabled one draws one there, exactly as before. On
+  // the app ground every disc carries the same 1pt ring: gray at rest, its
+  // own fill when filled, so a toggle changes colour and never moves the row
+  // by a point.
+  const ring = disabled
+    ? surface.disabledRing
+    : onMedia
+      ? null
+      : danger || accept || active
+        ? fill
+        : surface.idleRing;
+  // On the app ground a finger on the forest or red disc darkens it (the
+  // shade); the opacity dip would let the white page through and tint it.
+  // On media the dip already darkens toward the black ground, so it stays.
+  const shaded = !onMedia && !disabled && (danger === true || accept === true);
+  // The drawn icon, in the exact colour the Text used: the surface's ink on
+  // a disc at rest, the disc's opposite on a filled (active) one, white on
+  // the end and answer discs. The icons hide themselves from VoiceOver, so
+  // the button still reads once, by its label. Muted on a disabled disc, the
+  // other half of the recession below.
+  const ink = disabled
+    ? surface.disabledGlyph
+    : danger || accept
+      ? surface.actionGlyph
+      : active
+        ? surface.activeGlyph
+        : surface.idleGlyph;
+  const Icon = CONTROL_GLYPHS[glyph];
+  const icon = Icon ? (
+    <Icon size={22} color={ink} />
+  ) : (
+    <Text
+      style={{ color: ink, fontSize: 18 }}
+      // The glyph is decoration; the button already has a proper label, and
+      // reading "✕" aloud helps nobody.
+      accessibilityElementsHidden
+      importantForAccessibility="no"
+    >
+      {glyph}
+    </Text>
+  );
   return (
     <Pressable
       onPress={onPress}
@@ -209,8 +419,9 @@ export function ControlButton({
       // DISABLED IS A RECESSED SURFACE, NEVER OPACITY (see
       // primitives.tsx:173). The disabled arm used to be `opacity: 0.4`,
       // which took the glyph under the contrast floor; it now empties the
-      // disc to its `mediaLine` edge and mutes the icon. `pressed` keeps its
-      // dip — a finger on a control is feedback, not a state.
+      // disc to its ring and mutes the icon. `pressed` keeps its
+      // dip — a finger on a control is feedback, not a state — except on a
+      // forest or red disc on the app ground, which takes the shade.
       style={({ pressed }) => [
         {
           minWidth: 44,
@@ -219,47 +430,18 @@ export function ControlButton({
           alignItems: 'center',
           justifyContent: 'center',
           borderRadius: 22,
-          opacity: pressed ? 0.7 : 1,
-          ...(disabled
-            ? { borderWidth: 1, borderColor: theme.color.mediaLine }
-            : null),
-          backgroundColor: disabled
-            ? 'transparent'
-            : danger
-              ? theme.color.danger
-              : active
-                ? theme.color.mediaInk
-                : theme.color.mediaLine,
+          opacity: pressed && !shaded ? 0.7 : 1,
+          ...(ring !== null ? { borderWidth: 1, borderColor: ring } : null),
+          backgroundColor: fill,
         },
       ]}
     >
-      {(() => {
-        // The drawn icon, in the exact colour the Text used: `mediaInk` on
-        // the wash and the danger disc, `mediaBlack` on an active (filled)
-        // one. The icons hide themselves from VoiceOver, so the button still
-        // reads once, by its label.
-        // Muted on a disabled disc, the other half of the recession above.
-        const ink = disabled
-          ? theme.color.mediaInkMuted
-          : danger || !active
-            ? theme.color.mediaInk
-            : theme.color.mediaBlack;
-        const Icon = CONTROL_GLYPHS[glyph];
-        if (Icon) {
-          return <Icon size={22} color={ink} />;
-        }
-        return (
-          <Text
-            style={{ color: ink, fontSize: 18 }}
-            // The glyph is decoration; the button already has a proper label, and
-            // reading "✕" aloud helps nobody.
-            accessibilityElementsHidden
-            importantForAccessibility="no"
-          >
-            {glyph}
-          </Text>
-        );
-      })()}
+      {({ pressed }) => (
+        <>
+          {pressed && shaded ? <PressShade radius={22} theme={theme} /> : null}
+          {icon}
+        </>
+      )}
     </Pressable>
   );
 }

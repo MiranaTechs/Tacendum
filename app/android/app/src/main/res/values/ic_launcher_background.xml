@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The adaptive launcher icon's background layer: pure white, the same
+     ground as the iOS app icon. -->
+<resources>
+    <color name="ic_launcher_background">#FFFFFF</color>
+</resources>

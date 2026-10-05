@@ -15,9 +15,9 @@ import UIKit
  *     App.tsx, which cannot run until the bundle is live.
  *
  * The cover mirrors the JS `privacy-overlay`: opaque paperGround sheet with
- * the brand mark (BrandMark.tsx ratios, bar height 20) at the quarter line —
- * the same composition the loading frame, the lock screen and the launch
- * storyboard hold, so every cover of the app is the same image.
+ * the brand mark (the app icon's proportions, bar height 20) at the quarter
+ * line — the same composition the loading frame, the lock screen and the
+ * launch storyboard hold, so every cover of the app is the same image.
  */
 @objc(ScreenSecurityImpl)
 public final class ScreenSecurityImpl: NSObject {
@@ -155,9 +155,9 @@ public final class ScreenSecurityImpl: NSObject {
     ) { _ in hideCover() }
   }
 
-  // theme.ts: paperGround #EFF2EB, pine #0E6B45.
+  // theme.ts: paperGround #FFFFFF, pine #0E6B45.
   private static let paperGround = UIColor(
-    red: 0xEF / 255.0, green: 0xF2 / 255.0, blue: 0xEB / 255.0, alpha: 1
+    red: 0xFF / 255.0, green: 0xFF / 255.0, blue: 0xFF / 255.0, alpha: 1
   )
   private static let pine = UIColor(
     red: 0x0E / 255.0, green: 0x6B / 255.0, blue: 0x45 / 255.0, alpha: 1
@@ -175,11 +175,14 @@ public final class ScreenSecurityImpl: NSObject {
     sheet.backgroundColor = paperGround
     sheet.autoresizingMask = [.flexibleWidth, .flexibleHeight]
 
-    // Two turns of a conversation, bar height 20 (BrandMark.tsx ratios), the
-    // mark's top at the quarter line of the screen. The sheet is rebuilt on
-    // every resignation, so the frame math needs no rotation handling.
+    // Two turns of a conversation in the app icon's proportions, bar height
+    // 20, the mark's top at the quarter line of the screen: the outlined
+    // incoming bar opens at upper left, then the solid reply answers at lower
+    // right, the order BrandMark.tsx and the app icon draw. The sheet is
+    // rebuilt on every resignation, so the frame math needs no rotation
+    // handling.
     let size: CGFloat = 20
-    let markWidth = (1.545 + 2.795) * size
+    let markWidth = (1.545 + 2.955) * size
     let mark = UIView(
       frame: CGRect(
         x: (sheet.bounds.width - markWidth) / 2,
@@ -191,22 +194,22 @@ public final class ScreenSecurityImpl: NSObject {
       .flexibleLeftMargin, .flexibleRightMargin, .flexibleBottomMargin,
     ]
 
+    let outlined = UIView(
+      frame: CGRect(x: 0, y: 0, width: 2.795 * size, height: size))
+    outlined.backgroundColor = .clear
+    outlined.layer.borderColor = pine.cgColor
+    outlined.layer.borderWidth = 0.33 * size
+    outlined.layer.cornerRadius = size / 2
+    mark.addSubview(outlined)
+
     let solid = UIView(
-      frame: CGRect(x: 0, y: 0, width: 2.955 * size, height: size))
+      frame: CGRect(
+        x: 1.545 * size, y: (1 + 0.227) * size, width: 2.955 * size,
+        height: size
+      ))
     solid.backgroundColor = pine
     solid.layer.cornerRadius = size / 2
     mark.addSubview(solid)
-
-    let reply = UIView(
-      frame: CGRect(
-        x: 1.545 * size, y: (1 + 0.227) * size, width: 2.795 * size,
-        height: size
-      ))
-    reply.backgroundColor = .clear
-    reply.layer.borderColor = pine.cgColor
-    reply.layer.borderWidth = 0.33 * size
-    reply.layer.cornerRadius = size / 2
-    mark.addSubview(reply)
 
     sheet.addSubview(mark)
     window.addSubview(sheet)

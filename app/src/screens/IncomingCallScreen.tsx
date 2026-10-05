@@ -10,6 +10,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { cameraAvailableForAnswer } from '../call';
+import { callSurface, PressShade } from '../components/CallControls';
 import { Avatar } from '../ui/Avatar';
 import { tileName, UNNAMED } from '../ui/CallTile';
 import { useTheme } from '../theme';
@@ -26,6 +27,10 @@ import { useTheme } from '../theme';
  * alternative — decline, then call back voice-only — costs both people a
  * round trip. It is also the honest fallback when the camera permission is
  * denied, which is a first-class state rather than an error.
+ *
+ * An app screen, not a media one: nothing here ever shows video, so it sits
+ * on the app's own ground (white in light, charcoal in dark). The answer and
+ * decline discs are the forest and red every call surface uses.
  */
 
 export interface IncomingCallScreenProps {
@@ -60,6 +65,7 @@ export function IncomingCallScreen({
   const theme = useTheme();
   const insets = useSafeAreaInsets();
   const { fontScale } = useWindowDimensions();
+  const surface = callSurface(theme, false);
   const styles = useMemo(() => makeStyles(theme), [theme]);
   // The module's answer, when the prop leaves it to the screen. Read once
   // per ring and only for a video invite — an audio invite offers no video
@@ -100,7 +106,12 @@ export function IncomingCallScreen({
         withVideo ? 'video' : 'audio'
       } call from ${shownName}`}
     >
-      <StatusBar barStyle="light-content" />
+      {/* The app ground's bar: dark glyphs on white, light on charcoal, and
+          on Android the bar takes the same ground. */}
+      <StatusBar
+        barStyle={surface.barStyle}
+        backgroundColor={surface.barBackground}
+      />
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={[
@@ -196,12 +207,27 @@ function AnswerButton({
   basis?: number;
   theme: ReturnType<typeof useTheme>;
 }): React.JSX.Element {
-  const background =
-    tone === 'danger'
-      ? theme.color.danger
+  const surface = callSurface(theme, false);
+  // Answer and decline are the call actions every call surface shares: one
+  // forest disc and one red, each under a white label, in both appearances.
+  // Anything else is the neutral control: a white disc inside a gray ring.
+  //
+  // No state here is drawn with opacity. This screen sits on the white app
+  // ground, where a dimmed disc lets the page through: the pending answer
+  // (every incoming video call opens on "Checking camera…") was mint under
+  // a white label at 2.5:1, and a pressed one 3.8:1. So a button that cannot
+  // act is the house's disabled button, the gray inset with a muted label;
+  // a finger on the forest or red disc darkens it (PressShade); a finger on
+  // the neutral disc fills it with the gray pressed fill.
+  const action = (tone === 'accept' || tone === 'danger') && !disabled;
+  const background = disabled
+    ? theme.color.paperInset
+    : tone === 'danger'
+      ? surface.endDisc
       : tone === 'accept'
-      ? theme.color.pine
-      : theme.color.mediaLine;
+        ? surface.answerDisc
+        : surface.idleDisc;
+  const ring = action ? null : disabled ? surface.disabledRing : surface.idleRing;
   return (
     <Pressable
       onPress={onPress}
@@ -221,29 +247,37 @@ function AnswerButton({
           borderRadius: 28,
           paddingHorizontal: 12,
           paddingVertical: 16,
-          backgroundColor: background,
-          opacity: disabled ? 0.55 : pressed ? 0.75 : 1,
+          backgroundColor:
+            pressed && !action && !disabled ? theme.color.paperInset : background,
+          ...(ring === null ? null : { borderWidth: 1, borderColor: ring }),
         },
       ]}
     >
-      <Text
-        style={{
-          color:
-            tone === 'accept' || tone === 'danger'
-              ? theme.color.onPine
-              : theme.color.mediaInk,
-          fontSize: 15,
-          fontWeight: '600',
-          textAlign: 'center',
-        }}
-      >
-        {label}
-      </Text>
+      {({ pressed }) => (
+        <>
+          {pressed && action ? <PressShade radius={28} theme={theme} /> : null}
+          <Text
+            style={{
+              color: disabled
+                ? surface.disabledGlyph
+                : action
+                  ? surface.actionGlyph
+                  : surface.idleGlyph,
+              fontSize: 15,
+              fontWeight: '600',
+              textAlign: 'center',
+            }}
+          >
+            {label}
+          </Text>
+        </>
+      )}
     </Pressable>
   );
 }
 
 function makeStyles(theme: ReturnType<typeof useTheme>) {
+  const surface = callSurface(theme, false);
   return StyleSheet.create({
     root: {
       position: 'absolute',
@@ -251,7 +285,7 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       left: 0,
       right: 0,
       bottom: 0,
-      backgroundColor: theme.color.mediaBlack,
+      backgroundColor: surface.ground,
     },
     scroll: { flex: 1 },
     content: {
@@ -261,20 +295,20 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       gap: 32,
     },
     identity: { alignItems: 'center', gap: 12 },
+    /** Placement only: the `Avatar` inside draws the whole face, the app's
+     * one face for a person — the photo in its hairline ring, or white
+     * letters on the solid forest disc in both appearances. */
     avatar: {
       width: 112,
       height: 112,
       borderRadius: 56,
-      backgroundColor: theme.color.pineWash,
-      borderWidth: 1,
-      borderColor: theme.color.pineLine,
       alignItems: 'center',
       justifyContent: 'center',
     },
-    peer: { color: theme.color.mediaInk, fontSize: 24, fontWeight: '600' },
-    kind: { color: theme.color.mediaInkMuted, fontSize: 15 },
+    peer: { color: surface.ink, fontSize: 24, fontWeight: '600' },
+    kind: { color: surface.inkMuted, fontSize: 15 },
     note: {
-      color: theme.color.mediaInkMuted,
+      color: surface.inkMuted,
       fontSize: 13,
       textAlign: 'center',
     },

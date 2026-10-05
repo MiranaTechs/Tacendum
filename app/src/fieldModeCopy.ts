@@ -56,12 +56,12 @@ import { Platform } from 'react-native';
  */
 export const FIELD_MODE_SCREENSHOT_LINES = {
   ios:
-    'Screenshots cannot be blocked. When one is taken in a conversation, ' +
-    'the conversation says so — on both sides. That is always true, with ' +
+    'Screenshots cannot be blocked. When one is taken in a room, ' +
+    'the room says so — on both sides. That is always true, with ' +
     'Field Mode on or off.',
   android:
     'Screenshots and screen recordings are refused by the system, so ' +
-    'nothing is announced in a conversation — there is nothing to ' +
+    'nothing is announced in a room — there is nothing to ' +
     'announce. That is always true, with Field Mode on or off.',
 } as const;
 

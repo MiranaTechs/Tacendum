@@ -18,6 +18,7 @@ import { timeLabel } from '../time';
 import { useTheme } from '../theme';
 import { InlineError, PrimaryButton, TextAction } from './primitives';
 import { AiUsagePanel } from './AiUsagePanel';
+import { CHIP_SELECTED_EDGE } from './ChoiceRow';
 
 const PROVIDER_COPY: Record<db.AiAgentStateRow['provider'], string> = {
   claude: 'Claude',
@@ -91,7 +92,7 @@ const COPY = {
     'The selected agent or its reported project/capabilities changed, or its repository context moved. Review the current details and choose the task again.',
   failed:
     'The request wasn’t queued. Check that the agent answerer is configured, then try again.',
-  queued: 'Request queued in this conversation. This does not mean the task ran.',
+  queued: 'Request queued in this room. This does not mean the task ran.',
 } as const;
 
 export function AiAgentSection({
@@ -587,6 +588,7 @@ export function AiAgentSection({
           editable={!templateBusy}
           keyboardAppearance={t.scheme}
           selectionColor={t.color.pine}
+          cursorColor={t.color.pine}
           placeholder="Request name"
           placeholderTextColor={t.color.inkMuted}
           accessibilityLabel="Saved request name"
@@ -598,7 +600,7 @@ export function AiAgentSection({
               minHeight: t.layout.touchTarget,
               color: t.color.inkBody,
               backgroundColor: t.color.paperSheet,
-              borderColor: t.color.lineStrong,
+              borderColor: t.color.lineField,
             },
           ]}
         />
@@ -617,6 +619,7 @@ export function AiAgentSection({
           editable={!templateBusy}
           keyboardAppearance={t.scheme}
           selectionColor={t.color.pine}
+          cursorColor={t.color.pine}
           placeholder="Request to review before sending"
           placeholderTextColor={t.color.inkMuted}
           accessibilityLabel="Saved request text"
@@ -628,7 +631,7 @@ export function AiAgentSection({
               minHeight: 120,
               color: t.color.inkBody,
               backgroundColor: t.color.paperSheet,
-              borderColor: t.color.lineStrong,
+              borderColor: t.color.lineField,
             },
           ]}
         />
@@ -733,6 +736,7 @@ export function AiAgentSection({
           editable={!busy}
           keyboardAppearance={t.scheme}
           selectionColor={t.color.pine}
+          cursorColor={t.color.pine}
           placeholderTextColor={t.color.inkMuted}
           accessibilityLabel="Request to send"
           testID="peer-ai-task-input"
@@ -743,7 +747,7 @@ export function AiAgentSection({
               minHeight: 120,
               color: t.color.inkBody,
               backgroundColor: t.color.paperSheet,
-              borderColor: t.color.lineStrong,
+              borderColor: t.color.lineField,
             },
           ]}
         />
@@ -871,10 +875,16 @@ export function AiAgentSection({
                       styles.notifyChoice,
                       {
                         minHeight: t.layout.touchTarget,
+                        // The chosen mode's forest edge is ChoiceRow's 1.5pt,
+                        // the other a hairline, so the choice reads by weight
+                        // and luminance, never by its label's hue alone; the
+                        // padding gives the width back, so nothing moves.
+                        borderWidth: active ? CHIP_SELECTED_EDGE : StyleSheet.hairlineWidth,
+                        paddingHorizontal:
+                          14 - (active ? CHIP_SELECTED_EDGE - StyleSheet.hairlineWidth : 0),
                         borderColor: active ? t.color.pineLine : t.color.lineSoft,
-                        backgroundColor: active
-                          ? t.color.pineWash
-                          : pressed
+                        backgroundColor:
+                          pressed && !active
                             ? t.color.paperInset
                             : t.color.paperSheet,
                       },
@@ -919,7 +929,7 @@ export function AiAgentSection({
               </View>
             ) : currentPreference.acknowledgedAt !== null ? (
               <Text
-                style={[t.type.timeStatus, styles.line, { color: t.color.pine }]}
+                style={[t.type.timeStatus, styles.line, { color: t.color.inkBody }]}
                 testID="peer-ai-notify-applied"
               >
                 {`Applied by agent · ${timeLabel(
@@ -942,7 +952,7 @@ export function AiAgentSection({
       ) : null}
       {notifyNote ? (
         <Text
-          style={[t.type.compactBody, styles.line, { color: t.color.pine }]}
+          style={[t.type.compactBody, styles.line, { color: t.color.inkBody }]}
           testID="peer-ai-notify-note"
         >
           {notifyNote}
@@ -979,9 +989,9 @@ export function AiAgentSection({
               {
                 minHeight: t.layout.touchTarget,
                 borderColor: t.color.lineSoft,
-                backgroundColor: taskControlsDisabled
-                  ? t.color.paperInset
-                  : pressed
+                // A disabled row stays white: its muted label says so.
+                backgroundColor:
+                  pressed && !taskControlsDisabled
                     ? t.color.pineWash
                     : t.color.paperSheet,
               },
@@ -995,14 +1005,20 @@ export function AiAgentSection({
             >
               {task.label}
             </Text>
-            <Text
-              allowFontScaling={false}
-              importantForAccessibility="no"
-              accessibilityElementsHidden
-              style={[t.type.iconGlyph, { color: t.color.pine }]}
-            >
-              ›
-            </Text>
+            {/* Only a row that can act draws the ›: a disabled row is white
+                with a gray label, and the label's hue alone (forest against
+                the muted gray, 1.04:1) must not be what tells them apart. */}
+            {taskControlsDisabled ? null : (
+              <Text
+                allowFontScaling={false}
+                importantForAccessibility="no"
+                accessibilityElementsHidden
+                testID={`peer-ai-task-${task.id}-chevron`}
+                style={[t.type.iconGlyph, { color: t.color.inkMuted }]}
+              >
+                ›
+              </Text>
+            )}
           </Pressable>
         ))}
       </View>
@@ -1071,9 +1087,9 @@ export function AiAgentSection({
                     styles.savedUse,
                     {
                       minHeight: t.layout.touchTarget,
-                      backgroundColor: taskControlsDisabled
-                        ? t.color.paperInset
-                        : pressed
+                      // A disabled row stays white: its muted label says so.
+                      backgroundColor:
+                        pressed && !taskControlsDisabled
                           ? t.color.pineWash
                           : t.color.paperSheet,
                     },
@@ -1092,14 +1108,18 @@ export function AiAgentSection({
                   >
                     {template.name}
                   </Text>
-                  <Text
-                    allowFontScaling={false}
-                    importantForAccessibility="no"
-                    accessibilityElementsHidden
-                    style={[t.type.iconGlyph, { color: t.color.pine }]}
-                  >
-                    ›
-                  </Text>
+                  {/* Only a row that can act draws the › (see the tasks). */}
+                  {taskControlsDisabled ? null : (
+                    <Text
+                      allowFontScaling={false}
+                      importantForAccessibility="no"
+                      accessibilityElementsHidden
+                      testID={`peer-ai-saved-${template.id}-chevron`}
+                      style={[t.type.iconGlyph, { color: t.color.inkMuted }]}
+                    >
+                      ›
+                    </Text>
+                  )}
                 </Pressable>
                 <View style={styles.savedActions}>
                   <TextAction
@@ -1120,7 +1140,11 @@ export function AiAgentSection({
                   <View
                     style={[
                       styles.deleteConfirm,
-                      { backgroundColor: t.color.paperLayer },
+                      {
+                        backgroundColor: t.color.paperLayer,
+                        borderTopWidth: t.hairline,
+                        borderTopColor: t.color.lineSoft,
+                      },
                     ]}
                   >
                     <Text style={[t.type.compactBody, { color: t.color.inkBody }]}>
@@ -1151,7 +1175,7 @@ export function AiAgentSection({
         </View>
       )}
       {note ? (
-        <Text style={[t.type.compactBody, styles.line, { color: t.color.pine }]} testID="peer-ai-task-note">
+        <Text style={[t.type.compactBody, styles.line, { color: t.color.inkBody }]} testID="peer-ai-task-note">
           {note}
         </Text>
       ) : null}
@@ -1178,9 +1202,8 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
     gap: 8,
   },
+  // Edge and horizontal padding are set per chip (see the choices).
   notifyChoice: {
-    paddingHorizontal: 14,
-    borderWidth: StyleSheet.hairlineWidth,
     alignItems: 'center',
     justifyContent: 'center',
   },

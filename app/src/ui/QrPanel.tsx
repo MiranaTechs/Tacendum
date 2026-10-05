@@ -29,7 +29,7 @@ const COPY = {
     // The device is named in the
     // platform's own words via the token.
     `It is made on this ${DEVICE_NOUN} and Tacendum never sends it anywhere. Where it goes next is whatever you pick in the share sheet.`,
-    'Anyone who has the picture can start a chat with you. Send it the way you would send your phone number — and a saved picture stays in Photos.',
+    'Anyone who has the picture can open a room with you. Send it the way you would send your phone number — and a saved picture stays in Photos.',
   ],
   drawFailed: 'Tacendum couldn’t draw your QR code. Your ID above still works.',
   // The code itself is still on screen when this shows, so the sentence points
@@ -44,7 +44,7 @@ const COPY = {
  * The code's own ink and paper — the LIGHT palette, in both modes.
  *
  * A QR is a printed artefact, not a themed surface. Read from the dark
- * tokens these become #E9EFE9 on #1C221E: pale modules on a near-black quiet
+ * tokens these become #EDEDED on #232323: pale modules on a charcoal quiet
  * zone, a contrast-inverted code. Both of this product's scanners are its own
  * and are inversion-blind (AVCaptureMetadataOutput; ZXing's
  * RGBLuminanceSource), and deep links are refused, so the system camera
@@ -57,8 +57,8 @@ const COPY = {
  * fixing them here is also what stops a theme flip from restarting a draw of
  * a code somebody is currently pointing a phone at.
  *
- * Measured on the light palette: inkStrong on paperSheet is 17.17:1. Pine —
- * this system's *action* colour — is 6.34:1, needlessly marginal for a cheap
+ * Measured on the light palette: inkStrong on paperSheet is 17.76:1. Pine —
+ * this system's *action* colour — is 6.55:1, needlessly marginal for a cheap
  * decoder pointed at a recompressed screenshot at an angle, which is why the
  * ink is the strong one and not the brand one.
  */
@@ -169,7 +169,7 @@ export function QrPanel({ id }: { id: string }) {
       ]}
     >
       {error ? (
-        // On paperSheet already; dangerWash on this surface measures under AA.
+        // On paperSheet, the panel's own surface.
         <InlineError
           message={error}
           testID="self-qr-error"

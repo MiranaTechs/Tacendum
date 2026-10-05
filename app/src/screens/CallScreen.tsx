@@ -26,6 +26,7 @@ import { EARPIECE_KNOWN_ABSENT } from '../audioRoute';
 // a second mute button. Refactor-only: the components are
 // unchanged and this screen's rendered tree is byte-identical.
 import {
+  callSurface,
   ControlButton,
   durationAnnouncementFrom,
   durationFrom,
@@ -274,9 +275,11 @@ function PeerFace({
   labelled?: boolean;
   /**
    * Set where the face stands INSIDE a video surface, which paints itself
-   * opaque black when it has no track. Without the pine ground under it the
+   * opaque black when it has no track. Without the wash ground under it the
    * disc floats in that black, which is the state the hardware report
-   * (2026-08-13) named: "person B is all dark screen".
+   * (2026-08-13) named: "person B is all dark screen". The disc there is the
+   * media face, the same in both appearances: the app's white disc read as a
+   * hole in the black, and changed look the moment the call connected.
    */
   ground?: boolean;
 }): React.JSX.Element {
@@ -301,6 +304,7 @@ function PeerFace({
         photoB64={photoB64}
         size={size}
         {...(labelled ? { accessibilityLabel: `${shown}'s picture` } : {})}
+        {...(ground ? { tone: 'media' as const } : {})}
       />
     </View>
   );
@@ -561,7 +565,7 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
    * `connectedAt`) correctly stays on the disc.
    *
    * Before either, the person is drawn the way an audio call draws them: one
-   * centred disc over the pine ground. No scrim
+   * centred disc over the wash ground. No scrim
    * and no blur is added to the connected case instead; theme.ts rules
    * scrims out of the product outright.
    */
@@ -613,7 +617,10 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
     () => statusLabelAt(state, tick),
     [state, tick],
   );
-  const styles = useMemo(() => makeStyles(theme), [theme]);
+  // A call that carries or awaits video is media; an audio call is an app
+  // screen on the app's own ground (see `callSurface`).
+  const surface = callSurface(theme, isVideo);
+  const styles = useMemo(() => makeStyles(theme, isVideo), [theme, isVideo]);
 
   // The notice, spoken. `accessibilityLiveRegion` is an ANDROID prop —
   // iOS has no live-region support in React Native — so without this a
@@ -648,7 +655,14 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
 
   return (
     <View style={styles.root} accessibilityViewIsModal>
-      <StatusBar barStyle="light-content" />
+      {/* The bar follows the surface: light glyphs over a video call's black,
+          the app's own rule over an audio call's ground. Android also paints
+          the bar itself, so it takes the same ground rather than keeping the
+          app's. */}
+      <StatusBar
+        barStyle={surface.barStyle}
+        backgroundColor={surface.barBackground}
+      />
 
       {/* The remote video fills the screen. It renders nothing until a track
           arrives — which is normal, since this screen is up while the call is
@@ -692,11 +706,12 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
               photoB64={peerAvatarB64}
             />
           )}
-          {/* Before the call connects: the audio layout's disc, over the pine
-              ground, so the surface is neither black nor mistakable for the
-              far camera. `PeerFace` also refuses account IDs, so a
-              "name" that is really the peer's id cannot letter this surface
-              and the raw name goes down. */}
+          {/* Before the call connects: the audio layout's disc, drawn in the
+              media palette, over the wash ground, so the surface is neither
+              black nor mistakable for the far camera, and the person wears
+              the same face once it connects. `PeerFace` also refuses account
+              IDs, so a "name" that is really the peer's id cannot letter this
+              surface and the raw name goes down. */}
           {!swapped && !mediaEstablished && (
             <PeerFace
               peerId={call.peerId}
@@ -783,7 +798,7 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
                 // The photo is withheld until there is media for it to stand
                 // in for, exactly as on the full surface: a cover-cropped
                 // face in the corner reads as the far camera just as
-                // readily. The pine ground and the monogram stay, so the
+                // readily. The wash ground and the monogram stay, so the
                 // corner is never bare black.
                 photoB64={mediaEstablished ? peerAvatarB64 : null}
                 compact
@@ -795,7 +810,7 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
 
       {/* Audio-only shows the person, not a black rectangle. The same
           face the video call falls back to, at the size the whole screen is
-          for it. */}
+          for it, on the app's own ground: an audio call is an app screen. */}
       {!isVideo && (
         <PeerFace
           peerId={call.peerId}
@@ -835,7 +850,7 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
             accessibilityHint="Keeps the call going while you use the app"
             testID="call-minimize"
           >
-            <MinimizeGlyph size={22} color={theme.color.mediaInk} />
+            <MinimizeGlyph size={22} color={surface.minimizeGlyph} />
           </Pressable>
         )}
         <Text style={styles.peer} numberOfLines={1}>
@@ -870,7 +885,12 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
           <Text style={styles.status} accessibilityLiveRegion="polite">Video starting…</Text>
         )}
         {state.name === 'connected' && (
-          <QualityBars level={quality} status={qualityStatus} theme={theme} />
+          <QualityBars
+            level={quality}
+            status={qualityStatus}
+            theme={theme}
+            onMedia={isVideo}
+          />
         )}
 
         {state.name === 'reconnecting' && (
@@ -971,6 +991,7 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
           busy={pendingMedia.has('mute')}
           onPress={runMuteControl}
           theme={theme}
+          onMedia={isVideo}
         />
         {/* Offered only on a call that NEGOTIATED video (`call.video`): an
             audio call — placed as one, or answered without video — has no
@@ -988,6 +1009,7 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
               busy={pendingMedia.has('video')}
               onPress={runVideoControl}
               theme={theme}
+              onMedia={isVideo}
             />
             <ControlButton
               label="Flip camera"
@@ -996,6 +1018,7 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
               disabled={!videoEnabled || pendingMedia.has('video')}
               onPress={onFlipCamera}
               theme={theme}
+              onMedia={isVideo}
             />
           </>
         )}
@@ -1013,6 +1036,7 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
             active={speakerOn}
             onPress={onToggleSpeaker}
             theme={theme}
+            onMedia={isVideo}
           />
         )}
         <ControlButton
@@ -1022,13 +1046,21 @@ export function CallScreen(props: CallScreenProps): React.JSX.Element | null {
           danger
           onPress={onHangup}
           theme={theme}
+          onMedia={isVideo}
         />
       </View>
     </View>
   );
 }
 
-function makeStyles(theme: ReturnType<typeof useTheme>) {
+/**
+ * `isVideo` picks the surface: a video call keeps every media colour, and an
+ * audio call takes the app's own ground and inks from the same roles. The
+ * corner preview and the wash ground below exist only on a video call, so
+ * they read the media tokens directly.
+ */
+function makeStyles(theme: ReturnType<typeof useTheme>, isVideo: boolean) {
+  const surface = callSurface(theme, isVideo);
   return StyleSheet.create({
     root: {
       position: 'absolute',
@@ -1036,13 +1068,13 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       left: 0,
       right: 0,
       bottom: 0,
-      backgroundColor: theme.color.mediaBlack,
+      backgroundColor: surface.ground,
       justifyContent: 'space-between',
     },
     header: {
       paddingHorizontal: 20,
       paddingBottom: 12,
-      backgroundColor: theme.color.mediaHud,
+      backgroundColor: surface.band,
     },
     /** 44×44 (HIG minimum), pulled 11pt into the gutter so the 22pt glyph's
      * left edge lines up with the name under it. */
@@ -1055,17 +1087,17 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       alignItems: 'center',
       justifyContent: 'center',
     },
-    minimizePressed: { backgroundColor: theme.color.mediaLine },
-    peer: { color: theme.color.mediaInk, fontSize: 22, fontWeight: '600' },
+    minimizePressed: { backgroundColor: surface.minimizePressed },
+    peer: { color: surface.ink, fontSize: 22, fontWeight: '600' },
     statusRow: {
       flexDirection: 'row',
       alignItems: 'baseline',
       gap: 10,
       marginTop: 4,
     },
-    status: { color: theme.color.mediaInkMuted, fontSize: 15 },
+    status: { color: surface.inkMuted, fontSize: 15 },
     duration: {
-      color: theme.color.mediaInkMuted,
+      color: surface.inkMuted,
       fontSize: 15,
       fontVariant: ['tabular-nums'],
     },
@@ -1073,7 +1105,7 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
     // still working. A red banner would read as a failure.
     fill: { width: '100%', height: '100%' },
     notice: {
-      color: theme.color.mediaInkMuted,
+      color: surface.inkMuted,
       fontSize: 13,
       marginTop: 6,
       textAlign: 'center',
@@ -1089,10 +1121,10 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       paddingHorizontal: 14,
       borderRadius: 999,
       borderWidth: 1,
-      borderColor: theme.color.mediaLine,
+      borderColor: surface.line,
     },
     controlFailure: {
-      color: theme.color.mediaInk,
+      color: surface.ink,
       fontSize: 13,
       marginTop: 8,
       textAlign: 'center',
@@ -1113,16 +1145,16 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       paddingHorizontal: 14,
       borderRadius: 999,
       borderWidth: 1,
-      borderColor: theme.color.mediaLine,
+      borderColor: surface.line,
     },
-    switchVoiceLabel: { color: theme.color.mediaInk, fontSize: 13 },
+    switchVoiceLabel: { color: surface.ink, fontSize: 13 },
     controls: {
       flexDirection: 'row',
       justifyContent: 'space-around',
       alignItems: 'center',
       paddingHorizontal: 16,
       paddingTop: 16,
-      backgroundColor: theme.color.mediaHud,
+      backgroundColor: surface.band,
     },
     remoteVideo: {
       position: 'absolute',
@@ -1161,10 +1193,10 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       alignItems: 'center',
       justifyContent: 'center',
     },
-    /** The same centring, plus the ground: the pine wash the app puts behind
-     * every photo-less person on the media surface (`PeerBackdrop`'s own
-     * fill). Used where the disc stands inside a video surface, which is
-     * opaque black with no track in it. */
+    /** The same centring, plus the ground: mediaWash, the fill behind every
+     * photo-less person on a video surface (`PeerBackdrop`'s own fill). Used
+     * where the disc stands inside a video surface, which is opaque black
+     * with no track in it, so the disc never floats in bare black. */
     avatarGround: {
       position: 'absolute',
       top: 0,
@@ -1173,7 +1205,7 @@ function makeStyles(theme: ReturnType<typeof useTheme>) {
       bottom: 0,
       alignItems: 'center',
       justifyContent: 'center',
-      backgroundColor: theme.color.pineWash,
+      backgroundColor: theme.color.mediaWash,
     },
     // The person-at-surface-size styles (backdrop, backdropPhoto, the two
     // monogram sizes) moved to ../ui/PeerBackdrop.tsx with the component.

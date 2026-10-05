@@ -220,7 +220,7 @@ describe('the Message sounds toggle', () => {
     expect(note).toBe(
       'A short tone when a message arrives while Tacendum is open, and the ' +
         'sound on its notifications while it is closed — not for the ' +
-        'conversation you are reading, and never during a call. Your ' +
+        'room you have open, and never during a call. Your ' +
         'iPhone’s notification settings and its silent switch decide first: ' +
         'Off here only takes a sound away. Calls ring on their own.',
     );

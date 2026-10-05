@@ -114,7 +114,7 @@ describe('ChatListScreen', () => {
     const content = share.mock.calls[0]![0] as { message?: string; url?: string };
     expect(content.url).toBeUndefined();
     expect(content.message).toBe(
-      `My Tacendum ID:\n${PROFILE.userId}\nAdd me in Tacendum → Start a chat.`,
+      `My Tacendum ID:\n${PROFILE.userId}\nAdd me in Tacendum → Open a room.`,
     );
 
     setString.mockRestore();
@@ -126,44 +126,49 @@ describe('ChatListScreen', () => {
 });
 
 describe('StartChatScreen', () => {
-  test('owns the field, the id, and refuses your own id', async () => {
+  test('owns the field, the id, and catches your own id before it is sent', async () => {
     const tree = await render(
       <StartChatScreen
         profile={PROFILE}
         onBack={jest.fn()}
         onOpenChat={jest.fn()}
-        onFindByEmail={jest.fn()}
+        onOpenAccountEmail={jest.fn()}
       />,
     );
 
     expect(byId(tree, 'new-peer-input').length).toBeGreaterThan(0);
-    // Your own id is on this surface too, behind "Show my ID" (the screen
-    // is for reaching THEM). Rewritten deliberately — the earlier
-    // assertion pinned the block open.
+    // Your own id is on this surface too, behind My ID (kept: the screen
+    // is for reaching THEM).
     expect(byId(tree, 'self-user-id').length).toBe(0);
     await ReactTestRenderer.act(async () => {
       byId(tree, 'show-self-id')[0].props.onPress();
     });
     expect(byId(tree, 'self-user-id').length).toBeGreaterThan(0);
-    // The no-directory explanation sits in the open here — a dedicated
-    // surface has room for it, so it no longer hides behind an ⓘ toggle.
-    // Reworded with the code that changed the fact:
-    // typed, consent-gated find-by-email exists now, so the pinned sentence
-    // claims "no public directory" — still true, structurally — instead of
-    // "no search", which stopped being true on this very screen.
-    const texts = tree.root
-      .findAllByType(require('react-native').Text)
-      .map(n =>
-        Array.isArray(n.props.children)
-          ? n.props.children.join('')
-          : String(n.props.children ?? ''),
-      );
-    expect(texts.some(s => s.includes('no public directory'))).toBe(true);
+
+    // The honesty sentence is still reachable on this surface — behind the
+    // screen's ⓘ since build 33, because teaching copy lives behind an ⓘ
+    // (a standing design rule). It still claims "no public directory"
+    // (true, structurally) and names the classes this binary can find.
+    const texts = () =>
+      tree.root
+        .findAllByType(require('react-native').Text)
+        .map(n =>
+          Array.isArray(n.props.children)
+            ? n.props.children.join('')
+            : String(n.props.children ?? ''),
+        );
+    expect(texts().some(s => s.includes('no public directory'))).toBe(false);
+    await ReactTestRenderer.act(async () => {
+      byId(tree, 'start-chat-info')
+        .find(n => typeof n.props.onPress === 'function')!
+        .props.onPress();
+    });
+    expect(texts().some(s => s.includes('no public directory'))).toBe(true);
     // Build 24: with the username class live the sentence names both doors
     // (the deck's pin-gated literal); a pin-OFF binary keeps the landed wording.
     const { USERNAME_UI_ENABLED } = require('../src/usernameUi') as typeof import('../src/usernameUi');
     expect(
-      texts.some(s =>
+      texts().some(s =>
         s.includes(
           USERNAME_UI_ENABLED
             ? 'the email or username of someone who chose to be found'
@@ -172,11 +177,15 @@ describe('StartChatScreen', () => {
       ),
     ).toBe(true);
 
+    // Your own ID is caught BEFORE the commit since build 33:
+    // the self notice shows and there is no button; the go key explains.
     await ReactTestRenderer.act(async () => {
       byId(tree, 'new-peer-input')[0].props.onChangeText(PROFILE.userId);
     });
+    expect(byId(tree, 'start-chat-self').length).toBeGreaterThan(0);
+    expect(byId(tree, 'start-chat').length).toBe(0);
     await ReactTestRenderer.act(async () => {
-      byId(tree, 'start-chat')[0].props.onPress();
+      byId(tree, 'new-peer-input')[0].props.onSubmitEditing();
     });
     expect(byId(tree, 'start-chat-error').length).toBeGreaterThan(0);
 
@@ -192,7 +201,7 @@ describe('StartChatScreen', () => {
         profile={PROFILE}
         onBack={jest.fn()}
         onOpenChat={onOpenChat}
-        onFindByEmail={jest.fn()}
+        onOpenAccountEmail={jest.fn()}
       />,
     );
 

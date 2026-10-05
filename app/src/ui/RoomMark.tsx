@@ -2,6 +2,11 @@ import React from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { monogram } from '../person';
 import { useTheme } from '../theme';
+import { MONOGRAM_FACE } from './Avatar';
+
+/** How far down the doorway reaches, as a share of the mark: deep enough to
+ * read as an open door on the solid face at every size it is drawn. */
+export const DOOR_DEPTH = 0.12;
 
 interface Props {
   roomId: string;
@@ -24,16 +29,18 @@ interface Props {
 /**
  * A room, at any size: the Quiet Room's own geometry — four walls and an
  * open threshold — scaled to sit exactly where a person's disc sits. A
- * person is a circle; a room is a walled square with a doorway. Same paper,
- * same pine, same monogram mechanism: the distinction is FORM, never a new
- * colour, because the palette is closed.
+ * person is a circle; a room is a solid square with a doorway cut into its
+ * top wall. Same forest, same white letters (MONOGRAM_FACE, 2026-10-05),
+ * same monogram mechanism: the distinction is FORM, never a new colour,
+ * because the palette is closed.
  *
  * This is THE room signal, repeated wherever an identity mark appears (the
  * chat list row, the thread header), so a list mixing rooms and people reads
  * at a glance: circles are people, walled squares are places. It is visual
- * only — every surface that shows it also says "room" in its accessibility
- * label, because a distinction that exists only visually is not a
- * distinction for everyone.
+ * only — every surface that shows it also says "group" in its accessibility
+ * label (the list row "Kitchen, group, …", the thread header "Kitchen,
+ * group, 3 people"), because a distinction that exists only visually is not
+ * a distinction for everyone.
  */
 export function RoomMark({
   roomId,
@@ -45,26 +52,35 @@ export function RoomMark({
 }: Props) {
   const t = useTheme();
   // The doorway keeps the Quiet Room's proportion (a 64pt opening in its
-  // 176pt top wall), centred; whole pixels so the jambs stay crisp. The
-  // opening is real — the fill sits inside the walls, so the row's own
-  // paper shows through the threshold.
+  // 176pt top wall), centred; whole pixels so its edges stay crisp. On a
+  // solid face a 1pt gap in a 1pt wall reads as a nick, not a door, so the
+  // opening has depth: the two side pieces are the walls with their jambs,
+  // full height, and the floor under the doorway starts DOOR_DEPTH of the
+  // mark down (6pt in a 48pt row, 4pt in a 36pt header, 12pt on the 104pt
+  // hero). The row's own ground shows through the threshold, the way the
+  // Rooms tab draws its door as a clear gap. One forest, the same in both
+  // appearances.
   const jamb = Math.round((size - Math.round(size * (64 / 176))) / 2);
-  const wall = { backgroundColor: t.color.pineLine };
+  const depth = Math.max(2, Math.round(size * DOOR_DEPTH));
+  const face = { backgroundColor: MONOGRAM_FACE.fill };
   const glyph = monogramSize ?? Math.round(size * 0.34);
 
   const mark = (
     <View style={[styles.center, { width: size, height: size }]} {...(testID ? { testID } : {})}>
-      <View style={[styles.fill, { backgroundColor: t.color.pineWash }]} />
-      <View style={[styles.wall, wall, { left: 0, top: 0, width: 1, height: size }]} />
-      <View style={[styles.wall, wall, { right: 0, top: 0, width: 1, height: size }]} />
-      <View style={[styles.wall, wall, { left: 0, bottom: 0, width: size, height: 1 }]} />
-      <View style={[styles.wall, wall, { left: 0, top: 0, width: jamb, height: 1 }]} />
-      <View style={[styles.wall, wall, { right: 0, top: 0, width: jamb, height: 1 }]} />
+      <View style={[styles.piece, face, { left: 0, top: 0, width: jamb, height: size }]} />
+      <View style={[styles.piece, face, { right: 0, top: 0, width: jamb, height: size }]} />
+      <View
+        style={[
+          styles.piece,
+          face,
+          { left: jamb, top: depth, width: size - 2 * jamb, height: size - depth },
+        ]}
+      />
       <Text
         style={[
           t.type.rowTitle,
           {
-            color: t.color.pine,
+            color: MONOGRAM_FACE.ink,
             fontSize: glyph,
             lineHeight: Math.round(glyph * 1.25),
           },
@@ -97,6 +113,5 @@ export function RoomMark({
 
 const styles = StyleSheet.create({
   center: { alignItems: 'center', justifyContent: 'center' },
-  fill: { position: 'absolute', left: 1, top: 1, right: 1, bottom: 1 },
-  wall: { position: 'absolute' },
+  piece: { position: 'absolute' },
 });

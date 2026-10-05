@@ -46,13 +46,13 @@ describe('the deck, by identity', () => {
 
   it('line 2 — what goes with it, and that you would come back as someone new', () => {
     expect(LOSS_COPY.lines[1]).toBe(
-      'What goes with it: your Tacendum ID, every conversation here, and the trust each person has pinned to you. To reach them again you would be someone new, and they would add you again.',
+      'What goes with it: your Tacendum ID, every room here, and the trust each person has pinned to you. To reach them again you would be someone new, and they would add you again.',
     );
   });
 
   it('line 3 — what an email brings back, in the scope the recovery deck states', () => {
     expect(LOSS_COPY.lines[2]).toBe(
-      'What an email brings back, if you have linked one: your account grouping, and being findable by that email. Never the key, never the messages, never the trust — everyone sees a fresh safety number.',
+      'What an email brings back, if you have linked one: which devices are yours, and being findable by that email. Never the key, never the messages, never the trust — everyone sees a fresh safety number.',
     );
   });
 
@@ -100,7 +100,17 @@ describe('every line agrees with the module that owns its truth', () => {
     // things only". This page must not add a third — a username clause was
     // drafted and CUT here for exactly that reason.
     expect(ACCOUNTS_COPY.recoverScope).toContain('two things only');
-    expect(ACCOUNTS_COPY.recoverScope).toContain('your account grouping');
+    // The first thing is named the way the site and both store listings name
+    // it ("which devices are yours"), never as a bare "your account": the key
+    // IS the account (RegisterScreen), and no recovery brings a key back.
+    expect(ACCOUNTS_COPY.recoverScope).toContain(
+      'two things only: which devices are yours, and your findability',
+    );
+    expect(LOSS_COPY.lines[2]).toContain(
+      'which devices are yours, and being findable by that email',
+    );
+    expect(ACCOUNTS_COPY.recoverScope).not.toMatch(/only: your account\b/);
+    expect(LOSS_COPY.lines[2]).not.toMatch(/one: your account\b/);
     expect(ACCOUNTS_COPY.recoverScope).toContain('your findability by email');
     expect(ACCOUNTS_COPY.recoverScope).not.toMatch(/username/i);
     expect(LOSS_COPY.lines[2]).not.toMatch(/username/i);

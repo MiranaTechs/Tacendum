@@ -384,7 +384,7 @@ function chip(tree: ReactTestRenderer.ReactTestRenderer, testID: string) {
 }
 
 describe('peer profile — the timer while blocked', () => {
-  test('blocked: every chip is disabled in its accessibilityState, drawn recessed and muted, and the reason is on screen', async () => {
+  test('blocked: every chip is disabled in its accessibilityState, drawn white with a gray edge and a muted label, and the reason is on screen', async () => {
     blockedAt.at = T0;
     const { StyleSheet } = jest.requireActual<typeof import('react-native')>(
       'react-native',
@@ -403,8 +403,10 @@ describe('peer profile — the timer while blocked', () => {
       const c = chip(tree, `peer-disappear-${option.seconds}`);
       expect(c.props.disabled).toBe(true);
       expect(c.props.accessibilityState.disabled).toBe(true);
+      // A locked chip is a row-like control, so it stays white: the gray edge,
+      // the muted label and the line below carry the state, never a fill.
       const style = StyleSheet.flatten(c.props.style({ pressed: false }));
-      expect(style.backgroundColor).toBe(theme.color.paperInset);
+      expect(style.backgroundColor).toBe(theme.color.paperSheet);
       expect(style.borderColor).toBe(theme.color.lineSoft);
       const label = c.findByType(Text);
       expect(StyleSheet.flatten(label.props.style).color).toBe(

@@ -1,16 +1,15 @@
 /**
- * The ID field's frame.
+ * The field's frame.
  *
- *  - the field does NOT take focus on entry — QR is the lead
- *    rail (§4), and a keyboard on entry covered the scanner, the photo door,
- *    Find by email and the person's own ID. And the keyboard's go key with
- *    nothing typed starts nothing and says nothing: the disabled button was
- *    designed to prevent "That's 0 of 26 characters", and the field's own
- *    submit used to produce it.
+ *  - the field does NOT take focus on entry — a keyboard on
+ *    entry would cover Scan and My ID. And the keyboard's go key with
+ *    nothing typed starts nothing and says nothing: "That's 0 of 26
+ *    characters" was the old disabled button's own promise broken.
  *  - the copy notice's timer is cleared on unmount.
- *  - the Start chat button is a floor with padding from the
- *    scale, never a fixed 112pt, and it drops under the field below
- *    layout.narrowWidth.
+ *  - the action never shares the field's row (restated in build 33), so
+ *    "never squeeze the field" holds by construction — the button is full
+ *    width under the field, and the only control inside the field's border
+ *    is its own clear button.
  *
  * Harness follows StartChat.qr.test.tsx: the fake op-sqlite stub records
  * every write, so a chat that was NOT started is provable. */
@@ -29,6 +28,8 @@ jest.mock('react-native-image-picker', () => ({
 }));
 
 const theme = themeTokens();
+
+const PROFILE_PEER = '01BX5ZZKBKACTAV9WEVGEMMVRZ';
 
 const sqlite = (
   jest.requireMock('@op-engineering/op-sqlite') as {
@@ -81,7 +82,7 @@ async function render(
       profile={PROFILE}
       onBack={jest.fn()}
       onOpenChat={jest.fn()}
-      onFindByEmail={jest.fn()}
+      onOpenAccountEmail={jest.fn()}
     />
   );
   let tree!: ReactTestRenderer.ReactTestRenderer;
@@ -98,20 +99,29 @@ async function render(
   return tree;
 }
 
-/** The field itself: the composite carrying onChangeText. */
+/** The field itself: the outermost node carrying onChangeText. */
 function field(tree: ReactTestRenderer.ReactTestRenderer) {
-  return tree.root.find(
+  return tree.root.findAll(
     n =>
       n.props.testID === 'new-peer-input' &&
       typeof n.props.onChangeText === 'function',
-  );
+  )[0]!;
 }
 
-/** The control itself: a Pressable's host View carries no `onPress`. */
+/** The control itself. Harness change for build 33: PrimaryButton,
+ * OutlineButton and TextAction put testID and onPress on the composite AND
+ * its Pressable, so the first match is taken rather than a `find`. */
 function control(tree: ReactTestRenderer.ReactTestRenderer, id: string) {
-  return tree.root.find(
+  return tree.root.findAll(
     n => n.props.testID === id && typeof n.props.onPress === 'function',
-  );
+  )[0]!;
+}
+
+/** Type a whole value in one change (a paste of an ID fills it grouped). */
+async function type(tree: ReactTestRenderer.ReactTestRenderer, text: string) {
+  await ReactTestRenderer.act(async () => {
+    field(tree).props.onChangeText(text);
+  });
 }
 
 function shownText(tree: ReactTestRenderer.ReactTestRenderer): string {
@@ -127,13 +137,13 @@ function shownText(tree: ReactTestRenderer.ReactTestRenderer): string {
 
 /** A host node's flattened style (the View under a composite). */
 function hostStyle(tree: ReactTestRenderer.ReactTestRenderer, id: string) {
-  const host = tree.root.find(
+  const host = tree.root.findAll(
     n => n.props.testID === id && typeof n.type === 'string',
-  );
+  )[0]!;
   return StyleSheet.flatten(host.props.style) as Record<string, unknown>;
 }
 
-test('the ID field does not take focus on entry — QR stays the lead rail', async () => {
+test('the field does not take focus on entry — the keyboard would cover Scan and My ID', async () => {
   const tree = await render();
   expect(field(tree).props.autoFocus).toBeFalsy();
 });
@@ -154,13 +164,13 @@ test('the copy notice’s timer is cleared on unmount', async () => {
   jest.spyOn(Clipboard, 'setString').mockImplementation(() => {});
   // The screen resolves `setTimeout`/`clearTimeout` on the global at call
   // time, so spies on the (fake) globals see its calls. The copy timer is
-  // the one armed for COPY_NOTICE_MS (3000); the notice's own announce
-  // effect arms another, which is why the count alone cannot be the pin.
+  // the one armed for the notice's 3000 ms; other effects arm their own,
+  // which is why the count alone cannot be the pin.
   const armed = jest.spyOn(globalThis, 'setTimeout');
   const cleared = jest.spyOn(globalThis, 'clearTimeout');
   const tree = await render();
 
-  // The own-ID block waits behind "Show my ID".
+  // Your own ID waits behind My ID; the timer is useTransientNotice's now.
   await ReactTestRenderer.act(async () => {
     control(tree, 'show-self-id').props.onPress();
   });
@@ -182,28 +192,46 @@ test('the copy notice’s timer is cleared on unmount', async () => {
   expect(cleared).toHaveBeenCalledWith(handle);
 });
 
-test('the Start chat button is a floor with scale padding, never a fixed 112pt', async () => {
+// Rewritten for build 33: the action no longer shares the field's row, so
+// the "floor, not a fixed width" rule becomes "full width under the field".
+test('Start chat is a full-width button under the field, never a fixed width', async () => {
   const tree = await render();
-  const button = control(tree, 'start-chat');
-  const style = StyleSheet.flatten(button.props.style({ pressed: false })) as {
-    width?: number;
-    minWidth?: number;
-    paddingHorizontal?: number;
+  await type(tree, PROFILE_PEER);
+  const style = hostStyle(tree, 'start-chat') as {
+    width?: number | string;
+    minHeight?: number;
   };
-  expect(style.width).toBeUndefined();
-  expect(style.minWidth).toBeGreaterThan(0);
-  expect(style.paddingHorizontal).toBe(theme.space.s6);
+  expect(style.width).toBe('100%');
+  expect(style.minHeight).toBe(theme.layout.buttonHeight);
 });
 
-test('below layout.narrowWidth the button drops under the field; above it they share a row', async () => {
-  const narrow = await render(theme.layout.narrowWidth);
-  expect(hostStyle(narrow, 'start-chat-panel').flexDirection).toBe('column');
-  const narrowButton = StyleSheet.flatten(
-    control(narrow, 'start-chat').props.style({ pressed: false }),
-  ) as { alignSelf?: string; marginLeft?: number };
-  expect(narrowButton.alignSelf).toBe('stretch');
-  expect(narrowButton.marginLeft).toBeUndefined();
-
-  const wide = await render(theme.layout.narrowWidth + 200);
-  expect(hostStyle(wide, 'start-chat-panel').flexDirection).toBe('row');
+// Rewritten for build 33 as an invariant: the clear button lives inside the
+// bordered field on purpose, and no action can ever squeeze the field.
+test('at and above layout.narrowWidth no action sits inside the field; its one button is Clear; Start chat comes after it', async () => {
+  for (const width of [theme.layout.narrowWidth, theme.layout.narrowWidth + 200]) {
+    const tree = await render(width);
+    await type(tree, PROFILE_PEER);
+    const box = tree.root.findAll(
+      n => n.props.testID === 'new-peer-field' && typeof n.type === 'string',
+    )[0]!;
+    const inside = box.findAll(n => typeof n.type === 'string');
+    expect(inside.some(n => n.props.testID === 'start-chat')).toBe(false);
+    expect(inside.some(n => n.props.testID === 'discovery-search')).toBe(false);
+    expect(
+      inside
+        .filter(n => n.props.accessibilityRole === 'button')
+        .map(n => n.props.testID),
+    ).toEqual(['new-peer-clear']);
+    const order = tree.root
+      .findAll(
+        n =>
+          typeof n.type === 'string' &&
+          (n.props.testID === 'new-peer-field' || n.props.testID === 'start-chat'),
+      )
+      .map(n => n.props.testID);
+    expect(order).toEqual(['new-peer-field', 'start-chat']);
+    await ReactTestRenderer.act(async () => {
+      tree.unmount();
+    });
+  }
 });

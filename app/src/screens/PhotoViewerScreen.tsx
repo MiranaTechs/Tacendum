@@ -400,8 +400,14 @@ export function PhotoViewerScreen({
     >
       {/* RN's StatusBar is a stack of mounted declarations: this one wins while
           the viewer is mounted and unmounting reverts to App.tsx's dark ink.
-          Without it the clock is black on a near-black ground. */}
-      <StatusBar barStyle="light-content" animated={false} />
+          Without it the clock is black on the black ground. Android also
+          paints the bar itself, so it takes the viewer's black too, rather
+          than leaving the app's white bar above a black photo. */}
+      <StatusBar
+        barStyle="light-content"
+        backgroundColor={t.color.mediaBlack}
+        animated={false}
+      />
 
       <Animated.View style={[styles.fill, dragStyle]}>
         <ScrollView
@@ -518,7 +524,7 @@ export function PhotoViewerScreen({
           onPress={close}
           accessibilityRole="button"
           accessibilityLabel="Close photo"
-          accessibilityHint="Returns to the conversation"
+          accessibilityHint="Returns to the room"
           testID="photo-close"
           style={styles.target}
         >

@@ -761,7 +761,7 @@ describe('find by username: the chip is shown and chosen, the typed handle rides
     await press(tree, 'discovery-search');
     expect(search).toHaveBeenCalledWith('Alice_7');
     const text = rendered(tree);
-    expect(text).toContain('Start a chat with Alice_7?');
+    expect(text).toContain('Open a room with Alice_7?');
     expect(text).toContain('This account answers on 2 devices.');
     expect(text).toContain(ACCOUNTS_USERNAME_COPY.findTofu);
     expect(ULID_RE.test(text)).toBe(false);

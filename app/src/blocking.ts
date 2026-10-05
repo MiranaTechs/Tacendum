@@ -272,8 +272,8 @@ export const BLOCK_EXPLAINER: string[] = [
   // SUBSTANCE divergence, so the Platform branch stays; only the noun is
   // token-rendered.
   Platform.OS === 'android'
-    ? `While they are blocked, this ${DEVICE_NOUN} sends them nothing: no replies, no delivery or read marks, no reactions, no calls. To them the chat looks like one where you stopped replying.`
-    : `While they are blocked, this ${DEVICE_NOUN} sends them nothing: no replies, no delivery or read marks, no reactions, no screenshot notices, no calls. To them the chat looks like one where you stopped replying.`,
+    ? `While they are blocked, this ${DEVICE_NOUN} sends them nothing: no replies, no delivery or read marks, no reactions, no calls. To them the room looks like one where you stopped replying.`
+    : `While they are blocked, this ${DEVICE_NOUN} sends them nothing: no replies, no delivery or read marks, no reactions, no screenshot notices, no calls. To them the room looks like one where you stopped replying.`,
 ];
 
 /**
@@ -299,7 +299,7 @@ export const BLOCK_COPY = {
   blockedTitle: 'You blocked this person.',
   blockedBody:
     'Their messages arrive here and are discarded. They are not saved, and they will not appear if you unblock.',
-  blockedQuiet: 'Nothing is sent to them from this chat.',
+  blockedQuiet: 'Nothing is sent to them from this room.',
   unblock: 'Unblock',
   /** Replaces the timestamp in the chat list row. */
   rowStatus: 'Blocked',
@@ -311,7 +311,7 @@ export const BLOCK_COPY = {
    * surface left to reverse it.
    */
   drawerBlockedNote:
-    'Unblock first if you want to delete this conversation — deleting it here would take the only way back with it.',
+    'Unblock first if you want to delete this room — deleting it here would take the only way back with it.',
   /** Said when the composer is replaced by the banner; nothing else announces that. */
   bannerAnnounce: `The composer is closed. You blocked this person on this ${DEVICE_NOUN}.`,
   blockedAnnounce: `Blocked. Their messages will be discarded on this ${DEVICE_NOUN}.`,
