@@ -1555,6 +1555,81 @@ export const UsernameEligibilityResponse = z
 export type UsernameEligibilityResponse = z.infer<typeof UsernameEligibilityResponse>;
 
 /**
+ * GET /v1/identifiers/state (token path; fix/username-discovery, 2026-10-08
+ * — approved by recommendation): the
+ * authenticated caller's OWN account-group facts. A linked sibling device, a
+ * reinstalled phone or a recovered account cannot learn these from its local
+ * rows — the server never echoes a name (§4.9) and identifier
+ * rows do not sync between siblings — so without this read the app showed
+ * the claim form, the attach form and the own-name refusals on every device
+ * but the one that acted.
+ *
+ * A NEW route, deliberately, rather than one more field on the eligibility
+ * read above: `UsernameEligibilityResponse` is parsed `.strict()` by builds
+ * 31-33 with no OTA path, so any new field THERE disables username claim
+ * and search fleet-wide the day the server deploys. That shape stays
+ * byte-identical (a recorded ruling); this one carries the facts.
+ *
+ * Nothing about another party travels here — no name, no identifier, no
+ * target, no refusal reason — only the caller's own group:
+ *  - `hasVerifiedIdentifier`: the possession proof claim and username lookup
+ *    need (the eligibility read's exact boolean: email OR phone linked).
+ *  - `emailLinked` / `phoneLinked`: whether the group holds a verified claim
+ *    of that class (the attach form is wrong on a sibling when it does).
+ *  - `holdsUsername`: whether the group holds a username ref (the claim form
+ *    is wrong when it does; a local row is a phantom when it does not).
+ *  - `usernameCooldownUntil`: the §4.8 rename/unlink cool-down's end, or
+ *    `null` when no window is running. UNIT: UNIX EPOCH SECONDS — the group
+ *    row stores `usernameRenamedAt` in whole seconds (`Math.floor(now /
+ *    1000)`, the same number the rename and claim conditions compare), and
+ *    the wire carries `usernameRenamedAt + USERNAME_RENAME_COOLDOWN_SECONDS`
+ *    in that same unit; the app converts to its millisecond clock exactly
+ *    once, at the module boundary. Since the 2026-10-08 gate pass the
+ *    window is the LATER of the group's stamp and the caller's own user-row
+ *    stamp (a dissolving unlink carries the stamp onto the member, so the
+ *    30-day rule survives the group — the gate pass's ruling).
+ *  - `usernameSince` / `emailSince` (2026-10-08 gate pass, taken by
+ *    recommendation): the UNIX SECONDS at which the LIVE claim row of that
+ *    class was written (`createdAt` of the username row — a rename or a
+ *    take-back writes a new row; `verifiedAt` of the email row), or `null`
+ *    when the group holds none. A device whose local row predates the live
+ *    row holds a PHANTOM — a sibling renamed the account or replaced the
+ *    address — and `holdsUsername`/`emailLinked` alone cannot say so (both
+ *    stay true). A stamp, never a name: nothing about the row's content.
+ *  - `usernameFindable`: the held name's own consent bit as the server holds
+ *    it (the §4.6 bit the claim or the last toggle sent), or `null` when no
+ *    name is held — so a sibling's rename form starts at the CURRENT
+ *    findability instead of flipping an unfindable name findable by a
+ *    default it could not see. The toggle's 204 stays uniform; this is a
+ *    read of the caller's own account, not a receipt for any write.
+ *  - `emailFindable` (2026-10-08 proof pass, taken by recommendation): the
+ *    linked email's consent bit the same way, or `null` when the group
+ *    holds no email — so a sibling's Email screen can SHOW findability by
+ *    email and move it (the consent write is group-keyed), instead of
+ *    "switched from the device that linked it": a lost, reinstalled or
+ *    recovered linking device left no device able to switch it. A bit,
+ *    never the address.
+ * `.strict()`: a rider field is malformed on the client (a ServerAheadError,
+ * never silently stripped), so a widened answer needs a client that reads
+ * it shipped FIRST. (These four landed before the route ever shipped: no
+ * client parses the five-key shape, so no deploy ordering changes.)
+ */
+export const IdentifierStateResponse = z
+  .object({
+    hasVerifiedIdentifier: z.boolean(),
+    emailLinked: z.boolean(),
+    phoneLinked: z.boolean(),
+    holdsUsername: z.boolean(),
+    usernameCooldownUntil: z.number().int().nullable(),
+    usernameSince: z.number().int().nullable(),
+    emailSince: z.number().int().nullable(),
+    usernameFindable: z.boolean().nullable(),
+    emailFindable: z.boolean().nullable(),
+  })
+  .strict();
+export type IdentifierStateResponse = z.infer<typeof IdentifierStateResponse>;
+
+/**
  * POST /v1/identifiers/username/unlink (token path):
  * the per-class twin of the email/phone unlink, whose routes carry no body —
  * this schema PINS that emptiness (`.strict()` on the empty object: any key

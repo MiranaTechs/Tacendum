@@ -32,6 +32,7 @@ import { ACCOUNTS_USERNAME_COPY } from '../src/accountsUsernameCopy';
 import * as db from '../src/db';
 import { spellId } from '../src/person';
 import { StartChatScreen } from '../src/screens/StartChatScreen';
+import { resetLookupPacing } from '../src/screens/startChat/useReachLookup';
 import { themeTokens } from '../src/theme';
 import { PaneWidthProvider } from '../src/windowClass';
 
@@ -85,6 +86,22 @@ const VERIFIED: db.AccountIdentifierRow = {
   restoredAt: null,
 };
 
+/** The caller-owned state read's "eligible" (fix/username-discovery,
+ * 2026-10-08): the username preflight reads this, never the uncached legacy
+ * eligibility read. */
+const STATE_ELIGIBLE: accountsUsername.IdentifierState = {
+  source: 'state',
+  eligibility: 'eligible',
+  holdsUsername: false,
+  emailLinked: true,
+  phoneLinked: false,
+  cooldownUntil: null,
+  usernameSince: null,
+  emailSince: null,
+  usernameFindable: null,
+  emailFindable: null,
+};
+
 const REAL_OS = Platform.OS;
 function setPlatform(os: string): void {
   Object.defineProperty(Platform, 'OS', { value: os, configurable: true });
@@ -109,6 +126,11 @@ beforeEach(async () => {
   sqlite.reset();
   db.setWorkspace('real');
   await db.initDb();
+  // The state read keeps a landed answer for a moment: never across tests.
+  accountsUsername.invalidateIdentifierState();
+  // The lookup ledger is the DEVICE's, per process (the gate pass): every
+  // test starts its day and minute empty.
+  resetLookupPacing();
 });
 
 afterEach(async () => {
@@ -320,8 +342,8 @@ describe('your own ID, email or name is caught before anything is sent', () => {
       .spyOn(db, 'loadUsernameIdentifier')
       .mockResolvedValue({ username: 'alice_7', claimedAt: 1, discoverable: true });
     const eligibility = jest
-      .spyOn(accountsUsername, 'getUsernameEligibility')
-      .mockResolvedValue('eligible');
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValue(STATE_ELIGIBLE);
     const byName = jest
       .spyOn(accountsUsername, 'discoverySearchByUsername')
       .mockResolvedValue({ outcome: 'no_match' });
@@ -413,8 +435,8 @@ describe('your own ID, email or name is caught before anything is sent', () => {
     const named = deferred<db.UsernameIdentifierRow | null>();
     jest.spyOn(db, 'loadUsernameIdentifier').mockReturnValueOnce(named.promise);
     const eligibility = jest
-      .spyOn(accountsUsername, 'getUsernameEligibility')
-      .mockResolvedValue('eligible');
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValue(STATE_ELIGIBLE);
     const byName = jest
       .spyOn(accountsUsername, 'discoverySearchByUsername')
       .mockResolvedValue({ outcome: 'no_match' });
@@ -493,8 +515,8 @@ describe('the field says what it was given before anything happens', () => {
 
   test('@Alice_7 and Find: the preflight first, then the lookup with the sigil dropped', async () => {
     const eligibility = jest
-      .spyOn(accountsUsername, 'getUsernameEligibility')
-      .mockResolvedValue('eligible');
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValue(STATE_ELIGIBLE);
     const byName = jest
       .spyOn(accountsUsername, 'discoverySearchByUsername')
       .mockResolvedValue({ outcome: 'no_match' });
@@ -572,8 +594,8 @@ describe('invariants: no lookup while typing, for yourself, or for malformed inp
       .spyOn(accounts, 'discoverySearch')
       .mockResolvedValue({ outcome: 'no_match' });
     const eligibility = jest
-      .spyOn(accountsUsername, 'getUsernameEligibility')
-      .mockResolvedValue('eligible');
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValue(STATE_ELIGIBLE);
     const byName = jest
       .spyOn(accountsUsername, 'discoverySearchByUsername')
       .mockResolvedValue({ outcome: 'no_match' });
@@ -600,8 +622,8 @@ describe('invariants: no lookup while typing, for yourself, or for malformed inp
       .spyOn(accounts, 'discoverySearch')
       .mockResolvedValue({ outcome: 'no_match' });
     const eligibility = jest
-      .spyOn(accountsUsername, 'getUsernameEligibility')
-      .mockResolvedValue('eligible');
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValue(STATE_ELIGIBLE);
     const byName = jest
       .spyOn(accountsUsername, 'discoverySearchByUsername')
       .mockResolvedValue({ outcome: 'no_match' });
@@ -760,8 +782,8 @@ describe('an action appears only when its press can succeed', () => {
 
   test('a malformed username shows the rule under the field, offers no Find, and the go key refuses it with no call', async () => {
     const eligibility = jest
-      .spyOn(accountsUsername, 'getUsernameEligibility')
-      .mockResolvedValue('eligible');
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValue(STATE_ELIGIBLE);
     const byName = jest
       .spyOn(accountsUsername, 'discoverySearchByUsername')
       .mockResolvedValue({ outcome: 'no_match' });
@@ -784,8 +806,8 @@ describe('an action appears only when its press can succeed', () => {
   });
 
   test('Find says what it is doing: Checking… during the preflight, Finding… during the lookup, busy throughout', async () => {
-    const preflight = deferred<accountsUsername.UsernameEligibilityOutcome>();
-    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockReturnValue(preflight.promise);
+    const preflight = deferred<accountsUsername.IdentifierState>();
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockReturnValue(preflight.promise);
     const lookup = deferred<Awaited<ReturnType<typeof accountsUsername.discoverySearchByUsername>>>();
     jest.spyOn(accountsUsername, 'discoverySearchByUsername').mockReturnValue(lookup.promise);
     const tree = await render();
@@ -797,7 +819,7 @@ describe('an action appears only when its press can succeed', () => {
     expect(checking.props.accessibilityState).toEqual({ disabled: true, busy: true });
 
     await ReactTestRenderer.act(async () => {
-      preflight.resolve('eligible');
+      preflight.resolve(STATE_ELIGIBLE);
     });
     const finding = hosts(tree, 'discovery-search')[0]!;
     expect(textIn(finding)).toBe('Finding…');
@@ -856,7 +878,12 @@ describe('the settle before letter-led or unknown text is named', () => {
     expect(kind(tree)).toBeNull();
     expect(has(tree, 'discovery-search')).toBe(false);
     await blur(tree);
-    expect(kind(tree)).toBe(ACCOUNTS_USERNAME_COPY.startChatUnknown);
+    // RE-CUT (D7, fix/username-discovery 2026-10-08): a dotted name is the
+    // username kind with the rule under it and nothing to find — it used to
+    // be "Not an ID, username or email yet", with no hint about the dot.
+    expect(kind(tree)).toBe('Username');
+    expect(messageOf(tree, 'reach-status')).toBe(ACCOUNTS_USERNAME_COPY.startChatHandleRule);
+    expect(has(tree, 'discovery-search')).toBe(false);
   });
 
   test('@-led text is a username at once', async () => {

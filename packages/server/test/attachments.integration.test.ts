@@ -7,9 +7,17 @@ import { makeS3Attachments, makeS3Client, readS3Config } from '../src/storage.js
  * presigned PUT/GET pair the app uses, plus proof that the signed
  * Content-Length actually rejects a different-sized upload. Skips when MinIO
  * is unreachable (same posture as the DynamoDB Local integration suites).
+ *
+ * The store is read from the environment, exactly as the DynamoDB suites
+ * read DDB_ENDPOINT: unset, S3_ENDPOINT is the compose MinIO on
+ * localhost:9000; set, it is whatever MinIO a verification stood up on a
+ * free port. The old `readS3Config({})` pinned localhost:9000 no matter what
+ * was set, and on a Mac running Herd that port is php-fpm — so under
+ * TACENDUM_REQUIRE_DDB=1 this file failed as a whole even with a reachable
+ * throwaway MinIO beside the throwaway DynamoDB Local (2026-10-08 verify).
  */
 
-const config = readS3Config({});
+const config = readS3Config();
 const store = makeS3Attachments(makeS3Client(config), config.bucket);
 
 let available = false;

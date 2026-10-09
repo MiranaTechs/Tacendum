@@ -184,6 +184,26 @@ describe('the scan side says what actually failed', () => {
     await press(tree, 'link-scan-camera');
     await press(tree, 'link-confirm-code');
     expect(errorAt(tree, 'link-failed')).toBe(LINKING_COPY.refused);
+    // The way back names the real order (the proof pass, 2026-10-08): the
+    // ceremony starts HERE, by scanning the new device's code.
+    expect(LINKING_COPY.refused).toContain('scan it from here');
+    expect(LINKING_COPY.refused).not.toContain('start again from the new device');
+    expect(LINKING_COPY.expired).toContain('scan it from here');
+  });
+
+  it('the link-offer budget’s 429 is its own sentence, never "expired or taken" (the proof pass, 2026-10-08)', async () => {
+    jest.spyOn(qr, 'readIdFromCamera').mockResolvedValue(OTHER);
+    jest.spyOn(OffererCeremony, 'begin').mockResolvedValue(
+      fakeCeremony({
+        confirm: jest.fn().mockRejectedValue(new ApiRequestError('rate limited', 429, 'rate_limited')),
+      }),
+    );
+    const tree = await render();
+    await press(tree, 'link-scan-camera');
+    await press(tree, 'link-confirm-code');
+    expect(errorAt(tree, 'link-failed')).toBe(LINKING_COPY.rateLimited);
+    expect(LINKING_COPY.rateLimited).toMatch(/too many link attempts/i);
+    expect(LINKING_COPY.rateLimited).not.toContain('expired');
   });
 });
 

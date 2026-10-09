@@ -148,6 +148,9 @@ const USERNAME_TOKEN_ROUTES = [
   'POST /v1/identifiers/username/unlink',
   'POST /v1/identifiers/username/discoverable',
   'GET /v1/identifiers/username/eligibility',
+  // The caller-owned state read (2026-10-08): the same wrapper, the same
+  // collapse, on HttpFn beside the eligibility read.
+  'GET /v1/identifiers/state',
 ];
 /** Which deployed host serves a route key — the chooser every loop below
  * uses, so a route added to the wrong table here fails its parity case. */
@@ -610,6 +613,38 @@ describe('flag ON: the REAL handlers answer behind the AWS dispatch (not a mount
       expect(offAgain.statusCode).toBe(403); // the lookup collapses the alien shape
     } finally {
       db.setAccountsFeatureEnabled(false);
+    }
+  });
+});
+
+describe('the caller-owned state read reaches ITS OWN handler through the REAL AWS dispatch (2026-10-08 — the field report\'s sibling fix)', () => {
+  it('GET /v1/identifiers/state answers the eight strict keys for the bearer\'s OWN group and nothing else (five at birth, the three caller-own facts of the 2026-10-08 gate pass after), the eligibility key beside it keeps its ONE key (builds 31-33), and a bearer-less read is the ordinary 401 once both flags are on', async () => {
+    db.setAccountsFeatureEnabled(true);
+    db.setAccountsUsernameFeatureEnabled(true);
+    try {
+      const who = await seedUser();
+      const read = async (routeKey: string, token?: string): Promise<LambdaResponse> =>
+        invokeHttp(
+          httpEvent({
+            routeKey,
+            ...(token !== undefined ? { headers: { authorization: `Bearer ${token}` } } : {}),
+          }),
+        );
+      const state = await read('GET /v1/identifiers/state', who.token);
+      expect(state.statusCode).toBe(200);
+      expect(state.body).toBe(
+        '{"hasVerifiedIdentifier":false,"emailLinked":false,"phoneLinked":false,"holdsUsername":false,"usernameCooldownUntil":null,"usernameSince":null,"emailSince":null,"usernameFindable":null,"emailFindable":null}',
+      );
+      const eligibility = await read('GET /v1/identifiers/username/eligibility', who.token);
+      expect(eligibility.statusCode).toBe(200);
+      expect(eligibility.body).toBe('{"hasVerifiedIdentifier":false}');
+      // Two keys, two handlers: the state read's body is not the
+      // eligibility read's, and vice versa.
+      expect(state.body).not.toBe(eligibility.body);
+      expect((await read('GET /v1/identifiers/state')).statusCode).toBe(401);
+    } finally {
+      db.setAccountsFeatureEnabled(false);
+      db.setAccountsUsernameFeatureEnabled(false);
     }
   });
 });

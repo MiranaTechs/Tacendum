@@ -91,6 +91,10 @@ function readError(error: unknown, source: ScanSource): string | null {
  * accounts module's `isRefusal` line, drawn here. */
 function ceremonyError(error: unknown): string {
   if (error instanceof NoVerificationCodeError) return LINKING_COPY.noCode;
+  // The link-offer budget's 429 is the one self-keyed refusal the server
+  // tells apart (the proof pass, 2026-10-08): it discloses only this
+  // device's own spend, so the sentence may name it.
+  if (error instanceof ApiRequestError && error.status === 429) return LINKING_COPY.rateLimited;
   if (error instanceof ApiRequestError) return LINKING_COPY.refused;
   return LINKING_COPY.transportFailed;
 }
@@ -312,8 +316,11 @@ export function LinkDeviceScreen({
 
         {phase.name === 'linked' && (
           <>
+            {/* THIS device offered: it keeps its history; the NEW device is
+                the one that starts from today (the proof pass — the pinned
+                acceptor sentence described the wrong device here). */}
             <Text style={[t.type.body, { color: t.color.inkStrong }]} testID="link-done">
-              Linked. {LINKING_COPY.historyStance}
+              {LINKING_COPY.linkedOfferer}
             </Text>
             <PrimaryButton label="Done" testID="link-done-button" onPress={onDone} />
           </>

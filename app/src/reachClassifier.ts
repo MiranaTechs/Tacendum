@@ -30,10 +30,19 @@ import {
  *     long address used to make up an ID out of its letters;
  *  3. a leading `@` is a handle;
  *  4. an ID is judged on the RAW text (`fold` maps O to 0, so "oliver" would
- *     otherwise read as 011VER…), and an unbroken run of more than 26 ID
- *     characters is TOO LONG, never trimmed: one extra character at the start
- *     or in the middle is somebody else's ID;
- *  5. a letter-led word is a handle, and anything else is unknown.
+ *     otherwise read as 011VER…), an o-, i- or l-led run of 26 reads as an
+ *     ID only when at least one of ITS raw characters is a digit (a minted
+ *     ID always carries several; a 26-letter name used to read as one), and
+ *     an unbroken run of more than 26 ID characters is TOO LONG, never
+ *     trimmed: one extra character at the start or in the middle is
+ *     somebody else's ID;
+ *  5. a letter-led word is a handle — so is one with a hyphen, a dot or a
+ *     sentence's punctuation in it, with nothing to find, so the shape rule
+ *     can show — and anything else is unknown.
+ *
+ * A sentence's punctuation after an ADDRESS ("alice@example.com.") is not
+ * part of it, exactly as the paste reader below has always read it. It is
+ * never stripped from a handle: that class is refused, never repaired.
  */
 
 /** Who "you" are on this device, for the "That's you" check. */
@@ -66,8 +75,16 @@ export interface ClassifyOptions {
 const GROUPING = /[\s\-_.,:;/|()[\]]/g;
 const LEADING_GROUPING = /^[\s\-_.,:;/|()[\]]+/;
 const MAILTO = /^mailto:/i;
-/** A handle as typed: a letter, then letters, digits or underscores. */
-const HANDLE_WORD = /^[A-Za-z][A-Za-z0-9_]*$/;
+/** A handle as typed, or nearly one: a letter, then letters, digits and
+ * underscores — plus the hyphens and dots people put in names and the
+ * punctuation a sentence leaves at the end ("alice-smith", "alice.smith",
+ * "alice,"). The injected validator decides what can be found; the rest is
+ * named as the class with nothing to find, so the rule shows. */
+const HANDLE_LIKE = /^[A-Za-z][A-Za-z0-9_.-]*[.,;:!?]*$/;
+/** What a sentence leaves after an address. */
+const TRAILING_PUNCTUATION = /[.,;:!?]+$/;
+/** The folded alphabet, one character at a time. */
+const ALPHABET_CHAR = /^[0-9A-HJKMNP-TV-Z]$/;
 /** The brackets and quotes a link travels in: "<https://…>", "(https://…)",
  * "\"https://…\"", Markdown's "[text](https://…)", an HTML href="…". */
 const WRAPPERS = /[<>()[\]{}"'`]+/;
@@ -89,6 +106,21 @@ function compactLength(text: string): number {
 
 function emailValid(label: string): boolean {
   return EmailIdentifier.safeParse(normalizeEmailIdentifier(label)).success;
+}
+
+/**
+ * The raw characters behind a folded ID: the slice at the run's own index
+ * (`fold` is length-preserving), or, for an ID typed in groups, every raw
+ * character that survives the fold's alphabet — when `extractId` found the
+ * ID that way, those characters ARE the ID. Digits are judged here because
+ * the fold MAKES digits out of O, I and L: a raw run with none is a name.
+ */
+function rawBehind(text: string, id: string): string {
+  const at = fold(text).indexOf(id);
+  if (at >= 0) return text.slice(at, at + id.length);
+  return Array.from(text)
+    .filter(ch => ALPHABET_CHAR.test(fold(ch)))
+    .join('');
 }
 
 /**
@@ -133,9 +165,10 @@ export function classifyReach(raw: string, mine: SelfKeys, opts: ClassifyOptions
   // not a link; "ID:<id>" with no space is, like any scheme glued to an ID.
   if (isLink(text)) return { kind: 'unknown' };
 
-  // 2. An email: an @ that is not the first character.
+  // 2. An email: an @ that is not the first character. A sentence's
+  // punctuation after the address is not part of it.
   if (text.indexOf('@') > 0) {
-    const label = text.replace(MAILTO, '');
+    const label = text.replace(MAILTO, '').replace(TRAILING_PUNCTUATION, '');
     const valid = emailValid(label);
     return {
       kind: 'email',
@@ -152,14 +185,19 @@ export function classifyReach(raw: string, mine: SelfKeys, opts: ClassifyOptions
   }
 
   // 4. An ID: digit-led in the RAW text, or a 0-7-led ID whose run is
-  // exactly 26 (so "O1BX…" typed with the letter O reads once it is whole,
-  // and no name of 27 to 32 letters ever reads as an over-long ID).
+  // exactly 26 AND carries a raw digit (so "O1BX…" typed with the letter O
+  // reads once it is whole, no 26-letter name ever reads as an ID, and no
+  // name of 27 to 32 letters ever reads as an over-long ID).
   const attempt = idAttempt(text);
   const firstCharacter = attempt.replace(LEADING_GROUPING, '').charAt(0);
   const digitLed = /[0-9]/.test(firstCharacter);
   const run = longestRun(attempt);
   const whole = extractId(text);
-  const wholeOk = whole !== null && /^[0-7]/.test(whole) && run === 26;
+  const wholeOk =
+    whole !== null &&
+    /^[0-7]/.test(whole) &&
+    run === 26 &&
+    /[0-9]/.test(rawBehind(text, whole));
   if (digitLed || wholeOk) {
     if (run > 26) {
       return {
@@ -180,8 +218,9 @@ export function classifyReach(raw: string, mine: SelfKeys, opts: ClassifyOptions
     };
   }
 
-  // 5. A letter-led word is a handle, when that class is live.
-  if (opts.handleShape !== null && HANDLE_WORD.test(text)) {
+  // 5. A letter-led word is a handle, when that class is live — a hyphen, a
+  // dot or trailing punctuation included, as the class with nothing to find.
+  if (opts.handleShape !== null && HANDLE_LIKE.test(text)) {
     return handleReach(text, opts.handleShape, mine);
   }
 

@@ -27,6 +27,10 @@ import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
 import App from '../App';
 import { ACCOUNTS_COPY } from '../src/accountsCopy';
+import * as accountsUsername from '../src/accountsUsername';
+import { ACCOUNTS_USERNAME_COPY } from '../src/accountsUsernameCopy';
+import * as api from '../src/api';
+import * as db from '../src/db';
 import { LINKING_COPY } from '../src/linkingCopy';
 import { SettingsScreen } from '../src/screens/SettingsScreen';
 
@@ -157,5 +161,42 @@ describe('Settings → ACCOUNT (App wiring)', () => {
       });
       expect(devRoute()).toBe(name);
     }
+  });
+});
+
+// --- V1 (fix/username-discovery, 2026-10-08): the Account lead is a fact ----
+
+/**
+ * V1: Settings > Account opened with "Verify an email address to set a
+ * username or search for people by username." for EVERY account, verified
+ * ones included — on the reporter's phone it read as an unfinished setup
+ * step, on the sibling iPad as the app having lost the verification. The
+ * screen reads no row and no eligibility there (and must not: the local
+ * rows are empty on a sibling), so the lead has to be true in every state.
+ */
+describe('Settings → ACCOUNT lead (V1)', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('is a fact true in every state — no instruction to verify, and no row or network read behind it', async () => {
+    const rows = jest.spyOn(db, 'loadAccountIdentifier');
+    const state = jest.spyOn(accountsUsername, 'getIdentifierState');
+    const legacy = jest.spyOn(accountsUsername, 'getUsernameEligibility');
+    const wire = jest.spyOn(api, 'apiIdentifierState');
+    const tree = await renderSettings({});
+    await enterAccount(tree);
+    const lead = tree.root.findByProps({ testID: 'settings-account-verification-note' });
+    const text = JSON.stringify(lead.props.children);
+    expect(text).toContain(ACCOUNTS_USERNAME_COPY.verificationSummary);
+    expect(ACCOUNTS_USERNAME_COPY.verificationSummary).toBe(
+      'Usernames and username search need a verified email on the account. Rooms and calls by Tacendum ID or QR code need none.',
+    );
+    expect(text).not.toContain('Verify an email address to');
+    expect(text.toLowerCase()).not.toMatch(/^"verify/);
+    // The second fact now rides the lead: the old separate line is gone.
+    expect(tree.root.findAllByProps({ testID: 'settings-account-without-verification' })).toHaveLength(0);
+    for (const spy of [rows, state, legacy, wire]) expect(spy).not.toHaveBeenCalled();
+    await ReactTestRenderer.act(async () => {
+      tree.unmount();
+    });
   });
 });

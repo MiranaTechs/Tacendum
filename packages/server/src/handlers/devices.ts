@@ -196,9 +196,6 @@ export const linkOfferInitHandler: AuthedHandler = async (event, deps, auth) => 
   let rosterEpoch: number;
   let declaredOffererClass: typeof offererClass = undefined;
   if (offerer.groupId !== undefined) {
-    // Grouped offerer: the roster knows its class; declaring one is a
-    // malformed ceremony, refused rather than ignored.
-    if (offererClass !== undefined) return accountsRefusal();
     const group = await deps.db.getAccountGroup(offerer.groupId);
     if (!group) return accountsRefusal();
     // The offerer must appear in the AUTHORITATIVE roster: a user row still naming a groupId is a pointer, never
@@ -206,7 +203,16 @@ export const linkOfferInitHandler: AuthedHandler = async (event, deps, auth) => 
     // a group it left, at the group's CURRENT epoch, which the accept-time
     // epoch pin would then happily admit. Precheck arm; the racing half is
     // the link transaction's own `contains(memberIds,:off)` condition.
-    if (!group.members.some((m) => m.userId === auth.userId)) return accountsRefusal();
+    const self = group.members.find((m) => m.userId === auth.userId);
+    if (!self) return accountsRefusal();
+    // Grouped offerer: the roster knows its class. A declared class that
+    // AGREES with the roster is ignored (field report 2026-10-08, S2 —
+    // the §3 lazy-solo founder whose email attach minted its group never
+    // learned the groupId, so builds 31-33 declare their class on every
+    // offer and were refused here, which made an email-first account unable
+    // to link at all); a declared class the roster does NOT hold for this
+    // member is still a malformed ceremony, refused rather than repaired.
+    if (offererClass !== undefined && offererClass !== self.class) return accountsRefusal();
     groupId = offerer.groupId;
     rosterEpoch = group.epoch;
   } else {

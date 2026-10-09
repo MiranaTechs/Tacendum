@@ -144,7 +144,9 @@ describe('the restored-placeholder marker rides the identifier row', () => {
     expect(writes[0]![0]).toMatch(/restoredAt/);
     // The row leads with its CLASS (one row per kind — the
     // per-class migration): the email accessor writes the email row.
-    expect(writes[0]![1]).toEqual(['email', 'a@b.co', 5, 0, null, null, 9]);
+    // …and, since the proof pass (2026-10-08), the server-stamp column
+    // (`serverSince`) as the eighth — null here, no stamp adopted yet.
+    expect(writes[0]![1]).toEqual(['email', 'a@b.co', 5, 0, null, null, 9, null]);
   });
 
   it('a fresh file is born per-class with restoredAt; an earlier-era file REBUILDS with the row carried', async () => {

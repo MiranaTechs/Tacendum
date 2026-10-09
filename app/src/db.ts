@@ -2067,7 +2067,8 @@ export async function initSchema(d: Handle): Promise<void> {
       discoverable INTEGER NOT NULL DEFAULT 0,
       pendingValue TEXT,
       pendingRequestedAt INTEGER,
-      restoredAt INTEGER
+      restoredAt INTEGER,
+      serverSince INTEGER
     )`);
   // THE PER-CLASS REBUILD MIGRATION (the chats-table discipline:
   // PRAGMA-detect the old shape, then rebuild CARRYING the data; the bare
@@ -2160,6 +2161,21 @@ export async function initSchema(d: Handle): Promise<void> {
       throw error;
     }
   }
+  // THE SERVER-STAMP COLUMN (the proof pass, 2026-10-08): `serverSince` is
+  // the server's own birth stamp of the live row this device wrote (the
+  // state route's `usernameSince` / `emailSince`, read back right after the
+  // write), so a later read tells this row from a sibling's by EXACT
+  // equality instead of comparing two clocks. An older file (and the two
+  // rebuilds above, which carry the columns they know) lacks it: added in
+  // place — NULL means "no stamp", and the skew rule governs that row.
+  const accountIdentifierColsNow = (
+    (await d.execute(`PRAGMA table_info(account_identifier)`)).rows as {
+      name: string;
+    }[]
+  ).map(c => c.name);
+  if (!accountIdentifierColsNow.includes('serverSince')) {
+    await d.execute(`ALTER TABLE account_identifier ADD COLUMN serverSince INTEGER`);
+  }
   // A recovery THIS device started: the groupId + completesAt the
   // verify leg answered, held so the pending state survives a relaunch and
   // completion can name the group. Deleted on completion or abandonment.
@@ -2245,6 +2261,20 @@ export async function initSchema(d: Handle): Promise<void> {
       key TEXT PRIMARY KEY CHECK (key = 'unlink'),
       username TEXT NOT NULL,
       unlinkedAt INTEGER NOT NULL
+    )`);
+  // The end of the username cool-down THIS device started (§4.8,
+  // 2026-10-08 — U2): a rename stamps the
+  // server's 30-day window exactly as an unlink does, and the refusal of
+  // the next change is the reasonless 403 by design, so the device keeps
+  // the window's end for EVERY verb that stamps it, not only the unlink.
+  // One row, latest wins; kept by a take-back (the server's window runs
+  // on), cleared by a claim that lands with no window running. The state
+  // route carries the same fact for siblings and reinstalls; this row is
+  // the offline fallback. Rendered only under USERNAME_UI_ENABLED.
+  await d.execute(`
+    CREATE TABLE IF NOT EXISTS username_cooldown (
+      key TEXT PRIMARY KEY CHECK (key = 'cooldown'),
+      until INTEGER NOT NULL
     )`);
   // Per-PAIR verification match records (the design row
   // 26b): a matched/mismatch stamp per peer DEVICE, beside the chat-level
@@ -2458,6 +2488,8 @@ export const DB_TABLES = [
   // unlink memory (build 24) names the former name itself.
   'username_notice',
   'username_unlink',
+  // The window's end names when this account last changed its name (U2).
+  'username_cooldown',
   'peer_device_safety',
 ] as const;
 
@@ -8831,6 +8863,13 @@ export interface AccountIdentifierRow {
    * so `discoverable` here is a placeholder, not a decision. The owner's
    * first toggle records a real decision and clears this mark. */
   restoredAt: number | null;
+  /** The server's own birth stamp of the live email row this device wrote
+   * (the state route's `emailSince`, ms on this device's scale, read back
+   * right after the attach landed — the proof pass, 2026-10-08): the row is
+   * a phantom when the account's live stamp differs from it, exactly. Null
+   * or absent: no stamp (an older row, or the read-back did not land), and
+   * the clock-skew rule governs instead. */
+  since?: number | null;
 }
 
 /** One per-class row as the store holds it, raw. */
@@ -8841,13 +8880,14 @@ interface IdentifierClassRow {
   pendingValue: string | null;
   pendingRequestedAt: number | null;
   restoredAt: number | null;
+  serverSince: number | null;
 }
 
 async function loadIdentifierClassRow(
   kind: IdentifierKind,
 ): Promise<IdentifierClassRow | null> {
   const res = await conn().execute(
-    `SELECT value, verifiedAt, discoverable, pendingValue, pendingRequestedAt, restoredAt
+    `SELECT value, verifiedAt, discoverable, pendingValue, pendingRequestedAt, restoredAt, serverSince
      FROM account_identifier WHERE kind = ?`,
     [kind],
   );
@@ -8860,9 +8900,9 @@ async function saveIdentifierClassRow(
 ): Promise<void> {
   await conn().execute(
     `INSERT OR REPLACE INTO account_identifier
-     (kind, value, verifiedAt, discoverable, pendingValue, pendingRequestedAt, restoredAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [kind, row.value, row.verifiedAt, row.discoverable, row.pendingValue, row.pendingRequestedAt, row.restoredAt],
+     (kind, value, verifiedAt, discoverable, pendingValue, pendingRequestedAt, restoredAt, serverSince)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [kind, row.value, row.verifiedAt, row.discoverable, row.pendingValue, row.pendingRequestedAt, row.restoredAt, row.serverSince],
   );
 }
 
@@ -8876,6 +8916,7 @@ export async function loadAccountIdentifier(): Promise<AccountIdentifierRow | nu
     pendingEmail: row.pendingValue ?? null,
     pendingRequestedAt: row.pendingRequestedAt ?? null,
     restoredAt: row.restoredAt ?? null,
+    since: row.serverSince ?? null,
   };
 }
 
@@ -8887,6 +8928,7 @@ export async function saveAccountIdentifier(row: AccountIdentifierRow): Promise<
     pendingValue: row.pendingEmail,
     pendingRequestedAt: row.pendingRequestedAt,
     restoredAt: row.restoredAt,
+    serverSince: row.since ?? null,
   });
 }
 
@@ -8935,6 +8977,8 @@ export async function savePhoneIdentifier(row: PhoneIdentifierRow): Promise<void
     pendingValue: row.pendingPhone,
     pendingRequestedAt: row.pendingRequestedAt,
     restoredAt: row.restoredAt,
+    // The phone class is dark; no stamp is read back for it yet.
+    serverSince: null,
   });
 }
 
@@ -8959,6 +9003,12 @@ export interface UsernameIdentifierRow {
   username: string;
   claimedAt: number;
   discoverable: boolean;
+  /** The server's own birth stamp of the live username row this device
+   * wrote (the state route's `usernameSince`, ms, read back right after the
+   * claim or rename landed — the proof pass, 2026-10-08): the row is a
+   * phantom when the account's live stamp differs from it, exactly. Null or
+   * absent: no stamp, and the clock-skew rule governs. */
+  since?: number | null;
 }
 
 export async function loadUsernameIdentifier(): Promise<UsernameIdentifierRow | null> {
@@ -8968,6 +9018,7 @@ export async function loadUsernameIdentifier(): Promise<UsernameIdentifierRow | 
     username: row.value,
     claimedAt: row.verifiedAt,
     discoverable: row.discoverable === 1,
+    since: row.serverSince ?? null,
   };
 }
 
@@ -8979,6 +9030,7 @@ export async function saveUsernameIdentifier(row: UsernameIdentifierRow): Promis
     pendingValue: null,
     pendingRequestedAt: null,
     restoredAt: null,
+    serverSince: row.since ?? null,
   });
 }
 
@@ -9118,6 +9170,33 @@ export async function loadUsernameUnlink(): Promise<UsernameUnlinkRow | null> {
 
 export async function clearUsernameUnlink(): Promise<void> {
   await conn().execute(`DELETE FROM username_unlink`);
+}
+
+/** The end of the username cool-down this device started (§4.8, U2 —
+ * 2026-10-08): stamped by a landed rename AND a landed unlink (the two
+ * verbs the server stamps `usernameRenamedAt` on), kept by a take-back,
+ * cleared by a claim landing with no window running. `until` is ms on the
+ * device's Date.now() scale, like every row here; the SERVER's clock is the
+ * gate, this is the device's memory of what it did. */
+export interface UsernameCooldownRow {
+  until: number;
+}
+
+export async function saveUsernameCooldown(row: UsernameCooldownRow): Promise<void> {
+  await conn().execute(
+    `INSERT OR REPLACE INTO username_cooldown (key, until) VALUES ('cooldown', ?)`,
+    [row.until],
+  );
+}
+
+export async function loadUsernameCooldown(): Promise<UsernameCooldownRow | null> {
+  const res = await conn().execute(`SELECT until FROM username_cooldown WHERE key = 'cooldown'`);
+  const row = (res.rows as unknown as UsernameCooldownRow[])[0];
+  return row ? { until: Number(row.until) } : null;
+}
+
+export async function clearUsernameCooldown(): Promise<void> {
+  await conn().execute(`DELETE FROM username_cooldown`);
 }
 
 /** Per-PAIR verification match record: this device's

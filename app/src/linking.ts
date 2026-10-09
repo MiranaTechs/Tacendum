@@ -4,15 +4,35 @@ import {
   parseAccountsNoticeTolerant,
   type AccountsNoticeFrame,
   type DeviceClass,
+  type GroupMemberCerts,
   type LinkOfferInitResponse,
   type PrekeyBundle,
 } from '@tacendum/shared';
-import { ulid } from 'ulid';
 import * as apiModule from './api';
 import * as cryptoModule from 'tacendum-crypto';
 import * as dbModule from './db';
 import { currentToken } from './reauth';
 import { DEVICE_SLOT_CLASS, type DeviceSlotClass } from './deviceNoun';
+// THE NONCE'S RANDOMNESS (the proof pass, 2026-10-08 — a shipped defect
+// since 1.1 (33)): the `ulid` package's default generator looks for
+// `globalThis.crypto`, which Hermes does not provide (no polyfill is
+// installed, on purpose — PLAN §7 rule 1 forbids a JS-side RNG), so every
+// unlink, revoke and dissolve threw `ULIDError PRNG_DETECT` before any
+// request left: the roster screen showed the LINK refusal for an unlink, a
+// lost tablet's slot could never be freed, and the downgrade removed the
+// email and then failed on the dissolve, every retry. Jest never saw it
+// because Node has crypto. The nonce now comes from msgid's ULID factory
+// over the NATIVE RNG (SecRandomCopyBytes through tacendum-crypto): the
+// same source every message id already uses, and the one PLAN §7 allows.
+import { nextMsgId } from './msgid';
+// The cached account-level read every identifier surface renders from
+// (accountsUsername.getIdentifierState): every roster change this module
+// lands — a link completed on either side, a member* notice applied, a
+// revocation — changes what that read would answer (the gate pass,
+// 2026-10-08: a new iPad that read the state just before linking kept
+// "verify an email first" for the cache's life). Call-time use only; the
+// import cycle through accounts.ts is inert (accounts.ts says the same).
+import { invalidateIdentifierState } from './accountsUsername';
 
 /**
  * The device-linking ceremony, client half —
@@ -145,7 +165,17 @@ export interface LinkingDeps {
   token(): Promise<string | null>;
   selfId(): Promise<string | null>;
   now(): number;
-  freshNonce(): string;
+  /** The offer nonce (a fresh ULID per mutation). Optional: absent, the
+   * module draws `nativeLinkNonce` — the suites that pin a nonce inject
+   * one; the suite that pins the SOURCE leaves it out. Sync or async. */
+  freshNonce?(): string | Promise<string>;
+}
+
+/** The nonce every roster mutation and the dissolve sign: a ULID from the
+ * native RNG (msgid's pool-backed factory), never the `ulid` package's own
+ * PRNG detection, which has nothing to find on Hermes. */
+export function nativeLinkNonce(): Promise<string> {
+  return nextMsgId();
 }
 
 function defaultDeps(): LinkingDeps {
@@ -168,7 +198,7 @@ function defaultDeps(): LinkingDeps {
     token: currentToken,
     selfId: async () => (await dbModule.loadProfile())?.userId ?? null,
     now: Date.now,
-    freshNonce: () => ulid(),
+    freshNonce: nativeLinkNonce,
   };
 }
 
@@ -355,15 +385,8 @@ async function completeOffererLink(
   const siblings = bundle.siblings ?? [];
   const mine = siblings.find(s => s.userId === selfUserId);
   if (!mine) return false;
-  // The roster entry naming THIS device MUST carry the ceremony's certificates
-  // — the acceptance we verify below. A certless self entry (a server serving
-  // us as a ceremony-less member — the certs-optional change) proves
-  // nothing, so completion just keeps stalling, the ceremony's designed answer
-  // to a lie.
-  if (!mine.certs) return false;
   // CLIENT-VERIFIED COMPLETION (tuple binding hardened at
-  // a hardening pass): the roster entry naming THIS device
-  // carries the ceremony's certificates — the acceptance IS the joiner's
+  // a hardening pass): the acceptance IS the joiner's
   // certification of us, so it must verify: signer = the CEREMONY-PINNED
   // joiner key, subject = OUR registered key, and every context field from
   // OUR OWN pending record (group, nonce, epoch, class, expiry) — never
@@ -373,22 +396,47 @@ async function completeOffererLink(
   // just keeps stalling, which is the ceremony's designed answer to a lie.
   const ownKey = await deps.crypto.identityPublicKey();
   if (ownKey === null) return false;
-  const acceptVerified = await deps.crypto.verifyLinkOp(
-    pending.acceptorIdentityKey,
-    'accept',
-    {
-      groupId: pending.groupId,
-      offererUserId: selfUserId,
-      acceptorUserId: pending.acceptorUserId,
-      subjectIdentityPubKey: ownKey,
-      class: pending.acceptorClass,
-      rosterEpoch: pending.rosterEpoch,
-      offerNonce: pending.offerNonce,
-      expiresAt: pending.expiresAt,
-    },
-    mine.certs.acceptSig,
-  );
-  if (!acceptVerified) return false;
+  const verifiesAcceptance = (acceptSig: string): Promise<boolean> =>
+    deps.crypto.verifyLinkOp(
+      pending.acceptorIdentityKey,
+      'accept',
+      {
+        groupId: pending.groupId,
+        offererUserId: selfUserId,
+        acceptorUserId: pending.acceptorUserId,
+        subjectIdentityPubKey: ownKey,
+        class: pending.acceptorClass,
+        rosterEpoch: pending.rosterEpoch,
+        offerNonce: pending.offerNonce,
+        expiresAt: pending.expiresAt,
+      },
+      acceptSig,
+    );
+  // WHERE THE ACCEPTANCE SITS. A first link stores the ceremony on BOTH
+  // member entries, so the entry naming THIS device on the joiner's bundle
+  // carries it. The server's JOIN branch (S2, fix/username-discovery
+  // 2026-10-08) appends only the joiner's entry: this device's own entry is
+  // then certless (an attach-created founder — the certs-optional
+  // shape) or still carries an EARLIER ceremony's certs (a re-link after an
+  // unlink), and the joiner's own entry — the one that does carry THIS
+  // ceremony's — is filtered out of the joiner's bundle. So when the entry
+  // here does not verify, the joiner's entry on this device's OWN bundle is
+  // read and verified EXACTLY the same way: same pinned signer, same op,
+  // same tuple from the pending record. Only the bytes' location differs;
+  // nothing a lying server can place there verifies unless the pinned
+  // joiner key signed this very ceremony. Asked only once the joiner's
+  // bundle already names this device — i.e. once an acceptance committed —
+  // so a stalled offer spends none of this device's own prekeys.
+  let certs: GroupMemberCerts | null =
+    mine.certs && (await verifiesAcceptance(mine.certs.acceptSig)) ? mine.certs : null;
+  if (certs === null) {
+    const own = await deps.api.getPrekeyBundle(token, selfUserId);
+    assertBundleNames(own, selfUserId);
+    const theirs = (own.siblings ?? []).find(s => s.userId === pending.acceptorUserId);
+    if (!theirs?.certs) return false;
+    if (!(await verifiesAcceptance(theirs.certs.acceptSig))) return false;
+    certs = theirs.certs;
+  }
   const epoch = bundle.rosterVersion ?? pending.rosterEpoch + 1;
   await deps.db.saveLinkGroup(pending.groupId, epoch);
   const now = deps.now();
@@ -404,7 +452,7 @@ async function completeOffererLink(
     class: pending.acceptorClass,
     state: 'linked',
     updatedAt: now,
-    certsJson: JSON.stringify(mine.certs),
+    certsJson: JSON.stringify(certs),
     identityKeyPub: pending.acceptorIdentityKey,
   });
   await deps.db.upsertLinkedDevice({
@@ -412,10 +460,13 @@ async function completeOffererLink(
     class: localDeviceClass(),
     state: 'linked',
     updatedAt: now,
-    certsJson: JSON.stringify(mine.certs),
+    certsJson: JSON.stringify(certs),
     identityKeyPub: ownKey,
   });
   await deps.db.deletePendingLinkCeremony();
+  // This device's account group just gained a member whose verified email
+  // and claimed name are now this device's facts too.
+  invalidateIdentifierState();
   notify(rosterListeners);
   return true;
 }
@@ -543,14 +594,41 @@ export class OffererCeremony {
         await reconcilePendingLink(this.deps);
         grouped = await this.deps.db.loadLinkGroup();
       }
+      // THE ATTACH-CREATED GROUP (S2, fix/username-discovery 2026-10-08): a
+      // device that verified an email BEFORE its first link is grouped
+      // server-side — the attach lazily minted a solo group (§3) — while it
+      // holds no local group row: the verify answer is `{}` and no bundle
+      // carries a groupId, so nothing could have written one. Declaring an
+      // offererClass from that state is the one thing linkOfferInit refuses
+      // (the roster already knows the class), and every retry answered the
+      // collapsed refusal. So before declaring, the device asks its OWN
+      // bundle: the keys route serves `rosterVersion` exactly when the
+      // caller is grouped. One own one-time prekey, once per ceremony from
+      // a row-less state — the acceptor side already spends the same.
+      let groupedServerSide = grouped !== null;
+      if (!groupedServerSide) {
+        const own = await this.deps.api.getPrekeyBundle(token, this.selfUserId);
+        assertBundleNames(own, this.selfUserId);
+        groupedServerSide = own.rosterVersion !== undefined;
+      }
       const init = await this.deps.api.linkOfferInit(token, {
         acceptorUserId: this.acceptorId,
         acceptorClass,
         // First link only: A declares its own slot; a grouped offerer's
         // roster already knows and the server refuses a redundant claim.
-        ...(grouped ? {} : { offererClass: localDeviceClass() }),
+        ...(groupedServerSide ? {} : { offererClass: localDeviceClass() }),
       });
       this.init = init;
+      // NOTHING is recorded locally at init (the gate pass, 2026-10-08): the
+      // group the server named becomes local truth only when the acceptance
+      // is VERIFIED (`completeOffererLink` stores it), exactly as before this
+      // train. A row written here outlived an abandoned ceremony, and when
+      // the attach-created solo group later dissolved (the email removed as
+      // the last identifier, or the downgrade's email leg) the stale row
+      // made every later link classless and refused, made the downgrade's
+      // dissolve fail on every retry, and made recovery notices for the
+      // re-attached group implausible. `groupedServerSide` lives for this
+      // request alone; the next ceremony probes the own bundle again.
       const signature = await this.deps.crypto.signLinkOp('offer', {
         groupId: init.groupId,
         offererUserId: this.selfUserId,
@@ -866,6 +944,9 @@ export class AcceptorCeremony {
       }
       await this.deps.db.deletePendingLinkOffer(this.offer.offerNonce);
       this.phase = 'linked';
+      // This device just joined an account whose email and name are now
+      // its own facts: the next state read goes to the wire.
+      invalidateIdentifierState();
       notify(rosterListeners);
       notify(pendingOfferListeners);
     } catch (error) {
@@ -1049,6 +1130,7 @@ export async function handleAccountsNoticeFrame(
         group.groupId,
         Math.max(group.rosterEpoch, notice.certs.rosterEpoch + 1),
       );
+      invalidateIdentifierState();
       notify(rosterListeners);
       return 'stored';
     }
@@ -1108,6 +1190,9 @@ export async function handleAccountsNoticeFrame(
           Math.max(group.rosterEpoch, notice.signedRosterEpoch + 1),
         );
       }
+      // A roster this device left, or that lost a member: the account's
+      // facts as this device may read them changed with it.
+      invalidateIdentifierState();
       notify(rosterListeners);
       return 'stored';
     }
@@ -1210,6 +1295,10 @@ export async function handleAccountsNoticeFrame(
       // names nothing (no groupId) that could be checked.
       await deps.db.clearUsernameIdentifier();
       await deps.db.saveUsernameNotice({ receivedAt: deps.now() });
+      // The account holds no name now: a state read cached a moment ago
+      // would still say it does (the username screen, when it is open,
+      // re-reads through its listener; this covers the screen being closed).
+      invalidateIdentifierState();
       notify(usernameNoticeListeners);
       return 'stored';
     }
@@ -1304,7 +1393,7 @@ export async function mutateRoster(
   if (rosterEpoch !== group.rosterEpoch) {
     await deps.db.saveLinkGroup(group.groupId, rosterEpoch);
   }
-  const offerNonce = deps.freshNonce();
+  const offerNonce = await (deps.freshNonce ?? nativeLinkNonce)();
   // The mutation's own explicit expiry, comfortably inside the
   // server-capped ceiling (one link-offer TTL from now).
   const expiresAt = Math.floor(deps.now() / 1000) + Math.floor(LINK_OFFER_TTL_SECONDS / 2);
@@ -1394,6 +1483,7 @@ export async function mutateRoster(
     );
     await deps.db.saveLinkGroup(group.groupId, rosterEpoch + 1);
   }
+  invalidateIdentifierState();
   notify(rosterListeners);
   // The SIGNED statement peers must hear: the committed
   // mutation's exact tuple + signature feeds the in-band notice fan-out.
@@ -1526,7 +1616,7 @@ export async function dissolveGrouping(
   const ownClass =
     rows.find(d => d.userId === selfUserId && d.state === 'linked')?.class ??
     localDeviceClass();
-  const offerNonce = deps.freshNonce();
+  const offerNonce = await (deps.freshNonce ?? nativeLinkNonce)();
   const expiresAt =
     Math.floor(deps.now() / 1000) + Math.floor(LINK_OFFER_TTL_SECONDS / 2);
   const tuple = {

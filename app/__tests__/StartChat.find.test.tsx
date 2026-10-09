@@ -29,11 +29,17 @@ import * as accountsUsername from '../src/accountsUsername';
 import { ACCOUNTS_USERNAME_COPY } from '../src/accountsUsernameCopy';
 import * as api from '../src/api';
 import { ApiRequestError } from '../src/api';
+import { API_BASE } from '../src/config';
 import * as db from '../src/db';
 import { LINKING_COPY } from '../src/linkingCopy';
 import { messaging } from '../src/messaging';
 import * as reauth from '../src/reauth';
 import { COPY, StartChatScreen } from '../src/screens/StartChatScreen';
+import {
+  LOOKUPS_PER_DAY,
+  LOOKUPS_PER_MINUTE,
+  resetLookupPacing,
+} from '../src/screens/startChat/useReachLookup';
 import { session } from '../src/session';
 import { ThemeProvider, themeTokens } from '../src/theme';
 import { Avatar } from '../src/ui/Avatar';
@@ -90,10 +96,13 @@ const PROFILE: db.ProfileRow = {
 const PEER = '01BX5ZZKBKACTAV9WEVGEMMVRZ';
 const ANCHOR = '01HQZZZZ00000000000000000A';
 const PHOTO = 'file:///tmp/picked/IMG_0042.HEIC';
+// RE-CUT (D3, fix/username-discovery 2026-10-08): the miss now says how the
+// day's searches work — shared by the account's linked devices, reset at
+// midnight UTC — where it used to name "today's searches" and nothing else.
 const MISS_EMAIL =
-  'No match — or your account is under three days old, or today’s searches are used up. Tacendum cannot tell you which, by design.';
+  'No match — or your account is under three days old, or today’s searches are used up. Tacendum cannot tell you which, by design. Searches are shared by your linked devices and reset at midnight UTC.';
 const MISS_NAME =
-  'No match — or you’ve used today’s searches. Tacendum cannot tell you which, by design.';
+  'No match — or you’ve used today’s searches. Tacendum cannot tell you which, by design. Searches are shared by your linked devices and reset at midnight UTC.';
 
 const VERIFIED: db.AccountIdentifierRow = {
   email: 'me@example.com',
@@ -130,15 +139,28 @@ beforeEach(async () => {
   nativeQr.__qr.reset();
   nativeQr.scanWithCamera.mockClear();
   picker.launchImageLibrary.mockReset();
+  // The state read keeps a landed answer for a moment: never across tests.
+  accountsUsername.invalidateIdentifierState();
+  // The lookup ledger is the DEVICE's, per process (the gate pass): every
+  // test starts its day and minute empty.
+  resetLookupPacing();
 });
 
 afterEach(async () => {
+  jest.useRealTimers();
   setPlatform(REAL_OS);
   mockUsernameUiEnabled = true;
   session.setMode('real');
   jest.restoreAllMocks();
   await db.close();
 });
+
+/** The clock, stepped under fake timers (the pacing tests). */
+async function advance(ms: number): Promise<void> {
+  await ReactTestRenderer.act(async () => {
+    jest.advanceTimersByTime(ms);
+  });
+}
 
 async function render(
   opts: {
@@ -234,6 +256,18 @@ function messageOf(tree: Tree, id: string): string {
   return textIn(node);
 }
 
+/** A notice's sentence alone — the first text node under it — where
+ * `messageOf` would also read the label of the action beneath it. */
+function sentenceOf(tree: Tree, id: string): string {
+  const node = hosts(tree, id)[0];
+  if (!node) throw new Error(`nothing with testID ${id} is on screen`);
+  const text = node.findAll(
+    n => typeof n.type === 'string' && typeof n.props.children === 'string',
+  )[0];
+  if (!text) throw new Error(`no sentence under ${id}`);
+  return text.props.children as string;
+}
+
 function card(tree: Tree): ReactTestInstance {
   const node = hosts(tree, 'discovery-result-card')[0];
   if (!node) throw new Error('no found card on screen');
@@ -254,6 +288,37 @@ function foundBy(deviceCount = 1) {
   return jest
     .spyOn(accounts, 'discoverySearch')
     .mockResolvedValue({ outcome: 'found', anchor: ANCHOR, deviceCount });
+}
+
+/** The caller-owned state read (fix/username-discovery, 2026-10-08): the ONE
+ * group-level answer the username preflight and the own-email door read.
+ * A 'state' answer carries the three facts; 'legacy' (today's production
+ * server, no state route) and every refusal or failure carry null = unknown. */
+type StateAnswer = accountsUsername.IdentifierState;
+function stateOf(
+  eligibility: accountsUsername.IdentifierStateEligibility,
+  source: accountsUsername.IdentifierStateSource = 'state',
+): StateAnswer {
+  const landed = eligibility === 'eligible' || eligibility === 'needs_verification';
+  const known = source === 'state' && landed;
+  return {
+    source,
+    eligibility,
+    holdsUsername: known ? false : null,
+    emailLinked: known ? eligibility === 'eligible' : null,
+    phoneLinked: known ? false : null,
+    cooldownUntil: null,
+    usernameSince: null,
+    emailSince: null,
+    usernameFindable: null,
+    emailFindable: null,
+  };
+}
+/** The state read answers these in turn, then the last one for ever. */
+function stateReads(...answers: StateAnswer[]): jest.SpyInstance {
+  const spy = jest.spyOn(accountsUsername, 'getIdentifierState');
+  for (const answer of answers) spy.mockResolvedValueOnce(answer);
+  return spy.mockResolvedValue(answers[answers.length - 1] ?? stateOf('eligible'));
 }
 
 async function findEmail(tree: Tree, email: string): Promise<void> {
@@ -302,7 +367,7 @@ describe('found: the typed text, never an ID, and the tap opens the chat', () =>
   });
 
   test('found by username: marked as a server introduction, and the card never shows the @', async () => {
-    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('eligible');
+    stateReads(stateOf('eligible'));
     jest
       .spyOn(accountsUsername, 'discoverySearchByUsername')
       .mockResolvedValue({ outcome: 'found', anchor: ANCHOR, deviceCount: 1 });
@@ -480,10 +545,10 @@ describe('one lookup at a time; a superseded answer is dropped', () => {
   });
 
   test('leaving mid-preflight never starts a lookup', async () => {
-    let resolveEligibility!: (value: accountsUsername.UsernameEligibilityOutcome) => void;
-    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockReturnValue(
+    let resolveState!: (value: StateAnswer) => void;
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockReturnValue(
       new Promise(resolve => {
-        resolveEligibility = resolve;
+        resolveState = resolve;
       }),
     );
     const byName = jest
@@ -496,7 +561,7 @@ describe('one lookup at a time; a superseded answer is dropped', () => {
       tree.unmount();
     });
     await ReactTestRenderer.act(async () => {
-      resolveEligibility('eligible');
+      resolveState(stateOf('eligible'));
     });
 
     expect(byName).not.toHaveBeenCalled();
@@ -633,10 +698,16 @@ describe('a duress session is network-silent', () => {
       });
 
       // The positive control: the guard, not the harness, kept fetch silent.
+      // Outside duress an email Find reaches the wire twice — the lookup,
+      // and the caller-owned state read that drives the own-email door
+      // (fix/username-discovery, 2026-10-08) — each exactly once.
       session.setMode('real');
       const ordinary = await render();
       await findEmail(ordinary, 'lena@studio.co');
-      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const paths = (fetchSpy.mock.calls as unknown as Array<[unknown]>).map(([url]) =>
+        String(url).slice(API_BASE.length),
+      );
+      expect(paths.sort()).toEqual(['/v1/discovery/lookup', '/v1/identifiers/state']);
     } finally {
       globalThis.fetch = realFetch;
       session.setMode('real');
@@ -647,10 +718,17 @@ describe('a duress session is network-silent', () => {
 /* ── misses ─────────────────────────────────────────────────────────── */
 
 describe('every miss looks the same, and the copy says so', () => {
-  test('after a miss Find is hidden and the go key calls nothing; an edit brings Find back', async () => {
+  // AMENDED (D6, fix/username-discovery 2026-10-08): Find stays hidden and
+  // the go key still calls nothing after a miss; the miss now carries a
+  // quiet Search again — exactly one more lookup — because a person waiting
+  // for a friend to turn findability on, or suspecting a budget, had to
+  // change the text and change it back to ask again.
+  test('after a miss Find is hidden and the go key calls nothing; Search again sends exactly one more lookup; an edit brings Find back', async () => {
     const search = jest
       .spyOn(accounts, 'discoverySearch')
-      .mockResolvedValue({ outcome: 'no_match' });
+      .mockResolvedValueOnce({ outcome: 'no_match' })
+      .mockResolvedValueOnce({ outcome: 'no_match' })
+      .mockResolvedValue({ outcome: 'found', anchor: ANCHOR, deviceCount: 1 });
     const tree = await render();
     await findEmail(tree, 'lena@studio.co');
 
@@ -659,13 +737,47 @@ describe('every miss looks the same, and the copy says so', () => {
     await submit(tree);
     expect(search).toHaveBeenCalledTimes(1);
 
+    // Search again: the same text, one more lookup, and the answer renders.
+    expect(textIn(control(tree, 'discovery-search-again'))).toBe('Search again');
+    expect(control(tree, 'discovery-search-again').props.accessibilityLabel).toBe('Search again');
+    await press(tree, 'discovery-search-again');
+    expect(search).toHaveBeenCalledTimes(2);
+    expect(search).toHaveBeenLastCalledWith('lena@studio.co');
+    expect(has(tree, 'discovery-no-match')).toBe(true);
+    // Twice in one frame is still one lookup; a found answer shows the card.
+    await ReactTestRenderer.act(async () => {
+      control(tree, 'discovery-search-again').props.onPress();
+      control(tree, 'discovery-search-again').props.onPress();
+    });
+    expect(search).toHaveBeenCalledTimes(3);
+    expect(has(tree, 'discovery-result-card')).toBe(true);
+    expect(has(tree, 'discovery-search-again')).toBe(false);
+
     await typeEach(tree, 'x');
-    expect(has(tree, 'discovery-no-match')).toBe(false);
+    expect(has(tree, 'discovery-result-card')).toBe(false);
     expect(has(tree, 'discovery-search')).toBe(true);
+  });
+
+  test('Search again on a username miss runs the lookup again from the visit’s one state answer: no second preflight read', async () => {
+    const state = stateReads(stateOf('eligible'));
+    const byName = jest
+      .spyOn(accountsUsername, 'discoverySearchByUsername')
+      .mockResolvedValue({ outcome: 'no_match' });
+    const tree = await render();
+    await type(tree, '@mira_k');
+    await press(tree, 'discovery-search');
+    expect(has(tree, 'discovery-no-match')).toBe(true);
+
+    await press(tree, 'discovery-search-again');
+    expect(byName).toHaveBeenCalledTimes(2);
+    expect(byName).toHaveBeenLastCalledWith('mira_k');
+    expect(state).toHaveBeenCalledTimes(1);
+    expect(has(tree, 'discovery-no-match')).toBe(true);
   });
 
   test('a miss, not findable, a recovery pause and a spent budget are one miss on screen', async () => {
     jest.spyOn(reauth, 'currentToken').mockResolvedValue('bearer');
+    stateReads(stateOf('eligible'));
     // The wire answers every refused case with ONE collapsed 403.
     const lookup = jest.spyOn(api, 'apiDiscoveryLookup');
     const tree = await render();
@@ -683,25 +795,40 @@ describe('every miss looks the same, and the copy says so', () => {
 
   test('an email miss names the three-day rule; a username miss never does', async () => {
     jest.spyOn(accounts, 'discoverySearch').mockResolvedValue({ outcome: 'no_match' });
-    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('eligible');
+    // The device that verified the address holds its row: it catches its
+    // own email before sending, so the miss line never adds the self case
+    // here (the proof pass — the sibling's line does; see D1 below).
+    jest.spyOn(db, 'loadAccountIdentifier').mockResolvedValue(VERIFIED);
+    stateReads(stateOf('eligible'));
     jest
       .spyOn(accountsUsername, 'discoverySearchByUsername')
       .mockResolvedValue({ outcome: 'no_match' });
     const tree = await render();
 
     await findEmail(tree, 'lena@studio.co');
-    expect(messageOf(tree, 'discovery-no-match')).toBe(MISS_EMAIL);
+    expect(sentenceOf(tree, 'discovery-no-match')).toBe(MISS_EMAIL);
     expect(messageOf(tree, 'discovery-no-match')).toContain('under three days old');
+    // The only other words in the notice are its action's.
+    expect(messageOf(tree, 'discovery-no-match')).toBe(`${MISS_EMAIL} ${COPY.searchAgain}`);
 
     await type(tree, '@mira_k');
     await press(tree, 'discovery-search');
-    expect(messageOf(tree, 'discovery-no-match')).toBe(MISS_NAME);
+    expect(sentenceOf(tree, 'discovery-no-match')).toBe(MISS_NAME);
     expect(messageOf(tree, 'discovery-no-match')).not.toContain('three days');
+
+    // D3: both say how the day's searches work — shared across the
+    // account's linked devices, reset at midnight UTC — so fast testing on
+    // two devices no longer reads as "broken".
+    for (const line of [COPY.missLine, COPY.missLineEmail]) {
+      expect(line).toContain('shared by your linked devices');
+      expect(line).toContain('reset at midnight UTC');
+      expect(line).toContain('Tacendum cannot tell you which, by design.');
+    }
   });
 
   test('the miss ⓘ: the email lead and its explainer; the username lead and its explainer', async () => {
     jest.spyOn(accounts, 'discoverySearch').mockResolvedValue({ outcome: 'no_match' });
-    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('eligible');
+    stateReads(stateOf('eligible'));
     jest
       .spyOn(accountsUsername, 'discoverySearchByUsername')
       .mockResolvedValue({ outcome: 'no_match' });
@@ -726,28 +853,288 @@ describe('every miss looks the same, and the copy says so', () => {
     expect(nameLines.join(' ')).toContain('holding a username is not enough');
   });
 
-  test('an email miss with no verified email here offers Link an email, which carries the draft; a username miss never does', async () => {
+  // RE-CUT (D1, fix/username-discovery 2026-10-08): the door used to hang
+  // on THIS DEVICE's email row, so every linked sibling — no row of its
+  // own, the account verified on the phone — got "verify an email first"
+  // on every email miss. It now hangs on the account group's own answer:
+  // the state read says the account holds no verified email or phone.
+  test('an email miss on an account with no verified email or phone offers Link an email, which carries the draft', async () => {
     jest.spyOn(db, 'loadAccountIdentifier').mockResolvedValue(null);
     jest.spyOn(accounts, 'discoverySearch').mockResolvedValue({ outcome: 'no_match' });
-    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('eligible');
-    jest
-      .spyOn(accountsUsername, 'discoverySearchByUsername')
-      .mockResolvedValue({ outcome: 'no_match' });
+    stateReads(stateOf('needs_verification'));
     const onOpenAccountEmail = jest.fn();
     const tree = await render({ onOpenAccountEmail });
 
     await findEmail(tree, 'lena@studio.co');
+    expect(has(tree, 'discovery-no-match')).toBe(true);
     expect(messageOf(tree, 'discovery-needs-own-email')).toContain(
       'To search, verify an email on your account first.',
     );
     expect(messageOf(tree, 'discovery-needs-own-email')).not.toContain('round-trip');
     await press(tree, 'discovery-link-email');
     expect(onOpenAccountEmail).toHaveBeenCalledWith('lena@studio.co');
+  });
+});
 
-    await type(tree, '@mira_k');
-    await press(tree, 'discovery-search');
+/* ── D1: a linked sibling, and the own-email door (2026-10-08) ─────────── */
+
+describe('D1: your own email or name from a linked sibling — no local rows, the account verified on another device', () => {
+  const OWN_EMAIL = 'me@example.com';
+  const OWN_NAME = 'me_name';
+  /** The sibling: nothing attached or claimed on THIS device. */
+  function sibling(): void {
+    jest.spyOn(db, 'loadAccountIdentifier').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameIdentifier').mockResolvedValue(null);
+  }
+  /** The server's self-miss (discovery.ts, keyed on the account group). */
+  function misses() {
+    return {
+      byEmail: jest.spyOn(accounts, 'discoverySearch').mockResolvedValue({ outcome: 'no_match' }),
+      byName: jest
+        .spyOn(accountsUsername, 'discoverySearchByUsername')
+        .mockResolvedValue({ outcome: 'no_match' }),
+    };
+  }
+  const SELF_SENTENCE =
+    'Searching for your own email or username, from any of your devices, always shows no match.';
+
+  test('an own-email miss gets NO “verify an email first” door — the account is verified — and the miss ⓘ says a self search always misses', async () => {
+    sibling();
+    const { byEmail } = misses();
+    stateReads({
+      source: 'state',
+      eligibility: 'eligible',
+      holdsUsername: true,
+      emailLinked: true,
+      phoneLinked: false,
+      cooldownUntil: null,
+      usernameSince: null,
+      emailSince: null,
+      usernameFindable: null,
+      emailFindable: null,
+    });
+    const tree = await render();
+    await findEmail(tree, OWN_EMAIL);
+
+    // The sibling cannot match the text (names never travel), so the
+    // search is sent and misses — that part is ruled. The false door is not.
+    expect(byEmail).toHaveBeenCalledWith(OWN_EMAIL);
     expect(has(tree, 'discovery-no-match')).toBe(true);
     expect(has(tree, 'discovery-needs-own-email')).toBe(false);
+    expect(has(tree, 'discovery-link-email')).toBe(false);
+    const lines = info(tree, 'discovery-info').props.lines as string[];
+    expect(lines[0]).toBe(COPY.missInfoLeadEmail);
+    // RE-CUT 2026-10-08 (the gate pass): the self rule is said ONCE in this
+    // sheet — by the shared email deck's line the sheet appends — no longer
+    // also at the end of the lead (the sheet read the same rule twice).
+    expect(lines.filter(line => line.endsWith('from any of your devices, always shows no match.'))).toHaveLength(1);
+    expect(lines.join(' ')).toContain('from any of your devices');
+    expect(COPY.missInfoLeadEmail).not.toContain(SELF_SENTENCE);
+    expect(COPY.missInfoLeadEmail).not.toContain('from any of your devices');
+  });
+
+  test('the proof pass: on a sibling the VISIBLE miss line says the self case too — the account holds an email or a name this device cannot match', async () => {
+    sibling();
+    misses();
+    stateReads({
+      source: 'state',
+      eligibility: 'eligible',
+      holdsUsername: true,
+      emailLinked: true,
+      phoneLinked: false,
+      cooldownUntil: null,
+      usernameSince: null,
+      emailSince: null,
+      usernameFindable: true,
+      emailFindable: false,
+    });
+    const tree = await render();
+    await findEmail(tree, OWN_EMAIL);
+    expect(sentenceOf(tree, 'discovery-no-match')).toBe(COPY.missLineEmailMaybeSelf);
+    expect(COPY.missLineEmailMaybeSelf).toContain('your own email always shows no match');
+    expect(COPY.missLineEmailMaybeSelf).toContain('Tacendum cannot tell you which, by design.');
+    expect(COPY.missLineEmailMaybeSelf).toContain('reset at midnight UTC');
+
+    await type(tree, OWN_NAME);
+    await ReactTestRenderer.act(async () => {
+      input(tree).props.onBlur();
+    });
+    await press(tree, 'discovery-search');
+    expect(sentenceOf(tree, 'discovery-no-match')).toBe(ACCOUNTS_USERNAME_COPY.startChatMissLineMaybeSelf);
+    expect(ACCOUNTS_USERNAME_COPY.startChatMissLineMaybeSelf).toContain('your own username always shows no match');
+  });
+
+  test('the proof pass: the self case is said only where the account holds that class — a sibling of a name-less account gets the plain line', async () => {
+    sibling();
+    misses();
+    stateReads(stateOf('eligible')); // emailLinked true, holdsUsername false
+    const tree = await render();
+    await type(tree, OWN_NAME);
+    await ReactTestRenderer.act(async () => {
+      input(tree).props.onBlur();
+    });
+    await press(tree, 'discovery-search');
+    expect(sentenceOf(tree, 'discovery-no-match')).toBe(MISS_NAME);
+    await findEmail(tree, OWN_EMAIL);
+    expect(sentenceOf(tree, 'discovery-no-match')).toBe(COPY.missLineEmailMaybeSelf);
+  });
+
+  test('an own-username miss: the state read is the preflight (never the uncached legacy read), and no door either', async () => {
+    sibling();
+    const { byName } = misses();
+    const legacy = jest.spyOn(accountsUsername, 'getUsernameEligibility');
+    const state = stateReads(stateOf('eligible'));
+    const tree = await render();
+    await type(tree, OWN_NAME);
+    // A bare name is named after the settle, or at once on leaving the field.
+    await ReactTestRenderer.act(async () => {
+      input(tree).props.onBlur();
+    });
+    expect(kind(tree)).toBe('Username');
+    await press(tree, 'discovery-search');
+
+    expect(byName).toHaveBeenCalledWith(OWN_NAME);
+    expect(has(tree, 'discovery-no-match')).toBe(true);
+    expect(has(tree, 'discovery-needs-own-email')).toBe(false);
+    expect(state).toHaveBeenCalledTimes(1);
+    expect(legacy).not.toHaveBeenCalled();
+  });
+
+  test('the door hangs on the FACT that the account holds no verified email or phone, from either source; unknown (refused, failed) shows none', async () => {
+    const cases: Array<[StateAnswer, boolean]> = [
+      [stateOf('needs_verification', 'state'), true],
+      [stateOf('needs_verification', 'legacy'), true],
+      [stateOf('eligible', 'state'), false],
+      [stateOf('eligible', 'legacy'), false],
+      [stateOf('refused', 'state'), false],
+      [stateOf('refused', 'legacy'), false],
+      [stateOf('failed', 'state'), false],
+      [stateOf('failed', 'legacy'), false],
+    ];
+    for (const [answer, door] of cases) {
+      sibling();
+      misses();
+      stateReads(answer);
+      // The DEVICE's lookup ledger (the gate pass) counts across these
+      // screens exactly as across remounts; this case is about the door,
+      // so each screen starts its minute empty.
+      resetLookupPacing();
+      const tree = await render();
+      await findEmail(tree, 'lena@studio.co');
+      expect([answer.source, answer.eligibility, has(tree, 'discovery-no-match')]).toEqual([
+        answer.source,
+        answer.eligibility,
+        true,
+      ]);
+      expect([answer.source, answer.eligibility, has(tree, 'discovery-needs-own-email')]).toEqual([
+        answer.source,
+        answer.eligibility,
+        door,
+      ]);
+      await ReactTestRenderer.act(async () => {
+        tree.unmount();
+      });
+      jest.restoreAllMocks();
+    }
+  });
+
+  test('one state read per visit: an email miss, a username Find and another email miss read it once; a refused or failed read is asked again', async () => {
+    sibling();
+    misses();
+    const state = stateReads(stateOf('eligible'));
+    const tree = await render();
+    await findEmail(tree, 'lena@studio.co');
+    await type(tree, '@mira_k');
+    await press(tree, 'discovery-search');
+    await findEmail(tree, 'lena@studio.co');
+    expect(state).toHaveBeenCalledTimes(1);
+    await ReactTestRenderer.act(async () => {
+      tree.unmount();
+    });
+
+    jest.restoreAllMocks();
+    sibling();
+    misses();
+    const refused = stateReads(stateOf('refused'), stateOf('refused'), stateOf('eligible'));
+    // The device's ledger counted the first screen's lookups (the gate
+    // pass); this case is about the state read, so the minute starts empty.
+    resetLookupPacing();
+    const again = await render();
+    await findEmail(again, 'lena@studio.co');
+    await findEmail(again, 'mira@x.com');
+    expect(refused).toHaveBeenCalledTimes(2);
+    // Once an answer lands, it is kept for the visit.
+    await findEmail(again, 'lena@studio.co');
+    await findEmail(again, 'mira@x.com');
+    expect(refused).toHaveBeenCalledTimes(3);
+  });
+});
+
+/* ── U3 (the consumer side): a refused read is not a connection problem ── */
+
+describe('U3: the username preflight tells a refused read from a failed one', () => {
+  /** The neutral sentence lives in the username deck as `eligibilityRefused`
+   * (lane 1's key, fix/username-discovery 2026-10-08). Until that lands in
+   * this checkout the test installs it, so the screen's wiring is proved
+   * either way; with the real key present nothing is touched. */
+  const NEUTRAL = 'Tacendum could not check username access right now. Try again in a minute.';
+  function withRefusedSentence(): { sentence: string; restore: () => void } {
+    const deck = ACCOUNTS_USERNAME_COPY as unknown as Record<string, unknown>;
+    const existing = deck.eligibilityRefused;
+    if (typeof existing === 'string') return { sentence: existing, restore: () => undefined };
+    Object.defineProperty(deck, 'eligibilityRefused', {
+      value: NEUTRAL,
+      configurable: true,
+      enumerable: true,
+      writable: true,
+    });
+    return {
+      sentence: NEUTRAL,
+      restore: () => {
+        delete deck.eligibilityRefused;
+      },
+    };
+  }
+
+  test('REFUSED (the frozen 403: the caller’s budget or a dark flag): the neutral sentence, never “Check your connection”; Try again reads again, then looks up', async () => {
+    const installed = withRefusedSentence();
+    try {
+      const state = stateReads(stateOf('refused'), stateOf('eligible'));
+      const byName = jest
+        .spyOn(accountsUsername, 'discoverySearchByUsername')
+        .mockResolvedValue({ outcome: 'no_match' });
+      const tree = await render();
+      await type(tree, '@mira_k');
+      await press(tree, 'discovery-search');
+
+      const notice = messageOf(tree, 'discovery-username-eligibility-unavailable');
+      expect(notice).toContain(installed.sentence);
+      expect(notice).not.toContain('Check your connection');
+      expect(byName).not.toHaveBeenCalled();
+
+      await press(tree, 'discovery-username-eligibility-retry');
+      expect(state).toHaveBeenCalledTimes(2);
+      expect(byName).toHaveBeenCalledTimes(1);
+      expect(has(tree, 'discovery-no-match')).toBe(true);
+    } finally {
+      installed.restore();
+    }
+  });
+
+  test('FAILED (no network, the deadline, duress): the connection sentence stays', async () => {
+    stateReads(stateOf('failed'));
+    const byName = jest.spyOn(accountsUsername, 'discoverySearchByUsername');
+    const tree = await render();
+    await type(tree, '@mira_k');
+    await press(tree, 'discovery-search');
+
+    expect(messageOf(tree, 'discovery-username-eligibility-unavailable')).toContain(
+      ACCOUNTS_USERNAME_COPY.eligibilityUnavailable,
+    );
+    expect(messageOf(tree, 'discovery-username-eligibility-unavailable')).toContain(
+      'Check your connection',
+    );
+    expect(byName).not.toHaveBeenCalled();
   });
 });
 
@@ -755,9 +1142,7 @@ describe('every miss looks the same, and the copy says so', () => {
 
 describe('the username preflight', () => {
   test('needs verification: the deck door and Link an email, the reason behind its ⓘ, never a miss and no lookup', async () => {
-    jest
-      .spyOn(accountsUsername, 'getUsernameEligibility')
-      .mockResolvedValue('needs_verification');
+    stateReads(stateOf('needs_verification'));
     const byName = jest.spyOn(accountsUsername, 'discoverySearchByUsername');
     const onOpenAccountEmail = jest.fn();
     const tree = await render({ onOpenAccountEmail });
@@ -780,11 +1165,8 @@ describe('the username preflight', () => {
     expect(onOpenAccountEmail).toHaveBeenCalledWith('@mira_k');
   });
 
-  test('unavailable: Try again forces a fresh read, then looks up', async () => {
-    const eligibility = jest
-      .spyOn(accountsUsername, 'getUsernameEligibility')
-      .mockResolvedValueOnce('unavailable')
-      .mockResolvedValue('eligible');
+  test('unavailable (a failed read): Try again is a fresh read, then the lookup', async () => {
+    const state = stateReads(stateOf('failed'), stateOf('eligible'));
     const byName = jest
       .spyOn(accountsUsername, 'discoverySearchByUsername')
       .mockResolvedValue({ outcome: 'no_match' });
@@ -795,7 +1177,7 @@ describe('the username preflight', () => {
     expect(has(tree, 'discovery-username-eligibility-unavailable')).toBe(true);
     expect(byName).not.toHaveBeenCalled();
     await press(tree, 'discovery-username-eligibility-retry');
-    expect(eligibility).toHaveBeenCalledTimes(2);
+    expect(state).toHaveBeenCalledTimes(2);
     expect(byName).toHaveBeenCalledTimes(1);
   });
 });
@@ -909,6 +1291,7 @@ describe('with the username pin OFF', () => {
   test('zero username calls end to end, and the own-name row is never read', async () => {
     mockUsernameUiEnabled = false;
     const eligibility = jest.spyOn(accountsUsername, 'getUsernameEligibility');
+    const state = jest.spyOn(accountsUsername, 'getIdentifierState');
     const byName = jest.spyOn(accountsUsername, 'discoverySearchByUsername');
     const ownName = jest.spyOn(db, 'loadUsernameIdentifier');
     const tree = await render();
@@ -919,6 +1302,7 @@ describe('with the username pin OFF', () => {
       'That isn’t an ID or an email. Check what they sent you.',
     );
     expect(eligibility).not.toHaveBeenCalled();
+    expect(state).not.toHaveBeenCalled();
     expect(byName).not.toHaveBeenCalled();
     expect(ownName).not.toHaveBeenCalled();
   });
@@ -936,5 +1320,214 @@ describe('one condition, one sentence (byte equality)', () => {
     ).toBe(true);
     expect(COPY.findOffline).toBe(ACCOUNTS_COPY.failed);
     expect(ACCOUNTS_COPY.failed).toBe(LINKING_COPY.transportFailed);
+  });
+});
+
+/* ── D3: the lookup budgets, paced on the device (2026-10-08) ─────────── */
+
+describe('D3: the lookup budgets are paced here before the wire refuses them as a miss', () => {
+  // The server keeps 5 lookups per clock minute per device and 20 per UTC
+  // day (per device and per account group), fixed windows aligned to the
+  // clock, every refusal the uniform miss. Nothing paced on the device, so
+  // six quick presses turned a real, consented target into "No match".
+  const MINUTE = 60_000;
+  const MINUTE_SENTENCE = 'Up to five searches a minute — wait a moment.';
+  const DAY_SENTENCE =
+    'This device has sent today’s 20 searches. Searches are shared by your linked devices and reset at midnight UTC.';
+
+  function startClock(iso = '2026-10-08T15:00:00.000Z'): void {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date(iso));
+  }
+
+  test('the constants are the server’s: 5 a minute, 20 a day', () => {
+    expect(LOOKUPS_PER_MINUTE).toBe(5);
+    expect(LOOKUPS_PER_DAY).toBe(20);
+  });
+
+  test('the sixth lookup inside one clock minute is refused here with no wire call; when the minute rolls Find returns and the next press goes through', async () => {
+    startClock();
+    const search = jest
+      .spyOn(accounts, 'discoverySearch')
+      .mockResolvedValue({ outcome: 'no_match' });
+    const tree = await render();
+    for (let n = 1; n <= 5; n += 1) {
+      await findEmail(tree, `p${n}@x.com`);
+      expect(search).toHaveBeenCalledTimes(n);
+      expect(has(tree, 'discovery-no-match')).toBe(true);
+    }
+
+    await findEmail(tree, 'p6@x.com');
+    expect(search).toHaveBeenCalledTimes(5);
+    expect(messageOf(tree, 'discovery-paced')).toBe(MINUTE_SENTENCE);
+    expect(messageOf(tree, 'discovery-paced')).toBe(COPY.pacedMinute);
+    expect(has(tree, 'discovery-no-match')).toBe(false);
+    expect(has(tree, 'discovery-search')).toBe(false);
+    // The go key sends nothing either.
+    await submit(tree);
+    expect(search).toHaveBeenCalledTimes(5);
+
+    // 59 s in: still the brake. The minute rolls: Find is back on its own.
+    await advance(MINUTE - 1);
+    expect(has(tree, 'discovery-paced')).toBe(true);
+    await advance(1);
+    expect(has(tree, 'discovery-paced')).toBe(false);
+    expect(has(tree, 'discovery-search')).toBe(true);
+    await press(tree, 'discovery-search');
+    expect(search).toHaveBeenCalledTimes(6);
+    expect(has(tree, 'discovery-no-match')).toBe(true);
+  });
+
+  test('the brake is clock-aligned like the server’s window: lookups late in one minute and early in the next are two windows', async () => {
+    startClock('2026-10-08T15:00:50.000Z');
+    const search = jest
+      .spyOn(accounts, 'discoverySearch')
+      .mockResolvedValue({ outcome: 'no_match' });
+    const tree = await render();
+    for (let n = 1; n <= 5; n += 1) await findEmail(tree, `p${n}@x.com`);
+    await advance(10_000);
+    for (let n = 6; n <= 10; n += 1) {
+      await findEmail(tree, `p${n}@x.com`);
+      expect(search).toHaveBeenCalledTimes(n);
+    }
+    await findEmail(tree, 'p11@x.com');
+    expect(search).toHaveBeenCalledTimes(10);
+    expect(has(tree, 'discovery-paced')).toBe(true);
+  });
+
+  test('only lookups the server answered count: a transport failure, a locally refused shape and a remembered found answer spend nothing', async () => {
+    startClock();
+    const search = jest
+      .spyOn(accounts, 'discoverySearch')
+      .mockResolvedValueOnce({ outcome: 'error' })
+      .mockResolvedValueOnce({ outcome: 'error' })
+      .mockResolvedValueOnce({ outcome: 'error' })
+      .mockResolvedValueOnce({ outcome: 'error' })
+      .mockResolvedValueOnce({ outcome: 'error' })
+      .mockResolvedValueOnce({ outcome: 'found', anchor: ANCHOR, deviceCount: 1 })
+      .mockResolvedValue({ outcome: 'no_match' });
+    const tree = await render();
+    // Five transport failures: the server never saw them.
+    for (let n = 1; n <= 5; n += 1) {
+      await findEmail(tree, `p${n}@x.com`);
+      expect(has(tree, 'discovery-error')).toBe(true);
+    }
+    // A malformed address is refused on the device.
+    await type(tree, 'mira@');
+    await submit(tree);
+    expect(has(tree, 'discovery-invalid')).toBe(true);
+    // One found, then the same person again and again from memory.
+    await findEmail(tree, 'lena@studio.co');
+    expect(has(tree, 'discovery-result-card')).toBe(true);
+    for (let n = 0; n < 6; n += 1) {
+      await typeEach(tree, 'x');
+      await findEmail(tree, 'lena@studio.co');
+      expect(has(tree, 'discovery-result-card')).toBe(true);
+    }
+    expect(search).toHaveBeenCalledTimes(6);
+    // The first miss of the minute is still sent: one answered lookup so far.
+    await findEmail(tree, 'mira@x.com');
+    expect(search).toHaveBeenCalledTimes(7);
+    expect(has(tree, 'discovery-no-match')).toBe(true);
+    expect(has(tree, 'discovery-paced')).toBe(false);
+  });
+
+  test('the twenty-first lookup of a UTC day is refused here with the day sentence; it does not return with the minute, and a fresh Find meets it again', async () => {
+    startClock();
+    const search = jest
+      .spyOn(accounts, 'discoverySearch')
+      .mockResolvedValue({ outcome: 'no_match' });
+    const tree = await render();
+    for (let n = 1; n <= 20; n += 1) {
+      if (n > 1 && (n - 1) % 5 === 0) await advance(MINUTE);
+      await findEmail(tree, `p${n}@x.com`);
+      expect(search).toHaveBeenCalledTimes(n);
+    }
+    await advance(MINUTE);
+    await findEmail(tree, 'p21@x.com');
+    expect(search).toHaveBeenCalledTimes(20);
+    expect(messageOf(tree, 'discovery-paced')).toBe(DAY_SENTENCE);
+    expect(messageOf(tree, 'discovery-paced')).toBe(COPY.pacedDay(LOOKUPS_PER_DAY));
+    expect(has(tree, 'discovery-search')).toBe(false);
+
+    await advance(MINUTE);
+    expect(has(tree, 'discovery-paced')).toBe(true);
+    expect(has(tree, 'discovery-search')).toBe(false);
+    // An edit brings Find back; its press meets the day's brake again.
+    await typeEach(tree, 'x');
+    expect(has(tree, 'discovery-search')).toBe(true);
+    await press(tree, 'discovery-search');
+    expect(search).toHaveBeenCalledTimes(20);
+    expect(messageOf(tree, 'discovery-paced')).toBe(DAY_SENTENCE);
+  });
+
+  test('the brake notice takes screen-reader focus like a miss', async () => {
+    startClock();
+    const focusSpy = jest.spyOn(AccessibilityInfo, 'setAccessibilityFocus');
+    const handle = jest.fn((node: unknown) => {
+      const n = node as { children?: unknown; props?: { children?: unknown } } | null;
+      const children = n?.props?.children ?? n?.children;
+      return children === COPY.pacedMinute ? 44 : null;
+    });
+    const original = Object.getOwnPropertyDescriptor(RN, 'findNodeHandle')!;
+    Object.defineProperty(RN, 'findNodeHandle', { configurable: true, get: () => handle });
+    try {
+      jest.spyOn(accounts, 'discoverySearch').mockResolvedValue({ outcome: 'no_match' });
+      const tree = await render({
+        createNodeMock: element => ({ children: element.props.children }),
+      });
+      for (let n = 1; n <= 6; n += 1) await findEmail(tree, `p${n}@x.com`);
+      expect(has(tree, 'discovery-paced')).toBe(true);
+      expect(focusSpy).toHaveBeenLastCalledWith(44);
+    } finally {
+      Object.defineProperty(RN, 'findNodeHandle', original);
+    }
+  });
+});
+
+/* ── the gate pass (2026-10-08): the ledger is the device’s, not the visit’s ── */
+
+describe('the gate pass: the lookup ledger survives a remount of Open a room', () => {
+  test('five lookups, leave, come back: the sixth press in the same minute is refused here with no wire call', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-10-08T15:00:00.000Z'));
+    const search = jest.spyOn(accounts, 'discoverySearch').mockResolvedValue({ outcome: 'no_match' });
+    const first = await render();
+    for (let n = 1; n <= 5; n += 1) await findEmail(first, `p${n}@x.com`);
+    expect(search).toHaveBeenCalledTimes(5);
+    await ReactTestRenderer.act(async () => {
+      first.unmount();
+    });
+    // Opening a found room, the Link-an-email door or Back unmounts the
+    // screen; the day's and the minute's counts are the device's.
+    const again = await render();
+    await findEmail(again, 'p6@x.com');
+    expect(search).toHaveBeenCalledTimes(5);
+    expect(messageOf(again, 'discovery-paced')).toBe(COPY.pacedMinute);
+    // The minute rolls: the brake lifts on its own, here too.
+    await advance(60_000);
+    expect(has(again, 'discovery-paced')).toBe(false);
+  });
+
+  test('the day’s brake lifts itself at midnight UTC, the minute’s at the minute', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-10-08T23:54:30.000Z'));
+    const search = jest.spyOn(accounts, 'discoverySearch').mockResolvedValue({ outcome: 'no_match' });
+    const tree = await render();
+    // Four clock minutes of five (23:54, 23:55, 23:56, 23:57).
+    for (let n = 1; n <= 20; n += 1) {
+      if (n > 1 && (n - 1) % 5 === 0) await advance(60_000);
+      await findEmail(tree, `p${n}@x.com`);
+    }
+    expect(search).toHaveBeenCalledTimes(20);
+    await findEmail(tree, 'p21@x.com');
+    expect(messageOf(tree, 'discovery-paced')).toBe(COPY.pacedDay(LOOKUPS_PER_DAY));
+    // 00:00:00Z is 150 s away: the brake lifts without a press, exactly then.
+    await advance(150_000 - 1);
+    expect(has(tree, 'discovery-paced')).toBe(true);
+    await advance(1);
+    expect(has(tree, 'discovery-paced')).toBe(false);
+    await findEmail(tree, 'p22@x.com');
+    expect(search).toHaveBeenCalledTimes(21);
   });
 });

@@ -137,7 +137,7 @@ export const ACCOUNTS_PHONE_COPY = {
   /** The four-way indistinguishability, extended to the phone
    * classes — same designed collapse, same closing sentence. */
   discoverNoMatchNumber:
-    'No match. That covers several cases on purpose: this number may not be on Tacendum, its owner may not have turned findability on, they may be inside a recovery pause — or your searches for today may be used up. Tacendum cannot tell you which, by design.',
+    'No match. That covers several cases on purpose: this number may not be on Tacendum, its owner may not have turned findability on, they may be inside a recovery pause — or your searches for today (shared by your linked devices, resets at midnight UTC) may be used up. Tacendum cannot tell you which, by design.',
   /** The class-blind caller gate, stated honestly: ANY
    * verified identifier passes, so the hint names both. */
   discoverNeedsOwnIdentifier:
@@ -157,6 +157,10 @@ export const ACCOUNTS_PHONE_COPY = {
   discoverExplainNumber: [
     'If a miss looked different from “registered but not findable”, typing a number would reveal whether its owner uses Tacendum — without their consent. So every refusal is identical, including the one your own daily search budget causes.',
     'Searching needs a verified email or phone number on your own account, and an account at least three days old. That makes bulk scraping expensive without changing what you see here.',
+    // D3 — the email deck's budget line BY REFERENCE (one source, no drift).
+    ACCOUNTS_COPY.discoverExplain[2],
+    // D1 — the self-miss rule, this class named in the shared shape.
+    'Searching for your own phone number or email, from any of your devices, always shows no match.',
   ],
   /** The EMAIL class's explainer with the phone class live: the
    * landed second line said "needs a
@@ -167,6 +171,9 @@ export const ACCOUNTS_PHONE_COPY = {
   discoverExplainEmailBoth: [
     ACCOUNTS_COPY.discoverExplain[0],
     'Searching needs a verified email or phone number on your own account, and an account at least three days old. That makes bulk scraping expensive without changing what you see here.',
+    // D3 + D1 (the 2026-10-08 fix train), by reference.
+    ACCOUNTS_COPY.discoverExplain[2],
+    ACCOUNTS_COPY.discoverExplain[3],
   ],
 
   /* ── recovery (the same narrow scope, both classes) ────── */
@@ -175,7 +182,7 @@ export const ACCOUNTS_PHONE_COPY = {
    * pair. Renders ONLY under PHONE_UI_ENABLED; the landed email-only
    * sentence keeps its bytes while the pin is false. */
   recoverScopeBoth:
-    'Recovery restores two things only: which devices are yours, and your findability by the email or phone number linked to your account. Your messages are not here — they lived only on your old devices. Your old keys are not here — they were never stored anywhere else. Your contacts will see a new safety number and be asked to review it, exactly as if you were a new device — and until each of them accepts that change, messages between you and them wait. That warning is real and correct.',
+    'Recovery restores two things only: which devices are yours, and your findability by the email or phone number linked to your account. Your messages are not here — they lived only on your old devices. Your old keys are not here — they were never stored anywhere else. People you message will see a new safety number and be asked to review it, exactly as if you were a new device — and until each of them accepts that change, messages between you and them wait. That warning is real and correct.',
   recoverNumberLabel: 'The phone number linked to your account',
   recoverCodeSentNumber: (number: string) =>
     `If ${number} is linked to an account, a code is on its way. The answer here looks the same either way — only the device holding that number knows.`,
@@ -220,5 +227,5 @@ export const ACCOUNTS_PHONE_COPY = {
    * destroy state the sentence never disclosed. */
   downgradeIntroBoth: `Removes any email or phone number linked to your account, with your findability by either, and un-groups your devices. Every device keeps its own rooms — nothing leaves this ${DEVICE_NOUN} — and each continues as its own separate account, exactly what it always was underneath.`,
   downgradeConfirmBoth:
-    'Go back to anonymous? Any linked email or phone number and your findability are deleted, your devices stop being grouped, and the people you talk to will see your devices as unrelated contacts from now on.',
+    'Go back to anonymous? Any linked email or phone number and your findability are deleted, your devices stop being grouped, and the people you talk to will see your devices as separate, unrelated accounts from now on.',
 } as const;

@@ -290,6 +290,14 @@ export const LIMITS = {
    * (the one named non-member of the collapse). Shared by the phone attach
    * legs — one caller, one route budget. */
   identifierRoute: { capacity: 10, refillPerSec: 10 / 60 }, // 10 burst, 10/min per caller
+  /** The caller-owned identifier STATE read (`GET /v1/identifiers/state`,
+   * 2026-10-08 — the field report's sibling fix, U3): its OWN bucket,
+   * `idstate:<userId>`, so a focused session's claims, toggles, unlinks and
+   * lookups on the shared `identifierRoute` window can never starve the
+   * read every account screen mounts with; three times that window because
+   * a read costs nothing but two GetItems and discloses only the caller's
+   * own facts. Refuses in the lane's ONE frozen shape, never a 429. */
+  identifierState: { capacity: 30, refillPerSec: 30 / 60 }, // 30 burst, 30/min per caller
   // --- Phone linking + recovery (the phone release
   // pins). RELEASE values the suites assert verbatim; the
   // attach budget is deliberately NOT here: phone attach draws the SAME

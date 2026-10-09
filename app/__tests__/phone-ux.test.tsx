@@ -794,6 +794,9 @@ describe('the finding-11 halves, on the real engine', () => {
       pendingEmail: null,
       pendingRequestedAt: null,
       restoredAt: null,
+      // The server-stamp column (the proof pass, 2026-10-08) reads null on
+      // a carried row: no stamp until a settled read adopts one.
+      since: null,
     });
     // A pre-migration STARTED recovery defaults to 'email' — the only kind
     // that could have started one — with its columns carried.

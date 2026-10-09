@@ -1,4 +1,5 @@
 import { DEVICE_NOUN } from './deviceNoun';
+import { HANDLE_CLASS_LIVE, OTHER_FINDABLE_CLASS_LIVE } from './findableClasses';
 
 /**
  * The identifier / discovery / recovery copy deck — one
@@ -74,6 +75,86 @@ export const ACCOUNTS_COPY = {
     `Remove ${address}? It can no longer win back which devices are yours, and nobody can find you by it. Your devices and rooms are untouched.`,
   emailUnlinkRefused: 'That did not work. Try again.',
 
+  /* ── the REQUEST step's own answers, and the account's facts this
+   *    device cannot read from its rows (D2, the 2026-10-08 fix train) ── */
+  /** The request step's 403 — BEFORE any code exists, so the verify
+   * sentence above ("the code may be wrong or expired") would describe a
+   * code that was never asked for. What the server refuses here is the
+   * CALLER's own state: its account already holds its one email (an
+   * address a linked sibling verified counts — this device's rows never
+   * learn of it), or email linking is switched off. Which one, it
+   * deliberately does not say; neither names any address. */
+  emailRequestRefused:
+    'That request did not go through. This account may already have an email linked — including from one of your other devices — or linking an email may be switched off right now; the server deliberately does not say which.',
+  /** The request step's 429: the caller's OWN budgets (this device's burst
+   * of identifier requests, or the account's daily attach allowance —
+   * 10 new codes a day, counted across its linked devices). Self-keyed
+   * answers disclose nothing about any address, so this sentence may say
+   * what they are. */
+  emailRequestRateLimited:
+    'Too many requests. Wait a minute and try again — an account can ask for at most 10 new codes a day, counted across all of its linked devices.',
+  /** The DAILY allowance, told apart from the minute's burst by the
+   * server's Retry-After (the gate pass, 2026-10-08): waiting a minute
+   * answers the same refusal, so the sentence names the real wait. */
+  emailRequestRateLimitedToday:
+    'This account’s 10 new codes for today are used up, counted across all of its linked devices. They reset at midnight UTC.',
+  /** This device's own pacing of its identifier-route calls (U3, applied
+   * to the email legs at the gate pass): the server allows ten a minute per
+   * device and every identifier class's legs share that window, so the
+   * eleventh is said BEFORE the tap. The handle deck's sentence,
+   * byte-for-byte. */
+  paced: (seconds: number) => `Try again in ${seconds} s.`,
+  /** While the account's own facts are still being read (the gate pass):
+   * the attach form waits for them, so a linked sibling never sees a form
+   * flash over an address its account already holds. */
+  emailChecking: 'Checking this account’s email…',
+  /** An address that is not complete yet (the shared schema's shape): said
+   * under the field, and the button stays dark — the server's collapsed
+   * refusal must never be blamed on the account for a typo. Open a room's
+   * field says the same words. */
+  emailUnfinished: 'Finish the address',
+  /** The GROUP holds a verified email and this device holds no row for it:
+   * a linked sibling (the iPad, a reinstalled phone) linked the address.
+   * The address itself is unreadable here by design — the server keeps a
+   * keyed hash and never echoes it, and the rows do not sync between
+   * devices — so the surface says the fact it has and offers the two verbs
+   * that need no address: Remove and the downgrade. */
+  emailHeldElsewhere:
+    'Your account already has a verified email, linked from another device. The address itself is only readable on the device that linked it.',
+  /** The §4 switch on a sibling (the proof pass, 2026-10-08): the account's
+   * CURRENT setting, read from the caller-owned state (the server's consent
+   * bit), and movable from here — the consent write is group-keyed — so a
+   * lost, reinstalled or recovered linking device leaves the switch with
+   * the devices that remain. The sentence says whose record the switch
+   * shows, since this device holds none of its own. */
+  emailHeldElsewhereFindability:
+    'This switch shows the account’s current setting and can be changed from any linked device.',
+  /** The same state while the bit could not be read (the server holds no
+   * live row for the ref, or the read is older than this build): no
+   * switch, the fact said. */
+  emailHeldElsewhereFindabilityUnknown:
+    'Findability by email could not be read right now. It can be switched from any linked device once it loads.',
+  /** emailUnlinkConfirm without the address this device does not know. */
+  emailHeldElsewhereUnlinkConfirm:
+    'Remove the email linked from your other device? It can no longer win back which devices are yours, and nobody can find you by it. Your devices and rooms are untouched.',
+  /** A local row said "linked" while the account holds no email: the
+   * address was removed from another device (or the account was
+   * downgraded there). The row is cleared and this says why the form is
+   * back. */
+  emailRemovedElsewhere:
+    'The email linked to this account was removed from another device. You can link one again below.',
+  /** A local row said "linked" while the account's live email is NEWER
+   * than it (the gate pass): the address was changed from another device.
+   * The row is cleared and the held-elsewhere state follows. */
+  emailChangedElsewhere:
+    'The email linked to this account was changed from another device. The new address is only readable on the device that linked it.',
+  /** The stop-gap for a server that does not yet answer the state read
+   * (the eligibility read says the account holds a verified identifier,
+   * and this device holds no row): the form stays, and this says where the
+   * address can be changed. */
+  emailMaybeHeldElsewhere:
+    'If this account already has an email, linked from one of your other devices, change or remove it from that device.',
+
   /* ── discoverability (the design consent toggle, default OFF) ────────────── */
   discoverableTitle: 'Findable by email',
   discoverableLabel: 'People who have my email can find me',
@@ -82,7 +163,13 @@ export const ACCOUNTS_COPY = {
   discoverableExplainLabel: 'What turning this on discloses',
   discoverableExplain: [
     'On means: anyone who types this exact email into Tacendum can find your account — they learn how many devices it has and what kinds, and can open a room with you. Nobody is told your email by Tacendum; only someone who already knows it can use it.',
-    'Off is the default, and off means nobody can look you up — by this email or anything else.',
+    // CLASS-SCOPED whenever another findable class is live (the proof
+    // pass, 2026-10-08): with the handle class in the world, "by this
+    // email or anything else" overpromised — a findable name still finds
+    // the account. The pin-OFF binary keeps the landed bytes.
+    OTHER_FINDABLE_CLASS_LIVE
+      ? 'Off is the default, and off means nobody can look you up by this email. Any other way you let people find you — a name you claimed — has its own switch, on its own screen.'
+      : 'Off is the default, and off means nobody can look you up — by this email or anything else.',
     'What the server stores is a scrambled form of the address, keyed by a secret. That protects the list if it leaks, and stops bulk scraping — but the operator of the server, or someone who compels them, could still test addresses against it. This buys leak-resistance, not blindness.',
     'After an account recovery, findability pauses for 7 days even when this is on — so a stolen email cannot instantly redirect the people who look you up.',
     'This switch is your side of the record: the server deliberately answers every consent change identically, so what you see here is what you set — never a receipt.',
@@ -105,11 +192,21 @@ export const ACCOUNTS_COPY = {
   /** The designed indistinguishability, said instead of hidden: the server
    * answers the same for every case the caller has no right to resolve. */
   discoverNoMatch:
-    'No match. That covers several cases on purpose: this email may not be on Tacendum, its owner may not have turned findability on, they may be inside a recovery pause — or your searches for today may be used up. Tacendum cannot tell you which, by design.',
+    'No match. That covers several cases on purpose: this email may not be on Tacendum, its owner may not have turned findability on, they may be inside a recovery pause — or your searches for today (shared by your linked devices, resets at midnight UTC) may be used up. Tacendum cannot tell you which, by design.',
   discoverExplainLabel: 'Why every miss looks the same',
   discoverExplain: [
     'If a miss looked different from “registered but not findable”, typing an email would reveal whether its owner uses Tacendum — without their consent. So every refusal is identical, including the one your own daily search budget causes.',
     'Searching needs a verified email on your own account, and an account at least three days old. That makes bulk scraping expensive without changing what you see here.',
+    // D3 (the 2026-10-08 fix train): the budgets the uniform miss hides —
+    // the per-minute brake, the daily count, and that the day is the
+    // ACCOUNT's (every linked device draws it) on a UTC clock.
+    'Searches are rationed: up to 5 a minute, and 20 a day (shared by your linked devices, resets at midnight UTC). A search past either limit answers the same miss.',
+    // D1: the self-miss is keyed on the account, so a sibling that holds
+    // no local row for the address cannot catch it before sending — the
+    // sheet says the rule instead. This is the EMAIL class's sheet; the
+    // handle class's deck says the same of its own name (the word census
+    // keeps that class's name out of this deck).
+    'Searching for your own email, from any of your devices, always shows no match.',
   ],
   discoverError: 'The search could not reach the server. Check your connection and try again.',
   /** The result card — labeled with the email the finder TYPED, never an
@@ -126,9 +223,16 @@ export const ACCOUNTS_COPY = {
 
   /* ── downgrade to anonymous ───────────────────────────────── */
   downgradeTitle: 'Go back to anonymous',
-  downgradeIntro: `Removes your email and your findability, and un-groups your devices. Every device keeps its own rooms — nothing leaves this ${DEVICE_NOUN} — and each continues as its own separate account, exactly what it always was underneath.`,
-  downgradeConfirm:
-    'Go back to anonymous? Your email and findability are deleted, your devices stop being grouped, and the people you talk to will see your devices as unrelated contacts from now on.',
+  // THE NAME GOES TOO (the proof pass, 2026-10-08): the dissolve tombstones
+  // the account's claimed name server-side, so with the handle class live
+  // both sentences say so — in this deck's class-neutral words (the word
+  // census keeps the class's name out of it). Pin OFF: the landed bytes.
+  downgradeIntro: HANDLE_CLASS_LIVE
+    ? `Removes your email, any name you claimed to be found by, and your findability, and un-groups your devices. Every device keeps its own rooms — nothing leaves this ${DEVICE_NOUN} — and each continues as its own separate account, exactly what it always was underneath.`
+    : `Removes your email and your findability, and un-groups your devices. Every device keeps its own rooms — nothing leaves this ${DEVICE_NOUN} — and each continues as its own separate account, exactly what it always was underneath.`,
+  downgradeConfirm: HANDLE_CLASS_LIVE
+    ? 'Go back to anonymous? Your email, any name you claimed to be found by, and your findability are deleted, your devices stop being grouped, and the people you talk to will see your devices as separate, unrelated accounts from now on.'
+    : 'Go back to anonymous? Your email and findability are deleted, your devices stop being grouped, and the people you talk to will see your devices as separate, unrelated accounts from now on.',
   downgradeAction: 'Downgrade',
   downgradeDone: 'Done. This account is anonymous again.',
   downgradeFailed:
@@ -138,7 +242,7 @@ export const ACCOUNTS_COPY = {
   recoverTitle: 'Recover my account',
   /** THE SCOPE SENTENCE — stated before anything is asked. */
   recoverScope:
-    'Recovery restores two things only: which devices are yours, and your findability by email. Your messages are not here — they lived only on your old devices. Your old keys are not here — they were never stored anywhere else. Your contacts will see a new safety number and be asked to review it, exactly as if you were a new device — and until each of them accepts that change, messages between you and them wait. That warning is real and correct.',
+    'Recovery restores two things only: which devices are yours, and your findability by email. Your messages are not here — they lived only on your old devices. Your old keys are not here — they were never stored anywhere else. People you message will see a new safety number and be asked to review it, exactly as if you were a new device — and until each of them accepts that change, messages between you and them wait. That warning is real and correct.',
   recoverExplainLabel: 'Why recovery is this narrow',
   recoverExplain: [
     'Tacendum holds no copy of your messages and no copy of your keys — so there is nothing more it could give back, to you or to anyone pretending to be you.',

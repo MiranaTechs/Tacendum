@@ -4,6 +4,10 @@ import * as dbModule from './db';
 import { currentToken } from './reauth';
 import { DEVICE_SLOT_CLASS, type DeviceSlotClass } from './deviceNoun';
 import {
+  // The shared identifier-route pacing (U3; the gate pass 2026-10-08): the
+  // server charges every phone leg to the same per-device window the other
+  // identifier classes' legs draw, so each is counted before it is sent.
+  noteIdentifierRouteCall,
   normalizedPhoneOrNull,
   pickDiscoveryAnchor,
   type DiscoveryOutcome,
@@ -82,6 +86,7 @@ export async function requestPhoneAttachCode(
   if (normalized === null) return 'invalid';
   const token = await deps.token();
   if (!token) return 'failed';
+  noteIdentifierRouteCall(deps.now());
   try {
     await deps.api.phoneRequestCode(token, normalized, DEVICE_SLOT_CLASS);
   } catch (error) {
@@ -118,6 +123,7 @@ export async function confirmPhoneAttach(
   if (normalized === null) return 'invalid';
   const token = await deps.token();
   if (!token) return 'failed';
+  noteIdentifierRouteCall(deps.now());
   try {
     await deps.api.phoneVerify(token, normalized, code);
   } catch (error) {
@@ -143,6 +149,7 @@ export async function setPhoneDiscoverable(
 ): Promise<SimpleOutcome> {
   const token = await deps.token();
   if (!token) return 'failed';
+  noteIdentifierRouteCall(deps.now());
   try {
     await deps.api.setPhoneDiscoverable(token, on);
   } catch (error) {
@@ -163,6 +170,7 @@ export async function unlinkPhoneIdentifier(
 ): Promise<SimpleOutcome> {
   const token = await deps.token();
   if (!token) return 'failed';
+  noteIdentifierRouteCall(deps.now());
   try {
     await deps.api.phoneUnlink(token);
   } catch (error) {

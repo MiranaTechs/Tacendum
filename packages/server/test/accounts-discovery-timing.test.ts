@@ -26,7 +26,7 @@ import {
   phoneVerifyRoute,
 } from '../src/handlers/identifiers.js';
 import { usernameClaimRoute, usernameUnlinkRoute } from '../src/handlers/username.js';
-import type { HttpEvent } from '../src/handlers/http.js';
+import type { HttpEvent, HttpResult } from '../src/handlers/http.js';
 import { makeTestDeps, type TestDeps } from './helpers.js';
 
 /**
@@ -171,6 +171,34 @@ function gated(name: string, fn: () => Promise<void>): void {
     if (!available) return ctx.skip();
     await fn();
   });
+}
+
+/**
+ * A non-refusal from the lookup route inside a timed run is never a timing
+ * fact — it is a store fact, and the plain `toBe(discoveryRefusal())` that
+ * caught one said only "401, not 403" (2026-10-08 verify: one 401 in four
+ * runs of the EMPIRICAL case under the shared-store parallel run, on a token
+ * that had just answered 600 refusals, unexplained and unreproduced). The
+ * route's 401 has exactly three sources — the session row absent, the
+ * session expired against the injected clock, the caller's user row absent
+ * or tombstoned — so the next one names which, read back the moment it
+ * happens, instead of leaving a re-run to decide. Called AFTER the elapsed
+ * time is taken: on the green path it is one comparison.
+ */
+async function explainNonRefusal(
+  res: HttpResult,
+  caller: { userId: string; token: string },
+  deps: TestDeps,
+): Promise<void> {
+  if (res.statusCode === 403) return;
+  const session = await db.getSession(caller.token);
+  const state = await db.userAccountState(caller.userId);
+  const nowSeconds = Math.floor(deps.now() / 1000);
+  throw new Error(
+    `lookup answered ${res.statusCode} ${res.body ?? '(no body)'} instead of the frozen refusal — ` +
+      `session row ${session === undefined ? 'ABSENT' : `present (expiresAt ${session.expiresAt}, nowSeconds ${nowSeconds})`}, ` +
+      `caller user row ${state}`,
+  );
 }
 
 async function mkAcct(deps: TestDeps): Promise<{ userId: string; token: string }> {
@@ -423,6 +451,7 @@ describe('miss vs non-consented: one exit, one clock', () => {
       const start = performance.now();
       const res = await discoveryLookupRoute(post(caller.token, body), deps);
       const elapsed = performance.now() - start;
+      await explainNonRefusal(res, caller, deps);
       expect(res).toBe(discoveryRefusal());
       return elapsed;
     };
@@ -526,6 +555,7 @@ describe('miss vs non-consented: one exit, one clock', () => {
       const start = performance.now();
       const res = await discoveryLookupRoute(post(caller.token, body), deps);
       const elapsed = performance.now() - start;
+      await explainNonRefusal(res, caller, deps);
       expect(res).toBe(discoveryRefusal());
       return elapsed;
     };

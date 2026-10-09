@@ -130,16 +130,36 @@ describe('the worked cases (one row each)', () => {
     });
   });
 
-  test('documented edge: an O-led 26-character entry that is Crockford after the fold reads as an ID', () => {
-    expect(on('oliverjameswilliamsdavidxy')).toMatchObject({
-      kind: 'id',
-      id: '011VERJAMESW1111AMSDAV1DXY',
-      count: 26,
-    });
+  // RE-CUT (D4, fix/username-discovery 2026-10-08): the "documented edge"
+  // this test used to pin read a 26-LETTER name as the ID 011VERJAMESW…
+  // and offered Open room to it — a room addressed to nobody, or to a
+  // stranger. A minted ULID always carries digits, so an o-, i- or l-led
+  // run of 26 reads as an ID only when at least one of ITS raw characters
+  // is a digit; a letters-only run is a name.
+  test('an o-, i- or l-led run of 26 letters is a name, never an ID: a minted ID always carries digits (D4)', () => {
+    for (const name of [
+      'oliverjameswilliamsdavidxy',
+      'oliverbenjaminalexanderxyz',
+      'ivanbenjaminalexanderxyzab',
+    ]) {
+      expect([name, on(name)]).toEqual([
+        name,
+        { kind: 'handle', label: name, normalized: name, self: false },
+      ]);
+      expect([name, off(name)]).toEqual([name, { kind: 'unknown' }]);
+    }
     // The sigil still reaches the name.
     expect(on('@oliverjameswilliamsdavidxy').kind).toBe('handle');
-    // And with the class dark the edge is unchanged (it is an ID rule).
-    expect(off('oliverjameswilliamsdavidxy').kind).toBe('id');
+    // The falsifiers: one digit anywhere IN the run, and the O-typed-for-0
+    // transcription, still read as the ID once whole.
+    expect(on('oliverbenjaminalexander1xy')).toMatchObject({
+      kind: 'id',
+      id: '011VERBENJAM1NA1EXANDER1XY',
+      count: 26,
+    });
+    expect(on(`O${PEER.slice(1)}`)).toMatchObject({ kind: 'id', id: PEER, count: 26 });
+    // A digit BESIDE the run does not make the run an ID.
+    expect(on('oliverbenjaminalexanderxyz 1234567890123').kind).not.toBe('id');
   });
 
   test('27-character O- or I-led names are names (their run is 27), never a red "27 of 26"', () => {
@@ -205,6 +225,55 @@ describe('the worked cases (one row each)', () => {
     });
   });
 
+  // D5 (fix/username-discovery 2026-10-08): "alice@example.com." typed with
+  // a sentence's period passed the shape check, so Find sent it, spent a
+  // search and answered a miss. The paste reader already dropped the period;
+  // the typed path now does the same.
+  test('a sentence’s trailing punctuation after an address is not part of it: Find sends the address without it (D5)', () => {
+    for (const raw of [
+      'alice@example.com.',
+      'alice@example.com,',
+      'alice@example.com!?',
+      'mailto:alice@example.com;',
+    ]) {
+      expect([raw, on(raw)]).toEqual([
+        raw,
+        { kind: 'email', label: 'alice@example.com', valid: true, self: false },
+      ]);
+    }
+    // Your own address with a period after it is still yours.
+    expect(on('me@example.com.', MINE)).toEqual({
+      kind: 'email',
+      label: 'me@example.com',
+      valid: true,
+      self: true,
+    });
+    // The falsifier: an unfinished address stays unfinished.
+    expect(on('mira@.')).toEqual({ kind: 'email', label: 'mira@', valid: false, self: false });
+  });
+
+  // D7 (fix/username-discovery 2026-10-08): "alice-smith" and "alice," were
+  // none of the three, so the row said "Not an ID, username or email yet"
+  // with no hint that only letters, digits and underscores are allowed.
+  // Letter-led text that is NEARLY a name is the handle class with nothing
+  // to find, so the rule shows. Refused, never repaired (§4.3): the hyphen,
+  // dot or comma is not stripped from a name — the person removes it.
+  test('a hyphenated, dotted or comma-tailed name is the handle class with nothing to find, so the rule can show (D7)', () => {
+    for (const raw of ['alice-smith', 'alice.smith', 'alice,', 'alice_smith.', 'Alice-7!', 'alice;']) {
+      expect([raw, on(raw)]).toEqual([
+        raw,
+        { kind: 'handle', label: raw, normalized: null, self: false },
+      ]);
+      expect([raw, off(raw)]).toEqual([raw, { kind: 'unknown' }]);
+    }
+    // The sigil form was already this, and stays so.
+    expect(on('@Alice.')).toEqual({ kind: 'handle', label: 'Alice.', normalized: null, self: false });
+    // Not letter-led, or broken by a space: still none of the three.
+    for (const raw of ['-alice', '.alice', 'alice smith', 'alice - smith']) {
+      expect([raw, on(raw)]).toEqual([raw, { kind: 'unknown' }]);
+    }
+  });
+
   test('a short ID inside prose is judged by its own token: 25 of 26, never "the letter U"', () => {
     expect(on(`My Tacendum ID is ${PEER.slice(0, 25)}`)).toEqual({
       kind: 'id',
@@ -234,8 +303,10 @@ describe('the worked cases (one row each)', () => {
     expect(on(`X${PEER}`)).toMatchObject({ kind: 'handle', label: `X${PEER}` });
   });
 
-  test('prose, a dotted name and a formatted phone number are none of the three', () => {
-    for (const raw of ['see you soon', 'alice.smith', '+1 555 123 4567']) {
+  // RE-CUT (D7, 2026-10-08): the dotted name "alice.smith" left this list —
+  // it is the handle class with nothing to find now (its own test above).
+  test('prose and a formatted phone number are none of the three', () => {
+    for (const raw of ['see you soon', '+1 555 123 4567']) {
       expect([raw, on(raw)]).toEqual([raw, { kind: 'unknown' }]);
     }
   });

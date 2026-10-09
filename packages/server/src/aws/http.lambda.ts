@@ -41,6 +41,7 @@ import {
   setUsernameDiscoverableRoute,
 } from '../handlers/discovery.js';
 import {
+  identifierStateRoute,
   usernameClaimRoute,
   usernameEligibilityRoute,
   usernameRenameRoute,
@@ -155,6 +156,12 @@ export const routes: Record<string, Handler> = {
   'POST /v1/identifiers/username/unlink': usernameUnlinkRoute,
   'POST /v1/identifiers/username/discoverable': setUsernameDiscoverableRoute,
   'GET /v1/identifiers/username/eligibility': usernameEligibilityRoute,
+  // The caller-owned identifier state read (2026-10-08, the field
+  // report's sibling fix): the caller's OWN group facts — no name, nothing
+  // about another party — behind the same two flags as the eligibility
+  // read, on its own caller bucket. Builds 31-33 never request it; the
+  // new app falls back to the eligibility read where this key is absent.
+  'GET /v1/identifiers/state': identifierStateRoute,
   'POST /v1/recovery/request-code': recoveryRequestCodeRoute,
   'POST /v1/recovery/verify': recoveryVerifyRoute,
   'POST /v1/recovery/cancel': recoveryCancelRoute,

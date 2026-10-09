@@ -1,5 +1,6 @@
 import {
   type AccountsNotice,
+  type IdentifierStateResponse,
   RESERVED_USERNAMES,
   RESERVED_USERNAME_SKELETONS,
   USERNAME_RENAME_COOLDOWN_SECONDS,
@@ -104,11 +105,31 @@ function isReservedUsername(normalized: string, skeleton: string): boolean {
   );
 }
 
+/** The later of the group row's `usernameRenamedAt` and the caller row's
+ * (the stamp a dissolving unlink carried onto the member; 2026-10-08 gate
+ * pass), or undefined when neither stands. Unix seconds. */
+function latestUsernameStamp(
+  groupStamp: number | undefined,
+  callerStamp: number | undefined,
+): number | undefined {
+  if (groupStamp === undefined) return callerStamp;
+  if (callerStamp === undefined) return groupStamp;
+  return Math.max(groupStamp, callerStamp);
+}
+
+/** Whether a stamp is inside the §4.8 window at `nowSeconds` — the exact
+ * cutoff arithmetic the rename and claim conditions use. */
+function cooldownRunning(stamp: number | undefined, nowSeconds: number): boolean {
+  return stamp !== undefined && stamp > nowSeconds - USERNAME_RENAME_COOLDOWN_SECONDS;
+}
+
 /**
  * POST /v1/identifiers/username/claim — and /rename, the SAME verb spelled
- * for the client's intent (the claim endpoint IS rename when the group
- * already holds a username ref; no discriminant field exists, the route
- * decides nothing the group state does not). Priced BEFORE resolution, in
+ * for the client's intent (the group's state decides which transaction
+ * runs; no discriminant field exists). Since 2026-10-08 the SPELLING carries
+ * ONE guard (step 2b below, the field report's silent-rename fix): the
+ * /claim spelling on a group that already holds a name is refused, never
+ * run as the rename the group's state implies. Priced BEFORE resolution, in
  * this order and for these reasons:
  *
  *  1. the caller-keyed route budget (`idroute:`), then the K_id set and the
@@ -118,6 +139,25 @@ function isReservedUsername(normalized: string, skeleton: string): boolean {
  *     never qualifies). Fresh verified accounts may claim immediately;
  *     proof plus the caller and fleet budgets retain the anti-automation
  *     cost. Refused: the frozen bytes, never an oracle about the caller;
+ *  2b. THE /claim-SPELLING GUARD (field report 2026-10-08, U1; taken by
+ *     recommendation): the username is
+ *     device-local client state the server never echoes (§4.9) and nothing
+ *     syncs it to a linked sibling, so a sibling device (an iPad, a Mac, a
+ *     reinstalled phone) shows the CLAIM form for an account that already
+ *     holds a name, and its "claim" of a different name used to run here as
+ *     the rename the group's state implied — silently renaming the account
+ *     out from under the phone that still displays the old name, and
+ *     consuming the 30-day cool-down. The /claim spelling on a group that
+ *     holds a username ref is therefore the frozen refusal, BEFORE the
+ *     budgets: no claim attempt spent, no admitted counter, no transaction
+ *     (so the same-name retry of a sibling or the holder spends nothing
+ *     either — it used to draw a claim attempt before the `same_name`
+ *     no-op). The /rename spelling keeps the group-state routing exactly:
+ *     it is the client's EXPLICIT intent (the "Change my username" form the
+ *     shipped builds 31-33 send only when they hold a local row), and on a
+ *     claimless group it still claims. The spelling discloses nothing the
+ *     caller did not already send: the refusal is caller-keyed and byte-
+ *     identical to every other refusal of this lane;
  *  3. the rename cool-down as a caller-state precheck for a HOLDER (the
  *     transaction's `usernameRenamedAt` condition is the enforcement) — a
  *     holder inside its 30 days spends nothing on a rename that cannot
@@ -142,165 +182,185 @@ function isReservedUsername(normalized: string, skeleton: string): boolean {
  *     the transaction — `claimUsername` for a group holding no name,
  *     `renameUsername` (the five-item Put-overwrite transaction) for a
  *     holder.
+ *
+ * ONE body behind two thin route wrappers: `spelling` is the only thing the
+ * route key contributes, and step 2b is the only place that reads it.
  */
-const usernameClaimHandler: AuthedHandler = async (event, deps, auth) => {
-  if ((await deps.rateLimit.take(`idroute:${auth.userId}`, LIMITS.identifierRoute)) > 0) {
-    return usernameRefusal();
-  }
-  // Awaited: on a fresh container the first read starts the K_id fetch
-  // (identifiers.ts `hmacKeys`) — an earlier first-tap 403 was this line
-  // refusing on "in flight" instead of waiting for the key.
-  const keys = await hmacKeys(deps);
-  if (!keys) return usernameRefusal();
-  // `.strict` + the explicit consent bit: a rider field, a missing
-  // `discoverable`, or a name outside USERNAME_STRICT after normalization is
-  // malformed and collapses — never repaired, never stripped.
-  const parsed = parseJson(event, UsernameClaimRequest);
-  if (!parsed.ok) return usernameRefusal();
-
-  const caller = await deps.db.getUserById(auth.userId);
-  if (!identifierEligible(caller)) return usernameRefusal();
-  const nowMs = deps.now();
-  const nowSeconds = Math.floor(nowMs / 1000);
-  // Grouped by construction: the possession-proof gate below can only
-  // be satisfied by a group, and a solo device holds no refs at all.
-  if (caller.groupId === undefined) return usernameRefusal();
-  const group = await deps.db.getAccountGroup(caller.groupId);
-  if (!group) return usernameRefusal();
-  const possessionRefs =
-    classRefs(group.identifierRefs, EMAIL_CLAIM_KEY_PREFIX).length +
-    classRefs(group.identifierRefs, PHONE_CLAIM_KEY_PREFIX).length;
-  if (possessionRefs === 0) return usernameRefusal();
-
-  const held = classRefs(group.identifierRefs, USERNAME_CLAIM_KEY_PREFIX);
-  // The cool-down (caller state only — the transactions' condition is the
-  // enforcement and rename/unlink consume it on success alone): the
-  // same cutoff arithmetic the five-item rename and the claim condition on.
-  const inCooldown =
-    group.usernameRenamedAt !== undefined &&
-    group.usernameRenamedAt > nowSeconds - USERNAME_RENAME_COOLDOWN_SECONDS;
-  // A holder's precheck: nothing spent on a rename that cannot commit. (A
-  // non-holder's is below — it needs the claim key.)
-  if (held.length > 0 && inCooldown) return usernameRefusal();
-
-  // The budgets, group-scoped then fleet-wide — both charged per ATTEMPT,
-  // both refusing in the frozen shape (never a 429 on this lane). In AWS
-  // `deps.rateLimit` is the DDB fixed-window limiter, so each count is
-  // fleet-wide by construction.
-  if ((await deps.rateLimit.take(`unameclaim:${caller.groupId}`, LIMITS.usernameClaim)) > 0) {
-    return usernameRefusal();
-  }
-  if ((await deps.rateLimit.take('unameclaim-fleet', LIMITS.usernameClaimFleet)) > 0) {
-    // Field-free: the infra metric filter counts it; the class kill
-    // switch is one delete of the feature#accounts-username row.
-    deps.log('username_claim_fleet_refused');
-    return usernameRefusal();
-  }
-  // The ADMITTED-volume counter: field-free, every attempt that reaches the
-  // namespace — claimed, renamed, and taken alike — so an under-cap sustained
-  // occupancy walk pages at 50% of the ceiling without a refusal ever firing.
-  deps.log('username_claim_admitted');
-
-  // Plaintext exists from here to the key derivation and nowhere durable:
-  // the denylist reads it (exact and skeleton-vs-skeleton), opaque-ref.ts
-  // hashes it, and it is never logged.
-  const normalized = normalizeUsernameIdentifier(parsed.data.username);
-  const skeleton = usernameSkeleton(normalized);
-  if (isReservedUsername(normalized, skeleton)) {
-    deps.log('username_claim_taken');
-    return usernameTaken();
-  }
-  // Every active-version key of BOTH rows, newest first: index 0 is what the
-  // transaction WRITES; the tail is condition-checked with the tombstone-
-  // aware expression in the same transaction (uniqueness across the whole
-  // rotation window).
-  const claimKeys = activeUsernameClaimKeys(keys, normalized);
-  const skeletonKeys = activeNameskelClaimKeys(keys, skeleton);
-
-  if (held.length === 0) {
-    // THE CLAIM. A non-holder inside the cool-down (its last name change
-    // was an unlink — or a rename followed by an unlink) may only take its
-    // OWN name back: EVERY active version of the exact-name row is pre-read
-    // (the walk, ≤2 strongly consistent GetItems — the tombstone may
-    // sit on a RETIRING version, the corrected-spelling case), and only
-    // this group's live tombstone at one of them admits the attempt (the
-    // transaction drops the cool-down clause for it; the rows' tombstone-
-    // aware condition at every version is what then admits the reclaim).
-    // Anything else — a free name, a stranger's name — is the frozen
-    // refusal, no transaction: a claim of another name is a rename in two
-    // verbs and waits the same 30 days. The walk is caller-state-gated and,
-    // like every read of this class, reaps an elapsed tombstone.
-    let reclaimingOwn = false;
-    if (inCooldown) {
-      for (const key of claimKeys) {
-        const standing = await deps.db.getUsernameClaim(key, nowSeconds);
-        if (
-          standing !== undefined &&
-          'tombstoned' in standing &&
-          standing.formerGroupId === caller.groupId
-        ) {
-          reclaimingOwn = true;
-        }
-      }
-      if (!reclaimingOwn) return usernameRefusal();
+const makeUsernameClaimHandler =
+  (spelling: 'claim' | 'rename'): AuthedHandler =>
+  async (event, deps, auth) => {
+    if ((await deps.rateLimit.take(`idroute:${auth.userId}`, LIMITS.identifierRoute)) > 0) {
+      return usernameRefusal();
     }
-    // The recovery cool-down re-arm rides the group-row carrier only:
-    // the address-keyed shadow the attach lane also reads is written by
-    // recovery completion, and recovery is EXCLUDED for this class
-    // absolutely — no username-keyed shadow can ever exist.
-    const carried =
-      group.discoverableAfter !== undefined && group.discoverableAfter > nowSeconds
-        ? { discoverableAfter: group.discoverableAfter }
-        : {};
-    const result = await deps.db.claimUsername({
+    // Awaited: on a fresh container the first read starts the K_id fetch
+    // (identifiers.ts `hmacKeys`) — an earlier first-tap 403 was this line
+    // refusing on "in flight" instead of waiting for the key.
+    const keys = await hmacKeys(deps);
+    if (!keys) return usernameRefusal();
+    // `.strict` + the explicit consent bit: a rider field, a missing
+    // `discoverable`, or a name outside USERNAME_STRICT after normalization is
+    // malformed and collapses — never repaired, never stripped.
+    const parsed = parseJson(event, UsernameClaimRequest);
+    if (!parsed.ok) return usernameRefusal();
+
+    const caller = await deps.db.getUserById(auth.userId);
+    if (!identifierEligible(caller)) return usernameRefusal();
+    const nowMs = deps.now();
+    const nowSeconds = Math.floor(nowMs / 1000);
+    // Grouped by construction: the possession-proof gate below can only
+    // be satisfied by a group, and a solo device holds no refs at all.
+    if (caller.groupId === undefined) return usernameRefusal();
+    const group = await deps.db.getAccountGroup(caller.groupId);
+    if (!group) return usernameRefusal();
+    const possessionRefs =
+      classRefs(group.identifierRefs, EMAIL_CLAIM_KEY_PREFIX).length +
+      classRefs(group.identifierRefs, PHONE_CLAIM_KEY_PREFIX).length;
+    if (possessionRefs === 0) return usernameRefusal();
+
+    const held = classRefs(group.identifierRefs, USERNAME_CLAIM_KEY_PREFIX);
+    // Step 2b: the /claim spelling never renames. A group that holds a name
+    // changes it only through the /rename spelling (the explicit intent);
+    // every /claim on it — another name, the held name, a stale sibling's
+    // retype — is the frozen refusal before any budget is drawn.
+    if (spelling === 'claim' && held.length > 0) return usernameRefusal();
+    // The cool-down (caller state only — the transactions' condition is the
+    // enforcement and rename/unlink consume it on success alone): the
+    // same cutoff arithmetic the five-item rename and the claim condition on.
+    // The LATER of the group's stamp and the caller's own (the stamp a
+    // dissolving unlink carried onto the member — the 2026-10-08 gate pass;
+    // the next lazy-solo attach copies it onto the group it mints, so the
+    // transaction's group-row condition agrees).
+    const inCooldown = cooldownRunning(
+      latestUsernameStamp(group.usernameRenamedAt, caller.usernameRenamedAt),
+      nowSeconds,
+    );
+    // A holder's precheck: nothing spent on a rename that cannot commit. (A
+    // non-holder's is below — it needs the claim key.)
+    if (held.length > 0 && inCooldown) return usernameRefusal();
+
+    // The budgets, group-scoped then fleet-wide — both charged per ATTEMPT,
+    // both refusing in the frozen shape (never a 429 on this lane). In AWS
+    // `deps.rateLimit` is the DDB fixed-window limiter, so each count is
+    // fleet-wide by construction.
+    if ((await deps.rateLimit.take(`unameclaim:${caller.groupId}`, LIMITS.usernameClaim)) > 0) {
+      return usernameRefusal();
+    }
+    if ((await deps.rateLimit.take('unameclaim-fleet', LIMITS.usernameClaimFleet)) > 0) {
+      // Field-free: the infra metric filter counts it; the class kill
+      // switch is one delete of the feature#accounts-username row.
+      deps.log('username_claim_fleet_refused');
+      return usernameRefusal();
+    }
+    // The ADMITTED-volume counter: field-free, every attempt that reaches the
+    // namespace — claimed, renamed, and taken alike — so an under-cap sustained
+    // occupancy walk pages at 50% of the ceiling without a refusal ever firing.
+    deps.log('username_claim_admitted');
+
+    // Plaintext exists from here to the key derivation and nowhere durable:
+    // the denylist reads it (exact and skeleton-vs-skeleton), opaque-ref.ts
+    // hashes it, and it is never logged.
+    const normalized = normalizeUsernameIdentifier(parsed.data.username);
+    const skeleton = usernameSkeleton(normalized);
+    if (isReservedUsername(normalized, skeleton)) {
+      deps.log('username_claim_taken');
+      return usernameTaken();
+    }
+    // Every active-version key of BOTH rows, newest first: index 0 is what the
+    // transaction WRITES; the tail is condition-checked with the tombstone-
+    // aware expression in the same transaction (uniqueness across the whole
+    // rotation window).
+    const claimKeys = activeUsernameClaimKeys(keys, normalized);
+    const skeletonKeys = activeNameskelClaimKeys(keys, skeleton);
+
+    if (held.length === 0) {
+      // THE CLAIM. A non-holder inside the cool-down (its last name change
+      // was an unlink — or a rename followed by an unlink) may only take its
+      // OWN name back: EVERY active version of the exact-name row is pre-read
+      // (the walk, ≤2 strongly consistent GetItems — the tombstone may
+      // sit on a RETIRING version, the corrected-spelling case), and only
+      // this group's live tombstone at one of them admits the attempt (the
+      // transaction drops the cool-down clause for it; the rows' tombstone-
+      // aware condition at every version is what then admits the reclaim).
+      // Anything else — a free name, a stranger's name — is the frozen
+      // refusal, no transaction: a claim of another name is a rename in two
+      // verbs and waits the same 30 days. The walk is caller-state-gated and,
+      // like every read of this class, reaps an elapsed tombstone. "Own"
+      // means the GROUP that held the name — or, since 2026-10-08 (the
+      // field report's S3), the MEMBER whose dissolving unlink left it:
+      // that group died in the unlink's own transaction, so the take-back
+      // the unlink confirmation promises can only be exercised by the person
+      // (`formerUserId`), from whatever fresh group they verify into next.
+      let reclaimingOwn = false;
+      if (inCooldown) {
+        for (const key of claimKeys) {
+          const standing = await deps.db.getUsernameClaim(key, nowSeconds);
+          if (
+            standing !== undefined &&
+            'tombstoned' in standing &&
+            (standing.formerGroupId === caller.groupId || standing.formerUserId === auth.userId)
+          ) {
+            reclaimingOwn = true;
+          }
+        }
+        if (!reclaimingOwn) return usernameRefusal();
+      }
+      // The recovery cool-down re-arm rides the group-row carrier only:
+      // the address-keyed shadow the attach lane also reads is written by
+      // recovery completion, and recovery is EXCLUDED for this class
+      // absolutely — no username-keyed shadow can ever exist.
+      const carried =
+        group.discoverableAfter !== undefined && group.discoverableAfter > nowSeconds
+          ? { discoverableAfter: group.discoverableAfter }
+          : {};
+      const result = await deps.db.claimUsername({
+        userId: auth.userId,
+        groupId: caller.groupId,
+        refsSnapshot: group.identifierRefs,
+        claimKey: claimKeys[0]!,
+        skeletonKey: skeletonKeys[0]!,
+        retiringClaimKeys: claimKeys.slice(1),
+        retiringSkeletonKeys: skeletonKeys.slice(1),
+        discoverable: parsed.data.discoverable,
+        ...carried,
+        reclaimingOwn,
+        nowMs,
+      });
+      if (result === 'taken') {
+        deps.log('username_claim_taken');
+        return usernameTaken();
+      }
+      // identifier_cap, cooldown (raced past the precheck), stale,
+      // unknown_member: the caller's own state moved under it (a sibling
+      // claimed first, a membership ended, an unlink landed) — collapsed.
+      if (result !== 'claimed') return usernameRefusal();
+      deps.log('username_claimed', { userRef: userRefForLog(auth.userId, deps.userRefSalt) });
+      return json(200, {});
+    }
+
+    // THE RENAME: one TransactWrite, five items, Put-overwrites only —
+    // the old rows become tombstones the former owner may reclaim for 30 days,
+    // the new rows are born under the tombstone-aware condition, and the
+    // cool-down is consumed only if the whole transaction commits.
+    const result = await deps.db.renameUsername({
       userId: auth.userId,
       groupId: caller.groupId,
       refsSnapshot: group.identifierRefs,
-      claimKey: claimKeys[0]!,
-      skeletonKey: skeletonKeys[0]!,
-      retiringClaimKeys: claimKeys.slice(1),
-      retiringSkeletonKeys: skeletonKeys.slice(1),
+      oldClaimKey: held[0]!,
+      claimKeys,
+      skeletonKeys,
       discoverable: parsed.data.discoverable,
-      ...carried,
-      reclaimingOwn,
       nowMs,
     });
     if (result === 'taken') {
       deps.log('username_claim_taken');
       return usernameTaken();
     }
-    // identifier_cap, cooldown (raced past the precheck), stale,
-    // unknown_member: the caller's own state moved under it (a sibling
-    // claimed first, a membership ended, an unlink landed) — collapsed.
-    if (result !== 'claimed') return usernameRefusal();
-    deps.log('username_claimed', { userRef: userRefForLog(auth.userId, deps.userRefSalt) });
+    // cooldown (raced past the precheck), same_name (a no-op that must not
+    // consume the cool-down), stale, unknown_member: collapsed.
+    if (result !== 'renamed') return usernameRefusal();
+    deps.log('username_renamed', { userRef: userRefForLog(auth.userId, deps.userRefSalt) });
     return json(200, {});
-  }
-
-  // THE RENAME: one TransactWrite, five items, Put-overwrites only —
-  // the old rows become tombstones the former owner may reclaim for 30 days,
-  // the new rows are born under the tombstone-aware condition, and the
-  // cool-down is consumed only if the whole transaction commits.
-  const result = await deps.db.renameUsername({
-    userId: auth.userId,
-    groupId: caller.groupId,
-    refsSnapshot: group.identifierRefs,
-    oldClaimKey: held[0]!,
-    claimKeys,
-    skeletonKeys,
-    discoverable: parsed.data.discoverable,
-    nowMs,
-  });
-  if (result === 'taken') {
-    deps.log('username_claim_taken');
-    return usernameTaken();
-  }
-  // cooldown (raced past the precheck), same_name (a no-op that must not
-  // consume the cool-down), stale, unknown_member: collapsed.
-  if (result !== 'renamed') return usernameRefusal();
-  deps.log('username_renamed', { userRef: userRefForLog(auth.userId, deps.userRefSalt) });
-  return json(200, {});
-};
+  };
 
 /**
  * GET /v1/identifiers/username/eligibility — the caller's own readiness for
@@ -330,6 +390,121 @@ const usernameEligibilityHandler: AuthedHandler = async (_event, deps, auth) => 
     }
   }
   const response: UsernameEligibilityResponse = { hasVerifiedIdentifier };
+  return json(200, response);
+};
+
+/**
+ * GET /v1/identifiers/state (2026-10-08, the field report's sibling fix —
+ * taken by recommendation): the caller's
+ * OWN account-group facts, and nothing about any other party. A linked
+ * sibling (an iPad, a Mac, a reinstalled phone) holds no local identifier
+ * rows — the server never echoes a name (§4.9) and the rows do not sync —
+ * so without this read the app showed the claim form, the attach form and
+ * the own-name refusals on every device but the one that acted. The five
+ * strict keys of `IdentifierStateResponse`, in the pinned order:
+ *  - `hasVerifiedIdentifier`: the eligibility read's EXACT boolean (email
+ *    OR phone ref present) — the claim and username-lookup gate;
+ *  - `emailLinked` / `phoneLinked`: a verified claim of that class stands
+ *    on the group (the attach form is wrong on a sibling when it does);
+ *  - `holdsUsername`: the group holds a username ref (the claim form is
+ *    wrong when it does; a local row is a phantom when it does not);
+ *  - `usernameCooldownUntil`: the §4.8 rename/unlink cool-down's END in
+ *    UNIX SECONDS while a window runs (`usernameRenamedAt + 30 d`, the
+ *    exact arithmetic the rename and claim conditions use), else null —
+ *    from the LATER of the group's stamp and the caller's own user-row
+ *    stamp (the one a dissolving unlink carried; the gate pass), so a
+ *    solo device that just removed its last identifier still reads the
+ *    window it is inside;
+ *  - `usernameSince` / `emailSince` (the 2026-10-08 gate pass): the unix
+ *    seconds the LIVE claim row of that class was written, or null — the
+ *    one fact that tells a device its local row is a PHANTOM when a
+ *    sibling RENAMED the name or REPLACED the address (both leave
+ *    `holdsUsername` / `emailLinked` true). A stamp, never a name;
+ *  - `usernameFindable`: the held name's consent bit as the server holds
+ *    it, or null — a sibling's rename form starts at the current value
+ *    instead of a default it could not see;
+ *  - `emailFindable` (the 2026-10-08 proof pass): the linked email's
+ *    consent bit the same way, or null — so a sibling's Email screen can
+ *    show and move findability by email (the consent write is group-keyed)
+ *    after the linking device is lost, reinstalled or recovered.
+ *
+ * A NEW route rather than a field on the eligibility read, deliberately:
+ * `UsernameEligibilityResponse` is parsed `.strict()` by builds 31-33 with
+ * no OTA path, so one new field THERE would disable username claim and
+ * search fleet-wide the day this deploys; that shape stays byte-identical.
+ *
+ * The same discipline as the eligibility read, line for line: the caller
+ * pointer is read STRONGLY and the caller must stand in the AUTHORITATIVE
+ * roster before any fact of that group is consumed — a stale post-unlink
+ * pointer reads every fact false and no window, never the former group's
+ * email or name slot. No name, no claim key, no hash, no ULID, no target,
+ * no refusal reason travels — the plan's "no refusal reason travels on a
+ * caller-owned read" is amended to "no fact about ANOTHER party travels on
+ * a caller-owned read" (ruled 2026-10-08): these facts are the
+ * caller's own account, which the caller's own device already displays on
+ * the device that acted. Charged to its OWN caller-keyed bucket
+ * (`idstate:<userId>`, 30/min — U3): the app reads it on every account
+ * screen mount, so it must never draw the shared 10/min `idroute:` window a
+ * focused session's claims, toggles and lookups already spend; refused in
+ * the frozen shape like every refusal of this lane, and flag-gated exactly
+ * like the eligibility read (dark class, dark facts).
+ */
+const identifierStateHandler: AuthedHandler = async (_event, deps, auth) => {
+  if ((await deps.rateLimit.take(`idstate:${auth.userId}`, LIMITS.identifierState)) > 0) {
+    return usernameRefusal();
+  }
+  const caller = await deps.db.getUserById(auth.userId, undefined, { consistent: true });
+  if (!identifierEligible(caller)) return usernameRefusal();
+
+  const nowSeconds = Math.floor(deps.now() / 1000);
+  const response: IdentifierStateResponse = {
+    hasVerifiedIdentifier: false,
+    emailLinked: false,
+    phoneLinked: false,
+    holdsUsername: false,
+    usernameCooldownUntil: null,
+    usernameSince: null,
+    emailSince: null,
+    usernameFindable: null,
+    emailFindable: null,
+  };
+  // The caller's OWN stamp first (a solo device after a dissolving unlink
+  // holds the window on its user row and no group at all); the group's
+  // stamp joins it below when the caller stands in the roster.
+  let stamp = caller.usernameRenamedAt;
+  if (caller.groupId !== undefined) {
+    const group = await deps.db.getAccountGroup(caller.groupId);
+    if (group?.members.some((member) => member.userId === auth.userId)) {
+      const emailKeys = classRefs(group.identifierRefs, EMAIL_CLAIM_KEY_PREFIX);
+      const usernameKeys = classRefs(group.identifierRefs, USERNAME_CLAIM_KEY_PREFIX);
+      response.emailLinked = emailKeys.length > 0;
+      response.phoneLinked = classRefs(group.identifierRefs, PHONE_CLAIM_KEY_PREFIX).length > 0;
+      response.hasVerifiedIdentifier = response.emailLinked || response.phoneLinked;
+      response.holdsUsername = usernameKeys.length > 0;
+      stamp = latestUsernameStamp(group.usernameRenamedAt, stamp);
+      // The live rows' birth stamps and the name's consent bit: two
+      // strongly consistent GetItems off the group's own refs (never a
+      // Query, never a name). A ref whose row is gone or tombstoned under
+      // the handler's feet reads as no fact (null), never as a guess.
+      if (usernameKeys.length > 0) {
+        const live = await deps.db.getUsernameClaim(usernameKeys[0]!, nowSeconds);
+        if (live !== undefined && !('tombstoned' in live)) {
+          response.usernameSince = Math.floor(live.createdAt / 1000);
+          response.usernameFindable = live.discoverable;
+        }
+      }
+      if (emailKeys.length > 0) {
+        const live = await deps.db.getIdentifierClaim(emailKeys[0]!);
+        if (live !== undefined) {
+          response.emailSince = Math.floor(live.verifiedAt / 1000);
+          response.emailFindable = live.discoverable;
+        }
+      }
+    }
+  }
+  response.usernameCooldownUntil = cooldownRunning(stamp, nowSeconds)
+    ? stamp! + USERNAME_RENAME_COOLDOWN_SECONDS
+    : null;
   return json(200, response);
 };
 
@@ -444,10 +619,16 @@ export async function revokeUsernameAndNotify(
 
 // The wrapped routes (both flags FIRST, then bearer auth — devices.ts): what
 // the local adapter and the ordinary HTTP Lambda host mount, libsignal-free.
-// `/claim` and `/rename` are ONE handler behind two route keys: the group's
-// state decides which transaction runs the spelling is the client's
-// declared intent and carries no discriminant.
-export const usernameClaimRoute: Handler = accountsUsernameRoute(usernameClaimHandler);
-export const usernameRenameRoute: Handler = accountsUsernameRoute(usernameClaimHandler);
+// `/claim` and `/rename` are ONE body behind two route keys: the group's
+// state decides which transaction runs, and the spelling — the
+// client's declared intent — decides exactly one thing since 2026-10-08:
+// the /claim spelling never renames (step 2b).
+export const usernameClaimRoute: Handler = accountsUsernameRoute(makeUsernameClaimHandler('claim'));
+export const usernameRenameRoute: Handler = accountsUsernameRoute(
+  makeUsernameClaimHandler('rename'),
+);
 export const usernameUnlinkRoute: Handler = accountsUsernameRoute(usernameUnlinkHandler);
 export const usernameEligibilityRoute: Handler = accountsUsernameRoute(usernameEligibilityHandler);
+// The caller-owned state read (2026-10-08): its own handler, its own bucket,
+// the same two flags.
+export const identifierStateRoute: Handler = accountsUsernameRoute(identifierStateHandler);

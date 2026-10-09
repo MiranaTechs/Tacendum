@@ -52,6 +52,7 @@ import {
   setUsernameDiscoverableRoute,
 } from '../handlers/discovery.js';
 import {
+  identifierStateRoute,
   usernameClaimRoute,
   usernameEligibilityRoute,
   usernameRenameRoute,
@@ -333,6 +334,9 @@ const routes: Route[] = [
   { method: 'POST', pattern: '/v1/identifiers/username/unlink', handler: usernameUnlinkRoute },
   { method: 'POST', pattern: '/v1/identifiers/username/discoverable', handler: setUsernameDiscoverableRoute },
   { method: 'GET', pattern: '/v1/identifiers/username/eligibility', handler: usernameEligibilityRoute },
+  // The caller-owned identifier state read (2026-10-08, the field
+  // report's sibling fix): the caller's OWN group facts, same two flags.
+  { method: 'GET', pattern: '/v1/identifiers/state', handler: identifierStateRoute },
   { method: 'POST', pattern: '/v1/recovery/request-code', handler: recoveryRequestCodeRoute },
   { method: 'POST', pattern: '/v1/recovery/verify', handler: recoveryVerifyRoute },
   { method: 'POST', pattern: '/v1/recovery/cancel', handler: recoveryCancelRoute },

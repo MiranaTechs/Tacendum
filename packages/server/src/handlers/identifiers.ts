@@ -11,6 +11,7 @@ import {
   RECOVERY_DISCOVERY_COOLDOWN_SECONDS,
   RecoveryCodeRequest,
   RecoveryVerifyRequest,
+  USERNAME_RENAME_COOLDOWN_SECONDS,
   normalizeEmailIdentifier,
   normalizePhoneIdentifier,
   type AccountsNotice,
@@ -485,6 +486,22 @@ async function sendPhoneCodeLeg(
   return uniform;
 }
 
+/** The username cool-down a DISSOLVING unlink carried onto the caller's
+ * user row (§4.8; the 2026-10-08 gate pass), handed to the
+ * lazy-solo attach so the group it mints inherits the running window — a
+ * person cannot shed the 30-day rule by re-verifying. Nothing when no
+ * window runs, and nothing on the existing-group branch (the group row
+ * already carries its own stamp; the data layer ignores it there). */
+function carriedUsernameCooldown(
+  caller: { groupId?: string; usernameRenamedAt?: number },
+  nowSeconds: number,
+): { usernameRenamedAt?: number } {
+  if (caller.groupId !== undefined || caller.usernameRenamedAt === undefined) return {};
+  return caller.usernameRenamedAt > nowSeconds - USERNAME_RENAME_COOLDOWN_SECONDS
+    ? { usernameRenamedAt: caller.usernameRenamedAt }
+    : {};
+}
+
 /**
  * POST /v1/identifiers/email/request-code: ask for an attach code. The
  * caller's own state may refuse distinguishably (its group already holds its
@@ -622,6 +639,7 @@ const emailVerifyHandler: AuthedHandler = async (event, deps, auth) => {
     retiringClaimKeys: candidates.slice(1),
     nowMs: deps.now(),
     ...(carriedCooldown !== undefined ? { discoverableAfter: carriedCooldown } : {}),
+    ...carriedUsernameCooldown(caller, nowSeconds),
   });
   // claim_exists, identifier_cap, stale, already_grouped, code_gone,
   // unknown_member: each is a fact the caller has no consented right to
@@ -780,6 +798,7 @@ const phoneVerifyHandler: AuthedHandler = async (event, deps, auth) => {
     retiringClaimKeys: candidates.slice(1),
     nowMs: deps.now(),
     ...(carriedCooldown !== undefined ? { discoverableAfter: carriedCooldown } : {}),
+    ...carriedUsernameCooldown(caller, nowSeconds),
   });
   if (result !== 'attached') return accountsRefusal();
   deps.log('identifier_attached', { userRef: userRefForLog(auth.userId, deps.userRefSalt) });

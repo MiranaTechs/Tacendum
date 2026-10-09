@@ -40,6 +40,7 @@ import { LINK_POLL_STEPS_MS, LINK_POLL_TAIL_MS } from '../src/screens/LinkDevice
 import {
   AcceptorCeremony,
   currentRoster,
+  dissolveGrouping,
   handleAccountsNoticeFrame,
   LINKING_COPY,
   mutateRoster,
@@ -50,7 +51,9 @@ import {
   reconcilePendingLink,
   redrivePendingMutations,
   type LinkingDeps,
+  type PeerRosterNotice,
 } from '../src/linking';
+import * as accountsUsername from '../src/accountsUsername';
 import * as db from '../src/db';
 import { LinkedDevicesScreen } from '../src/screens/LinkedDevicesScreen';
 
@@ -546,6 +549,79 @@ describe('a scanned ULID alone NEVER produces a link', () => {
 
   it('the history sentence is byte-pinned into the link-time copy', () => {
     expect(LINKING_COPY.historyStance).toBe('This device shows messages from today forward.');
+  });
+
+  it('the join-existing-account copy (2026-10-08 follow-up) names the live doors and breaks no census', () => {
+    // The unlinked second device's guidance (the Email and handle screens'
+    // needs-verification states): every sentence passes the censuses the
+    // deck already lives under, and the doors it names are the live labels.
+    const all = [
+      LINKING_COPY.joinExistingAccount,
+      LINKING_COPY.joinExistingAccountLivedIn,
+      LINKING_COPY.joinExistingAccountInfoLabel,
+      ...LINKING_COPY.joinExistingAccountInfo,
+      LINKING_COPY.joinExistingAccountStartOver,
+    ];
+    expect(LINKING_COPY.joinExistingAccountInfo.length).toBeGreaterThanOrEqual(4);
+    expect(new Set(all).size).toBe(all.length);
+    for (const s of all) {
+      expect(typeof s).toBe('string');
+      expect(s.length).toBeGreaterThan(0);
+      // The Android drift net: no bare device noun outside the token —
+      // "device" and "phone number" are the words allowed.
+      expect(s).not.toMatch(/iphone|ipad|tablet/i);
+      expect(s.replace(/phone (number|call)s?/gi, '')).not.toMatch(/\bphone\b/i);
+      // The handle class's word census (this deck is not allowlisted).
+      expect(s).not.toMatch(/username/i);
+      // The Rooms vocabulary: rooms, never chats.
+      expect(s).not.toMatch(/\bchats?\b/i);
+      // No slot word spelled outside deviceNoun.ts (P3): "one device of
+      // each kind", as classMismatch and newDeviceSlot already say.
+      expect(s).not.toMatch(/\bslot\b/i);
+      // The QR payload is a bare ID: the copy names a QR code and a screen,
+      // never a link or a scheme.
+      expect(s).not.toMatch(/https?:|tacendum:|deep link/i);
+    }
+    // The live labels, by literal — a renamed door must fail here.
+    const info = LINKING_COPY.joinExistingAccountInfo.join(' ');
+    for (const door of [
+      'Settings',
+      'Account',
+      LINKING_COPY.settingsRow,
+      'Link a device',
+      'Your profile',
+      'Show QR code',
+    ]) {
+      expect(info).toContain(door);
+    }
+    // The ceremony's order (codeInstruction: the existing device confirms
+    // first) and its two preconditions, said where they matter.
+    expect(info).toContain('confirm it on the other device first, then here');
+    expect(info).toContain('one device of each kind');
+    expect(info).toContain('fresh install');
+    // The proof pass (2026-10-08): the three sentences added beside them
+    // — the offerer's own "Linked.", the link-offer budget's 429 and the
+    // roster-change refusal — ride the same census (no idiom noun, no
+    // handle-class word, no "chat"), and the offerer's sentence names the
+    // NEW device as the one that starts from today, never this one.
+    for (const s of [LINKING_COPY.linkedOfferer, LINKING_COPY.rateLimited, LINKING_COPY.rosterRefused]) {
+      expect(s).not.toMatch(/iphone|ipad|tablet/i);
+      expect(s.replace(/phone (number|call)s?/gi, '')).not.toMatch(/\bphone\b/i);
+      expect(s).not.toMatch(/username/i);
+      expect(s).not.toMatch(/\bchats?\b/i);
+    }
+    expect(LINKING_COPY.linkedOfferer).toBe('Linked. The new device shows messages from today forward.');
+    expect(LINKING_COPY.linkedOfferer).not.toBe(`Linked. ${LINKING_COPY.historyStance}`);
+    expect(LINKING_COPY.rosterRefused).not.toContain('new device');
+    expect(LINKING_COPY.joinExistingAccount).toContain('started from the other device');
+    expect(LINKING_COPY.joinExistingAccount).not.toMatch(/\bwill join\b/);
+    expect(LINKING_COPY.joinExistingAccountLivedIn).toContain('only a fresh install can be linked');
+    expect(LINKING_COPY.joinExistingAccountLivedIn).toContain('cannot be verified here as well');
+    expect(LINKING_COPY.joinExistingAccountStartOver).toContain('Delete account');
+    expect(LINKING_COPY.joinExistingAccountStartOver).toContain('Your profile');
+    // The pinned sentences this follow-up reuses by reference are unchanged.
+    expect(LINKING_COPY.historyStance).toBe('This device shows messages from today forward.');
+    expect(LINKING_COPY.settingsRow).toBe('Linked devices');
   });
 });
 
@@ -1535,5 +1611,541 @@ describe('the acceptor links exactly the ceremony counterpart', () => {
     expect(state.devices.some(d => d.userId === THIRD)).toBe(false);
     // The offerer's row carries the CEREMONY-pinned key, not a served one.
     expect(state.devices.find(d => d.userId === OTHER)?.identityKeyPub).toBe(rawKey(OTHER));
+  });
+});
+
+/* ── 11. the join branch (fix/username-discovery, 2026-10-08 — S2) ─── */
+
+/**
+ * S2, the client half. Two facts about the server the ceremony never
+ * accounted for:
+ *
+ *  (a) a device that verified an email BEFORE its first link is grouped
+ *      server-side — the attach lazily minted a solo group (§3) — while it
+ *      holds no local group row: the verify answer is `{}` and a bundle
+ *      carries no groupId. Its next offer therefore declared an
+ *      offererClass, which is the one thing linkOfferInit refuses from a
+ *      grouped offerer. The ceremony now asks its OWN bundle first (the
+ *      keys route serves rosterVersion exactly when the caller is grouped)
+ *      and records the group the server names at init.
+ *  (b) the server's JOIN branch appends only the joiner's entry: the
+ *      offerer's own entry stays certless (an attach-created founder) or
+ *      keeps an EARLIER ceremony's certs (a re-link after an unlink), and
+ *      the joiner's own entry — the one carrying THIS ceremony's certs —
+ *      is filtered out of the joiner's bundle. Completion now ALSO reads
+ *      the joiner's entry of the offerer's OWN bundle, verified EXACTLY as
+ *      before: the ceremony-pinned joiner key, op=accept, the tuple from
+ *      this device's own pending record. Only the bytes' location differs.
+ */
+describe('S2: the join branch — an attach-created founder links, and the offerer completes a join', () => {
+  const JOIN_EPOCH = 1;
+  /** The completion tuple of a JOIN: the server's init named the group's
+   * current epoch (1 for an attach-created solo group); everything else is
+   * this device's own pending record, subject = its own key. */
+  const JOIN_TUPLE = {
+    groupId: GROUP,
+    offererUserId: SELF,
+    acceptorUserId: OTHER,
+    subjectIdentityPubKey: rawKey(SELF),
+    class: 'tablet' as const,
+    rosterEpoch: JOIN_EPOCH,
+    offerNonce: NONCE,
+    expiresAt: EXPIRES,
+  };
+  const JOIN_CERTS = {
+    offerSig: fakeSig('offer', { ...JOIN_TUPLE, subjectIdentityPubKey: rawKey(OTHER) }),
+    acceptSig: fakeSig('accept', JOIN_TUPLE),
+    groupId: GROUP,
+    offererUserId: SELF,
+    acceptorUserId: OTHER,
+    class: 'tablet' as const,
+    rosterEpoch: JOIN_EPOCH,
+    offerNonce: NONCE,
+    expiresAt: EXPIRES,
+  };
+
+  /** A device grouped SERVER-SIDE with no local group row (it verified an
+   * email, which minted a solo group): its own bundle serves rosterVersion
+   * — the only wire that says so — and init answers the group's epoch. */
+  function attachCreatedFounder() {
+    const made = fakeDeps();
+    made.state.bundleSiblings.set(SELF, []); // grouped (rosterVersion served), alone
+    made.deps.api.linkOfferInit = async (_t, body) => {
+      made.calls.init.push(body);
+      return { groupId: GROUP, rosterEpoch: JOIN_EPOCH, offerNonce: NONCE, expiresAt: EXPIRES };
+    };
+    return made;
+  }
+
+  /** The join as the server serves it after the acceptance commits: this
+   * device's entry on the JOINER's bundle is certless (the join branch
+   * appends only the joiner's entry); the joiner's entry on this device's
+   * OWN bundle carries the ceremony's certs. */
+  function serveCommittedJoin(state: FakeState, joinerEntryCerts = JOIN_CERTS) {
+    state.bundleSiblings.set(OTHER, [{ userId: SELF, class: 'phone' }]);
+    state.bundleSiblings.set(SELF, [{ userId: OTHER, class: 'tablet', certs: joinerEntryCerts }]);
+  }
+
+  it('(a) an attach-created founder declares NO offererClass: the own bundle says grouped, init names the group', async () => {
+    const { deps, calls, state } = attachCreatedFounder();
+    const ceremony = await OffererCeremony.begin(OTHER, deps);
+    expect(calls.bundles).toEqual([OTHER]);
+    await ceremony.confirm('tablet');
+    // ONE own-bundle probe, before init, and the class is NOT declared.
+    expect(calls.bundles).toEqual([OTHER, SELF]);
+    expect(calls.init).toEqual([{ acceptorUserId: OTHER, acceptorClass: 'tablet' }]);
+    // The offer signs the epoch the server named for the join.
+    expect(calls.sign).toEqual([
+      {
+        op: 'offer',
+        tuple: {
+          groupId: GROUP,
+          offererUserId: SELF,
+          acceptorUserId: OTHER,
+          subjectIdentityPubKey: rawKey(OTHER),
+          class: 'tablet',
+          rosterEpoch: JOIN_EPOCH,
+          offerNonce: NONCE,
+          expiresAt: EXPIRES,
+        },
+      },
+    ]);
+    // RE-CUT 2026-10-08 (the gate pass): NO group row before the acceptance
+    // — the server-named id becomes local truth only when the acceptance is
+    // verified (completeOffererLink). The earlier pin recorded it at init;
+    // that row outlived an abandoned ceremony, and once the solo group
+    // dissolved it made every later link classless and refused, the
+    // downgrade's dissolve fail on every retry, and recovery notices for the
+    // re-attached group implausible (the abandoned-init case below).
+    expect(state.group).toBeNull();
+    expect(ceremony.phase).toBe('waiting');
+    expect(state.pendingCeremony).not.toBeNull();
+  });
+
+  it('(a) a truly solo device still declares its own class — and records no group before the acceptance', async () => {
+    const { deps, calls, state } = fakeDeps();
+    const ceremony = await OffererCeremony.begin(OTHER, deps);
+    await ceremony.confirm('tablet');
+    expect(calls.bundles).toEqual([OTHER, SELF]); // the probe: no rosterVersion served
+    expect(calls.init).toEqual([
+      { acceptorUserId: OTHER, acceptorClass: 'tablet', offererClass: 'phone' },
+    ]);
+    expect(state.group).toBeNull();
+  });
+
+  it('(a) a device holding a local group row probes nothing — the row is the answer', async () => {
+    const { deps, calls, state } = fakeDeps();
+    state.group = { groupId: GROUP, rosterEpoch: 3 };
+    const ceremony = await OffererCeremony.begin(OTHER, deps);
+    await ceremony.confirm('tablet');
+    expect(calls.bundles).toEqual([OTHER]);
+    expect(calls.init).toEqual([{ acceptorUserId: OTHER, acceptorClass: 'tablet' }]);
+    expect(state.group).toEqual({ groupId: GROUP, rosterEpoch: 3 });
+  });
+
+  it('(b) the offerer completes a join when only the JOINER\'s entry carries the certs — verified under the pinned key, over the pending tuple', async () => {
+    const { deps, calls, state } = attachCreatedFounder();
+    const ceremony = await OffererCeremony.begin(OTHER, deps);
+    await ceremony.confirm('tablet');
+    // Before the acceptance the joiner's bundle names no sibling: the probe
+    // stalls as ever and spends NONE of this device's own prekeys.
+    const before = calls.bundles.length;
+    expect(await ceremony.checkLinked()).toBe(false);
+    expect(calls.bundles.slice(before)).toEqual([OTHER]);
+    expect(calls.verify).toEqual([]);
+
+    serveCommittedJoin(state);
+    const probe = calls.bundles.length;
+    expect(await ceremony.checkLinked()).toBe(true);
+    expect(ceremony.phase).toBe('linked');
+    // The joiner's bundle first (its served key must still be the pinned
+    // one), then — only because the join committed — this device's own.
+    expect(calls.bundles.slice(probe)).toEqual([OTHER, SELF]);
+    // EXACTLY the original verification: signer = the ceremony-pinned
+    // joiner key, op = accept, the signature found on the joiner's entry.
+    expect(calls.verify).toEqual([{ key: rawKey(OTHER), op: 'accept', sig: JOIN_CERTS.acceptSig }]);
+    expect(state.group).toEqual({ groupId: GROUP, rosterEpoch: 1 });
+    expect((await currentRoster(deps)).map(d => d.userId).sort()).toEqual([SELF, OTHER].sort());
+    for (const row of state.devices) expect(JSON.parse(row.certsJson)).toEqual(JOIN_CERTS);
+    expect(state.devices.find(d => d.userId === OTHER)?.identityKeyPub).toBe(rawKey(OTHER));
+    expect(state.devices.find(d => d.userId === SELF)?.identityKeyPub).toBe(rawKey(SELF));
+    expect(state.pendingCeremony).toBeNull(); // consumed
+  });
+
+  it('(b) the unmounted path completes the same join: reconcilePendingLink shares the probe', async () => {
+    const { deps, state } = attachCreatedFounder();
+    const ceremony = await OffererCeremony.begin(OTHER, deps);
+    await ceremony.confirm('tablet');
+    serveCommittedJoin(state);
+    expect(await reconcilePendingLink(deps)).toBe(true);
+    expect(state.group?.groupId).toBe(GROUP);
+    expect((await currentRoster(deps)).map(d => d.userId).sort()).toEqual([SELF, OTHER].sort());
+    expect(state.pendingCeremony).toBeNull();
+  });
+
+  it('(b) a re-link after an unlink: the own entry carries the OLD ceremony\'s certs, so THIS ceremony\'s are read from the joiner\'s entry', async () => {
+    const RELINK_EPOCH = 2;
+    const { deps, calls, state } = fakeDeps();
+    // Grouped locally since the first ceremony (with THIRD, since unlinked).
+    state.group = { groupId: GROUP, rosterEpoch: RELINK_EPOCH };
+    const OLD_TUPLE = {
+      ...JOIN_TUPLE,
+      acceptorUserId: THIRD,
+      rosterEpoch: 0,
+      offerNonce: 'NONCE-FIRST-CEREMONY',
+    };
+    const OLD_CERTS = {
+      offerSig: fakeSig('offer', { ...OLD_TUPLE, subjectIdentityPubKey: rawKey(THIRD) }),
+      acceptSig: fakeSig('accept', OLD_TUPLE),
+      groupId: GROUP,
+      offererUserId: SELF,
+      acceptorUserId: THIRD,
+      class: 'tablet' as const,
+      rosterEpoch: 0,
+      offerNonce: 'NONCE-FIRST-CEREMONY',
+      expiresAt: EXPIRES,
+    };
+    state.devices = [
+      {
+        userId: SELF,
+        class: 'phone',
+        state: 'linked',
+        updatedAt: NOW_MS,
+        certsJson: JSON.stringify(OLD_CERTS),
+        identityKeyPub: rawKey(SELF),
+      },
+      {
+        userId: THIRD,
+        class: 'tablet',
+        state: 'unlinked',
+        updatedAt: NOW_MS,
+        certsJson: JSON.stringify(OLD_CERTS),
+        identityKeyPub: rawKey(THIRD),
+      },
+    ];
+    deps.api.linkOfferInit = async (_t, body) => {
+      calls.init.push(body);
+      return { groupId: GROUP, rosterEpoch: RELINK_EPOCH, offerNonce: NONCE, expiresAt: EXPIRES };
+    };
+    const RELINK_TUPLE = { ...JOIN_TUPLE, rosterEpoch: RELINK_EPOCH };
+    const RELINK_CERTS = { ...JOIN_CERTS, rosterEpoch: RELINK_EPOCH, acceptSig: fakeSig('accept', RELINK_TUPLE), offerSig: fakeSig('offer', { ...RELINK_TUPLE, subjectIdentityPubKey: rawKey(OTHER) }) };
+
+    const ceremony = await OffererCeremony.begin(OTHER, deps);
+    await ceremony.confirm('tablet');
+    expect(calls.init).toEqual([{ acceptorUserId: OTHER, acceptorClass: 'tablet' }]);
+    // The server's join branch: this device's entry keeps the FIRST
+    // ceremony's certs; the new tablet's entry carries THIS ceremony's.
+    state.bundleSiblings.set(OTHER, [{ userId: SELF, class: 'phone', certs: OLD_CERTS }]);
+    state.bundleSiblings.set(SELF, [
+      { userId: OTHER, class: 'tablet', certs: RELINK_CERTS },
+      { userId: THIRD, class: 'tablet', certs: OLD_CERTS }, // a server still listing the leaver
+    ]);
+    expect(await ceremony.checkLinked()).toBe(true);
+    // The own entry's old acceptance was tried under the pinned key and
+    // refused; the joiner's entry's verified — same key, same tuple.
+    expect(calls.verify).toEqual([
+      { key: rawKey(OTHER), op: 'accept', sig: OLD_CERTS.acceptSig },
+      { key: rawKey(OTHER), op: 'accept', sig: RELINK_CERTS.acceptSig },
+    ]);
+    expect((await currentRoster(deps)).map(d => d.userId).sort()).toEqual([SELF, OTHER].sort());
+    expect(JSON.parse(state.devices.find(d => d.userId === OTHER)!.certsJson)).toEqual(RELINK_CERTS);
+    expect(JSON.parse(state.devices.find(d => d.userId === SELF)!.certsJson)).toEqual(RELINK_CERTS);
+    // The leaver's history row is untouched and not re-linked.
+    expect(state.devices.find(d => d.userId === THIRD)?.state).toBe('unlinked');
+  });
+
+  describe('(b) negatives — the joiner\'s entry on the own bundle buys nothing the original path would refuse', () => {
+    /** A key-BOUND verify fake for the wrong-signer case: valid iff the
+     * signature was made by `key` over the exact op + tuple. */
+    const keyedSig = (key: string, op: string, tuple: Record<string, unknown>): string =>
+      b64(`sig(${key}:${op}:${sigDigest(op, tuple)})`);
+
+    async function committedCeremony(joinerEntryCerts: typeof JOIN_CERTS) {
+      const made = attachCreatedFounder();
+      const ceremony = await OffererCeremony.begin(OTHER, made.deps);
+      await ceremony.confirm('tablet');
+      serveCommittedJoin(made.state, joinerEntryCerts);
+      // Nothing is recorded before completion (the gate pass re-cut the
+      // init-time row): no local group row at all.
+      const groupBefore = made.state.group;
+      return { ...made, ceremony, groupBefore };
+    }
+
+    function nothingCompleted(
+      state: FakeState,
+      groupBefore: { groupId: string; rosterEpoch: number } | null,
+    ): void {
+      expect(groupBefore).toBeNull();
+      expect(state.group).toEqual(groupBefore); // untouched since init: still none
+      expect(state.devices).toEqual([]);
+      expect(state.pendingCeremony).not.toBeNull(); // the probe keeps stalling
+    }
+
+    it('WRONG SIGNER: an acceptance under a key that is not the ceremony-pinned joiner key', async () => {
+      const made = attachCreatedFounder();
+      made.deps.crypto.verifyLinkOp = async (key, op, tuple, sig) => {
+        made.calls.verify.push({ key, op, sig });
+        return sig === keyedSig(key, op, tuple as unknown as Record<string, unknown>);
+      };
+      const ceremony = await OffererCeremony.begin(OTHER, made.deps);
+      await ceremony.confirm('tablet');
+      const groupBefore = made.state.group; // none before the acceptance
+      // THIRD's key signed a byte-perfect accept over the right tuple:
+      serveCommittedJoin(made.state, {
+        ...JOIN_CERTS,
+        acceptSig: keyedSig(rawKey(THIRD), 'accept', JOIN_TUPLE),
+      });
+      expect(await ceremony.checkLinked()).toBe(false);
+      expect(ceremony.phase).toBe('waiting');
+      // Verified under the PINNED key only — never under a served one.
+      expect(made.calls.verify).toEqual([
+        { key: rawKey(OTHER), op: 'accept', sig: keyedSig(rawKey(THIRD), 'accept', JOIN_TUPLE) },
+      ]);
+      nothingCompleted(made.state, groupBefore);
+
+      // And the control: the SAME fake admits the genuine signer.
+      serveCommittedJoin(made.state, {
+        ...JOIN_CERTS,
+        acceptSig: keyedSig(rawKey(OTHER), 'accept', JOIN_TUPLE),
+      });
+      expect(await ceremony.checkLinked()).toBe(true);
+    });
+
+    it('WRONG TRANSCRIPT: a genuine acceptance over another nonce, another epoch, or another class', async () => {
+      for (const over of [
+        { offerNonce: 'SOME-OTHER-NONCE' },
+        { rosterEpoch: 0 },
+        { class: 'phone' as const },
+        { groupId: '01HQGGGG0000000000000000G1' },
+      ]) {
+        const { ceremony, state, calls, groupBefore } = await committedCeremony({
+          ...JOIN_CERTS,
+          acceptSig: fakeSig('accept', { ...JOIN_TUPLE, ...over }),
+        });
+        expect(await ceremony.checkLinked()).toBe(false);
+        expect(ceremony.phase).toBe('waiting');
+        expect(calls.verify).toHaveLength(1);
+        expect(calls.verify[0]!.key).toBe(rawKey(OTHER));
+        nothingCompleted(state, groupBefore);
+      }
+    });
+
+    it('STALE CEREMONY: the joiner\'s entry carries an EARLIER ceremony\'s certs, genuine over THAT tuple', async () => {
+      const STALE_TUPLE = { ...JOIN_TUPLE, rosterEpoch: 0, offerNonce: 'NONCE-EARLIER-OFFER' };
+      const { ceremony, state, groupBefore } = await committedCeremony({
+        ...JOIN_CERTS,
+        rosterEpoch: 0,
+        offerNonce: 'NONCE-EARLIER-OFFER',
+        offerSig: fakeSig('offer', { ...STALE_TUPLE, subjectIdentityPubKey: rawKey(OTHER) }),
+        acceptSig: fakeSig('accept', STALE_TUPLE),
+      });
+      // Completion rebuilds the tuple from its OWN pending record, never
+      // from the served certificate — so a real but older acceptance
+      // verifies against nothing here.
+      expect(await ceremony.checkLinked()).toBe(false);
+      nothingCompleted(state, groupBefore);
+    });
+
+    it('NO CERTS ANYWHERE: a server asserting membership on both bundles without a certificate completes nothing', async () => {
+      const made = attachCreatedFounder();
+      const ceremony = await OffererCeremony.begin(OTHER, made.deps);
+      await ceremony.confirm('tablet');
+      const groupBefore = made.state.group; // none before the acceptance
+      made.state.bundleSiblings.set(OTHER, [{ userId: SELF, class: 'phone' }]);
+      made.state.bundleSiblings.set(SELF, [{ userId: OTHER, class: 'tablet' }]);
+      expect(await ceremony.checkLinked()).toBe(false);
+      expect(made.calls.verify).toEqual([]);
+      nothingCompleted(made.state, groupBefore);
+    });
+
+    it('A ROTATED JOINER KEY: the joiner\'s bundle serving a different key is never a completion — and the own bundle is not even asked', async () => {
+      const made = attachCreatedFounder();
+      const ceremony = await OffererCeremony.begin(OTHER, made.deps);
+      await ceremony.confirm('tablet');
+      const groupBefore = made.state.group; // none before the acceptance
+      serveCommittedJoin(made.state);
+      made.deps.api.getPrekeyBundle = async (_t, userId) => {
+        made.calls.bundles.push(userId);
+        const bundle = bundleFor(userId, made.state.bundleSiblings.get(userId));
+        if (userId === OTHER) bundle.identityKey = 'IDKEY+ROTATED';
+        return bundle;
+      };
+      const before = made.calls.bundles.length;
+      expect(await ceremony.checkLinked()).toBe(false);
+      expect(made.calls.bundles.slice(before)).toEqual([OTHER]); // no own-bundle fetch
+      expect(made.calls.verify).toEqual([]);
+      nothingCompleted(made.state, groupBefore);
+    });
+
+    it('THE OWN BUNDLE NAMING ANOTHER ACCOUNT is refused like every mis-named bundle, and nothing is stored', async () => {
+      const made = attachCreatedFounder();
+      const ceremony = await OffererCeremony.begin(OTHER, made.deps);
+      await ceremony.confirm('tablet');
+      const groupBefore = made.state.group; // none before the acceptance
+      serveCommittedJoin(made.state);
+      made.deps.api.getPrekeyBundle = async (_t, userId) => {
+        made.calls.bundles.push(userId);
+        return userId === SELF
+          ? bundleFor(THIRD, [{ userId: OTHER, class: 'tablet', certs: JOIN_CERTS }])
+          : bundleFor(userId, made.state.bundleSiblings.get(userId));
+      };
+      await expect(ceremony.checkLinked()).rejects.toThrow('prekey bundle names the wrong account');
+      expect(made.calls.verify).toEqual([]);
+      nothingCompleted(made.state, groupBefore);
+      // The durable path swallows the transient and keeps the row.
+      expect(await reconcilePendingLink(made.deps)).toBe(false);
+      expect(made.state.pendingCeremony).not.toBeNull();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The gate pass (2026-10-08): an abandoned init leaves NO group row, so the
+// solo group's later dissolve cannot strand this device; and every roster
+// change drops the cached account-state read.
+// ---------------------------------------------------------------------------
+
+describe('the gate pass: an abandoned init, then the solo group dissolves — nothing stale is left behind', () => {
+  /** The server as devices.ts rules it after the dissolve: a solo offerer
+   * must declare its class (a classless init is the collapsed refusal), and
+   * the own bundle serves no rosterVersion. */
+  function dissolvedOnTheServer(made: ReturnType<typeof fakeDeps>): void {
+    made.state.bundleSiblings.delete(SELF);
+    made.deps.api.linkOfferInit = async (_t, body) => {
+      made.calls.init.push(body);
+      if (body.offererClass === undefined) {
+        const refusal = new Error('not available') as Error & { status: number; code: string };
+        refusal.status = 403;
+        refusal.code = 'accounts_refused';
+        throw refusal;
+      }
+      return { groupId: '01HQMINT0000000000000000M0', rosterEpoch: 0, offerNonce: NONCE, expiresAt: EXPIRES + 1_000 };
+    };
+  }
+
+  /** An attach-created founder (grouped server-side, no local row) whose
+   * ceremony nobody accepted: the offer expires with no row written. */
+  async function abandonedInit() {
+    const made = fakeDeps();
+    made.state.bundleSiblings.set(SELF, []);
+    made.deps.api.linkOfferInit = async (_t, body) => {
+      made.calls.init.push(body);
+      return { groupId: GROUP, rosterEpoch: 1, offerNonce: NONCE, expiresAt: EXPIRES };
+    };
+    const ceremony = await OffererCeremony.begin(OTHER, made.deps);
+    await ceremony.confirm('tablet');
+    expect(made.calls.init).toEqual([{ acceptorUserId: OTHER, acceptorClass: 'tablet' }]);
+    expect(made.state.group).toBeNull();
+    made.deps.now = () => NOW_MS + (LINK_OFFER_TTL_SECONDS + 1) * 1000;
+    expect(await ceremony.checkLinked()).toBe(false);
+    expect(ceremony.phase).toBe('failed');
+    expect(made.state.group).toBeNull();
+    expect(made.state.pendingCeremony).toBeNull();
+    return made;
+  }
+
+  it('the next ceremony probes the own bundle again and DECLARES the class, and is admitted', async () => {
+    const made = await abandonedInit();
+    dissolvedOnTheServer(made);
+    const next = await OffererCeremony.begin(OTHER, made.deps);
+    await next.confirm('tablet');
+    expect(made.calls.init[made.calls.init.length - 1]).toEqual({
+      acceptorUserId: OTHER,
+      acceptorClass: 'tablet',
+      offererClass: 'phone',
+    });
+    expect(next.phase).toBe('waiting');
+  });
+
+  it('Go back to anonymous dissolves nothing from here (no row, no peer notice, no self-unlink) and resolves — the email leg alone is the downgrade', async () => {
+    const made = await abandonedInit();
+    dissolvedOnTheServer(made);
+    const heard: PeerRosterNotice[] = [];
+    const off = onPeerRosterNotice(async notice => {
+      heard.push(notice);
+    });
+    try {
+      await expect(dissolveGrouping(made.deps)).resolves.toBeUndefined();
+    } finally {
+      off();
+    }
+    expect(made.calls.mutation).toEqual([]);
+    expect(made.calls.sign.filter(s => s.op === 'dissolve')).toEqual([]);
+    expect(heard).toEqual([]);
+  });
+
+  it('a recovery notice naming the group a later re-attach minted is plausible and STORED — the 72 h cancel warning reaches this device', async () => {
+    const made = await abandonedInit();
+    dissolvedOnTheServer(made);
+    const stored: Array<{ kind: string; groupId: string }> = [];
+    made.deps.db.saveRecoveryNotice = async row => {
+      stored.push({ kind: row.kind, groupId: row.groupId });
+    };
+    const REATTACHED = '01HQGGGG0000000000000000G2';
+    expect(
+      await handleAccountsNoticeFrame(
+        noticeFrame({
+          kind: 'recoveryRequested',
+          groupId: REATTACHED,
+          class: 'tablet',
+          completesAt: Math.floor(NOW_MS / 1000) + 72 * 3600,
+        }),
+        made.deps,
+      ),
+    ).toBe('stored');
+    expect(stored).toEqual([{ kind: 'requested', groupId: REATTACHED }]);
+  });
+});
+
+describe('the gate pass: every roster change drops the cached account-state read', () => {
+  it('the offerer’s completion, the acceptor’s acceptance, a member* notice and a revocation each invalidate it', async () => {
+    const invalidate = jest.spyOn(accountsUsername, 'invalidateIdentifierState');
+    // The offerer completes a join.
+    const made = fakeDeps();
+    made.state.bundleSiblings.set(SELF, []);
+    made.deps.api.linkOfferInit = async (_t, body) => {
+      made.calls.init.push(body);
+      return { groupId: GROUP, rosterEpoch: 1, offerNonce: NONCE, expiresAt: EXPIRES };
+    };
+    const ceremony = await OffererCeremony.begin(OTHER, made.deps);
+    await ceremony.confirm('tablet');
+    expect(invalidate).not.toHaveBeenCalled();
+    const JOIN_TUPLE = {
+      groupId: GROUP,
+      offererUserId: SELF,
+      acceptorUserId: OTHER,
+      subjectIdentityPubKey: rawKey(SELF),
+      class: 'tablet' as const,
+      rosterEpoch: 1,
+      offerNonce: NONCE,
+      expiresAt: EXPIRES,
+    };
+    const certs = {
+      offerSig: fakeSig('offer', { ...JOIN_TUPLE, subjectIdentityPubKey: rawKey(OTHER) }),
+      acceptSig: fakeSig('accept', JOIN_TUPLE),
+      groupId: GROUP,
+      offererUserId: SELF,
+      acceptorUserId: OTHER,
+      class: 'tablet' as const,
+      rosterEpoch: 1,
+      offerNonce: NONCE,
+      expiresAt: EXPIRES,
+    };
+    made.state.bundleSiblings.set(OTHER, [{ userId: SELF, class: 'phone', certs }]);
+    expect(await ceremony.checkLinked()).toBe(true);
+    expect(invalidate).toHaveBeenCalledTimes(1);
+
+    // The acceptor accepts.
+    const joiner = fakeDeps();
+    await handleAccountsNoticeFrame(noticeFrame(offerNotice()), joiner.deps);
+    const accepting = (await AcceptorCeremony.open(joiner.deps)) as AcceptorCeremony;
+    await accepting.accept();
+    expect(invalidate).toHaveBeenCalledTimes(2);
+
+    // A usernameRevoked notice lands with the screen closed.
+    expect(
+      await handleAccountsNoticeFrame(noticeFrame({ kind: 'usernameRevoked' }), joiner.deps),
+    ).toBe('stored');
+    expect(invalidate).toHaveBeenCalledTimes(3);
   });
 });

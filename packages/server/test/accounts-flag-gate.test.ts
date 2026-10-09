@@ -125,6 +125,9 @@ const USERNAME_ROUTE_KEYS = [
   'POST /v1/identifiers/username/unlink',
   'POST /v1/identifiers/username/discoverable',
   'GET /v1/identifiers/username/eligibility',
+  // The caller-owned state read (2026-10-08): the same two flags, the same
+  // collapse — dark class, dark facts.
+  'GET /v1/identifiers/state',
 ] as const;
 const usernameDispatchRoutes: ReadonlyArray<[name: string, route: Handler]> =
   USERNAME_ROUTE_KEYS.map((key) => {

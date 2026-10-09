@@ -269,14 +269,28 @@ export function makeMemoryDb(
   const usernameSkeletons = new Map<string, { groupId: string; claimKey: string }>();
   const usernameTombstones = new Map<
     string,
-    { freesAt: number; formerGroupId?: string; skeletonKey?: string }
+    { freesAt: number; formerGroupId?: string; formerUserId?: string; skeletonKey?: string }
   >();
   const usernameFreesAt = (nowMs: number): number =>
     Math.floor(nowMs / 1000) + USERNAME_TOMBSTONE_TTL_SECONDS;
-  const usernameKeyFree = (key: string, nowSeconds: number, groupId: string): boolean => {
+  // The store's USERNAME_CLAIM_FREE_CONDITION, arm for arm: no row, OR an
+  // elapsed tombstone, OR the tombstone this GROUP left, OR — the fourth arm
+  // (2026-10-08, S3) — the tombstone this MEMBER's dissolving unlink left,
+  // claimed from whatever fresh group it verified into since.
+  const usernameKeyFree = (
+    key: string,
+    nowSeconds: number,
+    groupId: string,
+    userId: string,
+  ): boolean => {
     if (identifierClaims.has(key) || usernameSkeletons.has(key)) return false;
     const tomb = usernameTombstones.get(key);
-    return tomb === undefined || tomb.freesAt <= nowSeconds || tomb.formerGroupId === groupId;
+    return (
+      tomb === undefined ||
+      tomb.freesAt <= nowSeconds ||
+      tomb.formerGroupId === groupId ||
+      tomb.formerUserId === userId
+    );
   };
   /** The store's `readLiveUsernameClaim` mirrored: the LIVE claim at the
    * key or undefined — and the store's THROW on a live row without its
@@ -293,14 +307,19 @@ export function makeMemoryDb(
   };
   /** The store's tombstone Put-overwrites for one live username claim and
    * its skeleton (rename/unlink/revoke/dissolve): the live rows leave their
-   * maps, the tombstones take their keys. `formerGroupId` absent = the
-   * nobody-reclaims shape. A ref whose live row is gone writes nothing; a
-   * live row without its skeleton key throws, as the store's pre-read does. */
+   * maps, the tombstones take their keys. `formerGroupId` AND `formerUserId`
+   * both absent = the nobody-reclaims shape; both present = a rename or a
+   * surviving unlink (the member's right outlives a later dissolve — the
+   * 2026-10-08 gate pass); `formerUserId` alone = the dissolving unlink's
+   * member-held take-back (S3). A ref whose live row is gone writes
+   * nothing; a live row without its skeleton key throws, as the store's
+   * pre-read does. */
   const tombstoneUsernameRows = (
     claimKey: string,
     groupId: string,
     nowMs: number,
     formerGroupId?: string,
+    formerUserId?: string,
   ): void => {
     const live = readLiveUsernameClaim(claimKey);
     if (!live || live.groupId !== groupId || live.skeletonKey === undefined) return;
@@ -310,11 +329,13 @@ export function makeMemoryDb(
     usernameTombstones.set(claimKey, {
       freesAt,
       ...(formerGroupId !== undefined ? { formerGroupId } : {}),
+      ...(formerUserId !== undefined ? { formerUserId } : {}),
       skeletonKey: live.skeletonKey,
     });
     usernameTombstones.set(live.skeletonKey, {
       freesAt,
       ...(formerGroupId !== undefined ? { formerGroupId } : {}),
+      ...(formerUserId !== undefined ? { formerUserId } : {}),
     });
   };
   /** The dissolve rule: a dying group's username refs are tombstoned
@@ -1591,6 +1612,15 @@ export function makeMemoryDb(
         if (group.members.length >= ACCOUNT_GROUP_MAX_MEMBERS) return 'group_full';
         if (acceptorRow.groupId !== undefined) return 'already_grouped';
         if (offererRow.groupId !== groupId) return 'stale_epoch';
+        // THE OFFERER'S OWN ENTRY TAKES THIS CEREMONY'S CERTS (the store's
+        // join branch, 2026-10-08 — the field report's S2 (b)): the
+        // first-link branch certifies both entries, but the join used to
+        // append the acceptor alone, so the offerer's entry kept whatever it
+        // had — nothing for an attach-created founder, the PREVIOUS
+        // ceremony's for a re-link after an unlink — and the offerer's
+        // completion probe stalled forever. Re-certified in place, the
+        // acceptor appended, everyone else untouched.
+        for (const m of group.members) if (m.userId === offererUserId) m.certs = { ...certs };
         group.members.push({
           userId: acceptorUserId,
           class: acceptorClass,
@@ -1789,7 +1819,7 @@ export function makeMemoryDb(
       }
       return live;
     },
-    async attachIdentifier({ userId, deviceClass, existingGroupId, newGroupId, claimKey, refsSnapshot, retiringClaimKeys, nowMs, discoverableAfter }) {
+    async attachIdentifier({ userId, deviceClass, existingGroupId, newGroupId, claimKey, refsSnapshot, retiringClaimKeys, nowMs, discoverableAfter, usernameRenamedAt }) {
       // The structural per-class backstop mirrored (first as in the
       // store): a matching snapshot already holding this class's ref refuses
       // before anything else — at cap 3 the size total no longer refuses
@@ -1863,6 +1893,8 @@ export function makeMemoryDb(
           epoch: 1,
           createdAt: nowMs,
           attachCreated: true,
+          // The carried username cool-down (the store's rule, 2026-10-08).
+          ...(usernameRenamedAt !== undefined ? { usernameRenamedAt } : {}),
         });
         row.groupId = newGroupId;
       }
@@ -1912,7 +1944,14 @@ export function makeMemoryDb(
       ) {
         accountGroups.delete(groupId);
         const row = usersById.get(userId);
-        if (row?.groupId === groupId) delete row.groupId;
+        if (row?.groupId === groupId) {
+          delete row.groupId;
+          // The username cool-down the dying row carried moves onto the
+          // member (the store's dissolve Update, 2026-10-08 gate pass).
+          if (group.usernameRenamedAt !== undefined) {
+            row.usernameRenamedAt = Math.max(row.usernameRenamedAt ?? 0, group.usernameRenamedAt);
+          }
+        }
         const pending = recoveries.get(groupId);
         if (pending !== undefined) {
           recoveries.delete(groupId);
@@ -2148,6 +2187,7 @@ export function makeMemoryDb(
       if (tomb.freesAt > nowSeconds) {
         const rec: UsernameTombstoneRecord = { claimKey, tombstoned: true, freesAt: tomb.freesAt };
         if (tomb.formerGroupId !== undefined) rec.formerGroupId = tomb.formerGroupId;
+        if (tomb.formerUserId !== undefined) rec.formerUserId = tomb.formerUserId;
         if (tomb.skeletonKey !== undefined) rec.skeletonKey = tomb.skeletonKey;
         return rec;
       }
@@ -2187,7 +2227,7 @@ export function makeMemoryDb(
       // step, so interleaved claims admit exactly what the store's
       // TransactWriteItems would: one winner.
       for (const key of [claimKey, skeletonKey, ...retiringClaimKeys, ...retiringSkeletonKeys]) {
-        if (!usernameKeyFree(key, nowSeconds, groupId)) return 'taken';
+        if (!usernameKeyFree(key, nowSeconds, groupId, userId)) return 'taken';
       }
       const group = accountGroups.get(groupId);
       if (!group || !group.members.some((m) => m.userId === userId)) return 'unknown_member';
@@ -2258,7 +2298,7 @@ export function makeMemoryDb(
       const own = new Set([oldClaimKey, old.skeletonKey]);
       for (const key of [...claimKeys, ...skeletonKeys]) {
         if (own.has(key)) continue;
-        if (!usernameKeyFree(key, nowSeconds, groupId)) return 'taken';
+        if (!usernameKeyFree(key, nowSeconds, groupId, userId)) return 'taken';
       }
       const group = accountGroups.get(groupId);
       if (!group || !group.members.some((m) => m.userId === userId)) return 'unknown_member';
@@ -2285,13 +2325,18 @@ export function makeMemoryDb(
       usernameTombstones.set(oldClaimKey, {
         freesAt,
         formerGroupId: groupId,
+        formerUserId: userId,
         ...(sameSkeleton ? {} : { skeletonKey: old.skeletonKey }),
       });
       if (sameSkeleton) {
         usernameSkeletons.set(old.skeletonKey, { groupId, claimKey: newClaimKey });
       } else {
         usernameSkeletons.delete(old.skeletonKey);
-        usernameTombstones.set(old.skeletonKey, { freesAt, formerGroupId: groupId });
+        usernameTombstones.set(old.skeletonKey, {
+          freesAt,
+          formerGroupId: groupId,
+          formerUserId: userId,
+        });
         usernameSkeletons.set(newSkeletonKey, { groupId, claimKey: newClaimKey });
         usernameTombstones.delete(newSkeletonKey);
       }
@@ -2331,13 +2376,28 @@ export function makeMemoryDb(
         group.epoch === 1 &&
         group.members.length === 1 &&
         group.members[0]!.userId === userId;
-      // The former-owner right exists only while the group survives to
-      // exercise it (the store's rule: no dangling group id in a row).
-      tombstoneUsernameRows(claimKey, groupId, nowMs, dissolve ? undefined : groupId);
+      // The former-owner right rides the GROUP while the group survives to
+      // exercise it — and the MEMBER beside it (the store's rule since the
+      // 2026-10-08 gate pass: the right outlives a later dissolve) — and the
+      // MEMBER alone when this unlink dissolves it (S3): no dangling group
+      // id in a row — but the person stays, and the take-back the unlink
+      // confirmation promised is theirs from whatever fresh group their
+      // next verified attach mints.
+      tombstoneUsernameRows(claimKey, groupId, nowMs, dissolve ? undefined : groupId, userId);
       if (dissolve) {
         accountGroups.delete(groupId);
         const row = usersById.get(userId);
-        if (row?.groupId === groupId) delete row.groupId;
+        if (row?.groupId === groupId) {
+          delete row.groupId;
+          // No group row left to stamp: the cool-down this unlink starts
+          // (or the later one the dying row already carried) moves onto
+          // the member — the store's dissolve Update, 2026-10-08.
+          row.usernameRenamedAt = Math.max(
+            row.usernameRenamedAt ?? 0,
+            group.usernameRenamedAt ?? 0,
+            Math.floor(nowMs / 1000),
+          );
+        }
         const pending = recoveries.get(groupId);
         if (pending !== undefined) {
           recoveries.delete(groupId);

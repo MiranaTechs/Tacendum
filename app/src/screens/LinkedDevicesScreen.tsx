@@ -274,7 +274,10 @@ export function LinkedDevicesScreen({
             <Text style={[t.type.compactBody, { color: t.color.inkMuted }]}>
               {LINKING_COPY.verificationLocal}
             </Text>
-            {detail.error && <InlineError message={LINKING_COPY.refused} />}
+            {/* A roster change that did not land says so (the proof pass,
+                2026-10-08): the LINK refusal's "start again from the new
+                device" made no sense over an unlink. */}
+            {detail.error && <InlineError message={LINKING_COPY.rosterRefused} />}
             {detail.confirm === null && (
               <>
                 <TextAction

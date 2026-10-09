@@ -1,7 +1,12 @@
 /**
- * DynamoDB Local ignores TTL (PLAN §4, §9). This sweep deletes rows whose
- * `expiresAt` (unix seconds) is in the past, from the tables that carry a TTL.
- * In AWS the same attribute is a real TTL and this script is unnecessary.
+ * Local tables carry NO TTL — scripts/create-tables.ts enables none on
+ * DynamoDB Local, because 2.x ENFORCES it (proved on 2.5.4, 2026-10-08) and
+ * the test rig's frozen clocks write expiries that are already in the past.
+ * (PLAN §4, §9 still describe the older "DynamoDB Local ignores TTL" world;
+ * the 1.x it was written against did.) This sweep is therefore the only
+ * reaper a local store has: it deletes rows whose `expiresAt` (unix seconds)
+ * is in the past, from the tables that carry one. In AWS the same attribute
+ * is a real TTL and this script is unnecessary.
  */
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {

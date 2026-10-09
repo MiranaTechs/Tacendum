@@ -8,6 +8,7 @@ import {
   CreateReportRequest,
   CreateReportResponse,
   DiscoveryLookupResponse,
+  IdentifierStateResponse,
   LinkOfferInitResponse,
   PrekeyBundle,
   RecoveryVerifyResponse,
@@ -177,6 +178,13 @@ export class ApiRequestError extends Error {
     message: string,
     readonly status: number,
     readonly code?: string,
+    /** The server's `Retry-After` in whole seconds, when a 429 carried one
+     * (the gate pass, 2026-10-08): the per-device burst window answers
+     * with seconds, the per-account DAILY allowance with hours — the two
+     * the request step must tell apart to say the right sentence. Null
+     * when absent or unreadable. Self-keyed answers only: no address-shaped
+     * refusal ever carries it. */
+    readonly retryAfterSeconds: number | null = null,
   ) {
     super(message);
     this.name = 'ApiRequestError';
@@ -315,7 +323,15 @@ async function request(
       } catch {
         // non-JSON error body; status alone will do
       }
-      throw new ApiRequestError(detail, res.status, code);
+      const retryRaw =
+        typeof res.headers?.get === 'function' ? res.headers.get('retry-after') : null;
+      const retry = retryRaw === null ? Number.NaN : Number(retryRaw);
+      throw new ApiRequestError(
+        detail,
+        res.status,
+        code,
+        Number.isFinite(retry) && retry >= 0 ? retry : null,
+      );
     }
     // Fetch can resolve at headers while its JSON body is still arriving.
     // Keep the same account fence through the reader every DTO wrapper uses.
@@ -942,6 +958,51 @@ export async function apiUsernameEligibility(token: string): Promise<UsernameEli
     'UsernameEligibilityResponse',
     await res.json(),
   );
+}
+
+/** What one `GET /v1/identifiers/state` attempt resolved to. The ONE DTO
+ * wrapper that reports its own outcome instead of throwing, because the
+ * route's ABSENCE is a legitimate answer this build must handle: today's
+ * production server (fef7a0dc) has no such route, API Gateway answers the
+ * routeKey miss with a 404, and the caller then falls back to the
+ * eligibility read. 'refused' is every other http-level answer (the frozen
+ * 403 above all — never a connection problem); 'failed' is a transport
+ * failure (no network, the deadline, the duress chokepoint). A 200 whose
+ * body fails the strict parse still throws ServerAheadError, like every
+ * other DTO wrapper. */
+export type IdentifierStateRead =
+  | { kind: 'state'; value: IdentifierStateResponse }
+  | { kind: 'absent' }
+  | { kind: 'refused' }
+  | { kind: 'failed' };
+
+/** GET /v1/identifiers/state — the caller's OWN account-group facts
+ * (fix/username-discovery, 2026-10-08): the possession proof, the email and
+ * phone classes linked, a username held, the §4.8 cool-down's end. No name,
+ * no identifier, no target, no reason — nothing about another party.
+ * Authenticated exactly like the eligibility read, no body. The eligibility
+ * read stays byte-identical (builds 31-33 parse it .strict() with no OTA),
+ * which is why this is a NEW route rather than a wider one. */
+export async function apiIdentifierState(token: string): Promise<IdentifierStateRead> {
+  let res: Response;
+  try {
+    res = await request('GET', '/v1/identifiers/state', { token, allowStatus: [404] });
+  } catch (error) {
+    return error instanceof ApiRequestError ? { kind: 'refused' } : { kind: 'failed' };
+  }
+  if (res.status === 404) return { kind: 'absent' };
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    // The account fence (a delayed body reaching a new identity) or a body
+    // that is not JSON at all: nothing readable arrived.
+    return { kind: 'failed' };
+  }
+  return {
+    kind: 'state',
+    value: parseDto(IdentifierStateResponse, 'IdentifierStateResponse', body),
+  };
 }
 
 /** POST /v1/discovery/lookup with the {username} field — the same route,

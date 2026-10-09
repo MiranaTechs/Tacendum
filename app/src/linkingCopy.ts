@@ -39,13 +39,30 @@ export const LINKING_COPY = {
    * sentence promised a verification act this screen does not offer. */
   verificationLocal: `This list is this ${DEVICE_NOUN}'s own record of your devices. Each device keeps its own list — nothing here is copied between them.`,
   /** The collapsed refusal, rendered honestly: the server deliberately does
-   * not say which condition refused. */
+   * not say which condition refused. The way back names the
+   * real order (the proof pass, 2026-10-08): the ceremony STARTS on this
+   * device, by scanning the new device's code — "start again from the new
+   * device" contradicted the join guidance below. */
   refused:
-    'That did not work. The link may have expired, or the slot may be taken — start again from the new device.',
+    'That did not work. The link may have expired, or the slot may be taken — start again: show the new device’s QR code and scan it from here.',
   /** The offer ran out before the new device confirmed: said as what it is,
    * never dressed as the collapsed refusal above. */
   expired:
-    'The request expired before the new device confirmed it. Start again from the new device.',
+    'The request expired before the new device confirmed it. Start again: show the new device’s QR code and scan it from here.',
+  /** The link-offer budget (5 a burst, 10 an hour per device), told apart
+   * by its 429 (the proof pass): a few retries in a row drew the collapsed
+   * sentence above, which blamed an expired link. */
+  rateLimited:
+    'Too many link attempts from this device. Wait an hour and try again — an account can start at most 10 links an hour.',
+  /** The OFFERER's end of a completed ceremony (the proof pass): this device
+   * keeps its whole history; it is the NEW device that starts from today.
+   * `historyStance` keeps its pinned bytes for the acceptor. */
+  linkedOfferer: 'Linked. The new device shows messages from today forward.',
+  /** A roster change that did not land — an unlink, a revoke (the proof
+   * pass: the LINK refusal above used to stand in for it, sending the
+   * person to "start again from the new device" over an unlink). */
+  rosterRefused:
+    'That did not work. Try again in a moment; if the device has already left the account, the list shows it on its next refresh.',
   /** A TRANSPORT failure — offline, DNS, a timeout — and never the server's
    * refusal: the refused sentence above would blame an expired link for a
    * request that never arrived. The account decks' sentence, byte-for-byte.
@@ -104,4 +121,48 @@ export const LINKING_COPY = {
    * plural the deck already speaks — no idiom noun, deliberately, because
    * the row names the ACCOUNT's devices, never this one. */
   settingsRow: 'Linked devices',
+
+  /* ── the unlinked second device (2026-10-08 follow-up): an unverified
+   *    device that is its own account, whose owner already has an account
+   *    with a verified email on ANOTHER device. The Email and handle screens'
+   *    needs-verification states render these beside "verify an email
+   *    first", which cannot work when the address is linked to the other
+   *    account (the code is sent, the verify is refused with the uniform
+   *    403). No idiom noun on purpose — "this device" throughout: the handle
+   *    deck's screen admits no DEVICE_NOUN, and the Android token census
+   *    keeps its count. Detection is LOCAL (db.loadLinkGroup() null and
+   *    db.pristineForLink()), never a wire call. ── */
+  /** The notice on a FRESH install (pristineForLink true): what can still
+   * be done, and from where. "Can join … if", never "will": this device
+   * cannot know the other device's kind. */
+  joinExistingAccount:
+    'Already using Tacendum with a verified email on another device? This device can join that account instead of verifying an email here — if it is a different kind of device, and the link is started from the other device. See how below.',
+  /** The notice on a LIVED-IN device (pristineForLink false — rooms,
+   * machines or consent decisions of its own; never a group row, which the
+   * screens rule out before choosing this): the door is closed, said
+   * plainly, with the one thing that is still true. */
+  joinExistingAccountLivedIn:
+    'Already using Tacendum with a verified email on another device? This device already has a life of its own — rooms, machines or consent decisions — so it can no longer join that account; only a fresh install can be linked. It stays its own account, and an email that is linked to the other account cannot be verified here as well.',
+  /** The ⓘ label. */
+  joinExistingAccountInfoLabel: 'How linking this device works',
+  /** The ⓘ lines, shared by both states; the screen appends `historyStance`
+   * after them (by reference — that sentence's bytes are pinned) and,
+   * on a lived-in device, `joinExistingAccountStartOver`. The doors are the
+   * live labels (Settings → Account → Linked devices → Link a device; Your
+   * profile → Show QR code), the order is `codeInstruction`'s (the existing
+   * device confirms first), the preconditions are the server's and the
+   * client's (one device of each kind; a fresh install, §2.2 step 1),
+   * and the refusal is the verify step's uniform 403 on an address the other
+   * account holds. */
+  joinExistingAccountInfo: [
+    'Linking is started from the device that already has the account: there, open Settings → Account → Linked devices → Link a device and scan this device’s QR code (Your profile → Show QR code). Both devices then show the same verification code — confirm it on the other device first, then here.',
+    'An account holds one device of each kind, so this device can join only if the device you already use is a different kind of device. Only a fresh install can join: a device with rooms, machines or consent decisions of its own stays its own account.',
+    'A linked device shares the account: the email verified on the other device counts for this device too, though the address itself stays readable only there, and what is set on the account can be changed or removed from either device.',
+    'Verifying the same email here instead does not work: an email can be linked to one account only, so the code is refused after it arrives. Verifying a different email here keeps this device a separate account.',
+  ],
+  /** Appended on a lived-in device only: the one way the door reopens, its
+   * cost said first (Delete account empties every local table, so the
+   * device set up again is a fresh install). */
+  joinExistingAccountStartOver:
+    'To join the other account from this device after all, delete this account here (Your profile → Delete account) and set the device up again as a fresh install — the rooms on this device would be gone, and it would still need to be a different kind of device from the one you already use.',
 } as const;

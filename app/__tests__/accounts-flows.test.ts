@@ -35,6 +35,12 @@ import {
   type PeerRosterNotice,
 } from '../src/linking';
 import type * as db from '../src/db';
+import * as accountsUsername from '../src/accountsUsername';
+import {
+  getIdentifierState,
+  invalidateIdentifierState,
+  type IdentifierStateDeps,
+} from '../src/accountsUsername';
 
 const SELF = '01HQAAAA00000000000000000A';
 const OTHER = '01HQBBBB00000000000000000B';
@@ -674,5 +680,311 @@ describe('dissolveGrouping — the flow that signs a dissolve', () => {
       offFail();
     }
     expect(mutations).toEqual([]);
+  });
+});
+
+/* ── D2 (fix/username-discovery, 2026-10-08): the request step's 429 ─── */
+
+describe('the code request tells a self-keyed 429 from the collapsed 403 (D2)', () => {
+  // The request-code route refuses two ways the caller may know apart: the
+  // frozen 403 (the group already holds its one email — including one a
+  // SIBLING linked — a class mismatch, the dark flag) and a 429 from the
+  // caller's OWN budgets (the per-device route burst, the per-group 10/day
+  // attach allowance). Both are self-keyed answers about the caller, never
+  // about an address, so the client may say which one it got.
+  it('a 429 answers rate_limited — and records no pending address', async () => {
+    const { deps, state } = fakeDeps({
+      emailRequestCode: async () => {
+        throw new ApiRequestError('too many requests; slow down', 429, 'rate_limited');
+      },
+    });
+    expect(await accounts.requestAttachCode('a@b.co', deps)).toBe('rate_limited');
+    expect(state.identifier).toBeNull();
+  });
+
+  it('every other http answer stays the collapsed refusal; a transport failure stays failed', async () => {
+    for (const status of [400, 403, 404, 409, 500, 503]) {
+      const { deps, state } = fakeDeps({
+        emailRequestCode: async () => {
+          throw new ApiRequestError('refused', status, 'accounts_refused');
+        },
+      });
+      expect(await accounts.requestAttachCode('a@b.co', deps)).toBe('refused');
+      expect(state.identifier).toBeNull();
+    }
+    const offline = fakeDeps({
+      emailRequestCode: async () => {
+        throw new TypeError('Network request failed');
+      },
+    });
+    expect(await accounts.requestAttachCode('a@b.co', offline.deps)).toBe('failed');
+    expect(offline.state.identifier).toBeNull();
+  });
+
+  it('the verify step is untouched: a 429 there is still the collapsed refusal (nothing is saved)', async () => {
+    const { deps, state } = fakeDeps({
+      emailVerify: async () => {
+        throw new ApiRequestError('too many requests', 429, 'rate_limited');
+      },
+    });
+    expect(await accounts.confirmAttach('a@b.co', '123456', deps)).toBe('refused');
+    expect(state.identifier).toBeNull();
+  });
+});
+
+/* ── the cached identifier state follows every write (the contract) ───── */
+
+describe('every identifier write invalidates the cached account state (fix/username-discovery)', () => {
+  // The Email screen renders the GROUP's facts (emailLinked) from the 60 s
+  // cache in accountsUsername.getIdentifierState. A write that changes
+  // those facts must drop the cache, or the screen that re-reads after the
+  // write shows the state before it. Proved as behaviour: prime the cache
+  // through injected deps, run the verb, and a re-read must reach the wire.
+  const wire = (ledger: number[]): IdentifierStateDeps => ({
+    api: {
+      identifierState: async () => {
+        ledger.push(1);
+        return {
+          kind: 'state',
+          value: {
+            hasVerifiedIdentifier: true,
+            emailLinked: true,
+            phoneLinked: false,
+            holdsUsername: false,
+            usernameCooldownUntil: null,
+            usernameSince: null,
+            emailSince: null,
+            usernameFindable: null,
+            emailFindable: null,
+          },
+        };
+      },
+      usernameEligibility: async () => ({ hasVerifiedIdentifier: true }),
+    },
+    token: async () => 'bearer',
+    now: () => NOW_MS,
+  });
+
+  beforeEach(() => invalidateIdentifierState());
+  afterEach(() => invalidateIdentifierState());
+
+  const attached: db.AccountIdentifierRow = {
+    email: 'alice@example.com',
+    verifiedAt: NOW_MS,
+    discoverable: false,
+    pendingEmail: null,
+    pendingRequestedAt: null,
+    restoredAt: null,
+  };
+
+  const verbs: Array<[string, (deps: accounts.AccountsDeps, state: Ledger) => Promise<unknown>]> = [
+    ['confirmAttach', deps => accounts.confirmAttach('alice@example.com', '123456', deps)],
+    [
+      'setDiscoverable',
+      (deps, state) => {
+        state.identifier = { ...attached };
+        return accounts.setDiscoverable(true, deps);
+      },
+    ],
+    [
+      'unlinkIdentifier',
+      (deps, state) => {
+        state.identifier = { ...attached };
+        return accounts.unlinkIdentifier(deps);
+      },
+    ],
+    ['downgradeToAnonymous', deps => accounts.downgradeToAnonymous(deps)],
+    [
+      'completeRecovery',
+      (deps, state) => {
+        state.recovery = {
+          kind: 'email',
+          value: 'a@b.co',
+          groupId: GROUP,
+          completesAt: Math.floor(NOW_MS / 1000) - 1,
+          verifiedAt: NOW_MS,
+        };
+        return accounts.completeRecovery(deps);
+      },
+    ],
+  ];
+
+  it.each(verbs)('%s: a landed write drops the cache, so the next read reaches the wire', async (_name, run) => {
+    const ledger: number[] = [];
+    expect((await getIdentifierState(wire(ledger))).emailLinked).toBe(true);
+    expect((await getIdentifierState(wire(ledger))).emailLinked).toBe(true);
+    expect(ledger).toHaveLength(1); // cached
+    const { deps, state } = fakeDeps();
+    await run(deps, state);
+    await getIdentifierState(wire(ledger));
+    expect(ledger).toHaveLength(2); // invalidated by the write
+  });
+
+  it('a REFUSED write changes no fact and keeps the cache', async () => {
+    const ledger: number[] = [];
+    await getIdentifierState(wire(ledger));
+    const { deps, state } = fakeDeps(refusing('emailVerify'));
+    expect(await accounts.confirmAttach('alice@example.com', '000000', deps)).toBe('refused');
+    expect(state.identifier).toBeNull();
+    await getIdentifierState(wire(ledger));
+    expect(ledger).toHaveLength(1);
+  });
+});
+
+/* ── the gate pass (2026-10-08): the daily 429, the shared pacing ledger,
+ *    refusals that drop the cache, the downgrade's username rows ───────── */
+
+/** A verified email row, as this device records one after an attach. */
+function attachedRow(): db.AccountIdentifierRow {
+  return {
+    email: 'alice@example.com',
+    verifiedAt: NOW_MS,
+    discoverable: false,
+    pendingEmail: null,
+    pendingRequestedAt: null,
+    restoredAt: null,
+  };
+}
+
+describe('the gate pass: the request step tells the DAY’s allowance from the minute’s burst by Retry-After', () => {
+  it('a 429 whose Retry-After is longer than the burst window is rate_limited_today; seconds, or no header, stay rate_limited', async () => {
+    const outcomes: Array<[number | null, string]> = [];
+    for (const retryAfter of [7_200, 61, 60, 30, null]) {
+      const { deps, state } = fakeDeps({
+        emailRequestCode: async () => {
+          throw new ApiRequestError('too many requests', 429, 'rate_limited', retryAfter);
+        },
+      });
+      outcomes.push([retryAfter, await accounts.requestAttachCode('a@b.co', deps)]);
+      expect(state.identifier).toBeNull();
+    }
+    expect(outcomes).toEqual([
+      [7_200, 'rate_limited_today'],
+      [61, 'rate_limited_today'],
+      [60, 'rate_limited'],
+      [30, 'rate_limited'],
+      [null, 'rate_limited'],
+    ]);
+  });
+
+  it('the real wire carries Retry-After onto the error: a 429 without the header reads null', () => {
+    expect(new ApiRequestError('x', 429, 'rate_limited').retryAfterSeconds).toBeNull();
+    expect(new ApiRequestError('x', 429, 'rate_limited', 90).retryAfterSeconds).toBe(90);
+  });
+});
+
+describe('the gate pass: the email legs draw the shared identifier-route window, so they count in its pacing ledger', () => {
+  beforeEach(() => accountsUsername.clearIdentifierRoutePacing());
+  afterEach(() => accountsUsername.clearIdentifierRoutePacing());
+
+  it('ten email legs in a minute (request, verify, consent, remove, the downgrade’s email leg) fill the ledger; the eleventh is told to wait', async () => {
+    expect(accountsUsername.identifierRoutePacing(NOW_MS)).toBeNull();
+    const { deps, state } = fakeDeps();
+    await accounts.requestAttachCode('a@b.co', deps); // 1
+    await accounts.confirmAttach('a@b.co', '123456', deps); // 2
+    state.identifier = { ...attachedRow() };
+    await accounts.setDiscoverable(true, deps); // 3
+    await accounts.unlinkIdentifier(deps); // 4
+    await accounts.downgradeToAnonymous(deps); // 5
+    for (let n = 0; n < 4; n += 1) await accounts.requestAttachCode('a@b.co', deps); // 9
+    expect(accountsUsername.identifierRoutePacing(NOW_MS)).toBeNull();
+    await accounts.requestAttachCode('a@b.co', deps); // 10
+    expect(accountsUsername.identifierRoutePacing(NOW_MS)).toBe(60);
+  });
+});
+
+describe('the gate pass: a REFUSED request-code, consent or remove drops the cached account state (a sibling changed it)', () => {
+  const wire = (ledger: number[]): IdentifierStateDeps => ({
+    api: {
+      identifierState: async () => {
+        ledger.push(1);
+        return {
+          kind: 'state',
+          value: {
+            hasVerifiedIdentifier: true,
+            emailLinked: true,
+            phoneLinked: false,
+            holdsUsername: false,
+            usernameCooldownUntil: null,
+            usernameSince: null,
+            emailSince: null,
+            usernameFindable: null,
+            emailFindable: null,
+          },
+        };
+      },
+      usernameEligibility: async () => ({ hasVerifiedIdentifier: true }),
+    },
+    token: async () => 'bearer',
+    now: () => NOW_MS,
+  });
+  beforeEach(() => invalidateIdentifierState());
+  afterEach(() => invalidateIdentifierState());
+
+  const refusedVerbs: Array<[string, (deps: accounts.AccountsDeps, state: Ledger) => Promise<unknown>, string]> = [
+    ['requestAttachCode', deps => accounts.requestAttachCode('a@b.co', deps), 'emailRequestCode'],
+    [
+      'setDiscoverable',
+      (deps, state) => {
+        state.identifier = { ...attachedRow() };
+        return accounts.setDiscoverable(true, deps);
+      },
+      'setDiscoverable',
+    ],
+    [
+      'unlinkIdentifier',
+      (deps, state) => {
+        state.identifier = { ...attachedRow() };
+        return accounts.unlinkIdentifier(deps);
+      },
+      'emailUnlink',
+    ],
+  ];
+
+  it.each(refusedVerbs)('%s refused: the next read reaches the wire', async (_name, run, wireName) => {
+    const ledger: number[] = [];
+    await getIdentifierState(wire(ledger));
+    expect(ledger).toHaveLength(1);
+    const { deps, state } = fakeDeps(refusing(wireName));
+    expect(await run(deps, state)).toBe('refused');
+    await getIdentifierState(wire(ledger));
+    expect(ledger).toHaveLength(2);
+  });
+});
+
+describe('the gate pass: the downgrade takes the username rows with it where a ceremonial group dissolved', () => {
+  function withUsernameRows(group: { groupId: string; rosterEpoch: number } | null) {
+    const made = fakeDeps();
+    const cleared: string[] = [];
+    made.state.group = group;
+    const deps: accounts.AccountsDeps = {
+      ...made.deps,
+      db: {
+        ...made.deps.db,
+        clearUsernameIdentifier: async () => {
+          cleared.push('username');
+        },
+        clearUsernameUnlink: async () => {
+          cleared.push('unlink');
+        },
+        clearUsernameCooldown: async () => {
+          cleared.push('cooldown');
+        },
+      },
+    };
+    return { deps, state: made.state, cleared };
+  }
+
+  it('a ceremonially grouped device: the dissolve’s last exit tombstoned the name, so the row and this device’s memories go', async () => {
+    const { deps, state, cleared } = withUsernameRows({ groupId: GROUP, rosterEpoch: 2 });
+    expect(await accounts.downgradeToAnonymous(deps)).toBe('downgraded');
+    expect(state.calls).toContain('dissolve');
+    expect(cleared).toEqual(['username', 'unlink', 'cooldown']);
+  });
+
+  it('a lazily minted solo founder (no local group): the name survives the email leg, so the rows stay', async () => {
+    const { deps, cleared } = withUsernameRows(null);
+    expect(await accounts.downgradeToAnonymous(deps)).toBe('downgraded');
+    expect(cleared).toEqual([]);
   });
 });

@@ -11,6 +11,7 @@ import {
 import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import {
   DISCOVERY_MIN_ACCOUNT_AGE_SECONDS,
+  IdentifierStateResponse,
   TABLES,
   TABLE_ENV_VARS,
   USERNAME_CLAIMS_PER_ACCOUNT_PER_DAY,
@@ -18,6 +19,7 @@ import {
   USERNAME_RENAME_COOLDOWN_SECONDS,
   USERNAME_TAKEN_BODY,
   USERNAME_TAKEN_STATUS,
+  UsernameEligibilityResponse,
   normalizeUsernameIdentifier,
   usernameSkeleton,
 } from '@tacendum/shared';
@@ -28,14 +30,20 @@ import {
   makeTestOnlyDataLayer,
   type TestOnlyDataLayer,
   type IdentifierClaimRecord,
+  type UsernameTombstoneRecord,
 } from '../src/db/data.js';
 import { activeNameskelClaimKeys, activeUsernameClaimKeys } from '../src/opaque-ref.js';
 import { LIMITS, type RateLimiter } from '../src/ratelimit.js';
 import { makeDdbRateLimiter } from '../src/ratelimit-ddb.js';
 import { accountsRefusal, isAccountsCollapsedRoute } from '../src/handlers/devices.js';
-import { emailRequestCodeRoute, emailVerifyRoute } from '../src/handlers/identifiers.js';
-import { setUsernameDiscoverableRoute } from '../src/handlers/discovery.js';
 import {
+  emailRequestCodeRoute,
+  emailUnlinkRoute,
+  emailVerifyRoute,
+} from '../src/handlers/identifiers.js';
+import { setDiscoverableRoute, setUsernameDiscoverableRoute } from '../src/handlers/discovery.js';
+import {
+  identifierStateRoute,
   usernameClaimRoute,
   usernameEligibilityRoute,
   usernameRefusal,
@@ -171,6 +179,79 @@ async function verifiedAcct(db: TestOnlyDataLayer, deps: TestDeps): Promise<Acct
   const groupId = (await db.getUserById(acct.userId))!.groupId!;
   canaries.add(groupId);
   return { ...acct, groupId };
+}
+
+/** The caller-owned GET: a bearer and nothing else (no body travels). */
+function get(token: string | undefined): HttpEvent {
+  return {
+    method: 'GET',
+    path: '/',
+    headers: token !== undefined ? { authorization: `Bearer ${token}` } : {},
+    sourceIp: '127.0.0.1',
+  };
+}
+
+/** A sibling device joined into `holder`'s EXISTING group through the data
+ * layer's join branch at the group's current epoch — the field report's
+ * linked iPad: a member of the account group that holds NO local identifier
+ * row of its own (nothing on the sibling ever attached, claimed or synced). */
+async function linkSibling(
+  db: TestOnlyDataLayer,
+  deps: TestDeps,
+  holder: Acct & { groupId: string },
+): Promise<Acct> {
+  const sibling = await mkAcct(db, deps);
+  const group = (await db.getAccountGroup(holder.groupId))!;
+  const offerNonce = `nonce-sib-${RUN}-${++seq}`;
+  const nowS = Math.floor(deps.now() / 1000);
+  expect(
+    await db.putLinkOffer({
+      offerNonce,
+      groupId: holder.groupId,
+      offererUserId: holder.userId,
+      acceptorUserId: sibling.userId,
+      acceptorClass: 'tablet',
+      rosterEpoch: group.epoch,
+      expiresAt: nowS + 600,
+      offerSig: Buffer.from(`o-${offerNonce}`).toString('base64'),
+    }),
+  ).toBe('created');
+  expect(
+    await db.linkDeviceToGroup({
+      offerNonce,
+      acceptSig: Buffer.from(`a-${offerNonce}`).toString('base64'),
+      nowSeconds: nowS,
+      linkedAtMs: deps.now(),
+    }),
+  ).toBe('linked');
+  expect((await db.getUserById(sibling.userId))?.groupId).toBe(holder.groupId);
+  return sibling;
+}
+
+/** The nine strict keys of the state read, in the pinned wire order (five
+ * at the route's birth; the three caller-own facts of the 2026-10-08 gate
+ * pass — the live rows' birth stamps and the name's consent bit — after;
+ * the email's consent bit from the proof pass last). */
+const STATE_KEYS = [
+  'hasVerifiedIdentifier',
+  'emailLinked',
+  'phoneLinked',
+  'holdsUsername',
+  'usernameCooldownUntil',
+  'usernameSince',
+  'emailSince',
+  'usernameFindable',
+  'emailFindable',
+] as const;
+
+/** One state read: 200, the strict shape, the pinned key order. */
+async function readState(deps: TestDeps, acct: Acct): Promise<IdentifierStateResponse> {
+  const res = await identifierStateRoute(get(acct.token), deps);
+  expect(res.statusCode).toBe(200);
+  expect(res.headers).toEqual({ 'content-type': 'application/json' });
+  const body = JSON.parse(res.body!) as unknown;
+  expect(Object.keys(body as object)).toEqual([...STATE_KEYS]);
+  return IdentifierStateResponse.parse(body);
 }
 
 function keysFor(name: string) {
@@ -350,6 +431,276 @@ function routesSuite(
       expect(takesOf(deps, `idroute:${sibling.userId}`)).toHaveLength(3);
     });
 
+    gated('THE /claim SPELLING ON A HOLDING GROUP (field report 2026-10-08, U1): a linked sibling with no local row that "claims" ANOTHER name on a group already holding one is the frozen refusal BEFORE the budgets — only the route bucket drawn, nothing admitted, no transaction, the held name and the stamp untouched; the held name through /claim spends nothing either, from the sibling and from the holder; /rename keeps the group-state routing', async () => {
+      const { db } = on();
+      const deps = freshDeps(db);
+      const f = family();
+      const a = await verifiedAcct(db, deps);
+      const s = await linkSibling(db, deps, a);
+      deps.advanceMs(DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000);
+      expect((await claim(deps, a, f('alice'))).statusCode).toBe(200);
+      const heldKey = keysFor(f('alice')).claimKeys[0]!;
+      const nowS = (): number => Math.floor(deps.now() / 1000);
+      const heldRefs = async (): Promise<string[]> =>
+        (await db.getAccountGroup(a.groupId))!.identifierRefs.filter((ref) =>
+          ref.startsWith(USERNAME_CLAIM_KEY_PREFIX),
+        );
+      // The report's silent rename: the sibling's claim form sends /claim
+      // with a NEW name. Before this guard the server ran it as the rename
+      // the group's state implied. Now: the frozen bytes, before the claim
+      // budgets — the route budget is the only take, the admitted counter
+      // does not move, no row is born, the stamp stays unset.
+      deps.advanceMs(7_000);
+      const mark = deps.takes.length;
+      const admitted = eventsOf(deps, 'username_claim_admitted');
+      expectFrozen(await claim(deps, s, f('zed')));
+      expect(deps.takes.slice(mark)).toEqual([`idroute:${s.userId}`]);
+      expect(eventsOf(deps, 'username_claim_admitted')).toBe(admitted);
+      expect(await heldRefs()).toEqual([heldKey]);
+      expect(await db.getUsernameClaim(keysFor(f('zed')).claimKeys[0]!, nowS())).toBeUndefined();
+      expect((await db.getAccountGroup(a.groupId))!.usernameRenamedAt).toBeUndefined();
+      // The HELD name through /claim — the sibling retyping what it was told,
+      // and the holder's own retry: frozen, and nothing spent (the holder's
+      // same-name /claim used to draw a claim attempt before the no-op).
+      deps.advanceMs(7_000);
+      const mark2 = deps.takes.length;
+      expectFrozen(await claim(deps, s, f('alice')));
+      expectFrozen(await claim(deps, a, f('alice')));
+      expect(deps.takes.slice(mark2)).toEqual([`idroute:${s.userId}`, `idroute:${a.userId}`]);
+      expect(eventsOf(deps, 'username_claim_admitted')).toBe(admitted);
+      expect(await heldRefs()).toEqual([heldKey]);
+      // `zed` was free all along — a stranger takes it — so the refusals
+      // above were the guard, never occupancy.
+      const c = await verifiedAcct(db, deps);
+      deps.advanceMs(7_000);
+      expect((await claim(deps, c, f('zed'))).statusCode).toBe(200);
+      // The /rename spelling is the explicit intent and keeps the §4.8
+      // group-state routing: the sibling, a member, renames deliberately,
+      // charged as every rename is.
+      deps.advanceMs(7_000);
+      const mark3 = deps.takes.length;
+      const admittedBeforeRename = eventsOf(deps, 'username_claim_admitted');
+      expect((await claim(deps, s, f('carol'), true, usernameRenameRoute)).statusCode).toBe(200);
+      expect(deps.takes.slice(mark3)).toContain(`unameclaim:${a.groupId}`);
+      expect(eventsOf(deps, 'username_claim_admitted')).toBe(admittedBeforeRename + 1);
+      expect(await heldRefs()).toEqual([keysFor(f('carol')).claimKeys[0]]);
+      // ...and /rename on a group holding NO name still claims (a device
+      // whose local row outlived a sibling's unlink pressing Change).
+      const d = await verifiedAcct(db, deps);
+      deps.advanceMs(7_000);
+      expect((await claim(deps, d, f('dave'), true, usernameRenameRoute)).statusCode).toBe(200);
+    });
+
+    gated('GET /v1/identifiers/state (field report 2026-10-08 — U1/U2/D2/U3): the caller\'s OWN account-group facts in the five pinned keys — true for a linked sibling with no local row, the cool-down\'s end in unix SECONDS while a window runs and null outside it, no name, no key, no hash — charged to its OWN 30/min bucket (never idroute:), refused in the frozen shape, 401 without a bearer; a stale pointer\'s non-member reads nothing of the former group', async () => {
+      const { db } = on();
+      const deps = freshDeps(db);
+      const f = family();
+      // A solo, unverified device: every fact false, no window — and the
+      // serialized bytes pinned once, key order included.
+      const solo = await mkAcct(db, deps);
+      const soloRes = await identifierStateRoute(get(solo.token), deps);
+      expect(soloRes.statusCode).toBe(200);
+      expect(soloRes.body).toBe(
+        '{"hasVerifiedIdentifier":false,"emailLinked":false,"phoneLinked":false,"holdsUsername":false,"usernameCooldownUntil":null,"usernameSince":null,"emailSince":null,"usernameFindable":null,"emailFindable":null}',
+      );
+      // The holder's group, read through the SIBLING that holds no local
+      // row: the email the phone verified and the name the phone claimed
+      // are the ACCOUNT's facts — and the moments their live rows were
+      // written (`emailSince`, `usernameSince`: unix seconds, the stamp a
+      // device compares its own row against), never the address or the name.
+      const a = await verifiedAcct(db, deps);
+      const emailSince = Math.floor(deps.now() / 1000);
+      const s = await linkSibling(db, deps, a);
+      deps.advanceMs(DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000);
+      expect(await readState(deps, s)).toEqual({
+        hasVerifiedIdentifier: true,
+        emailLinked: true,
+        phoneLinked: false,
+        holdsUsername: false,
+        usernameCooldownUntil: null,
+        usernameSince: null,
+        emailSince,
+        usernameFindable: null,
+        // The email's own consent bit rides the same read: OFF by
+        // construction after an attach (§4 default), never the address.
+        emailFindable: false,
+      });
+      // Claimed UNFINDABLE: the consent bit travels as the server holds it
+      // (a sibling's rename form must start there, not at the claim
+      // default), and the claim moment is the name's birth stamp.
+      expect((await claim(deps, a, f('alice'), false)).statusCode).toBe(200);
+      const aliceSince = Math.floor(deps.now() / 1000);
+      // A first claim never stamps: held, no window.
+      expect(await readState(deps, s)).toEqual({
+        hasVerifiedIdentifier: true,
+        emailLinked: true,
+        phoneLinked: false,
+        holdsUsername: true,
+        usernameCooldownUntil: null,
+        usernameSince: aliceSince,
+        emailSince,
+        usernameFindable: false,
+        emailFindable: false,
+      });
+      // The toggle moves the bit and NOT the stamp (a sibling's toggle must
+      // not make the holder's row read as a phantom).
+      expect(
+        (await setUsernameDiscoverableRoute(post(a.token, { discoverable: true }), deps)).statusCode,
+      ).toBe(204);
+      expect(await readState(deps, s)).toMatchObject({ usernameSince: aliceSince, usernameFindable: true });
+      // Nothing name-shaped travels (§4.9 — pointer never
+      // proof): not the name, not a claim key, not a hash, not a ULID.
+      const { normalized, claimKeys, skeletonKeys } = keysFor(f('alice'));
+      const raw = (await identifierStateRoute(get(s.token), deps)).body!;
+      for (const secret of [normalized, ...claimKeys, ...skeletonKeys, a.groupId, a.userId, s.userId]) {
+        expect(raw).not.toContain(secret);
+      }
+      // The eligibility read beside it stays byte-identical (builds 31-33
+      // parse it .strict()): the state read added nothing there.
+      const elig = await usernameEligibilityRoute(post(s.token, undefined), deps);
+      expect(elig.body).toBe('{"hasVerifiedIdentifier":true}');
+      // A rename at T0 opens the window: its END travels, in unix seconds —
+      // the same number the group row stores — to the sibling AND the
+      // holder; at 30 d − 1 s still the number; at 30 d exactly null.
+      deps.advanceMs(7_000);
+      expect((await claim(deps, a, f('bob'), true, usernameRenameRoute)).statusCode).toBe(200);
+      const t0 = Math.floor(deps.now() / 1000);
+      expect((await db.getAccountGroup(a.groupId))!.usernameRenamedAt).toBe(t0);
+      expect((await readState(deps, s)).usernameCooldownUntil).toBe(t0 + USERNAME_RENAME_COOLDOWN_SECONDS);
+      expect((await readState(deps, a)).usernameCooldownUntil).toBe(t0 + USERNAME_RENAME_COOLDOWN_SECONDS);
+      // The rename wrote a NEW live row: its birth stamp moves to the
+      // rename moment — the fact the phone that still shows `alice` reads
+      // its row against (the gate pass's rename-phantom rule) — and the
+      // bit is the rename's own.
+      expect(await readState(deps, a)).toMatchObject({ usernameSince: t0, usernameFindable: true });
+      deps.advanceMs(USERNAME_RENAME_COOLDOWN_SECONDS * 1000 - 1000);
+      expect((await readState(deps, s)).usernameCooldownUntil).toBe(t0 + USERNAME_RENAME_COOLDOWN_SECONDS);
+      deps.advanceMs(1000);
+      expect(await readState(deps, s)).toEqual({
+        hasVerifiedIdentifier: true,
+        emailLinked: true,
+        phoneLinked: false,
+        holdsUsername: true,
+        usernameCooldownUntil: null,
+        usernameSince: t0,
+        emailSince,
+        usernameFindable: true,
+        emailFindable: false,
+      });
+      // An unlink closes the slot and opens a window of its own (unlink
+      // stamps — UN-C6): the sibling learns both at once; the name's facts
+      // go with the name.
+      expect((await usernameUnlinkRoute(post(a.token, {}), deps)).statusCode).toBe(200);
+      const t1 = Math.floor(deps.now() / 1000);
+      expect(await readState(deps, s)).toEqual({
+        hasVerifiedIdentifier: true,
+        emailLinked: true,
+        phoneLinked: false,
+        holdsUsername: false,
+        usernameCooldownUntil: t1 + USERNAME_RENAME_COOLDOWN_SECONDS,
+        usernameSince: null,
+        emailSince,
+        usernameFindable: null,
+        emailFindable: false,
+      });
+      // The EMAIL toggle moves ITS bit alone (R-P7f) — and the sibling,
+      // which holds no row for the address, reads the account's current
+      // setting (the proof pass: a sibling could neither see nor switch it).
+      expect(
+        (await setDiscoverableRoute(post(a.token, { discoverable: true }), deps)).statusCode,
+      ).toBe(204);
+      expect(await readState(deps, s)).toMatchObject({ emailFindable: true, emailSince, usernameFindable: null });
+      expect(
+        (await setDiscoverableRoute(post(s.token, { discoverable: false }), deps)).statusCode,
+      ).toBe(204);
+      expect(await readState(deps, a)).toMatchObject({ emailFindable: false, emailSince });
+      // THE BUCKET (U3): the read draws `idstate:<caller>` and never the
+      // shared `idroute:` window a focused session can starve; refused in
+      // the frozen shape by its own bucket alone; 30 per minute, then frozen,
+      // then open again a minute later.
+      expect(takesOf(deps, `idstate:${s.userId}`).length).toBeGreaterThan(0);
+      const idrouteBefore = takesOf(deps, `idroute:${s.userId}`).length;
+      deps.refuse.add('idroute:');
+      expect((await identifierStateRoute(get(s.token), deps)).statusCode).toBe(200);
+      deps.refuse.delete('idroute:');
+      deps.refuse.add('idstate:');
+      expectFrozen(await identifierStateRoute(get(s.token), deps));
+      deps.refuse.delete('idstate:');
+      expect(takesOf(deps, `idroute:${s.userId}`)).toHaveLength(idrouteBefore);
+      deps.advanceMs(60_000);
+      for (let n = 1; n <= 30; n++) {
+        expect((await identifierStateRoute(get(s.token), deps)).statusCode, `read ${n}`).toBe(200);
+      }
+      expectFrozen(await identifierStateRoute(get(s.token), deps));
+      deps.advanceMs(60_000);
+      expect((await identifierStateRoute(get(s.token), deps)).statusCode).toBe(200);
+      // No bearer: the ordinary 401 (both flags on — the dark case is the
+      // FLAG case below). Nothing on the claim lane was charged or admitted
+      // by any read above.
+      expect((await identifierStateRoute(get(undefined), deps)).statusCode).toBe(401);
+      expect(eventsOf(deps, 'username_claim_admitted')).toBe(2);
+      // The sibling REPLACES the email (D2 lets it remove, then attach its
+      // own): the holder's row for the old address is now a phantom, and
+      // `emailSince` — moved to the new row's birth — is the one fact that
+      // says so; `emailLinked` stays true on both.
+      deps.advanceMs(61_000);
+      expect((await emailUnlinkRoute(post(s.token, undefined), deps)).statusCode).toBe(200);
+      expect((await readState(deps, a)).emailSince).toBeNull();
+      deps.advanceMs(61_000);
+      // The sibling attaches under ITS roster class (a grouped caller's
+      // declared class must be the roster's own — the request-code rule).
+      const replaced = `${s.userId}-replaced@example.test`;
+      expect(
+        (await emailRequestCodeRoute(post(s.token, { email: replaced, class: 'tablet' }), deps))
+          .statusCode,
+      ).toBe(200);
+      expect(
+        (
+          await emailVerifyRoute(
+            post(s.token, { email: replaced, code: deps.emailsSent.at(-1)!.code }),
+            deps,
+          )
+        ).statusCode,
+      ).toBe(200);
+      const replacedSince = Math.floor(deps.now() / 1000);
+      expect(replacedSince).toBeGreaterThan(emailSince);
+      expect(await readState(deps, a)).toMatchObject({ emailLinked: true, emailSince: replacedSince });
+      // A user-row pointer is not membership (the eligibility read's rule):
+      // the caller is read strongly, and a caller absent from the
+      // authoritative roster reads NOTHING of the former group — every fact
+      // false, no window — never the group's email or its name slot.
+      const realGetUser = deps.db.getUserById.bind(deps.db);
+      const realGetGroup = deps.db.getAccountGroup.bind(deps.db);
+      const consistency: Array<boolean | undefined> = [];
+      deps.db.getUserById = async (userId, signal, opts) => {
+        consistency.push(opts?.consistent);
+        return realGetUser(userId, signal, opts);
+      };
+      deps.db.getAccountGroup = async (groupId) => {
+        const group = await realGetGroup(groupId);
+        return group
+          ? { ...group, members: group.members.filter((member) => member.userId !== s.userId) }
+          : undefined;
+      };
+      try {
+        expect(await readState(deps, s)).toEqual({
+          hasVerifiedIdentifier: false,
+          emailLinked: false,
+          phoneLinked: false,
+          holdsUsername: false,
+          usernameCooldownUntil: null,
+          usernameSince: null,
+          emailSince: null,
+          usernameFindable: null,
+          emailFindable: null,
+        });
+        expect(consistency).toEqual([true]);
+      } finally {
+        deps.db.getUserById = realGetUser;
+        deps.db.getAccountGroup = realGetGroup;
+      }
+    });
+
     gated('THE REFUSAL DISCIPLINE (carve-out): `taken` is the ONE distinguishable answer — one frozen 409 object, byte-pinned — and a live claim, a skeleton conflict, a reserved name (exact and skeleton-vs-skeleton), and a live tombstone all answer it identically; the former owner reclaims through it', async () => {
       const { db } = on();
       const deps = freshDeps(db);
@@ -526,6 +877,12 @@ function routesSuite(
     });
 
     gated('RENAME under an ADVANCING clock: the five-item transaction re-points the name, a stranger is refused the old name (tombstone), the cool-down refuses a second rename at 30 d − 1 s and admits it at 30 d (the former-owner reclaim), and a same-name rename is the frozen refusal', async () => {
+      // Re-cut 2026-10-08 (the /claim-spelling refusal): a
+      // HOLDER's renames below travel on the /rename spelling the shipped
+      // clients send for "Change my username". The /claim spelling on a
+      // holding group is now the frozen refusal before the budgets (U1), so
+      // it no longer doubles as the rename it used to run here; it is
+      // asserted beside each rename as the spend-nothing refusal it became.
       const { db } = on();
       const deps = freshDeps(db);
       const f = family();
@@ -545,19 +902,26 @@ function routesSuite(
       expectTaken(await claim(deps, c, f('alice')));
       // The cool-down (caller-state, frozen bytes): T0 + 1 d, T0 + 30 d − 1 s.
       deps.advanceMs(DAY_MS);
+      expectFrozen(await claim(deps, a, f('alice'), true, usernameRenameRoute));
       expectFrozen(await claim(deps, a, f('alice')));
       deps.advanceMs(t0 + USERNAME_RENAME_COOLDOWN_SECONDS * 1000 - 1000 - deps.now());
+      expectFrozen(await claim(deps, a, f('alice'), true, usernameRenameRoute));
       expectFrozen(await claim(deps, a, f('alice')));
       expect(eventsOf(deps, 'username_claim_admitted')).toBe(3);
       // T0 + 30 d exactly: admitted — A takes its old name back through
       // its own tombstone (the former-owner right, at the boundary).
       deps.advanceMs(1000);
-      expect((await claim(deps, a, f('alice'))).statusCode).toBe(200);
+      expect((await claim(deps, a, f('alice'), true, usernameRenameRoute)).statusCode).toBe(200);
       // The no-op: renaming to the held name is the frozen refusal and
-      // consumes nothing (the cool-down stamp is the previous rename's).
+      // consumes nothing (the cool-down stamp is the previous rename's);
+      // the /claim spelling of the held name is the same frozen bytes, and
+      // spends nothing either.
       deps.advanceMs(USERNAME_RENAME_COOLDOWN_SECONDS * 1000);
+      expectFrozen(await claim(deps, a, f('alice'), true, usernameRenameRoute));
+      const mark = deps.takes.length;
       expectFrozen(await claim(deps, a, f('alice')));
-      expect((await claim(deps, a, f('dave'))).statusCode).toBe(200);
+      expect(deps.takes.slice(mark)).toEqual([`idroute:${a.userId}`]);
+      expect((await claim(deps, a, f('dave'), true, usernameRenameRoute)).statusCode).toBe(200);
     });
 
     gated('UNLINK IS A NAME CHANGE (the anti-hoarding rule): after an unlink the claim of ANOTHER name is the frozen refusal for 30 d — budget charged, no transaction, no tombstone minted, the stamp untouched — while the reclaim of the SAME name is admitted at once through the own-tombstone pre-read; at 30 d − 1 s still frozen, at 30 d admitted; a claim never stamps', async () => {
@@ -651,6 +1015,9 @@ function routesSuite(
         ['unlink', usernameUnlinkRoute],
         ['discoverable', setUsernameDiscoverableRoute],
         ['eligibility', usernameEligibilityRoute],
+        // The caller-owned state read (2026-10-08) is flag-gated exactly
+        // like the eligibility read: dark class, dark facts.
+        ['state', identifierStateRoute],
       ];
       const a = await verifiedAcct(store.db, deps);
       deps.advanceMs(DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000);
@@ -688,6 +1055,129 @@ function routesSuite(
       // Nothing was ever charged or admitted through a dark route.
       expect(takesOf(deps, 'unameclaim')).toEqual([]);
       expect(eventsOf(deps, 'username_claim_admitted')).toBe(0);
+    });
+
+    gated('the take-back survives the dissolving unlink (field report 2026-10-08, S3): a one-device attach-created account removes its email, then its username (the group dissolves): the tombstone names the former MEMBER, a stranger is refused for 30 days, and the former owner takes the name back through a FRESH group — inside a cool-down of its own too, through the handler\'s own-tombstone walk', async () => {
+      // BOTH DataLayers (the 2026-10-08 integrate pass landed the helpers.ts
+      // mirror): the store is the authority the twin must never out-permit,
+      // and the handler's own-tombstone walk is proved over both.
+      const { db } = on();
+      const deps = freshDeps(db);
+      const f = family();
+      const nowS = (): number => Math.floor(deps.now() / 1000);
+      const a = await verifiedAcct(db, deps);
+      deps.advanceMs(DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000);
+      expect((await claim(deps, a, f('alice'))).statusCode).toBe(200);
+      const aliceKey = keysFor(f('alice')).claimKeys[0]!;
+      // The email leaves first (the group survives on the name alone), then
+      // the name — the LAST identifier — and the lazy-solo group dissolves.
+      deps.advanceMs(7_000);
+      expect((await emailUnlinkRoute(post(a.token, undefined), deps)).statusCode).toBe(200);
+      deps.advanceMs(7_000);
+      expect((await usernameUnlinkRoute(post(a.token, {}), deps)).statusCode).toBe(200);
+      const unlinkedAt = nowS();
+      expect((await db.getUserById(a.userId))?.groupId).toBeUndefined();
+      expect(await db.getAccountGroup(a.groupId)).toBeUndefined();
+      const tomb = (await db.getUsernameClaim(aliceKey, nowS())) as UsernameTombstoneRecord;
+      expect(tomb.tombstoned).toBe(true);
+      expect(tomb.formerUserId).toBe(a.userId);
+      // The group that could reclaim is gone: no dangling group id.
+      expect(tomb.formerGroupId).toBeUndefined();
+      // A stranger is refused the name for the window (held, one bit).
+      const c = await verifiedAcct(db, deps);
+      deps.advanceMs(7_000);
+      expectTaken(await claim(deps, c, f('alice')));
+      // THE WINDOW SURVIVES THE GROUP (the 2026-10-08 gate pass, re-cutting
+      // this case's own earlier pin): the dissolving unlink carried its
+      // stamp onto the member's user row, the solo device reads the window
+      // it is inside, and the fresh group the next attach mints inherits
+      // it — so "unlink counts as a change" (UN-C6) holds across the
+      // dissolve. Before the carry, every name the person had ever held
+      // stayed reserved for them (`formerUserId`) while a DIFFERENT name
+      // was admitted at once: claim→unlink→re-attach→claim-another, one
+      // email code per hoarded name.
+      expect((await db.getUserById(a.userId))!.usernameRenamedAt).toBe(unlinkedAt);
+      expect((await readState(deps, a)).usernameCooldownUntil).toBe(
+        unlinkedAt + USERNAME_RENAME_COOLDOWN_SECONDS,
+      );
+      // The former owner verifies again — a NEW lazy-solo group, a new
+      // groupId — and the take-back the unlink copy promised holds: by the
+      // member, not by the dead group.
+      deps.advanceMs(60_000);
+      await attachEmail(deps, a, `${a.userId}-again@example.test`);
+      const newGroupId = (await db.getUserById(a.userId))!.groupId!;
+      canaries.add(newGroupId);
+      expect(newGroupId).not.toBe(a.groupId);
+      expect((await db.getAccountGroup(newGroupId))!.usernameRenamedAt).toBe(unlinkedAt);
+      expect((await readState(deps, a)).usernameCooldownUntil).toBe(
+        unlinkedAt + USERNAME_RENAME_COOLDOWN_SECONDS,
+      );
+      // Inside the carried window: another name is the frozen refusal (the
+      // attempt is charged and admitted as ever, the namespace untouched —
+      // no row is written), the own former name is admitted through the
+      // handler's walk, which sees the member in the tombstone.
+      deps.advanceMs(7_000);
+      const admittedBefore = eventsOf(deps, 'username_claim_admitted');
+      expectFrozen(await claim(deps, a, f('bob')));
+      expectFrozen(await claim(deps, a, f('carol')));
+      expect(eventsOf(deps, 'username_claim_admitted')).toBe(admittedBefore + 2);
+      expect(await db.getUsernameClaim(keysFor(f('bob')).claimKeys[0]!, nowS())).toBeUndefined();
+      deps.advanceMs(7_000);
+      expect((await claim(deps, a, f('alice'))).statusCode).toBe(200);
+      expect((await db.getAccountGroup(newGroupId))!.identifierRefs).toContain(aliceKey);
+      const live = await db.getUsernameClaim(aliceKey, nowS());
+      expect(live && 'groupId' in live ? live.groupId : undefined).toBe(newGroupId);
+      // ...and once the carried window passes, a different name is free.
+      deps.advanceMs(USERNAME_RENAME_COOLDOWN_SECONDS * 1000);
+      expect((await claim(deps, a, f('bob'), true, usernameRenameRoute)).statusCode).toBe(200);
+    });
+
+    gated('the take-back survives the OTHER order too (gate pass 2026-10-08): the name leaves first (the group survives, stamped), then the email dissolves the group — the earlier tombstone names the MEMBER beside the dead group, the carried stamp keeps a different name waiting, and the former owner takes the name back from a fresh group', async () => {
+      const { db } = on();
+      const deps = freshDeps(db);
+      const f = family();
+      const nowS = (): number => Math.floor(deps.now() / 1000);
+      const a = await verifiedAcct(db, deps);
+      deps.advanceMs(DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000);
+      expect((await claim(deps, a, f('alice'))).statusCode).toBe(200);
+      const aliceKey = keysFor(f('alice')).claimKeys[0]!;
+      // The name leaves first: the group survives on the email, stamped.
+      deps.advanceMs(7_000);
+      expect((await usernameUnlinkRoute(post(a.token, {}), deps)).statusCode).toBe(200);
+      const unlinkedAt = nowS();
+      expect((await db.getAccountGroup(a.groupId))!.usernameRenamedAt).toBe(unlinkedAt);
+      const tomb = (await db.getUsernameClaim(aliceKey, nowS())) as UsernameTombstoneRecord;
+      expect(tomb.tombstoned).toBe(true);
+      expect(tomb.formerGroupId).toBe(a.groupId);
+      expect(tomb.formerUserId).toBe(a.userId);
+      // Then the email — the LAST identifier — and the group dissolves; the
+      // stamp moves onto the member, and the tombstone outlives its group.
+      deps.advanceMs(7_000);
+      expect((await emailUnlinkRoute(post(a.token, undefined), deps)).statusCode).toBe(200);
+      expect(await db.getAccountGroup(a.groupId)).toBeUndefined();
+      expect((await db.getUserById(a.userId))!.groupId).toBeUndefined();
+      expect((await db.getUserById(a.userId))!.usernameRenamedAt).toBe(unlinkedAt);
+      expect(await readState(deps, a)).toMatchObject({
+        holdsUsername: false,
+        emailLinked: false,
+        usernameCooldownUntil: unlinkedAt + USERNAME_RENAME_COOLDOWN_SECONDS,
+      });
+      // A stranger: `taken` for the window.
+      const c = await verifiedAcct(db, deps);
+      deps.advanceMs(7_000);
+      expectTaken(await claim(deps, c, f('alice')));
+      // The former owner re-verifies into a fresh group: a different name
+      // waits (the carried window), the own name comes straight back.
+      deps.advanceMs(60_000);
+      await attachEmail(deps, a, `${a.userId}-again@example.test`);
+      const newGroupId = (await db.getUserById(a.userId))!.groupId!;
+      canaries.add(newGroupId);
+      expect((await db.getAccountGroup(newGroupId))!.usernameRenamedAt).toBe(unlinkedAt);
+      deps.advanceMs(7_000);
+      expectFrozen(await claim(deps, a, f('bob')));
+      expect((await claim(deps, a, f('alice'))).statusCode).toBe(200);
+      const live = await db.getUsernameClaim(aliceKey, nowS());
+      expect(live && 'groupId' in live ? live.groupId : undefined).toBe(newGroupId);
     });
   });
 }
@@ -841,6 +1331,9 @@ describe('the pins, the route tables, the collapse mark', () => {
     expect(LIMITS.usernameClaimFleet).toEqual({ capacity: 2000, refillPerSec: 2000 / 86400 });
     // The caller bucket is the attach pin's size, in its OWN window.
     expect(LIMITS.usernameClaim).toEqual(LIMITS.identifierAttach);
+    // The state read's OWN caller bucket (2026-10-08, U3): 30/min, three
+    // times the shared identifier-route window it must never draw.
+    expect(LIMITS.identifierState).toEqual({ capacity: 30, refillPerSec: 30 / 60 });
     expect(USERNAME_TAKEN_STATUS).toBe(409);
     expect(USERNAME_TAKEN_BODY).toBe('{"error":"taken"}');
     // Both frozen answers are singletons — reference identity holds.
@@ -850,13 +1343,54 @@ describe('the pins, the route tables, the collapse mark', () => {
     expect(Object.isFrozen(usernameRefusal())).toBe(true);
   });
 
-  it('the AWS dispatch table and the local adapter both list all five routes, and every one carries the host-adapter collapse mark', () => {
+  it('WIRE COMPAT for builds 31-33 (no OTA, zod .strict() on every DTO): every body a shipped client parses on this lane is byte-identical — the eligibility read, the claim/rename/unlink 200, the taken 409, the collapsed refusal — and the new state read is a NEW route whose shape the old builds never request', async () => {
+    const db = makeMemoryDb();
+    db.setAccountsFeatureEnabled(true);
+    db.setAccountsUsernameFeatureEnabled(true);
+    const deps = freshDeps(db);
+    const f = family();
+    const a = await verifiedAcct(db, deps);
+    const solo = await mkAcct(db, deps);
+    // The eligibility read: exactly one key, both values, parsed by the
+    // shipped .strict() schema — and the four state keys are NOT there.
+    const eligTrue = await usernameEligibilityRoute(post(a.token, undefined), deps);
+    expect(eligTrue.body).toBe('{"hasVerifiedIdentifier":true}');
+    const eligFalse = await usernameEligibilityRoute(post(solo.token, undefined), deps);
+    expect(eligFalse.body).toBe('{"hasVerifiedIdentifier":false}');
+    for (const res of [eligTrue, eligFalse]) {
+      expect(res.statusCode).toBe(200);
+      expect(res.headers).toEqual({ 'content-type': 'application/json' });
+      expect(UsernameEligibilityResponse.safeParse(JSON.parse(res.body!)).success).toBe(true);
+    }
+    // The verbs' 200 is the empty object, the taken is the pinned 409, the
+    // refusal is the program's one frozen shape.
+    expect((await claim(deps, a, f('alice'))).body).toBe('{}');
+    deps.advanceMs(7_000);
+    expect((await claim(deps, a, f('bob'), true, usernameRenameRoute)).body).toBe('{}');
+    const b = await verifiedAcct(db, deps);
+    deps.advanceMs(7_000);
+    const taken = await claim(deps, b, f('bob'));
+    expect(taken.statusCode).toBe(409);
+    expect(taken.body).toBe('{"error":"taken"}');
+    deps.advanceMs(7_000);
+    expect((await usernameUnlinkRoute(post(a.token, {}), deps)).body).toBe('{}');
+    expect(usernameRefusal().body).toBe('{"error":{"code":"accounts_refused","detail":"not available"}}');
+    expect(usernameRefusal().statusCode).toBe(403);
+    // The state read parses under ITS strict schema and the eligibility
+    // schema REFUSES it — the two reads cannot be confused by a client.
+    const state = await identifierStateRoute(get(a.token), deps);
+    expect(IdentifierStateResponse.safeParse(JSON.parse(state.body!)).success).toBe(true);
+    expect(UsernameEligibilityResponse.safeParse(JSON.parse(state.body!)).success).toBe(false);
+  });
+
+  it('the AWS dispatch table and the local adapter both list all six routes, and every one carries the host-adapter collapse mark', () => {
     const keys = [
       'POST /v1/identifiers/username/claim',
       'POST /v1/identifiers/username/rename',
       'POST /v1/identifiers/username/unlink',
       'POST /v1/identifiers/username/discoverable',
       'GET /v1/identifiers/username/eligibility',
+      'GET /v1/identifiers/state',
     ];
     for (const key of keys) {
       const route = httpDispatch[key];
@@ -872,6 +1406,10 @@ describe('the pins, the route tables, the collapse mark', () => {
     expect(httpDispatch['GET /v1/identifiers/username/eligibility']).toBe(
       usernameEligibilityRoute,
     );
+    expect(httpDispatch['GET /v1/identifiers/state']).toBe(identifierStateRoute);
+    // The two routes are two HANDLERS: the state read never shares the
+    // eligibility read's function (or its bucket).
+    expect(identifierStateRoute).not.toBe(usernameEligibilityRoute);
     // The local adapter's table is module-private; its source is the census.
     const local = readFileSync(new URL('../src/local/http.ts', import.meta.url), 'utf8');
     for (const key of keys) {

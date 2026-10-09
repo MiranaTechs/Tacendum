@@ -60,6 +60,7 @@ import { ACCOUNTS_PHONE_COPY } from '../src/accountsPhoneCopy';
 import { ACCOUNTS_USERNAME_COPY } from '../src/accountsUsernameCopy';
 import * as db from '../src/db';
 import { handleAccountsNoticeFrame, type LinkingDeps } from '../src/linking';
+import { LINKING_COPY } from '../src/linkingCopy';
 import { messaging } from '../src/messaging';
 import * as reauth from '../src/reauth';
 import { session } from '../src/session';
@@ -185,8 +186,30 @@ const frame = (payload: object): AccountsNoticeFrame => ({
   ts: NOW_MS,
 });
 
+/** The claim surface reads the caller-owned STATE (fix/username-discovery,
+ * 2026-10-08); the find surfaces still read the legacy eligibility. Both
+ * are stubbed eligible here, with every sibling fact UNKNOWN (null) — the
+ * one-device world these cases were written in. The sibling-aware cases
+ * (section 9 below, username-claim-honesty) stub the facts they need. */
+const STATE_ELIGIBLE_DEFAULT: accountsUsername.IdentifierState = {
+  source: 'state',
+  eligibility: 'eligible',
+  holdsUsername: null,
+  emailLinked: null,
+  phoneLinked: null,
+  cooldownUntil: null,
+  usernameSince: null,
+  emailSince: null,
+  usernameFindable: null,
+  emailFindable: null,
+};
 beforeEach(() => {
+  // The identifier-route pacing ledger is module state on a trailing minute;
+  // with the clock pinned it never rolls, so every case starts it empty.
+  accountsUsername.clearIdentifierRoutePacing();
+  accountsUsername.invalidateIdentifierState();
   jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('eligible');
+  jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(STATE_ELIGIBLE_DEFAULT);
 });
 
 afterEach(() => {
@@ -327,8 +350,13 @@ describe('the claim surface (pin ON): local pre-checks, consent-at-claim, the pr
     tree.unmount();
   });
 
-  it('the authoritative group proof gate disables claim and offers verification; a linked sibling proof enables it despite empty local rows', async () => {
-    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('needs_verification');
+  it('the authoritative group proof gate withholds the form and offers verification; a linked sibling proof enables it despite empty local rows', async () => {
+    // Re-cut 2026-10-08 (U6): the unverified state used to render the full
+    // form under a permanently grey button; it now renders the reason and
+    // the door ALONE, so "input present + submit dark" became "no form".
+    jest
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValue({ ...STATE_ELIGIBLE_DEFAULT, eligibility: 'needs_verification' });
     stubRows({});
     const openEmail = jest.fn();
     const claim = jest.spyOn(accountsUsername, 'claimUsername');
@@ -336,16 +364,15 @@ describe('the claim surface (pin ON): local pre-checks, consent-at-claim, the pr
       <AccountUsernameScreen onBack={jest.fn()} onOpenAccountEmail={openEmail} />,
     );
     expect(has(none, 'account-username-needs-identifier')).toBe(true);
-    expect(has(none, 'account-username-input')).toBe(true);
-    await type(none, 'account-username-input', 'alice_7');
-    expect(submitDisabled(none)).toBe(true);
+    expect(has(none, 'account-username-input')).toBe(false);
+    expect(has(none, 'account-username-submit')).toBe(false);
     await press(none, 'account-username-link-email');
     expect(openEmail).toHaveBeenCalledTimes(1);
     expect(claim).not.toHaveBeenCalled();
     none.unmount();
 
     jest.restoreAllMocks();
-    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('eligible');
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(STATE_ELIGIBLE_DEFAULT);
     stubRows({});
     const some = await render(<AccountUsernameScreen onBack={jest.fn()} />);
     expect(has(some, 'account-username-needs-identifier')).toBe(false);
@@ -373,7 +400,7 @@ describe('the claim surface (pin ON): local pre-checks, consent-at-claim, the pr
 describe('the refusal render: taken, the generic retry, and the connection sentence are three distinct renders', () => {
   async function claimWith(outcome: accountsUsername.UsernameClaimOutcome): Promise<string> {
     jest.restoreAllMocks();
-    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('eligible');
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(STATE_ELIGIBLE_DEFAULT);
     stubRows({ email: EMAIL_ROW });
     jest.spyOn(accountsUsername, 'claimUsername').mockResolvedValue(outcome);
     const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
@@ -419,6 +446,9 @@ describe('the refusal render: taken, the generic retry, and the connection sente
         clearUsernameIdentifier: async () => undefined,
         saveUsernameUnlink: async () => undefined,
         clearUsernameUnlink: async () => undefined,
+        loadUsernameCooldown: async () => null,
+        saveUsernameCooldown: async () => undefined,
+        clearUsernameCooldown: async () => undefined,
       },
       token: async () => 'bearer',
       now: () => NOW_MS,
@@ -535,9 +565,12 @@ describe('the held state: the name from this device\'s row, the toggle, rename, 
     expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.claim);
     // The default is back — not the renamed row's old bit inherited.
     expect(consentChecked(tree)).toBe(true);
-    await type(tree, 'account-username-input', 'alice_9');
+    // The name typed is the one just removed: inside the window this device
+    // started, that is the one claim it knows the server admits (U2,
+    // 2026-10-08 — a different name is dark here now, with the date).
+    await type(tree, 'account-username-input', 'alice_7');
     await press(tree, 'account-username-submit');
-    expect(claim).toHaveBeenCalledWith('alice_9', true);
+    expect(claim).toHaveBeenCalledWith('alice_7', true);
     tree.unmount();
   });
 
@@ -962,7 +995,9 @@ describe('Settings → ACCOUNT: the username row (pin ON) is labeled from the de
     });
     // No verified identifier of either class: the sentence carries the door.
     stubRows({});
-    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('needs_verification');
+    jest
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValue({ ...STATE_ELIGIBLE_DEFAULT, eligibility: 'needs_verification' });
     // The boot now ASKS THE SERVER what build it still talks to, before the
     // socket. Left to the environment's real
     // `fetch`, that request is an outbound connection this suite never
@@ -1062,5 +1097,351 @@ describe('duress: a claim from the surface in a duress session touches the decoy
       await db.close();
       db.setWorkspace('real');
     }
+  });
+});
+
+/* ── 9. fix/username-discovery (2026-10-08): U4, U5, U6, V3 ──────────── */
+
+const STATE_ELIGIBLE: accountsUsername.IdentifierState = {
+  source: 'state',
+  eligibility: 'eligible',
+  holdsUsername: null,
+  emailLinked: null,
+  phoneLinked: null,
+  cooldownUntil: null,
+  usernameSince: null,
+  emailSince: null,
+  usernameFindable: null,
+  emailFindable: null,
+};
+const stateOf = (
+  partial: Partial<accountsUsername.IdentifierState>,
+): accountsUsername.IdentifierState => ({ ...STATE_ELIGIBLE, ...partial });
+
+/** The text of every node offered to the rotor as a header, in order. */
+function headerTexts(tree: ReactTestRenderer.ReactTestRenderer): string[] {
+  const out: string[] = [];
+  const strings = (node: unknown): string[] => {
+    if (node == null) return [];
+    if (typeof node === 'string') return [node];
+    if (Array.isArray(node)) return node.flatMap(strings);
+    return strings((node as { children?: unknown }).children);
+  };
+  const walk = (node: unknown): void => {
+    if (node == null || typeof node === 'string') return;
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+      return;
+    }
+    const el = node as { props?: { accessibilityRole?: string }; children?: unknown };
+    if (el.props?.accessibilityRole === 'header') out.push(strings(el.children).join(''));
+    walk(el.children);
+  };
+  walk(tree.toJSON());
+  return out;
+}
+
+/** Every string child in render order — what the glass actually prints,
+ * as opposed to the JSON of props (an accessibilityLabel is not a line). */
+function printed(tree: ReactTestRenderer.ReactTestRenderer): string[] {
+  const out: string[] = [];
+  const walk = (node: unknown): void => {
+    if (node == null) return;
+    if (typeof node === 'string') {
+      out.push(node);
+      return;
+    }
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+      return;
+    }
+    walk((node as { children?: unknown }).children);
+  };
+  walk(tree.toJSON());
+  return out;
+}
+
+describe('U5: the reserved-affix rule is mirrored locally — a reserved affix never spends a claim attempt', () => {
+  it('alice_team, admin_bob, tacendum_fan and their skeletons are refused on the device; affix-shaped, not substring-shaped', async () => {
+    stubRows({ email: EMAIL_ROW });
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(stateOf({}));
+    const claim = jest.spyOn(accountsUsername, 'claimUsername');
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    for (const typed of ['alice_team', 'admin_bob', 'tacendum_fan', 'support_x', 'mirana_1', 'adm1n_bob', 'rnirana_help']) {
+      await type(tree, 'account-username-input', typed);
+      expect([typed, rendered(tree).includes(ACCOUNTS_USERNAME_COPY.reserved)]).toEqual([typed, true]);
+      expect([typed, submitDisabled(tree)]).toEqual([typed, true]);
+      expect([typed, accountsUsername.checkUsernameLocally(typed)]).toEqual([typed, 'reserved']);
+    }
+    for (const typed of ['teamster', 'adminsky', 'alice_team_x', 'alice_7']) {
+      await type(tree, 'account-username-input', typed);
+      expect([typed, rendered(tree).includes(ACCOUNTS_USERNAME_COPY.reserved)]).toEqual([typed, false]);
+      expect([typed, submitDisabled(tree)]).toEqual([typed, false]);
+      expect([typed, accountsUsername.checkUsernameLocally(typed)]).toEqual([typed, 'ok']);
+    }
+    expect(claim).not.toHaveBeenCalled();
+    tree.unmount();
+  });
+});
+
+describe('U6: an unverified account sees the reason and the door, not a form under a grey button', () => {
+  it('needs_verification renders the notice and Link an email ALONE — no field, no consent box, no claim button', async () => {
+    stubRows({});
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValue(stateOf({ eligibility: 'needs_verification', holdsUsername: false }));
+    const openEmail = jest.fn();
+    const tree = await render(
+      <AccountUsernameScreen onBack={jest.fn()} onOpenAccountEmail={openEmail} />,
+    );
+    expect(has(tree, 'account-username-needs-identifier')).toBe(true);
+    expect(has(tree, 'account-username-link-email')).toBe(true);
+    expect(has(tree, 'account-username-input')).toBe(false);
+    expect(has(tree, 'account-username-consent')).toBe(false);
+    expect(has(tree, 'account-username-submit')).toBe(false);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.formatNote);
+    await press(tree, 'account-username-link-email');
+    expect(openEmail).toHaveBeenCalledTimes(1);
+    tree.unmount();
+  });
+
+  it('while the state read is still out there is no form either — only the checking line', async () => {
+    stubRows({});
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockImplementation(() => new Promise(() => undefined));
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(tree, 'account-username-eligibility-checking')).toBe(true);
+    expect(has(tree, 'account-username-input')).toBe(false);
+    expect(has(tree, 'account-username-submit')).toBe(false);
+    tree.unmount();
+  });
+});
+
+/* ── 10. the unlinked second device (2026-10-08 follow-up) ─────────── */
+
+/**
+ * The reported second device, read from production: a separate account
+ * that never linked and holds no verified identifier. This screen told it
+ * to "verify an email first" — a door that cannot work when the address is
+ * already linked to the other account (the code is sent, the verify is
+ * refused with the uniform 403) and never pointed at the thing that would:
+ * joining the other account, started FROM the other device, while this one
+ * is still a fresh install and a different kind of device. The guidance is
+ * client-only: the state read already in hand (needs_verification, on the
+ * new route AND the legacy fallback) plus two LOCAL reads — the group row
+ * (never linked) and the fresh-install check that chooses the sentence.
+ * An unknown renders nothing: no wrong guidance over a failed read.
+ */
+describe('the unlinked device (2026-10-08 follow-up): an unverified device that is its own account is told to link, not to verify', () => {
+  const NEEDS = stateOf({
+    eligibility: 'needs_verification',
+    holdsUsername: false,
+    emailLinked: false,
+    phoneLinked: false,
+  });
+  const GROUP: db.LinkGroupRow = { groupId: '01HQGRPZ00000000000000000G', rosterEpoch: 1 };
+
+  /** The screen's reads for this state, stubbed per case: the handle rows
+   * empty, the state read answering `state`, and the two LOCAL reads the
+   * guidance adds — the group row and the fresh-install check. */
+  function setup(over: {
+    group?: db.LinkGroupRow | null;
+    pristine?: boolean;
+    state?: accountsUsername.IdentifierState;
+    rejectGroup?: boolean;
+    rejectPristine?: boolean;
+  }): void {
+    stubRows({});
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(over.state ?? NEEDS);
+    const group = jest.spyOn(db, 'loadLinkGroup');
+    if (over.rejectGroup) group.mockRejectedValue(new Error('no db'));
+    else group.mockResolvedValue(over.group ?? null);
+    const pristine = jest.spyOn(db, 'pristineForLink');
+    if (over.rejectPristine) pristine.mockRejectedValue(new Error('no db'));
+    else pristine.mockResolvedValue(over.pristine ?? true);
+  }
+
+  /** The InlineNotice sentence under `testID`, or null. */
+  function messageAt(tree: ReactTestRenderer.ReactTestRenderer, testID: string): string | null {
+    const found = tree.root.findAllByProps({ testID }).find(n => n.props.message !== undefined);
+    return found ? (found.props.message as string) : null;
+  }
+
+  it('fresh install, no group, needs_verification → the fresh-install notice, the ⓘ and the "Link an email" door all render; still no form', async () => {
+    setup({});
+    const openEmail = jest.fn();
+    const tree = await render(
+      <AccountUsernameScreen onBack={jest.fn()} onOpenAccountEmail={openEmail} />,
+    );
+    // The reason and the door stand as before (U6)…
+    expect(has(tree, 'account-username-needs-identifier')).toBe(true);
+    expect(has(tree, 'account-username-link-email')).toBe(true);
+    expect(has(tree, 'account-username-input')).toBe(false);
+    expect(has(tree, 'account-username-consent')).toBe(false);
+    expect(has(tree, 'account-username-submit')).toBe(false);
+    // …and under the door, the thing that would actually work.
+    expect(messageAt(tree, 'account-username-join-existing')).toBe(LINKING_COPY.joinExistingAccount);
+    expect(has(tree, 'account-username-join-existing-info')).toBe(true);
+    // Teaching copy behind the ⓘ: collapsed by default, every line on press,
+    // the pinned history sentence by reference, and NOT the start-over line
+    // (this device is a fresh install — there is nothing to start over).
+    expect(rendered(tree)).not.toContain(LINKING_COPY.joinExistingAccountInfo[0]);
+    await press(tree, 'account-username-join-existing-info');
+    for (const line of LINKING_COPY.joinExistingAccountInfo) expect(rendered(tree)).toContain(line);
+    expect(rendered(tree)).toContain(LINKING_COPY.historyStance);
+    expect(rendered(tree)).not.toContain(LINKING_COPY.joinExistingAccountStartOver);
+    tree.unmount();
+  });
+
+  it('lived-in (pristineForLink false), no group → the lived-in notice; the ⓘ carries the start-over line', async () => {
+    setup({ pristine: false });
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(messageAt(tree, 'account-username-join-existing')).toBe(
+      LINKING_COPY.joinExistingAccountLivedIn,
+    );
+    await press(tree, 'account-username-join-existing-info');
+    for (const line of LINKING_COPY.joinExistingAccountInfo) expect(rendered(tree)).toContain(line);
+    expect(rendered(tree)).toContain(LINKING_COPY.historyStance);
+    expect(rendered(tree)).toContain(LINKING_COPY.joinExistingAccountStartOver);
+    tree.unmount();
+  });
+
+  it('a grouped device (a loadLinkGroup row) with needs_verification keeps today’s copy: no join-existing notice', async () => {
+    // Both devices unverified, already linked: "verify an email first" is
+    // exactly right there, and linking is not the answer.
+    setup({ group: GROUP });
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(tree, 'account-username-needs-identifier')).toBe(true);
+    expect(has(tree, 'account-username-join-existing')).toBe(false);
+    expect(has(tree, 'account-username-join-existing-info')).toBe(false);
+    tree.unmount();
+  });
+
+  it('an eligible device never shows it: the claim form, the held state and the held-elsewhere state are untouched', async () => {
+    setup({ state: stateOf({ holdsUsername: false }) });
+    const form = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(form, 'account-username-input')).toBe(true);
+    expect(has(form, 'account-username-join-existing')).toBe(false);
+    form.unmount();
+
+    jest.restoreAllMocks();
+    setup({ state: stateOf({ holdsUsername: true }) });
+    const elsewhere = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(elsewhere, 'account-username-held-elsewhere')).toBe(true);
+    expect(has(elsewhere, 'account-username-join-existing')).toBe(false);
+    elsewhere.unmount();
+
+    jest.restoreAllMocks();
+    setup({ state: stateOf({ holdsUsername: true }) });
+    jest.spyOn(db, 'loadUsernameIdentifier').mockResolvedValue(HELD);
+    const held = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(held, 'account-username-held')).toBe(true);
+    expect(has(held, 'account-username-join-existing')).toBe(false);
+    held.unmount();
+  });
+
+  it('the LEGACY read (today’s production server) shows it too — no server dependency', async () => {
+    setup({
+      state: {
+        source: 'legacy',
+        eligibility: 'needs_verification',
+        holdsUsername: null,
+        emailLinked: null,
+        phoneLinked: null,
+        cooldownUntil: null,
+        usernameSince: null,
+        emailSince: null,
+        usernameFindable: null,
+        emailFindable: null,
+      },
+    });
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(messageAt(tree, 'account-username-join-existing')).toBe(LINKING_COPY.joinExistingAccount);
+    expect(has(tree, 'account-username-join-existing-info')).toBe(true);
+    tree.unmount();
+  });
+
+  it('a failed local read renders nothing extra and does not crash — unknown is never wrong guidance; the reason and the door still render', async () => {
+    setup({ rejectGroup: true });
+    const noGroupRead = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(noGroupRead, 'account-username-needs-identifier')).toBe(true);
+    expect(has(noGroupRead, 'account-username-join-existing')).toBe(false);
+    expect(has(noGroupRead, 'account-username-join-existing-info')).toBe(false);
+    noGroupRead.unmount();
+
+    jest.restoreAllMocks();
+    setup({ rejectPristine: true });
+    const noPristineRead = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(noPristineRead, 'account-username-needs-identifier')).toBe(true);
+    expect(has(noPristineRead, 'account-username-join-existing')).toBe(false);
+    expect(has(noPristineRead, 'account-username-join-existing-info')).toBe(false);
+    noPristineRead.unmount();
+  });
+
+  it('no wire call is added: the guidance reads the state already in hand and two local rows, never the server', async () => {
+    setup({});
+    const stateRoute = jest.spyOn(api, 'apiIdentifierState');
+    const legacyRoute = jest.spyOn(api, 'apiUsernameEligibility');
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(tree, 'account-username-join-existing')).toBe(true);
+    await press(tree, 'account-username-join-existing-info');
+    expect(stateRoute).not.toHaveBeenCalled();
+    expect(legacyRoute).not.toHaveBeenCalled();
+    expect(accountsUsername.getIdentifierState).toHaveBeenCalledTimes(1);
+    expect(db.loadLinkGroup).toHaveBeenCalledTimes(1);
+    expect(db.pristineForLink).toHaveBeenCalledTimes(1);
+    tree.unmount();
+  });
+});
+
+describe('V3: the held state prints the findability heading once and the switch label once', () => {
+  it('the ruled heading is the deck’s title; the row label is the deck’s label; neither line repeats', async () => {
+    stubRows({ row: HELD, email: EMAIL_ROW });
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(stateOf({ holdsUsername: true }));
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    const lines = printed(tree);
+    expect(ACCOUNTS_USERNAME_COPY.discoverableTitle).toBe('Being found by username');
+    expect(ACCOUNTS_USERNAME_COPY.discoverableTitle).not.toBe(ACCOUNTS_USERNAME_COPY.discoverableLabel);
+    expect(lines.filter(l => l === ACCOUNTS_USERNAME_COPY.discoverableTitle)).toHaveLength(1);
+    expect(lines.filter(l => l === ACCOUNTS_USERNAME_COPY.discoverableLabel)).toHaveLength(1);
+    // The rotor's stops on this glass: the section heading is the TITLE,
+    // and the switch's label is not offered as one.
+    const headings = headerTexts(tree);
+    expect(headings).toContain(ACCOUNTS_USERNAME_COPY.discoverableTitle);
+    expect(headings).not.toContain(ACCOUNTS_USERNAME_COPY.discoverableLabel);
+    tree.unmount();
+  });
+});
+
+describe('U4: the name already held is said locally before any tap', () => {
+  it('typing the held name (any case) on the rename form shows "That is already your username." and keeps the submit dark; nothing is sent', async () => {
+    stubRows({ row: HELD, email: EMAIL_ROW });
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(stateOf({ holdsUsername: true }));
+    const claim = jest.spyOn(accountsUsername, 'claimUsername');
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    await press(tree, 'account-username-rename');
+    await type(tree, 'account-username-input', ' Alice_7 ');
+    expect(has(tree, 'account-username-local')).toBe(true);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.sameName);
+    expect(submitDisabled(tree)).toBe(true);
+    await press(tree, 'account-username-submit');
+    expect(claim).not.toHaveBeenCalled();
+    await type(tree, 'account-username-input', 'alice_8');
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.sameName);
+    expect(submitDisabled(tree)).toBe(false);
+    tree.unmount();
   });
 });

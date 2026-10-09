@@ -35,6 +35,7 @@ import {
   linkAcceptRoute,
   linkOfferSubmitRoute,
 } from '../src/handlers/devices-signed.js';
+import { emailRequestCodeRoute, emailVerifyRoute } from '../src/handlers/identifiers.js';
 import type { HttpEvent, HttpResult } from '../src/handlers/http.js';
 import { allQueued, makeTestDeps, parseBody, type LogEntry, type TestDeps } from './helpers.js';
 
@@ -183,6 +184,16 @@ function offerTuple(init: LinkOfferInitResponse, a: Acct, b: Acct): LinkOpTuple 
 /** Full ceremony a(phone) + b(tablet): init → submit → accept. */
 async function linkPair(deps: TestDeps, a: Acct, b: Acct): Promise<LinkOfferInitResponse> {
   const init = await initOffer(deps, a, b);
+  return finishCeremony(deps, a, b, init);
+}
+
+/** The signed legs of a ceremony whose init already ran: submit → accept. */
+async function finishCeremony(
+  deps: TestDeps,
+  a: Acct,
+  b: Acct,
+  init: LinkOfferInitResponse,
+): Promise<LinkOfferInitResponse> {
   const submit = await linkOfferSubmitRoute(
     post(a.token, {
       offerNonce: init.offerNonce,
@@ -200,6 +211,43 @@ async function linkPair(deps: TestDeps, a: Acct, b: Acct): Promise<LinkOfferInit
   );
   expect(accept.statusCode).toBe(200);
   return init;
+}
+
+/** A verified email through the REAL attach routes on a SOLO device — the
+ * §3 lazy-solo group is born here, certless and `attachCreated`, with the
+ * attaching device as its one `phone`-class member. */
+async function attachEmail(deps: TestDeps, acct: Acct, email: string): Promise<void> {
+  expect(
+    (await emailRequestCodeRoute(post(acct.token, { email, class: 'phone' }), deps)).statusCode,
+  ).toBe(200);
+  const code = deps.emailsSent.at(-1)!.code;
+  expect((await emailVerifyRoute(post(acct.token, { email, code }), deps)).statusCode).toBe(200);
+}
+
+/** The acceptance a ceremony's certificates must carry on EVERY entry they
+ * stand on: signed by the acceptor's REAL key over the tuple whose subject
+ * is the offerer's registered key — what the offerer's own completion probe
+ * (app linking.ts `completeOffererLink`) verifies before it stores the roster. */
+function acceptanceVerifies(
+  certs: NonNullable<Awaited<ReturnType<typeof db.getAccountGroup>>>['members'][number]['certs'],
+  offerer: Acct,
+  acceptor: Acct,
+): boolean {
+  if (!certs) return false;
+  return verifyIdentitySignature(
+    acceptor.pub,
+    linkOpSignedBytes('accept', {
+      groupId: certs.groupId,
+      offererUserId: certs.offererUserId,
+      acceptorUserId: certs.acceptorUserId,
+      subjectIdentityPubKey: offerer.pub,
+      class: certs.class,
+      rosterEpoch: certs.rosterEpoch,
+      offerNonce: certs.offerNonce,
+      expiresAt: certs.expiresAt,
+    }),
+    certs.acceptSig,
+  );
 }
 
 beforeAll(async () => {
@@ -769,6 +817,121 @@ describe('link ceremony happy path', () => {
     // Both user rows stamped.
     expect((await rawRow(SERVER_TABLES.users, { userId: a.userId }))?.groupId).toBe(init.groupId);
     expect((await rawRow(SERVER_TABLES.users, { userId: b.userId }))?.groupId).toBe(init.groupId);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The field report of 2026-10-08, S2: an account that verified an email
+// BEFORE its first link could not link at all (a), and a join into an
+// existing group never completed on the offering device (b).
+// ---------------------------------------------------------------------------
+
+describe('link after attach, and the offerer\'s own certificates on a join (field report 2026-10-08, S2)', () => {
+  gated('(a) attach an email on a solo device, then offer a link: the init leg TOLERATES a declared offererClass equal to the offerer\'s own roster class (builds 31-33 declare it whenever no local group row exists), still refuses a class the roster does not hold, and the ceremony completes with BOTH entries certified by THIS ceremony', async () => {
+    const deps = freshDeps();
+    const a = await mkAcct(deps);
+    await attachEmail(deps, a, `s2a-${a.userId}@example.test`);
+    const groupId = (await db.getUserById(a.userId))!.groupId!;
+    canaries.add(groupId);
+    const before = (await db.getAccountGroup(groupId))!;
+    expect(before.attachCreated).toBe(true);
+    expect(before.members).toHaveLength(1);
+    expect(before.members[0]!.certs).toBeUndefined();
+    const b = await mkAcct(deps);
+
+    // The shipped client's init: a solo-looking offerer declares its class.
+    // The roster already knows it as `phone`: ignored, never refused.
+    const declared = await linkOfferInitRoute(
+      post(a.token, { acceptorUserId: b.userId, acceptorClass: 'tablet', offererClass: 'phone' }),
+      deps,
+    );
+    expect(declared.statusCode).toBe(200);
+    const init = parseBody<LinkOfferInitResponse>(declared.body);
+    expect(init.groupId).toBe(groupId);
+    expect(init.rosterEpoch).toBe(1);
+    // A declared class the roster does NOT hold for this offerer is still a
+    // malformed ceremony: the collapsed refusal, and no second init row.
+    const c = await mkAcct(deps);
+    expectRefused(
+      await linkOfferInitRoute(
+        post(a.token, { acceptorUserId: c.userId, acceptorClass: 'tablet', offererClass: 'tablet' }),
+        deps,
+      ),
+    );
+
+    await finishCeremony(deps, a, b, init);
+    const group = (await db.getAccountGroup(groupId))!;
+    expect(group.epoch).toBe(2);
+    expect(group.members.map((m) => [m.userId, m.class])).toEqual([
+      [a.userId, 'phone'],
+      [b.userId, 'tablet'],
+    ]);
+    // (b)'s rule, on the attach-created founder: the OFFERER's own entry —
+    // born certless by the attach — now carries THIS ceremony's certs
+    // exactly as the acceptor's does, so the offerer's completion probe can
+    // verify the acceptance from its own entry.
+    for (const member of group.members) {
+      expect(member.certs?.offerNonce, member.userId).toBe(init.offerNonce);
+      expect(member.certs?.acceptorUserId, member.userId).toBe(b.userId);
+      expect(member.certs?.rosterEpoch, member.userId).toBe(1);
+      expect(acceptanceVerifies(member.certs, a, b), member.userId).toBe(true);
+    }
+    expect(group.members[0]!.certs).toEqual(group.members[1]!.certs);
+    // The email the attach minted rides through untouched.
+    expect(group.identifierRefs).toEqual(before.identifierRefs);
+    expect(group.attachCreated).toBe(true);
+  });
+
+  gated('(b) unlink, then link a replacement: the offerer\'s entry carries the NEW ceremony\'s certificates (not the first ceremony\'s), the newcomer\'s entry carries the same, and both verify under the newcomer\'s key', async () => {
+    const deps = freshDeps();
+    const a = await mkAcct(deps);
+    const b = await mkAcct(deps);
+    const first = await linkPair(deps, a, b);
+    const linked = (await db.getAccountGroup(first.groupId))!;
+    for (const member of linked.members) expect(member.certs?.offerNonce).toBe(first.offerNonce);
+
+    // The tablet leaves (the roster walk; epoch 1 → 2).
+    expect(
+      await db.unlinkDeviceFromGroup({
+        groupId: first.groupId,
+        actingUserId: a.userId,
+        targetUserId: b.userId,
+        rosterEpoch: 1,
+        nowMs: deps.now(),
+      }),
+    ).toBe('unlinked');
+    expect((await db.getAccountGroup(first.groupId))!.epoch).toBe(2);
+
+    // A replacement tablet joins through the join branch (grouped offerer,
+    // no declared class).
+    const c = await mkAcct(deps);
+    const second = await initOffer(deps, a, c, { offererClass: undefined });
+    expect(second.groupId).toBe(first.groupId);
+    expect(second.rosterEpoch).toBe(2);
+    await finishCeremony(deps, a, c, second);
+
+    const group = (await db.getAccountGroup(first.groupId))!;
+    expect(group.epoch).toBe(3);
+    expect(group.members.map((m) => [m.userId, m.class])).toEqual([
+      [a.userId, 'phone'],
+      [c.userId, 'tablet'],
+    ]);
+    const mine = group.members.find((m) => m.userId === a.userId)!;
+    const theirs = group.members.find((m) => m.userId === c.userId)!;
+    // Before this fix the offerer kept the FIRST ceremony's certs (acceptor
+    // b, nonce `first`), which the new tablet's key can never verify.
+    expect(mine.certs?.offerNonce).toBe(second.offerNonce);
+    expect(mine.certs?.offerNonce).not.toBe(first.offerNonce);
+    expect(mine.certs?.acceptorUserId).toBe(c.userId);
+    expect(mine.certs?.rosterEpoch).toBe(2);
+    expect(mine.certs).toEqual(theirs.certs);
+    expect(acceptanceVerifies(mine.certs, a, c)).toBe(true);
+    expect(acceptanceVerifies(theirs.certs, a, c)).toBe(true);
+    // ...and the first ceremony's acceptance does NOT verify under c's key —
+    // the certs really did change hands.
+    expect(acceptanceVerifies(linked.members[0]!.certs, a, c)).toBe(false);
+    // The departed tablet's row is still unlinked: nothing re-grouped it.
+    expect((await db.getUserById(b.userId))?.groupId).toBeUndefined();
   });
 });
 

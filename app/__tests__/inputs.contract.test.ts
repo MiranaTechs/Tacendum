@@ -556,8 +556,12 @@ describe('the rotor gets sections, and only sections', () => {
     expect(headingsOf(ruled('screens/AccountPhoneScreen.tsx'))).toEqual([
       'ACCOUNTS_PHONE_COPY.discoverableTitle',
     ]);
+    // The username deck follows the email and phone decks' pattern (V3,
+    // 2026-10-08): the ruled heading has its own title key, and the switch
+    // row keeps `discoverableLabel` — so the held state no longer prints
+    // 'Findable by username' twice.
     expect(headingsOf(ruled('screens/AccountUsernameScreen.tsx'))).toEqual([
-      'ACCOUNTS_USERNAME_COPY.discoverableLabel',
+      'ACCOUNTS_USERNAME_COPY.discoverableTitle',
     ]);
   });
 

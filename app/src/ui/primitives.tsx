@@ -196,6 +196,10 @@ export const PrimaryButton = React.forwardRef<
     testID?: string;
     style?: StyleProp<ViewStyle>;
     accessibilityLabel?: string;
+    /** Why the button is dark, for a screen reader (the proof pass,
+     * 2026-10-08): a disabled submit says nothing on its own, so the date a
+     * cool-down ends rides here. */
+    accessibilityHint?: string;
   }
 >(function PrimaryButtonInner(
   {
@@ -208,6 +212,7 @@ export const PrimaryButton = React.forwardRef<
     testID,
     style,
     accessibilityLabel,
+    accessibilityHint,
   },
   ref,
 ) {
@@ -223,6 +228,7 @@ export const PrimaryButton = React.forwardRef<
       accessibilityRole="button"
       accessibilityLabel={spoken}
       accessibilityState={{ disabled: !!inactive, busy: !!busy }}
+      {...(accessibilityHint ? { accessibilityHint } : {})}
       {...(testID ? { testID } : {})}
       style={({ pressed }) => [
         styles.primaryButton,
@@ -576,6 +582,7 @@ export function InlineNotice({
   testID,
   seq,
   messageRef,
+  announce = true,
 }: {
   message: string;
   tone?: 'quiet' | 'pine';
@@ -589,6 +596,13 @@ export function InlineNotice({
   /** Lands on the message Text, so a caller can move screen-reader focus to
    * the sentence when the notice replaces the control that held focus. */
   messageRef?: React.Ref<Text>;
+  /** False for a STATIC notice — a rule, a dated window, a standing fact
+   * the screen renders on every open (the proof pass, 2026-10-08): it
+   * reads in the rotor like any text and is never queued as an alert, so
+   * opening a screen with three standing notices no longer speaks three
+   * announcements before the person has moved. Default true: a notice that
+   * ANSWERS something the person did is announced, as before. */
+  announce?: boolean;
 }) {
   const t = useTheme();
   // accessibilityLiveRegion is Android-only, so without this every notice in
@@ -597,16 +611,15 @@ export function InlineNotice({
   // the announce (TYPE_ANNOUNCEMENT) would speak over it. Same gate, same
   // reason, as InlineError above and PinPad's announceCount.
   useEffect(() => {
-    if (Platform.OS !== 'ios') return;
+    if (!announce || Platform.OS !== 'ios') return;
     AccessibilityInfo.announceForAccessibilityWithOptions(message, {
       queue: true,
     });
-  }, [message, seq]);
+  }, [message, seq, announce]);
 
   return (
     <View
-      accessibilityLiveRegion="polite"
-      accessibilityRole="alert"
+      {...(announce ? { accessibilityLiveRegion: 'polite' as const, accessibilityRole: 'alert' as const } : {})}
       {...(testID ? { testID } : {})}
       style={[
         styles.inlineNotice,

@@ -1,15 +1,20 @@
 /**
  * Creates every Tacendum table (the shared `TABLES` set plus the
- * HttpFn-only call-metric dedupe table) in DynamoDB Local, with the same
- * TTL attribute the deployed tables use.
- * Idempotent: skips tables that already exist. Run: `pnpm tables:create`.
+ * HttpFn-only call-metric dedupe table) in DynamoDB Local. The TTL
+ * attribute the deployed tables use per table is
+ * recorded below (`TTL_ATTR`) and deliberately NOT enabled on a local store
+ * — see the note on that map. Idempotent: skips tables that already exist.
+ * Run: `pnpm tables:create`.
  *
  * IDEMPOTENT MEANS IT NEVER RESHAPES A TABLE IT DID NOT JUST CREATE. A local
  * `tacendum_users` created before keypair accounts landed still carries the
  * deleted `phone-index` GSI, and this script will report `= exists` and leave
  * it there. Harmless — nothing reads it any more — but if you want the local
  * shape to match the deployed one, drop the table (or `docker compose down`
- * and remove `.dynamodb-data/`) and run this again.
+ * and remove `.dynamodb-data/`) and run this again. The same applies to TTL:
+ * a local table this script created before 2026-10-08 has TTL ENABLED (it
+ * used to switch it on, assuming DynamoDB Local ignored it), and `= exists`
+ * leaves that as it is — recreate the store to be rid of it.
  */
 import {
   CreateTableCommand,
@@ -28,6 +33,13 @@ import {
 
 const ENDPOINT = process.env.DDB_ENDPOINT ?? 'http://localhost:8000';
 const REGION = process.env.AWS_REGION ?? 'us-east-1';
+// The same spelling readDynamoConfig (packages/server/src/db/client.ts)
+// reads: unset is DynamoDB Local on :8000, any other value is a DynamoDB
+// Local somewhere (a throwaway on a free port, the capture rig), and only
+// the empty string means the real regional endpoint — which this script,
+// with its fixed local credentials, is not the tool for: production tables
+// come from the CDK stack.
+const LOCAL = ENDPOINT !== '';
 
 const client = new DynamoDBClient({
   region: REGION,
@@ -38,9 +50,19 @@ const client = new DynamoDBClient({
 // PAY_PER_REQUEST mirrors on-demand DynamoDB and needs no throughput tuning.
 const BILLING = 'PAY_PER_REQUEST' as const;
 
-/** TTL attribute per table NAME (real TTL in AWS; swept manually locally) —
- * one entry per `timeToLiveAttribute` the CDK stack declares, so the local
- * shape matches the deployed one. */
+/** TTL attribute per table NAME — one entry per `timeToLiveAttribute` the
+ * CDK stack declares, kept as the record of
+ * the deployed shape and NOT enabled on a local store. The entry used to be
+ * switched on locally too, on the belief that DynamoDB Local accepts the
+ * call and ignores it (sweep.ts exists for that world). DynamoDB Local 2.x
+ * ENFORCES it: on 2.5.4 a `tacendum_sessions` row stamped with the test
+ * rig's frozen-clock expiry (test/helpers.ts makeTestDeps's 2023 base plus
+ * the 30-day session TTL — a real-past unix time) was reaped 4 s after its
+ * write (2026-10-08). With TTL on, every DDB-gated suite that mints a bearer
+ * under that clock can lose the session row mid-test and answer 401 where a
+ * 403 or 409 was pinned — two of ~19 such files did, under load, in one of
+ * three heavy runs. Expired rows on a local store are swept by sweep.ts and
+ * prune-local-ddb.mjs instead, on a clock that is the operator's. */
 const TTL_ATTR: Record<string, string> = {
   [TABLES.sessions]: 'expiresAt',
   [TABLES.messages]: 'expiresAt',
@@ -209,8 +231,11 @@ async function main(): Promise<void> {
     console.log(`+ created  ${name}`);
 
     const ttlAttr = TTL_ATTR[name];
-    if (ttlAttr) {
-      // DynamoDB Local accepts the call but does not enforce TTL (see sweep.ts).
+    if (ttlAttr && LOCAL) {
+      // Never on a local store: DynamoDB Local enforces TTL, and the test
+      // rig's frozen clocks write expiries in the past (see TTL_ATTR).
+      console.log(`  ttl off  ${name}.${ttlAttr} (local store: swept by scripts/sweep.ts)`);
+    } else if (ttlAttr) {
       await client.send(
         new UpdateTimeToLiveCommand({
           TableName: name,

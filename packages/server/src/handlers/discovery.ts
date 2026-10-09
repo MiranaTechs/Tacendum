@@ -185,12 +185,28 @@ const discoveryLookupHandler: AuthedHandler = async (event, deps, auth) => {
   // the uniform exit: the gate must not become an oracle about the caller.
   const caller = await deps.db.getUserById(auth.userId);
   if (!identifierEligible(caller)) return discoveryRefusal();
-  if (!usernameClassed && deps.now() - caller.createdAt < DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000) {
-    return discoveryRefusal();
-  }
   if (caller.groupId === undefined) return discoveryRefusal();
   const callerGroup = await deps.db.getAccountGroup(caller.groupId);
   if (!callerGroup) return discoveryRefusal();
+  // THE 72 h AGE IS THE ACCOUNT'S (field report 2026-10-08, S1; Appendix
+  // A amended the same day): measured from the OLDER of the calling device's
+  // row and its account group's row, never the device alone. Every linked
+  // device is a fresh userId by construction (§2.2's pristine-joiner rule),
+  // so the device anchor alone handed an iPad linked today into a months-
+  // old account three days of uniform email misses while the copy blamed
+  // "account" age. The group anchor admits it; the device anchor still
+  // admits an aged device whose lazy-solo group was re-minted by churn —
+  // and a young device in a young group stays refused, so the churn
+  // property holds (a re-minted young group lends nothing, and the
+  // `discuser:` window below stays per user row). Deliberately NOT "the
+  // oldest member": one aged member would lend its age to every fresh
+  // sibling of every re-minted group, re-opening the finding-1
+  // amplification the user anchor closed. Still caller-keyed and still
+  // before anything identifier-shaped is read or any daily window is spent.
+  const accountCreatedAt = Math.min(caller.createdAt, callerGroup.createdAt);
+  if (!usernameClassed && deps.now() - accountCreatedAt < DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000) {
+    return discoveryRefusal();
+  }
   // THE POSSESSION-CLASS PIN (load-bearing): the
   // "verified identifier" above means a POSSESSION-PROOF identifier — email
   // or phone, the classes an inbox round-trip mints. A username is free to
@@ -335,7 +351,6 @@ const discoveryLookupHandler: AuthedHandler = async (event, deps, auth) => {
   // routes through `identifierClaimDiscoverable`, never a
   // re-derivation). Only a LIVE claim passes the guard, so `claim.groupId`
   // below is typed by it.
-  //
   // SELF-DISCOVERY IS A MISS (field-reported, device-verified: the lookup
   // used to resolve the caller's OWN identifier, and the self-conversation
   // it seeded rendered undecryptable on every client). Consent is consent to

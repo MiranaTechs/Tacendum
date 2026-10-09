@@ -170,7 +170,15 @@ function verbs(db: DataLayer) {
       ) {
         for (const key of claimKeys) {
           const standing = await db.getUsernameClaim(key, clock.nowSeconds);
-          if (isTombstone(standing) && standing.formerGroupId === acct.groupId) reclaimingOwn = true;
+          // The handler's own-tombstone test (username.ts): the group that
+          // held the name, OR — since 2026-10-08 (S3) — the MEMBER whose
+          // dissolving unlink left it, whose group no longer exists.
+          if (
+            isTombstone(standing) &&
+            (standing.formerGroupId === acct.groupId || standing.formerUserId === acct.userId)
+          ) {
+            reclaimingOwn = true;
+          }
         }
       }
       return db.claimUsername({
@@ -835,6 +843,229 @@ function uniquenessSuite(
       expect(await v.unlink(a, clock)).toBe('unlinked');
       expect(await db.getIdentifierClaim(claimKeys[0]!)).toBeUndefined();
       expect(isTombstone(await v.read(f('alice'), clock))).toBe(true);
+    });
+
+    gated('the take-back survives the dissolving unlink (field report 2026-10-08, S3): a one-device attach-created account whose LAST identifier is its username — the dissolving unlink writes the former MEMBER on both tombstones (no dangling group id); a stranger is `taken` at 29 d; the former owner, verified again into a FRESH group, reclaims at once — inside that group\'s own cool-down too — exactly what the unlink confirmation promises', async () => {
+      // BOTH DataLayers (the 2026-10-08 integrate pass landed the helpers.ts
+      // mirror of the store's fourth condition arm and of the dissolving
+      // unlink's `formerUserId`). The store is the authority the twin must
+      // never out-permit — and once the rule is ruled, a twin that stayed
+      // LESS permissive would refuse the take-back every store-blind suite
+      // proves the handler's walk admits, hiding a handler regression there.
+      const db = getDb();
+      const v = verbs(db);
+      const clock = new Clock();
+      const f = family();
+      const a = await v.account(clock);
+      expect(await v.claim(a, f('alice'), clock)).toBe('claimed');
+      const { claimKeys, skeletonKeys } = keysFor(V1, f('alice'));
+
+      // The email leaves first — the group survives on the name alone.
+      const refs = await v.refs(a);
+      const emailRefs = refs.filter((ref) => !ref.startsWith(USERNAME_CLAIM_KEY_PREFIX));
+      expect(emailRefs).toHaveLength(1);
+      expect(
+        await db.unlinkIdentifierClass({
+          userId: a.userId,
+          groupId: a.groupId,
+          refsSnapshot: refs,
+          claimKeys: emailRefs,
+        }),
+      ).toBe('unlinked');
+      expect(await v.refs(a)).toEqual([claimKeys[0]]);
+
+      // Then the name — the LAST identifier — and the lazy-solo group dissolves.
+      clock.advance(DAY);
+      expect(await v.unlink(a, clock)).toBe('unlinked');
+      const unlinkedAt = clock.nowSeconds;
+      expect(await db.getAccountGroup(a.groupId)).toBeUndefined();
+      expect((await db.getUserById(a.userId))?.groupId).toBeUndefined();
+
+      // The tombstones: the former MEMBER on both rows, no group id at all —
+      // the group that could reclaim died in the same transaction, so nothing
+      // dangles, and the right moved to the person who can still exercise it.
+      const tomb = await v.read(f('alice'), clock);
+      expect(isTombstone(tomb)).toBe(true);
+      expect((tomb as UsernameTombstoneRecord).formerUserId).toBe(a.userId);
+      expect((tomb as UsernameTombstoneRecord).formerGroupId).toBeUndefined();
+      expect((tomb as UsernameTombstoneRecord).freesAt).toBe(unlinkedAt + USERNAME_TOMBSTONE_TTL_SECONDS);
+      // (The skeleton row's tombstone is not read here: `getUsernameClaim`
+      // answers only `kind = identifierClaim` rows on the store. Its member
+      // is proved below instead — the reclaim walks BOTH keys through the
+      // condition, so a skeleton tombstone without the member would answer
+      // `taken`.)
+      if (raw) {
+        // The row SHAPE (store only): a tombstone AT both keys, the member on
+        // each, no group id, no plaintext.
+        const claimRow = await raw(claimKeys[0]!);
+        expect(claimRow?.tombstoned).toBe(true);
+        expect(claimRow?.formerUserId).toBe(a.userId);
+        expect(claimRow?.formerGroupId).toBeUndefined();
+        expect(claimRow?.groupId).toBeUndefined();
+        const skeletonRow = await raw(skeletonKeys[0]!);
+        expect(skeletonRow?.tombstoned).toBe(true);
+        expect(skeletonRow?.formerUserId).toBe(a.userId);
+        expect(skeletonRow?.formerGroupId).toBeUndefined();
+      }
+
+      // A stranger is refused the name for the window (one bit: `taken`).
+      const c = await v.account(clock);
+      clock.advance(DAY);
+      expect(await v.claim(c, f('alice'), clock)).toBe('taken');
+
+      // The former owner verifies again: a NEW lazy-solo group for the SAME
+      // member (the lazy-attach recipe `account()` runs, on an existing row).
+      const again = emailClaimKey(1, identifierClaimHash(TEST_KID, `${a.userId}-again@example.test`));
+      await db.putEmailCode({
+        userId: a.userId,
+        purpose: 'attach',
+        claimKey: again,
+        deviceClass: 'phone',
+        code: '123456',
+        attempts: 0,
+        createdAt: clock.nowMs,
+        expiresAt: clock.nowSeconds + 300,
+      });
+      // THE WINDOW SURVIVES THE GROUP (the 2026-10-08 gate pass, re-cutting
+      // this case's own earlier pin — `bob` used to be `claimed` here): the
+      // dissolving unlink carried its stamp onto the member's user row, and
+      // the verify handler hands a still-running stamp to the lazy-solo
+      // attach, which copies it onto the group it mints — exactly as the
+      // `discoverableAfter` carrier rides. Without the carry every name the
+      // person ever held stayed reserved for them while a DIFFERENT name was
+      // admitted at once from each fresh group: hoarding, one code per name.
+      const carried = (await db.getUserById(a.userId))?.usernameRenamedAt;
+      expect(carried).toBe(unlinkedAt);
+      expect(
+        await db.attachIdentifier({
+          userId: a.userId,
+          deviceClass: 'phone',
+          newGroupId: uid(),
+          claimKey: again,
+          retiringClaimKeys: [],
+          nowMs: clock.nowMs,
+          // The handler's own spelling (`carriedUsernameCooldown`): the stamp
+          // rides only when the row holds one. Under exactOptionalPropertyTypes
+          // an explicit undefined is not an absent key, and the assertion above
+          // has just pinned the value that rides here.
+          ...(carried !== undefined ? { usernameRenamedAt: carried } : {}),
+        }),
+      ).toBe('attached');
+      const a2: Acct = { ...a, groupId: (await db.getUserById(a.userId))!.groupId! };
+      expect(a2.groupId).not.toBe(a.groupId);
+      expect((await db.getAccountGroup(a2.groupId))?.usernameRenamedAt).toBe(unlinkedAt);
+
+      // Inside the CARRIED window: another name is `cooldown` (refused by
+      // the group condition, nothing consumed) and the own former name is
+      // admitted: the walk sees the member, the condition admits by
+      // `formerUserId`, and the cool-down clause is dropped for the reclaim.
+      // (All inside `alice`'s 30-day tombstone window: the walk reads a LIVE
+      // tombstone; an elapsed one would be a plain free name.)
+      clock.advance(3_600_000);
+      expect(await v.claim(a2, f('bob'), clock)).toBe('cooldown');
+      expect(await v.claim(a2, f('carol'), clock)).toBe('cooldown');
+      expect(await v.heldRef(a2)).toBeUndefined();
+      expect(isTombstone(await v.read(f('alice'), clock))).toBe(true);
+      expect(await v.claim(a2, f('alice'), clock)).toBe('claimed');
+      expect(await v.heldRef(a2)).toBe(claimKeys[0]);
+      const live = await v.read(f('alice'), clock);
+      expect(isTombstone(live)).toBe(false);
+      expect((live as IdentifierClaimRecord).groupId).toBe(a2.groupId);
+      if (raw) {
+        // The reclaim overwrote both tombstones: the skeleton row is live
+        // again and names the new group.
+        expect((await raw(skeletonKeys[0]!))?.groupId).toBe(a2.groupId);
+        expect((await raw(skeletonKeys[0]!))?.tombstoned).toBeUndefined();
+      }
+    });
+
+    gated('the take-back survives the OTHER order (gate pass 2026-10-08): the name leaves first — its tombstones name the group AND the member — then the email dissolves the group: the stamp moves onto the member, a stranger is `taken`, and the former owner reclaims from a fresh group that inherited the window (a different name is `cooldown` there)', async () => {
+      const db = getDb();
+      const v = verbs(db);
+      const clock = new Clock();
+      const f = family();
+      const a = await v.account(clock);
+      expect(await v.claim(a, f('alice'), clock)).toBe('claimed');
+      const { claimKeys, skeletonKeys } = keysFor(V1, f('alice'));
+
+      // The name leaves first: the group survives on the email, stamped,
+      // and BOTH owners stand on both tombstones (the surviving-unlink
+      // shape since the gate pass; the group alone before it).
+      clock.advance(DAY);
+      expect(await v.unlink(a, clock)).toBe('unlinked');
+      const unlinkedAt = clock.nowSeconds;
+      expect((await db.getAccountGroup(a.groupId))?.usernameRenamedAt).toBe(unlinkedAt);
+      const tomb = await v.read(f('alice'), clock);
+      expect(isTombstone(tomb)).toBe(true);
+      expect((tomb as UsernameTombstoneRecord).formerGroupId).toBe(a.groupId);
+      expect((tomb as UsernameTombstoneRecord).formerUserId).toBe(a.userId);
+      if (raw) {
+        expect((await raw(skeletonKeys[0]!))?.formerGroupId).toBe(a.groupId);
+        expect((await raw(skeletonKeys[0]!))?.formerUserId).toBe(a.userId);
+      }
+
+      // Then the email — the LAST identifier — and the lazy-solo group
+      // dissolves: the stamp it carried moves onto the member.
+      const refs = await v.refs(a);
+      expect(
+        await db.unlinkIdentifierClass({
+          userId: a.userId,
+          groupId: a.groupId,
+          refsSnapshot: refs,
+          claimKeys: [...refs],
+        }),
+      ).toBe('unlinked');
+      expect(await db.getAccountGroup(a.groupId)).toBeUndefined();
+      expect((await db.getUserById(a.userId))?.groupId).toBeUndefined();
+      expect((await db.getUserById(a.userId))?.usernameRenamedAt).toBe(unlinkedAt);
+
+      // A stranger is refused the name for the window.
+      const c = await v.account(clock);
+      clock.advance(DAY);
+      expect(await v.claim(c, f('alice'), clock)).toBe('taken');
+
+      // The former owner verifies again, the handler's carry in hand: the
+      // fresh group inherits the window, a different name waits, the own
+      // name comes straight back.
+      const again = emailClaimKey(1, identifierClaimHash(TEST_KID, `${a.userId}-again@example.test`));
+      await db.putEmailCode({
+        userId: a.userId,
+        purpose: 'attach',
+        claimKey: again,
+        deviceClass: 'phone',
+        code: '123456',
+        attempts: 0,
+        createdAt: clock.nowMs,
+        expiresAt: clock.nowSeconds + 300,
+      });
+      // The stamp the dissolve moved onto the member is what the handler
+      // carries (`carriedUsernameCooldown`'s spelling: present only when the
+      // row holds one — an explicit undefined is not an absent key under
+      // exactOptionalPropertyTypes).
+      const carried = (await db.getUserById(a.userId))?.usernameRenamedAt;
+      expect(carried).toBe(unlinkedAt);
+      expect(
+        await db.attachIdentifier({
+          userId: a.userId,
+          deviceClass: 'phone',
+          newGroupId: uid(),
+          claimKey: again,
+          retiringClaimKeys: [],
+          nowMs: clock.nowMs,
+          ...(carried !== undefined ? { usernameRenamedAt: carried } : {}),
+        }),
+      ).toBe('attached');
+      const a2: Acct = { ...a, groupId: (await db.getUserById(a.userId))!.groupId! };
+      expect((await db.getAccountGroup(a2.groupId))?.usernameRenamedAt).toBe(unlinkedAt);
+      expect(await v.claim(a2, f('bob'), clock)).toBe('cooldown');
+      expect(await v.claim(a2, f('alice'), clock)).toBe('claimed');
+      expect(await v.heldRef(a2)).toBe(claimKeys[0]);
+      const live = await v.read(f('alice'), clock);
+      expect(isTombstone(live)).toBe(false);
+      expect((live as IdentifierClaimRecord).groupId).toBe(a2.groupId);
+      // Past the carried window a different name is free again.
+      clock.advance(30 * DAY);
+      expect(await v.rename(a2, f('bob'), clock)).toBe('renamed');
     });
   });
 }

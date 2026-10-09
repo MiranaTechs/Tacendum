@@ -74,6 +74,7 @@ import * as db from '../src/db';
 import { handleAccountsNoticeFrame, onUsernameNotice, type LinkingDeps } from '../src/linking';
 import * as reauth from '../src/reauth';
 import { session } from '../src/session';
+import { AccountUsernameScreen } from '../src/screens/AccountUsernameScreen';
 import { DiscoveryScreen } from '../src/screens/DiscoveryScreen';
 
 jest.mock('../src/registration', () => ({
@@ -190,6 +191,9 @@ function fakeUsernameDeps(
       },
       saveUsernameUnlink: async () => undefined,
       clearUsernameUnlink: async () => undefined,
+      loadUsernameCooldown: async () => null,
+      saveUsernameCooldown: async () => undefined,
+      clearUsernameCooldown: async () => undefined,
     },
     token: async () => 'bearer',
     now: () => NOW_MS,
@@ -277,6 +281,11 @@ const USERNAME_WORD_ALLOWLIST: ReadonlyArray<{ file: string; why: string }> = [
   { file: 'src/screens/StartChatScreen.tsx', why: 'the smart field’s username kind, copy and find answers, chosen from the deck only under the pin' },
   // Build 33: the inline find that replaced the trip to DiscoveryScreen.
   { file: 'src/screens/startChat/useReachLookup.ts', why: 'the inline find: username eligibility preflight, lookup and the own-name self key, all under the pin' },
+  // The 2026-10-08 proof pass: the one module that reads the pin and
+  // answers in class-neutral words, so the email deck can scope "off means
+  // nobody can look you up" to this email and the downgrade can name the
+  // claimed name — without either spelling the class.
+  { file: 'src/findableClasses.ts', why: 'reads the pin once and exports class-neutral facts (HANDLE_CLASS_LIVE, OTHER_FINDABLE_CLASS_LIVE) for the email deck' },
 ];
 
 /** The files that may IMPORT the dark module or the pin (part B's readers,
@@ -290,6 +299,19 @@ const USERNAME_IMPORTER_ALLOWLIST: ReadonlySet<string> = new Set([
   'src/screens/StartChatScreen.tsx',
   // Build 33: the inline find calls the module and reads the pin.
   'src/screens/startChat/useReachLookup.ts',
+  // fix/username-discovery (2026-10-08): the email and phone verbs
+  // (attach, remove, the consent toggle) change the facts the caller-owned
+  // state read carries, so accounts.ts invalidates that read's memory after
+  // each of them — the one import it makes from the module, and no surface.
+  'src/accounts.ts',
+  // The gate pass (2026-10-08): every roster change linking.ts lands — a
+  // link completed on either side, a member* notice, a revocation — changes
+  // what that read would answer, so linking.ts invalidates it too. The one
+  // import, call-time only; no surface.
+  'src/linking.ts',
+  // The proof pass (2026-10-08): the class-neutral facts module reads the
+  // pin so the email deck need not.
+  'src/findableClasses.ts',
 ]);
 
 /** An import of the module or the pin from ANY depth (build 33 widened it:
@@ -651,7 +673,9 @@ describe('the username row (db.ts kind = "username", the per-class shape)', () =
     await db.saveUsernameIdentifier({ username: 'alice_7', claimedAt: 123, discoverable: true });
     const insert = statements().find(([sql]) => sql.includes('INSERT OR REPLACE INTO account_identifier'));
     expect(insert).toBeDefined();
-    expect(insert![1]).toEqual(['username', 'alice_7', 123, 1, null, null, null]);
+    // The eighth value is the server's stamp (the proof pass, 2026-10-08):
+    // NULL until the screen adopts the live row's.
+    expect(insert![1]).toEqual(['username', 'alice_7', 123, 1, null, null, null, null]);
     await db.clearUsernameIdentifier();
     const del = statements().find(([sql]) => sql.includes('DELETE FROM account_identifier WHERE kind = ?'));
     expect(del![1]).toEqual(['username']);
@@ -721,7 +745,7 @@ describe('the CHECK-widening migration, on the real engine', () => {
     expect(dump()).toEqual(before);
     expect(ddl('account_identifier')).toContain("'username'");
     await db.saveUsernameIdentifier({ username: 'alice_7', claimedAt: 555, discoverable: false });
-    expect(await db.loadUsernameIdentifier()).toEqual({ username: 'alice_7', claimedAt: 555, discoverable: false });
+    expect(await db.loadUsernameIdentifier()).toEqual({ username: 'alice_7', claimedAt: 555, discoverable: false, since: null });
     expect(dump()).toHaveLength(3);
     // The other classes still read raw-equal through their own readers.
     expect((await db.loadAccountIdentifier())!.email).toBe('alice@example.com');
@@ -1109,5 +1133,165 @@ describe('with USERNAME_UI_ENABLED on (build 23, the shipped value), the find-by
     expect(wire.paths.filter(p => p.endsWith('/v1/discovery/lookup'))).toHaveLength(1);
     expect(wire.paths.filter(p => p.endsWith('/v1/identifiers/username/eligibility'))).toHaveLength(1);
     expect(wire.bodies).toEqual(['', JSON.stringify({ username: 'alice_7' })]);
+  });
+});
+
+/* ── 11. fix/username-discovery (2026-10-08): U3, U4, D1/D3 ──────────── */
+
+const STATE_ELIGIBLE: accountsUsername.IdentifierState = {
+  source: 'state',
+  eligibility: 'eligible',
+  holdsUsername: null,
+  emailLinked: null,
+  phoneLinked: null,
+  cooldownUntil: null,
+  usernameSince: null,
+  emailSince: null,
+  usernameFindable: null,
+  emailFindable: null,
+};
+const stateOf = (
+  partial: Partial<accountsUsername.IdentifierState>,
+): accountsUsername.IdentifierState => ({ ...STATE_ELIGIBLE, ...partial });
+
+function stubScreenRows(row: db.UsernameIdentifierRow | null = null): void {
+  jest.spyOn(db, 'loadUsernameIdentifier').mockResolvedValue(row);
+  jest.spyOn(db, 'loadUsernameNotice').mockResolvedValue(null);
+  jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+  jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+}
+
+const has = (tree: ReactTestRenderer.ReactTestRenderer, testID: string): boolean =>
+  tree.root.findAllByProps({ testID }).length > 0;
+const rendered = (tree: ReactTestRenderer.ReactTestRenderer): string =>
+  JSON.stringify(tree.toJSON());
+const submitDisabled = (tree: ReactTestRenderer.ReactTestRenderer): boolean =>
+  tree.root
+    .findAllByProps({ testID: 'account-username-submit' })
+    .find(n => n.props.disabled !== undefined)!.props.disabled === true;
+
+describe('U3: a refused state read is not a connection problem', () => {
+  beforeEach(() => {
+    accountsUsername.invalidateIdentifierState();
+    accountsUsername.clearIdentifierRoutePacing();
+  });
+
+  it('a 403 renders the neutral sentence, a network error renders the connection sentence, and Retry rechecks each time', async () => {
+    stubScreenRows();
+    jest
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValueOnce(stateOf({ eligibility: 'refused' }))
+      .mockResolvedValueOnce(stateOf({ eligibility: 'failed' }))
+      .mockResolvedValue(stateOf({}));
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(tree, 'account-username-eligibility-refused')).toBe(true);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.eligibilityRefused);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.eligibilityUnavailable);
+    await type(tree, 'alice_7');
+    expect(submitDisabled(tree)).toBe(true);
+    await press(tree, 'account-username-eligibility-retry');
+    expect(has(tree, 'account-username-eligibility-refused')).toBe(false);
+    expect(has(tree, 'account-username-eligibility-unavailable')).toBe(true);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.eligibilityUnavailable);
+    expect(submitDisabled(tree)).toBe(true);
+    await press(tree, 'account-username-eligibility-retry');
+    expect(has(tree, 'account-username-eligibility-unavailable')).toBe(false);
+    expect(submitDisabled(tree)).toBe(false);
+    tree.unmount();
+  });
+
+  it('the neutral sentence blames nothing and the connection sentence is the build-33 bytes', () => {
+    expect(ACCOUNTS_USERNAME_COPY.eligibilityRefused).toBe(
+      'Tacendum could not check username access right now. Try again in a minute.',
+    );
+    expect(ACCOUNTS_USERNAME_COPY.eligibilityRefused.toLowerCase()).not.toMatch(
+      /connection|network|offline|limit|budget|too many|quota/,
+    );
+    expect(ACCOUNTS_USERNAME_COPY.eligibilityUnavailable).toBe(
+      'Could not check username access. Check your connection and try again.',
+    );
+  });
+
+  it('pacing: the first ten identifier-route calls in a minute are never paced; the eleventh says how long; the window slides', () => {
+    expect(accountsUsername.IDENTIFIER_ROUTE_CALLS_PER_MINUTE).toBe(10);
+    expect(accountsUsername.identifierRoutePacing(NOW_MS)).toBeNull();
+    for (let i = 0; i < 10; i++) {
+      expect(accountsUsername.identifierRoutePacing(NOW_MS + i * 1000)).toBeNull();
+      accountsUsername.noteIdentifierRouteCall(NOW_MS + i * 1000);
+    }
+    // The eleventh, 10 s after the first: the first expires 50 s from now.
+    expect(accountsUsername.identifierRoutePacing(NOW_MS + 10_000)).toBe(50);
+    expect(accountsUsername.identifierRoutePacing(NOW_MS + 59_999)).toBe(1);
+    // The first call is a minute old: one slot is free again.
+    expect(accountsUsername.identifierRoutePacing(NOW_MS + 60_000)).toBeNull();
+    accountsUsername.noteIdentifierRouteCall(NOW_MS + 60_000);
+    expect(accountsUsername.identifierRoutePacing(NOW_MS + 60_000)).toBe(1);
+  });
+
+  it('the module notes its own wire calls — claim, rename, unlink, the toggle — so the screen can pace before the eleventh', async () => {
+    const held = { username: 'alice_7', claimedAt: 1, discoverable: true };
+    const { deps } = fakeUsernameDeps({}, held);
+    deps.now = () => NOW_MS;
+    for (let i = 0; i < 4; i++) {
+      await accountsUsername.claimUsername(`alice_${i}`, true, deps);
+      await accountsUsername.setUsernameDiscoverable(true, deps);
+    }
+    expect(accountsUsername.identifierRoutePacing(NOW_MS)).toBeNull();
+    await accountsUsername.unlinkUsername(deps);
+    expect(accountsUsername.identifierRoutePacing(NOW_MS)).toBeNull();
+    await accountsUsername.claimUsername('alice_9', true, deps);
+    expect(accountsUsername.identifierRoutePacing(NOW_MS)).toBe(60);
+    // A local refusal spends nothing and is never counted.
+    accountsUsername.clearIdentifierRoutePacing();
+    await accountsUsername.claimUsername('admin', true, deps);
+    await accountsUsername.claimUsername('ab', true, deps);
+    expect(accountsUsername.identifierRoutePacing(NOW_MS)).toBeNull();
+  });
+
+  it('the screen says "Try again in N s" BEFORE sending when this device is at the budget — and never for a first call', async () => {
+    jest.spyOn(Date, 'now').mockReturnValue(NOW_MS);
+    stubScreenRows({ username: 'alice_7', claimedAt: 1, discoverable: true });
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(stateOf({ holdsUsername: true }));
+    const claim = jest.spyOn(accountsUsername, 'claimUsername').mockResolvedValue('renamed');
+    for (let i = 0; i < 10; i++) accountsUsername.noteIdentifierRouteCall(NOW_MS - 30_000);
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    await press(tree, 'account-username-rename');
+    await type(tree, 'alice_8');
+    await press(tree, 'account-username-submit');
+    expect(claim).not.toHaveBeenCalled();
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.paced(30));
+    expect(ACCOUNTS_USERNAME_COPY.paced(30)).toBe('Try again in 30 s.');
+    tree.unmount();
+    // Half a minute later the oldest calls have aged out: the tap goes through.
+    accountsUsername.clearIdentifierRoutePacing();
+    const again = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    await press(again, 'account-username-rename');
+    await type(again, 'alice_8');
+    await press(again, 'account-username-submit');
+    expect(claim).toHaveBeenCalledWith('alice_8', true);
+    again.unmount();
+  });
+});
+
+describe('U4: renaming to the name already held is answered locally', () => {
+  it('the module answers "same" for the held name — case-folded, trimmed — without a wire call and without spending an attempt', async () => {
+    const held = { username: 'alice_7', claimedAt: 1, discoverable: true };
+    const { deps, saved, apiCalls } = fakeUsernameDeps({}, held);
+    expect(await accountsUsername.claimUsername(' Alice_7 ', true, deps)).toBe('same');
+    expect(await accountsUsername.claimUsername('alice_7', false, deps)).toBe('same');
+    expect(apiCalls).toEqual([]);
+    expect(saved).toEqual([]);
+    expect(ACCOUNTS_USERNAME_COPY.sameName).toBe('That is already your username.');
+  });
+});
+
+describe('D1/D3: the username deck’s miss lead names the self-miss and the shared daily budget', () => {
+  it('says that searching for your own email or username always misses, from any device, and that the day’s searches are shared and reset at midnight UTC', () => {
+    expect(ACCOUNTS_USERNAME_COPY.startChatMissInfoLead).toContain(
+      'Searching for your own email or username, from any of your devices, always shows no match.',
+    );
+    expect(ACCOUNTS_USERNAME_COPY.startChatMissInfoLead).toContain('shared by your linked devices');
+    expect(ACCOUNTS_USERNAME_COPY.startChatMissInfoLead).toContain('midnight UTC');
+    expect(ACCOUNTS_USERNAME_COPY.startChatMissInfoLead).toMatch(/^A miss can mean/);
   });
 });

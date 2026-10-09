@@ -30,6 +30,7 @@ import { ApiRequestError } from '../src/api';
 import * as accounts from '../src/accounts';
 import { ACCOUNTS_COPY } from '../src/accountsCopy';
 import * as accountsPhone from '../src/accountsPhone';
+import { ACCOUNTS_PHONE_COPY } from '../src/accountsPhoneCopy';
 import * as db from '../src/db';
 import { AccountEmailScreen } from '../src/screens/AccountEmailScreen';
 import { DiscoveryScreen } from '../src/screens/DiscoveryScreen';
@@ -545,5 +546,139 @@ describe('pickDiscoveryAnchor under the class strip', () => {
     };
     const phoneAnswer = await accountsPhone.discoverySearchByPhone('+15555550100', phoneDeps);
     expect(phoneAnswer).toEqual({ outcome: 'found', anchor: ULID_B, deviceCount: 2 });
+  });
+});
+
+/* ── 5. the accounts decks after the 2026-10-08 fix train ──────────── */
+
+describe('the accounts decks after fix/username-discovery (D1/D3 copy, V4 vocabulary, D2 sentences)', () => {
+  /** Every plain sentence in a deck: strings and string arrays (the
+   * interpolating functions are pinned by name below). */
+  const sentencesOf = (deck: Record<string, unknown>): string[] =>
+    Object.values(deck).flatMap(v =>
+      typeof v === 'string' ? [v] : Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [],
+    );
+
+  it('V4: nobody is a "contact" any more — the Rooms vocabulary speaks of people you talk to', () => {
+    expect(ACCOUNTS_COPY.downgradeConfirm).toContain('the people you talk to');
+    expect(ACCOUNTS_COPY.recoverScope).toContain('People you message will see a new safety number');
+    expect(ACCOUNTS_PHONE_COPY.downgradeConfirmBoth).toContain('the people you talk to');
+    expect(ACCOUNTS_PHONE_COPY.recoverScopeBoth).toContain(
+      'People you message will see a new safety number',
+    );
+    for (const sentence of [
+      ...sentencesOf(ACCOUNTS_COPY),
+      ...sentencesOf(ACCOUNTS_PHONE_COPY),
+      ACCOUNTS_COPY.emailUnlinkConfirm('a@b.example'),
+      ACCOUNTS_PHONE_COPY.numberUnlinkConfirm('+15555550100'),
+    ]) {
+      expect(sentence).not.toMatch(/\bcontacts?\b/i);
+    }
+    // The recovery-scope commitments the reworded sentence must keep (lossCopy pins
+    // the same substrings): two things only, no messages, the safety reset.
+    expect(ACCOUNTS_COPY.recoverScope).toContain('Recovery restores two things only');
+    expect(ACCOUNTS_COPY.recoverScope).toContain('your findability by email');
+    expect(ACCOUNTS_COPY.recoverScope).toContain('Your messages are not here');
+    expect(ACCOUNTS_COPY.recoverScope).toContain('a new safety number');
+  });
+
+  it('D1: the self-search truth is in the why-every-miss sheet — on both classes, by reference', () => {
+    // The EMAIL class's sheet speaks of the email; the handle class's deck
+    // says the same of its own name (the word census keeps that class's
+    // name out of this deck, exactly as `failed`'s comment records).
+    const SELF_SENTENCE =
+      'Searching for your own email, from any of your devices, always shows no match.';
+    expect(ACCOUNTS_COPY.discoverExplain).toContain(SELF_SENTENCE);
+    expect(ACCOUNTS_PHONE_COPY.discoverExplainEmailBoth).toContain(SELF_SENTENCE);
+    // The phone class names its own class in the same sentence shape.
+    expect(
+      ACCOUNTS_PHONE_COPY.discoverExplainNumber.some(
+        line =>
+          line.startsWith('Searching for your own') &&
+          line.includes('phone number') &&
+          line.endsWith('from any of your devices, always shows no match.'),
+      ),
+    ).toBe(true);
+  });
+
+  it('D3: the miss copy says the day’s searches are shared by linked devices and reset at midnight UTC', () => {
+    const CLAUSE = 'shared by your linked devices, resets at midnight UTC';
+    expect(ACCOUNTS_COPY.discoverNoMatch).toContain(CLAUSE);
+    expect(ACCOUNTS_PHONE_COPY.discoverNoMatchNumber).toContain(CLAUSE);
+    expect(ACCOUNTS_COPY.discoverExplain.join(' ')).toContain(CLAUSE);
+    expect(ACCOUNTS_PHONE_COPY.discoverExplainNumber.join(' ')).toContain(CLAUSE);
+    expect(ACCOUNTS_PHONE_COPY.discoverExplainEmailBoth.join(' ')).toContain(CLAUSE);
+    // The per-minute brake and the daily count, in numbers people can act on.
+    expect(ACCOUNTS_COPY.discoverExplain.join(' ')).toMatch(/5 a minute/);
+    expect(ACCOUNTS_COPY.discoverExplain.join(' ')).toMatch(/20 a day/);
+    // §4's designed collapse still closes the miss sentence (device-noun pins it too).
+    expect(ACCOUNTS_COPY.discoverNoMatch.endsWith('Tacendum cannot tell you which, by design.')).toBe(true);
+    expect(
+      ACCOUNTS_PHONE_COPY.discoverNoMatchNumber.endsWith('Tacendum cannot tell you which, by design.'),
+    ).toBe(true);
+    // The caller-gate line stays (true after the server's age-gate deploy):
+    expect(ACCOUNTS_COPY.discoverExplain[1]).toContain('an account at least three days old');
+    // The phone-class email sheet keeps its by-reference first line.
+    expect(ACCOUNTS_PHONE_COPY.discoverExplainEmailBoth[0]).toBe(ACCOUNTS_COPY.discoverExplain[0]);
+  });
+
+  it('D2: the request step has its own two sentences; the verify-step sentence keeps its bytes', () => {
+    expect(ACCOUNTS_COPY.emailRequestRefused).not.toBe(ACCOUNTS_COPY.emailRefused);
+    expect(ACCOUNTS_COPY.emailRequestRateLimited).not.toBe(ACCOUNTS_COPY.emailRefused);
+    expect(ACCOUNTS_COPY.emailRequestRateLimited).not.toBe(ACCOUNTS_COPY.emailRequestRefused);
+    // The 403 names the sibling case the report hit, and keeps the
+    // server's deliberate silence about which condition refused.
+    expect(ACCOUNTS_COPY.emailRequestRefused).toContain('other devices');
+    expect(ACCOUNTS_COPY.emailRequestRefused).toContain('does not say which');
+    expect(ACCOUNTS_COPY.emailRequestRefused).not.toContain('code may be wrong');
+    // The 429 is a self-keyed answer: it may say "too many" and "minute".
+    expect(ACCOUNTS_COPY.emailRequestRateLimited).toMatch(/too many/i);
+    expect(ACCOUNTS_COPY.emailRequestRateLimited).toMatch(/minute/);
+    // The held-elsewhere surface's sentences exist and name no address.
+    expect(ACCOUNTS_COPY.emailHeldElsewhere).toContain('linked from another device');
+    // RE-CUT 2026-10-08 (the proof pass): the held-elsewhere state now
+    // carries the switch itself — the account's current bit from the
+    // state read, movable from any linked device — so the sentence names
+    // whose record the switch shows, and no longer sends the person to
+    // "the device that linked it" (which may be lost, reinstalled or
+    // recovered).
+    expect(ACCOUNTS_COPY.emailHeldElsewhereFindability).toBe(
+      'This switch shows the account’s current setting and can be changed from any linked device.',
+    );
+    expect(ACCOUNTS_COPY.emailHeldElsewhereFindability).not.toContain('the device that linked it');
+    expect(ACCOUNTS_COPY.emailHeldElsewhereFindabilityUnknown).toContain('any linked device');
+    // The ⓘ's "off" line is class-scoped while another findable class is
+    // live (the proof pass): a findable name still finds the account, so
+    // "by this email or anything else" would be false. The handle class
+    // IS live in this build.
+    expect(ACCOUNTS_COPY.discoverableExplain[1]).toContain('by this email');
+    expect(ACCOUNTS_COPY.discoverableExplain[1]).not.toContain('anything else');
+    expect(ACCOUNTS_COPY.discoverableExplain[1]).toMatch(/own switch/);
+    expect(ACCOUNTS_COPY.discoverableExplain[1]).not.toMatch(/username/i);
+    // The downgrade names the claimed name it takes (the proof pass), in
+    // the deck's class-neutral words.
+    expect(ACCOUNTS_COPY.downgradeIntro).toContain('any name you claimed to be found by');
+    expect(ACCOUNTS_COPY.downgradeConfirm).toContain('any name you claimed to be found by');
+    expect(ACCOUNTS_COPY.downgradeIntro).not.toMatch(/username/i);
+    expect(ACCOUNTS_COPY.emailHeldElsewhereUnlinkConfirm).not.toContain('@');
+    expect(ACCOUNTS_COPY.emailRemovedElsewhere).toContain('another device');
+    expect(ACCOUNTS_COPY.emailMaybeHeldElsewhere).toContain('one of your other devices');
+    // The Android drift net's rule, applied to every new sentence: no bare
+    // device noun ("phone", "tablet", "iPhone", "iPad") outside the token —
+    // "device" and "phone number" are the words allowed.
+    for (const sentence of [
+      ACCOUNTS_COPY.emailRequestRefused,
+      ACCOUNTS_COPY.emailRequestRateLimited,
+      ACCOUNTS_COPY.emailHeldElsewhere,
+      ACCOUNTS_COPY.emailHeldElsewhereFindability,
+      ACCOUNTS_COPY.emailHeldElsewhereUnlinkConfirm,
+      ACCOUNTS_COPY.emailRemovedElsewhere,
+      ACCOUNTS_COPY.emailMaybeHeldElsewhere,
+      ...ACCOUNTS_COPY.discoverExplain,
+      ACCOUNTS_COPY.discoverNoMatch,
+    ]) {
+      expect(sentence).not.toMatch(/iphone|ipad|tablet/i);
+      expect(sentence.replace(/phone (number|call)s?/gi, '')).not.toMatch(/\bphone\b/i);
+    }
   });
 });

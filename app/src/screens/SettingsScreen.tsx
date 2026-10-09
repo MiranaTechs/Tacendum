@@ -1238,6 +1238,12 @@ export function SettingsScreen({
 
           {flow.step === 'menu' && section === 'account' ? (
             <>
+              {/* THE ACCOUNT LEAD (V1, 2026-10-08): a fact true in every
+                  state — it reads no identifier row and no eligibility, and
+                  must not: the local rows are empty on a linked sibling. It
+                  carries both facts (what needs a verified email, what needs
+                  none), so the separate no-verification line below renders
+                  only in a pin-OFF binary, where this lead is absent. */}
               {USERNAME_UI_ENABLED ? (
                 <Text
                   testID="settings-account-verification-note"
@@ -1250,18 +1256,19 @@ export function SettingsScreen({
                 >
                   {ACCOUNTS_USERNAME_COPY.verificationSummary}
                 </Text>
-              ) : null}
-              <Text
-                testID="settings-account-without-verification"
-                style={[
-                  t.type.compactBody,
-                  styles.categoryNote,
-                  !USERNAME_UI_ENABLED ? styles.detailStart : null,
-                  { color: t.color.inkMuted },
-                ]}
-              >
-                {ACCOUNTS_USERNAME_COPY.withoutVerification}
-              </Text>
+              ) : (
+                <Text
+                  testID="settings-account-without-verification"
+                  style={[
+                    t.type.compactBody,
+                    styles.categoryNote,
+                    styles.detailStart,
+                    { color: t.color.inkMuted },
+                  ]}
+                >
+                  {ACCOUNTS_USERNAME_COPY.withoutVerification}
+                </Text>
+              )}
               <SettingsSheet>
                 <MenuRow
                   label={COPY.linkedDevicesRow}

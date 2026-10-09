@@ -57,7 +57,7 @@ import { FoundCard } from './startChat/FoundCard';
 import { ClearGlyph, ScanGlyph } from './startChat/glyphs';
 import { MyIdSection, type MyIdCopy } from './startChat/MyIdSection';
 import { ReachHint, type ReachHintProps } from './startChat/ReachHint';
-import { useReachLookup, type FindPhase } from './startChat/useReachLookup';
+import { LOOKUPS_PER_DAY, useReachLookup, type FindPhase, type PreflightFailure } from './startChat/useReachLookup';
 
 interface Props {
   profile: db.ProfileRow;
@@ -181,10 +181,31 @@ export const COPY = {
     'Finding someone by email shows that an account answers to that address. It doesn’t prove who is holding it.',
     'To be sure it’s them, compare safety numbers in person or on a call. Being found changes who you can reach, never how much they are trusted.',
   ],
+  // The budget clause (D3, 2026-10-08): the day's searches are shared by
+  // the account's linked devices and reset at midnight UTC, so fast testing
+  // on two devices reads as what it is, not as "broken".
   missLine:
-    'No match — or you’ve used today’s searches. Tacendum cannot tell you which, by design.',
+    'No match — or you’ve used today’s searches. Tacendum cannot tell you which, by design. Searches are shared by your linked devices and reset at midnight UTC.',
   missLineEmail:
-    'No match — or your account is under three days old, or today’s searches are used up. Tacendum cannot tell you which, by design.',
+    'No match — or your account is under three days old, or today’s searches are used up. Tacendum cannot tell you which, by design. Searches are shared by your linked devices and reset at midnight UTC.',
+  /** The email miss when the account holds an email THIS device cannot
+   * match the typed text against (a linked sibling — the proof pass,
+   * 2026-10-08): the self case joins the visible line. The device that
+   * linked the address catches its own before sending, so it never sees
+   * this one. */
+  missLineEmailMaybeSelf:
+    'No match — or your account is under three days old, or today’s searches are used up, or it’s your own: your own email always shows no match. Tacendum cannot tell you which, by design. Searches are shared by your linked devices and reset at midnight UTC.',
+  /** One more lookup for the text that missed (D6). */
+  searchAgain: 'Search again',
+  /** The device's own brake, before the wire would refuse as a miss (D3):
+   * the minute's lifts by itself, the day's waits for midnight UTC. */
+  pacedMinute: 'Up to five searches a minute — wait a moment.',
+  pacedDay: (n: number) =>
+    `This device has sent today’s ${n} searches. Searches are shared by your linked devices and reset at midnight UTC.`,
+  // The self clause (D1, 2026-10-08) is said by the shared email deck's
+  // last line (ACCOUNTS_COPY.discoverExplain), which this sheet appends —
+  // once, not twice (the gate pass: the lead carried it too and the sheet
+  // read the same rule in two consecutive lines).
   missInfoLeadEmail:
     'A miss can mean the email isn’t on Tacendum, its owner hasn’t chosen to be found or is recovering their account — or your searches for today are used up.',
   needsOwnEmail: 'To search, verify an email on your account first.',
@@ -311,6 +332,21 @@ function selfHint(status: string): ReachHintProps {
     spoken: `${COPY.kindSelf}, ${status}`,
     status: { text: status, tone: 'muted' },
   };
+}
+
+/** The username deck with the sentence the preflight's REFUSED answer reads
+ * (U3, 2026-10-08): `eligibilityRefused`, the neutral sentence for the frozen
+ * 403 — the caller's budget or a dark flag, never a connection problem. It
+ * lives in the deck, which another lane of the same train adds it to; until
+ * that key exists this build keeps the connection sentence for both. */
+type UsernameDeck = typeof ACCOUNTS_USERNAME_COPY & { readonly eligibilityRefused?: string };
+
+function preflightSentence(reason: PreflightFailure): string {
+  const deck: UsernameDeck = ACCOUNTS_USERNAME_COPY;
+  if (reason === 'refused' && deck.eligibilityRefused !== undefined) {
+    return deck.eligibilityRefused;
+  }
+  return deck.eligibilityUnavailable;
 }
 
 /** The hint row for what the field holds, or null when there is nothing to
@@ -463,6 +499,7 @@ export function StartChatScreen({
     find: findTarget,
     retry: retryFind,
     retryEligibility,
+    searchAgain,
     openFound,
   } = useReachLookup({ userId: profile.userId, onOpenChat, onOpenFailed: bump });
 
@@ -881,7 +918,8 @@ export function StartChatScreen({
       phase.name !== 'none' &&
       phase.name !== 'needsVerification' &&
       phase.name !== 'unavailable' &&
-      phase.name !== 'error'
+      phase.name !== 'error' &&
+      phase.name !== 'paced'
     ) {
       return;
     }
@@ -1029,8 +1067,21 @@ export function StartChatScreen({
           <>
             <InlineNotice
               tone="quiet"
-              message={current.kind === 'email' ? COPY.missLineEmail : COPY.missLine}
+              message={
+                current.kind === 'email'
+                  ? current.maybeSelf
+                    ? COPY.missLineEmailMaybeSelf
+                    : COPY.missLineEmail
+                  : current.maybeSelf
+                    ? ACCOUNTS_USERNAME_COPY.startChatMissLineMaybeSelf
+                    : COPY.missLine
+              }
               messageRef={missRef}
+              action={{
+                label: COPY.searchAgain,
+                onPress: searchAgain,
+                testID: 'discovery-search-again',
+              }}
               testID="discovery-no-match"
             />
             <View style={styles.info}>
@@ -1101,7 +1152,7 @@ export function StartChatScreen({
         return (
           <InlineNotice
             tone="quiet"
-            message={ACCOUNTS_USERNAME_COPY.eligibilityUnavailable}
+            message={preflightSentence(current.reason)}
             messageRef={missRef}
             action={{
               label: ACCOUNTS_USERNAME_COPY.eligibilityRetry,
@@ -1119,6 +1170,19 @@ export function StartChatScreen({
             messageRef={missRef}
             action={{ label: COPY.retry, onPress: retryFind, testID: 'discovery-retry' }}
             testID="discovery-error"
+          />
+        );
+      case 'paced':
+        // No action: the minute's brake lifts itself and Find comes back;
+        // the day's has nothing a press can change before midnight UTC.
+        return (
+          <InlineNotice
+            tone="quiet"
+            message={
+              current.scope === 'minute' ? COPY.pacedMinute : COPY.pacedDay(LOOKUPS_PER_DAY)
+            }
+            messageRef={missRef}
+            testID="discovery-paced"
           />
         );
       case 'invalid':

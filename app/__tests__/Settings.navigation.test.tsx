@@ -261,7 +261,13 @@ test('an initial Account section explains verification and deletion outcomes', a
   const tree = await render({ initialSection: 'account' });
   const words = copy(tree);
 
-  expect(words).toMatch(/Verify an email address.*set a username.*search/i);
+  // The lead is a FACT, true in every state (V1, 2026-10-08): it names what
+  // needs a verified email and what needs none, and never reads as a setup
+  // step still owed — not even on a sibling device that holds no row.
+  expect(words).toMatch(
+    /Usernames and username search need a verified email.*Rooms and calls by Tacendum ID or QR code need none/,
+  );
+  expect(words).not.toContain('Verify an email address to');
   expect(words).toContain('Tacendum ID or QR code');
   expect(words).toContain('Deleting your account and starting again');
   expect(words).not.toContain('Other people keep their copies');

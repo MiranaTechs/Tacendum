@@ -25,7 +25,9 @@ import ReactTestRenderer from 'react-test-renderer';
 import * as accounts from '../src/accounts';
 import * as accountsUsername from '../src/accountsUsername';
 import { ACCOUNTS_USERNAME_COPY } from '../src/accountsUsernameCopy';
+import * as api from '../src/api';
 import * as db from '../src/db';
+import * as reauth from '../src/reauth';
 import { AccountUsernameScreen } from '../src/screens/AccountUsernameScreen';
 import { DiscoveryScreen } from '../src/screens/DiscoveryScreen';
 import { StartChatScreen } from '../src/screens/StartChatScreen';
@@ -107,9 +109,30 @@ function stubRows(opts: {
   jest.spyOn(db, 'loadUsernameUnlink').mockImplementation(async () => opts.unlink ?? null);
 }
 
+/** The claim surface reads the caller-owned STATE (fix/username-discovery,
+ * 2026-10-08); the find surfaces still read the legacy eligibility. Both
+ * stubbed eligible, every sibling fact UNKNOWN (null) — the one-device
+ * world of the cases above; section 8 stubs the facts it needs. */
+const STATE_ELIGIBLE_DEFAULT: accountsUsername.IdentifierState = {
+  source: 'state',
+  eligibility: 'eligible',
+  holdsUsername: null,
+  emailLinked: null,
+  phoneLinked: null,
+  cooldownUntil: null,
+  usernameSince: null,
+  emailSince: null,
+  usernameFindable: null,
+  emailFindable: null,
+};
 beforeEach(() => {
+  // The identifier-route pacing ledger is module state on a trailing minute;
+  // with the clock pinned it never rolls, so every case starts it empty.
+  accountsUsername.clearIdentifierRoutePacing();
+  accountsUsername.invalidateIdentifierState();
   jest.spyOn(Date, 'now').mockReturnValue(NOW_MS);
   jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('eligible');
+  jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(STATE_ELIGIBLE_DEFAULT);
 });
 
 afterEach(() => {
@@ -175,6 +198,9 @@ describe('the unlink memory: written by the module on a landed unlink, cleared b
           clearUsernameUnlink: async () => {
             clears.push(1);
           },
+          loadUsernameCooldown: async () => null,
+          saveUsernameCooldown: async () => undefined,
+          clearUsernameCooldown: async () => undefined,
         },
         token: async () => 'bearer',
         now: () => NOW_MS,
@@ -453,27 +479,29 @@ describe('unchecking consent on the CLAIM form says what a claim with findabilit
 /* ── 7. the proof precondition stops inviting a doomed tap ─────────── */
 
 describe('the authoritative claim precondition', () => {
-  it('missing group proof shows the verification door and disables claim', async () => {
-    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('needs_verification');
+  it('missing group proof shows the verification door and withholds the claim form', async () => {
+    // Re-cut 2026-10-08 (U6): the form used to render under a permanently
+    // grey button; the reason and the door now stand alone.
+    jest
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValue({ ...STATE_ELIGIBLE_DEFAULT, eligibility: 'needs_verification' });
     stubRows({});
     const onOpenAccountEmail = jest.fn();
     const tree = await render(
       <AccountUsernameScreen onBack={jest.fn()} onOpenAccountEmail={onOpenAccountEmail} />,
     );
     expect(has(tree, 'account-username-needs-identifier')).toBe(true);
-    expect(has(tree, 'account-username-input')).toBe(true);
-    await type(tree, 'account-username-input', 'alice_7');
-    const submit = tree.root
-      .findAllByProps({ testID: 'account-username-submit' })
-      .find(n => n.props.disabled !== undefined)!;
-    expect(submit.props.disabled).toBe(true);
+    expect(has(tree, 'account-username-input')).toBe(false);
+    expect(has(tree, 'account-username-submit')).toBe(false);
     await press(tree, 'account-username-link-email');
     expect(onOpenAccountEmail).toHaveBeenCalledTimes(1);
     tree.unmount();
   });
 
   it('without the door wired, the sentence stands alone', async () => {
-    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('needs_verification');
+    jest
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValue({ ...STATE_ELIGIBLE_DEFAULT, eligibility: 'needs_verification' });
     stubRows({});
     const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
     expect(has(tree, 'account-username-needs-identifier')).toBe(true);
@@ -481,11 +509,11 @@ describe('the authoritative claim precondition', () => {
     tree.unmount();
   });
 
-  it('an unavailable eligibility read says connection, keeps claim disabled, and Retry rechecks', async () => {
+  it('a failed state read says connection, keeps claim disabled, and Retry rechecks', async () => {
     jest
-      .spyOn(accountsUsername, 'getUsernameEligibility')
-      .mockResolvedValueOnce('unavailable')
-      .mockResolvedValue('eligible');
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValueOnce({ ...STATE_ELIGIBLE_DEFAULT, eligibility: 'failed' })
+      .mockResolvedValue(STATE_ELIGIBLE_DEFAULT);
     stubRows({});
     const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
     await type(tree, 'account-username-input', 'alice_7');
@@ -501,12 +529,770 @@ describe('the authoritative claim precondition', () => {
   });
 
   it('proof removal never disables consent or unlink cleanup for a held name', async () => {
-    jest.spyOn(accountsUsername, 'getUsernameEligibility').mockResolvedValue('needs_verification');
+    jest
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValue({ ...STATE_ELIGIBLE_DEFAULT, eligibility: 'needs_verification' });
     stubRows({ row: HELD });
     const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
     expect(has(tree, 'account-username-needs-identifier')).toBe(false);
     await press(tree, 'account-username-unlink');
     expect(has(tree, 'account-username-unlink-confirm')).toBe(true);
     tree.unmount();
+  });
+});
+
+/* ── 8. fix/username-discovery (2026-10-08): U1 — the linked sibling ──── */
+
+/**
+ * THE FOUNDER'S REPORT (2026-10-08): on a linked sibling (the iPad, a
+ * reinstalled phone) the screen read as if the account had never set a
+ * name — the empty claim form, the held name refused as "try again later",
+ * a different name silently RENAMING the account. The server never echoes
+ * a name (§4.9) and the rows do not sync, so the only honest source of
+ * "does this account hold a name" is the caller-owned state read.
+ */
+const STATE_ELIGIBLE: accountsUsername.IdentifierState = {
+  source: 'state',
+  eligibility: 'eligible',
+  holdsUsername: null,
+  emailLinked: null,
+  phoneLinked: null,
+  cooldownUntil: null,
+  usernameSince: null,
+  emailSince: null,
+  usernameFindable: null,
+  emailFindable: null,
+};
+const stateOf = (
+  partial: Partial<accountsUsername.IdentifierState>,
+): accountsUsername.IdentifierState => ({ ...STATE_ELIGIBLE, ...partial });
+
+describe('U1: a linked sibling with no local row on a group that holds a name', () => {
+  it('never renders the claim form and never sends /claim: the held-elsewhere state, Change = the rename form sent as /rename with the consent bit explicit', async () => {
+    const device = { row: null as db.UsernameIdentifierRow | null };
+    jest.spyOn(db, 'loadUsernameIdentifier').mockImplementation(async () => device.row);
+    jest.spyOn(db, 'loadUsernameNotice').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest.spyOn(db, 'saveUsernameIdentifier').mockImplementation(async row => {
+      device.row = { ...row };
+    });
+    jest.spyOn(db, 'clearUsernameUnlink').mockResolvedValue(undefined);
+    jest.spyOn(db, 'saveUsernameCooldown').mockResolvedValue(undefined);
+    jest.spyOn(reauth, 'currentToken').mockResolvedValue('tok');
+    jest
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockImplementation(async () =>
+        stateOf({ holdsUsername: true, emailLinked: true, phoneLinked: false }),
+      );
+    const claim = jest.spyOn(api, 'apiClaimUsername').mockResolvedValue(undefined);
+    const rename = jest.spyOn(api, 'apiRenameUsername').mockResolvedValue(undefined);
+
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(tree, 'account-username-held-elsewhere')).toBe(true);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.heldElsewhere);
+    expect(rendered(tree)).toContain('another device');
+    // Not the claim form, not a held name this device cannot know, and no
+    // switch over a bit the state read did not carry (null here): the
+    // fact is said instead (the proof pass — with the bit, the switch
+    // renders; section 9 below).
+    expect(has(tree, 'account-username-input')).toBe(false);
+    expect(has(tree, 'account-username-held')).toBe(false);
+    expect(has(tree, 'username-discoverable-toggle')).toBe(false);
+    expect(has(tree, 'username-discoverable-toggle-elsewhere')).toBe(false);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.heldElsewhereFindabilityUnknown);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.claim);
+
+    // Change opens the RENAME form: the consent box explicit (the claim
+    // default, since this device cannot read the current bit), the submit
+    // labelled as a change.
+    await press(tree, 'account-username-rename');
+    expect(has(tree, 'account-username-input')).toBe(true);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.renameSubmit);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.claim);
+    const box = tree.root
+      .findAllByProps({ testID: 'account-username-consent' })
+      .find(n => n.props.accessibilityRole === 'checkbox')!;
+    expect(box.props.accessibilityState.checked).toBe(true);
+    await type(tree, 'account-username-input', 'zed_1');
+    await press(tree, 'account-username-submit');
+    expect(rename).toHaveBeenCalledWith('tok', 'zed_1', true);
+    expect(claim).not.toHaveBeenCalled();
+    // The name this device just sent is the one it now knows (no server
+    // stamp yet: the next settled read adopts it — section 9).
+    expect(device.row).toEqual({ username: 'zed_1', claimedAt: NOW_MS, discoverable: true });
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.held('zed_1'));
+    expect(has(tree, 'account-username-held-elsewhere')).toBe(false);
+    tree.unmount();
+  });
+
+  it('Remove on the held-elsewhere state is the unlink verb (no name rides the wire), and the claim form that follows carries the cool-down with no invented name', async () => {
+    const group = { holds: true };
+    jest.spyOn(db, 'loadUsernameIdentifier').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameNotice').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest.spyOn(db, 'clearUsernameIdentifier').mockResolvedValue(undefined);
+    const unlinkMemory = jest.spyOn(db, 'saveUsernameUnlink').mockResolvedValue(undefined);
+    const cooldownMemory = jest.spyOn(db, 'saveUsernameCooldown').mockResolvedValue(undefined);
+    jest.spyOn(reauth, 'currentToken').mockResolvedValue('tok');
+    // The server's answer after the unlink carries the window the unlink
+    // stamped — the one this screen shows (the gate pass).
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockImplementation(async () =>
+      stateOf({
+        holdsUsername: group.holds,
+        cooldownUntil: group.holds ? null : NOW_MS + 30 * DAY_MS,
+      }),
+    );
+    const unlink = jest.spyOn(api, 'apiUnlinkUsername').mockImplementation(async () => {
+      group.holds = false;
+    });
+    const claim = jest.spyOn(api, 'apiClaimUsername');
+
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(tree, 'account-username-held-elsewhere')).toBe(true);
+    await press(tree, 'account-username-unlink');
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.unlinkConfirm);
+    await press(tree, 'account-username-unlink-confirm');
+    expect(unlink).toHaveBeenCalledWith('tok');
+    expect(claim).not.toHaveBeenCalled();
+    // This device performed the unlink without a readable row: the memory
+    // records the moment with an EMPTY name, and the window's end.
+    expect(unlinkMemory).toHaveBeenCalledWith({ username: '', unlinkedAt: NOW_MS });
+    expect(cooldownMemory).toHaveBeenCalledWith({ until: NOW_MS + 30 * DAY_MS });
+    // The group holds no name now: the CLAIM form, warned, naming nothing.
+    expect(has(tree, 'account-username-held-elsewhere')).toBe(false);
+    expect(has(tree, 'account-username-input')).toBe(true);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.cooldownAfterUnlink(''));
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.claim);
+    tree.unmount();
+  });
+});
+
+describe('U1: a phantom local row — the group holds no name (a sibling removed it)', () => {
+  it('is cleared on holdsUsername === false from the state route, with the changed-or-removed notice, and the claim form follows', async () => {
+    const device = { row: HELD as db.UsernameIdentifierRow | null };
+    jest.spyOn(db, 'loadUsernameIdentifier').mockImplementation(async () => device.row);
+    jest.spyOn(db, 'loadUsernameNotice').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    const clear = jest.spyOn(db, 'clearUsernameIdentifier').mockImplementation(async () => {
+      device.row = null;
+    });
+    jest
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValue(stateOf({ holdsUsername: false }));
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(clear).toHaveBeenCalledTimes(1);
+    expect(has(tree, 'account-username-held')).toBe(false);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.held('alice_7'));
+    expect(has(tree, 'account-username-phantom')).toBe(true);
+    // RE-CUT 2026-10-08 (the proof pass): the notice says WHICH happened —
+    // the group holds no name, so the name was REMOVED — never the hedge.
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.phantomRemoved);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.phantomCleared);
+    expect(ACCOUNTS_USERNAME_COPY.phantomRemoved).toContain('removed from another device');
+    expect(has(tree, 'account-username-input')).toBe(true);
+    expect(has(tree, 'username-discoverable-toggle')).toBe(false);
+    tree.unmount();
+  });
+
+  it('is NEVER cleared on the legacy path (the fact is unknown there) nor on an unknown fact from a refused or failed read', async () => {
+    for (const state of [
+      stateOf({ source: 'legacy' }),
+      stateOf({ source: 'state', eligibility: 'refused' }),
+      stateOf({ source: 'state', eligibility: 'failed' }),
+    ]) {
+      jest.restoreAllMocks();
+      jest.spyOn(Date, 'now').mockReturnValue(NOW_MS);
+      stubRows({ row: HELD, email: EMAIL_ROW });
+      jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+      const clear = jest.spyOn(db, 'clearUsernameIdentifier').mockResolvedValue(undefined);
+      jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(state);
+      const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+      expect([state.source, state.eligibility, clear.mock.calls.length]).toEqual([
+        state.source,
+        state.eligibility,
+        0,
+      ]);
+      expect(has(tree, 'account-username-held')).toBe(true);
+      expect(has(tree, 'account-username-phantom')).toBe(false);
+      tree.unmount();
+    }
+  });
+});
+
+describe('U1: the legacy path (today’s production server has no state route)', () => {
+  it('keeps the claim form, and a refused claim with no local row adds the stop-gap sentence under the generic retry', async () => {
+    stubRows({ email: EMAIL_ROW });
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValue(stateOf({ source: 'legacy' }));
+    jest.spyOn(accountsUsername, 'claimUsername').mockResolvedValue('refused');
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(tree, 'account-username-input')).toBe(true);
+    expect(has(tree, 'account-username-held-elsewhere-hint')).toBe(false);
+    await type(tree, 'account-username-input', 'alice_7');
+    await press(tree, 'account-username-submit');
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.tryLater);
+    expect(has(tree, 'account-username-held-elsewhere-hint')).toBe(true);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.heldElsewhereStopGap);
+    expect(ACCOUNTS_USERNAME_COPY.heldElsewhereStopGap).toContain('set on another device');
+    tree.unmount();
+  });
+
+  it('the stop-gap never shows where the state route answered: a refused claim on a group that holds no name is the plain generic retry', async () => {
+    stubRows({ email: EMAIL_ROW });
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest
+      .spyOn(accountsUsername, 'getIdentifierState')
+      .mockResolvedValue(stateOf({ holdsUsername: false }));
+    jest.spyOn(accountsUsername, 'claimUsername').mockResolvedValue('refused');
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    await type(tree, 'account-username-input', 'alice_7');
+    await press(tree, 'account-username-submit');
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.tryLater);
+    expect(has(tree, 'account-username-held-elsewhere-hint')).toBe(false);
+    tree.unmount();
+  });
+});
+
+/* ── 9. the gate pass (2026-10-08): the phantom after a sibling's RENAME,
+ *      this device's own verbs, the server's bit, the offline re-read ── */
+
+describe('the gate pass: a phantom row after a sibling’s RENAME (holdsUsername stays true; the live row is younger than this one)', () => {
+  function stubMemories(): void {
+    jest.spyOn(db, 'loadUsernameNotice').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest.spyOn(db, 'saveUsernameUnlink').mockResolvedValue(undefined);
+    jest.spyOn(db, 'saveUsernameCooldown').mockResolvedValue(undefined);
+    jest.spyOn(db, 'clearUsernameCooldown').mockResolvedValue(undefined);
+    jest.spyOn(reauth, 'currentToken').mockResolvedValue('tok');
+  }
+
+  it('the old name is cleared, the notice says so, the held-elsewhere state follows (no name, no switch), and Remove records the EMPTY name — never the old one', async () => {
+    const device = {
+      row: { username: 'alice_7', claimedAt: NOW_MS - 5 * DAY_MS, discoverable: true } as db.UsernameIdentifierRow | null,
+    };
+    jest.spyOn(db, 'loadUsernameIdentifier').mockImplementation(async () => device.row);
+    stubMemories();
+    const clear = jest.spyOn(db, 'clearUsernameIdentifier').mockImplementation(async () => {
+      device.row = null;
+    });
+    const unlinkMemory = jest.spyOn(db, 'saveUsernameUnlink').mockResolvedValue(undefined);
+    // The iPad renamed the account a day ago: the group still HOLDS a name,
+    // the live row was written yesterday, the window runs from then.
+    const renamedAt = NOW_MS - DAY_MS;
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(
+      stateOf({
+        holdsUsername: true,
+        emailLinked: true,
+        phoneLinked: false,
+        cooldownUntil: renamedAt + 30 * DAY_MS,
+        usernameSince: renamedAt,
+        usernameFindable: false,
+        emailFindable: null,
+      }),
+    );
+    const unlink = jest.spyOn(api, 'apiUnlinkUsername').mockResolvedValue(undefined);
+
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(clear).toHaveBeenCalledTimes(1);
+    expect(has(tree, 'account-username-held')).toBe(false);
+    expect(rendered(tree)).not.toContain('alice_7');
+    expect(has(tree, 'username-discoverable-toggle')).toBe(false);
+    expect(has(tree, 'account-username-phantom')).toBe(true);
+    // RE-CUT 2026-10-08 (the proof pass): the name was CHANGED — the live
+    // row is newer — and the notice says so, never the hedge.
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.phantomRenamed);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.phantomCleared);
+    expect(has(tree, 'account-username-held-elsewhere')).toBe(true);
+    expect(has(tree, 'account-username-input')).toBe(false);
+    // The window the sibling started is said with its date — and the
+    // sibling's name is UNFINDABLE (the state carried the bit): the switch
+    // on the held-elsewhere state shows it off (the proof pass).
+    expect(has(tree, 'account-username-cooldown-until')).toBe(true);
+    const sw = tree.root
+      .findAllByProps({ testID: 'username-discoverable-toggle-elsewhere' })
+      .find(n => n.props.onValueChange !== undefined)!;
+    expect(sw.props.value).toBe(false);
+    // Remove is the unlink verb, and the memory names NOTHING: this device
+    // cannot know which name it removed.
+    await press(tree, 'account-username-unlink');
+    await press(tree, 'account-username-unlink-confirm');
+    expect(unlink).toHaveBeenCalledTimes(1);
+    expect(unlinkMemory).toHaveBeenCalledWith({ username: '', unlinkedAt: NOW_MS });
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.cooldownAfterUnlink('alice_7'));
+    tree.unmount();
+  });
+
+  it('this device’s OWN claim is never a phantom: a live row a few seconds younger than the local row (latency, skew) keeps the held state', async () => {
+    const row: db.UsernameIdentifierRow = { username: 'alice_7', claimedAt: NOW_MS - 60_000, discoverable: true };
+    jest.spyOn(db, 'loadUsernameIdentifier').mockResolvedValue(row);
+    stubMemories();
+    const clear = jest.spyOn(db, 'clearUsernameIdentifier').mockResolvedValue(undefined);
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(
+      stateOf({ holdsUsername: true, usernameSince: NOW_MS - 58_000, usernameFindable: true, emailFindable: null }),
+    );
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(clear).not.toHaveBeenCalled();
+    expect(has(tree, 'account-username-held')).toBe(true);
+    expect(has(tree, 'account-username-phantom')).toBe(false);
+    // The allowance itself, pinned: five minutes either way is skew, more
+    // than that behind this row is another device's write.
+    expect(accountsUsername.STALE_ROW_SKEW_MS).toBe(5 * 60_000);
+    expect(accountsUsername.localRowStale(NOW_MS, NOW_MS + 5 * 60_000)).toBe(false);
+    expect(accountsUsername.localRowStale(NOW_MS, NOW_MS + 5 * 60_000 + 1)).toBe(true);
+    expect(accountsUsername.localRowStale(NOW_MS, null)).toBe(false);
+    // A row that carries the server's own stamp (the proof pass) is judged
+    // by EXACT equality instead — the skew allowance plays no part: one
+    // second's difference is a sibling's write; a slow clock is not.
+    expect(accountsUsername.localRowStale(NOW_MS, NOW_MS + 60_000, NOW_MS + 60_000)).toBe(false);
+    expect(accountsUsername.localRowStale(NOW_MS, NOW_MS + 61_000, NOW_MS + 60_000)).toBe(true);
+    expect(accountsUsername.localRowStale(NOW_MS, NOW_MS - 1000, NOW_MS)).toBe(true);
+    expect(accountsUsername.localRowStale(NOW_MS - 20 * 60_000, NOW_MS, NOW_MS)).toBe(false);
+    expect(accountsUsername.localRowStale(NOW_MS, null, NOW_MS)).toBe(false);
+    tree.unmount();
+  });
+
+  it('Change on the held-elsewhere state starts at the name’s CURRENT findability from the state route — an unfindable name stays unfindable unless the person ticks the box', async () => {
+    jest.spyOn(db, 'loadUsernameIdentifier').mockResolvedValue(null);
+    stubMemories();
+    jest.spyOn(db, 'saveUsernameIdentifier').mockResolvedValue(undefined);
+    jest.spyOn(db, 'clearUsernameUnlink').mockResolvedValue(undefined);
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(
+      stateOf({ holdsUsername: true, emailLinked: true, phoneLinked: false, usernameFindable: false, emailFindable: null }),
+    );
+    const rename = jest.spyOn(api, 'apiRenameUsername').mockResolvedValue(undefined);
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    await press(tree, 'account-username-rename');
+    const box = tree.root
+      .findAllByProps({ testID: 'account-username-consent' })
+      .find(n => n.props.accessibilityRole === 'checkbox')!;
+    expect(box.props.accessibilityState.checked).toBe(false);
+    await type(tree, 'account-username-input', 'zed_1');
+    await press(tree, 'account-username-submit');
+    expect(rename).toHaveBeenCalledWith('tok', 'zed_1', false);
+    tree.unmount();
+  });
+});
+
+describe('the gate pass: this device’s own verbs never read as a sibling’s (the row moves in the same batch as the fact)', () => {
+  /** A database that answers like op-sqlite: a few milliseconds later,
+   * never inside the act() batch the verb resolves in. */
+  const later = <T,>(value: () => T): Promise<T> =>
+    new Promise(resolve => setTimeout(() => resolve(value()), 15));
+  /** One database hop: the verb has landed, its re-read is still out. */
+  const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(() => resolve(), ms));
+  const oneHop = async (): Promise<void> => {
+    await ReactTestRenderer.act(async () => {
+      await sleep(22);
+    });
+  };
+  const settle = async (): Promise<void> => {
+    for (let i = 0; i < 6; i += 1) {
+      await ReactTestRenderer.act(async () => {
+        await sleep(10);
+      });
+    }
+  };
+  /** These cases drive the REAL state read through the api spy — the
+   * file's default module stub is lifted first. */
+  const realModule = (): void => {
+    jest.restoreAllMocks();
+    jest.spyOn(Date, 'now').mockReturnValue(NOW_MS);
+  };
+
+  it('after its own Remove: no "changed or removed from another device", the claim form with its own warning', async () => {
+    realModule();
+    // The row this device claimed yesterday, and the server's stamp for the
+    // same write (a phantom would be a row OLDER than the live one).
+    const device = {
+      row: { username: 'alice_7', claimedAt: NOW_MS - DAY_MS, discoverable: true } as db.UsernameIdentifierRow | null,
+      unlink: null as db.UsernameUnlinkRow | null,
+      cooldown: null as db.UsernameCooldownRow | null,
+    };
+    const group = { holds: true };
+    jest.spyOn(db, 'loadUsernameIdentifier').mockImplementation(() => later(() => device.row));
+    jest.spyOn(db, 'clearUsernameIdentifier').mockImplementation(async () => {
+      device.row = null;
+    });
+    jest.spyOn(db, 'loadUsernameNotice').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameUnlink').mockImplementation(async () => device.unlink);
+    jest.spyOn(db, 'saveUsernameUnlink').mockImplementation(async row => {
+      device.unlink = row;
+    });
+    jest.spyOn(db, 'loadUsernameCooldown').mockImplementation(async () => device.cooldown);
+    jest.spyOn(db, 'saveUsernameCooldown').mockImplementation(async row => {
+      device.cooldown = row;
+    });
+    jest.spyOn(reauth, 'currentToken').mockResolvedValue('tok');
+    jest.spyOn(api, 'apiIdentifierState').mockImplementation(async () => ({
+      kind: 'state',
+      value: {
+        hasVerifiedIdentifier: true,
+        emailLinked: true,
+        phoneLinked: false,
+        holdsUsername: group.holds,
+        usernameCooldownUntil: group.holds ? null : Math.floor(NOW_MS / 1000) + 30 * 86_400,
+        usernameSince: group.holds ? Math.floor(NOW_MS / 1000) - 86_400 : null,
+        emailSince: Math.floor(NOW_MS / 1000) - 86_400,
+        usernameFindable: group.holds ? true : null,
+        emailFindable: null,
+      },
+    }));
+    jest.spyOn(api, 'apiUnlinkUsername').mockImplementation(async () => {
+      group.holds = false;
+    });
+    accountsUsername.invalidateIdentifierState();
+
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    await settle();
+    expect(has(tree, 'account-username-held')).toBe(true);
+    await press(tree, 'account-username-unlink');
+    await press(tree, 'account-username-unlink-confirm');
+    // Right after the verb (its re-read still out), and after every later
+    // read has landed.
+    await oneHop();
+    expect(has(tree, 'account-username-held')).toBe(false);
+    expect(has(tree, 'account-username-phantom')).toBe(false);
+    await settle();
+    expect(has(tree, 'account-username-phantom')).toBe(false);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.phantomCleared);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.cooldownAfterUnlink('alice_7'));
+    expect(has(tree, 'account-username-input')).toBe(true);
+    tree.unmount();
+  });
+
+  it('after its own first claim: never "set on another device" — the held state from the first frame', async () => {
+    realModule();
+    const device = { row: null as db.UsernameIdentifierRow | null };
+    const group = { holds: false };
+    jest.spyOn(db, 'loadUsernameIdentifier').mockImplementation(() => later(() => device.row));
+    jest.spyOn(db, 'saveUsernameIdentifier').mockImplementation(async row => {
+      device.row = { ...row };
+    });
+    jest.spyOn(db, 'loadUsernameNotice').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest.spyOn(db, 'clearUsernameUnlink').mockResolvedValue(undefined);
+    jest.spyOn(reauth, 'currentToken').mockResolvedValue('tok');
+    jest.spyOn(api, 'apiIdentifierState').mockImplementation(async () => ({
+      kind: 'state',
+      value: {
+        hasVerifiedIdentifier: true,
+        emailLinked: true,
+        phoneLinked: false,
+        holdsUsername: group.holds,
+        usernameCooldownUntil: null,
+        usernameSince: group.holds ? Math.floor(NOW_MS / 1000) : null,
+        emailSince: Math.floor(NOW_MS / 1000) - 86_400,
+        usernameFindable: group.holds ? true : null,
+        emailFindable: null,
+      },
+    }));
+    jest.spyOn(api, 'apiClaimUsername').mockImplementation(async () => {
+      group.holds = true;
+    });
+    accountsUsername.invalidateIdentifierState();
+
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    await settle();
+    await type(tree, 'account-username-input', 'alice_7');
+    await press(tree, 'account-username-submit');
+    await oneHop();
+    expect(has(tree, 'account-username-held-elsewhere')).toBe(false);
+    expect(has(tree, 'account-username-held')).toBe(true);
+    await settle();
+    expect(has(tree, 'account-username-held-elsewhere')).toBe(false);
+    expect(has(tree, 'account-username-held')).toBe(true);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.held('alice_7'));
+    tree.unmount();
+  });
+});
+
+describe('the gate pass: a refused or failed RE-read keeps the last landed facts', () => {
+  it('a sibling on the held-elsewhere state taps Remove with the network gone: still held elsewhere, never the claim form', async () => {
+    // The REAL state read, through the api spy (the file's module stub lifted).
+    jest.restoreAllMocks();
+    jest.spyOn(Date, 'now').mockReturnValue(NOW_MS);
+    const net = { up: true };
+    jest.spyOn(reauth, 'currentToken').mockResolvedValue('tok');
+    jest.spyOn(db, 'loadUsernameIdentifier').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameNotice').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest.spyOn(api, 'apiIdentifierState').mockImplementation(async () => {
+      if (!net.up) return { kind: 'failed' };
+      return {
+        kind: 'state',
+        value: {
+          hasVerifiedIdentifier: true,
+          emailLinked: true,
+          phoneLinked: false,
+          holdsUsername: true,
+          usernameCooldownUntil: null,
+          usernameSince: Math.floor(NOW_MS / 1000) - 86_400,
+          emailSince: Math.floor(NOW_MS / 1000) - 86_400,
+          usernameFindable: true,
+          emailFindable: null,
+        },
+      };
+    });
+    jest.spyOn(api, 'apiUnlinkUsername').mockRejectedValue(new TypeError('Network request failed'));
+    accountsUsername.invalidateIdentifierState();
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(tree, 'account-username-held-elsewhere')).toBe(true);
+    net.up = false;
+    await press(tree, 'account-username-unlink');
+    await press(tree, 'account-username-unlink-confirm');
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.failed);
+    expect(has(tree, 'account-username-held-elsewhere')).toBe(true);
+    expect(has(tree, 'account-username-input')).toBe(false);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.claim);
+    tree.unmount();
+  });
+});
+
+/* ── 9. the proof pass (2026-10-08): the server's stamp on the row, the
+ *       sibling's rename inside the skew window, and the switch on the
+ *       held-elsewhere state ───────────────────────────────────────── */
+
+describe('the proof pass: a local row carries the server’s own stamp, so a sibling’s rename inside five minutes is seen — and a slow clock is not a phantom', () => {
+  function stubMemories(): void {
+    jest.spyOn(db, 'loadUsernameNotice').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest.spyOn(db, 'saveUsernameCooldown').mockResolvedValue(undefined);
+    jest.spyOn(db, 'clearUsernameCooldown').mockResolvedValue(undefined);
+    jest.spyOn(reauth, 'currentToken').mockResolvedValue('tok');
+  }
+
+  it('a fresh row (no stamp) ADOPTS the live row’s stamp on the first settled read, and is persisted with it', async () => {
+    const claimedAt = NOW_MS - 30_000;
+    const liveSince = NOW_MS - 28_000; // the server's clock, 2 s later: latency, not a sibling
+    const device = { row: { username: 'alice_7', claimedAt, discoverable: true } as db.UsernameIdentifierRow | null };
+    jest.spyOn(db, 'loadUsernameIdentifier').mockImplementation(async () => device.row);
+    stubMemories();
+    const save = jest.spyOn(db, 'saveUsernameIdentifier').mockImplementation(async row => {
+      device.row = { ...row };
+    });
+    const clear = jest.spyOn(db, 'clearUsernameIdentifier').mockResolvedValue(undefined);
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(
+      stateOf({ holdsUsername: true, usernameSince: liveSince, usernameFindable: true }),
+    );
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(clear).not.toHaveBeenCalled();
+    expect(save).toHaveBeenCalledWith({ username: 'alice_7', claimedAt, discoverable: true, since: liveSince });
+    expect(device.row).toEqual({ username: 'alice_7', claimedAt, discoverable: true, since: liveSince });
+    expect(has(tree, 'account-username-held')).toBe(true);
+    // The module's rule, pinned: a stamped row adopts nothing more; an
+    // unknown or a stale live row hands out no stamp.
+    expect(
+      accountsUsername.adoptableRowStamp({ stamp: claimedAt, since: liveSince }, stateOf({ holdsUsername: true, usernameSince: NOW_MS }), 'username'),
+    ).toBeNull();
+    expect(
+      accountsUsername.adoptableRowStamp({ stamp: claimedAt }, stateOf({ holdsUsername: true, usernameSince: claimedAt + 6 * 60_000 }), 'username'),
+    ).toBeNull();
+    expect(
+      accountsUsername.adoptableRowStamp({ stamp: claimedAt }, stateOf({ source: 'legacy', holdsUsername: null, usernameSince: null }), 'username'),
+    ).toBeNull();
+    tree.unmount();
+  });
+
+  it('claim on the phone, then a sibling renames within 60 s: the phone’s stamped row no longer matches the live stamp — cleared, said as a change, the held-elsewhere state follows', async () => {
+    const claimedAt = NOW_MS - 90_000;
+    const ownSince = NOW_MS - 89_000; // adopted after the claim landed
+    const siblingSince = ownSince + 60_000; // the iPad's Change, 60 s later — inside the old skew window
+    const device = {
+      row: { username: 'alice_7', claimedAt, discoverable: true, since: ownSince } as db.UsernameIdentifierRow | null,
+    };
+    jest.spyOn(db, 'loadUsernameIdentifier').mockImplementation(async () => device.row);
+    stubMemories();
+    const clear = jest.spyOn(db, 'clearUsernameIdentifier').mockImplementation(async () => {
+      device.row = null;
+    });
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(
+      stateOf({ holdsUsername: true, usernameSince: siblingSince, usernameFindable: true }),
+    );
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(clear).toHaveBeenCalledTimes(1);
+    expect(has(tree, 'account-username-held')).toBe(false);
+    expect(rendered(tree)).not.toContain('alice_7');
+    expect(has(tree, 'account-username-phantom')).toBe(true);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.phantomRenamed);
+    expect(has(tree, 'account-username-held-elsewhere')).toBe(true);
+    tree.unmount();
+  });
+
+  it('a device whose clock runs ten minutes slow keeps its own stamped row: the live stamp equals the stored one, so nothing is cleared', async () => {
+    const claimedAt = NOW_MS - 60_000; // this clock
+    const since = NOW_MS + 9 * 60_000; // the server's clock, ten minutes ahead of this device
+    const device = { row: { username: 'alice_7', claimedAt, discoverable: true, since } as db.UsernameIdentifierRow | null };
+    jest.spyOn(db, 'loadUsernameIdentifier').mockImplementation(async () => device.row);
+    stubMemories();
+    const clear = jest.spyOn(db, 'clearUsernameIdentifier').mockResolvedValue(undefined);
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(
+      stateOf({ holdsUsername: true, usernameSince: since, usernameFindable: true }),
+    );
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(clear).not.toHaveBeenCalled();
+    expect(has(tree, 'account-username-held')).toBe(true);
+    expect(has(tree, 'account-username-phantom')).toBe(false);
+    tree.unmount();
+  });
+
+  it('a row from an older build (no stamp) is still judged by the skew rule: a live row six minutes younger is a sibling’s', async () => {
+    const claimedAt = NOW_MS - 20 * 60_000;
+    const device = { row: { username: 'alice_7', claimedAt, discoverable: true } as db.UsernameIdentifierRow | null };
+    jest.spyOn(db, 'loadUsernameIdentifier').mockImplementation(async () => device.row);
+    stubMemories();
+    const clear = jest.spyOn(db, 'clearUsernameIdentifier').mockImplementation(async () => {
+      device.row = null;
+    });
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(
+      stateOf({ holdsUsername: true, usernameSince: claimedAt + 6 * 60_000, usernameFindable: true }),
+    );
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(clear).toHaveBeenCalledTimes(1);
+    expect(has(tree, 'account-username-held-elsewhere')).toBe(true);
+    tree.unmount();
+  });
+});
+
+describe('the proof pass: findability on the held-elsewhere state — the account’s bit, shown and movable from a sibling', () => {
+  function stubSibling(findable: boolean | null): { state: { findable: boolean | null } } {
+    const group = { findable };
+    jest.spyOn(db, 'loadUsernameIdentifier').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameNotice').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest.spyOn(reauth, 'currentToken').mockResolvedValue('tok');
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockImplementation(async () =>
+      stateOf({ holdsUsername: true, emailLinked: true, phoneLinked: false, usernameFindable: group.findable }),
+    );
+    return { state: group };
+  }
+
+  it('the switch shows the account’s current bit (on), and no local row is written for it', async () => {
+    stubSibling(true);
+    const save = jest.spyOn(db, 'saveUsernameIdentifier').mockResolvedValue(undefined);
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(tree, 'account-username-held-elsewhere')).toBe(true);
+    const sw = tree.root
+      .findAllByProps({ testID: 'username-discoverable-toggle-elsewhere' })
+      .find(n => n.props.onValueChange !== undefined)!;
+    expect(sw.props.value).toBe(true);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.discoverableTitle);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.heldElsewhereFindability);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.heldElsewhereFindabilityUnknown);
+    expect(has(tree, 'username-discoverable-toggle')).toBe(false);
+    expect(save).not.toHaveBeenCalled();
+    tree.unmount();
+  });
+
+  it('flipping it sends the group-keyed consent write and the switch follows the server’s re-read — the claiming device may be lost, reinstalled or recovered; this one still governs it', async () => {
+    const { state } = stubSibling(true);
+    const toggle = jest.spyOn(api, 'apiSetUsernameDiscoverable').mockImplementation(async (_t, on) => {
+      state.findable = on;
+    });
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    const sw = () =>
+      tree.root
+        .findAllByProps({ testID: 'username-discoverable-toggle-elsewhere' })
+        .find(n => n.props.onValueChange !== undefined)!;
+    await ReactTestRenderer.act(async () => {
+      sw().props.onValueChange(false);
+    });
+    expect(toggle).toHaveBeenCalledWith('tok', false);
+    expect(sw().props.value).toBe(false);
+    expect(has(tree, 'account-username-held-elsewhere')).toBe(true);
+    tree.unmount();
+  });
+
+  it('an unreadable bit (null) draws no switch and says the fact instead', async () => {
+    stubSibling(null);
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(has(tree, 'username-discoverable-toggle-elsewhere')).toBe(false);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.heldElsewhereFindabilityUnknown);
+    tree.unmount();
+  });
+
+  it('after a sibling’s REMOVE inside a window, ONE notice carries the fact, the date and the exception — never two stacked hedges', async () => {
+    const device = { row: HELD as db.UsernameIdentifierRow | null };
+    jest.spyOn(db, 'loadUsernameIdentifier').mockImplementation(async () => device.row);
+    jest.spyOn(db, 'loadUsernameNotice').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest.spyOn(db, 'saveUsernameCooldown').mockResolvedValue(undefined);
+    jest.spyOn(db, 'clearUsernameIdentifier').mockImplementation(async () => {
+      device.row = null;
+    });
+    const until = NOW_MS + 29 * DAY_MS;
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(
+      stateOf({ holdsUsername: false, cooldownUntil: until }),
+    );
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    const label = accountsUsername.cooldownEndLabel(until);
+    expect(has(tree, 'account-username-phantom')).toBe(true);
+    expect(rendered(tree)).toContain(ACCOUNTS_USERNAME_COPY.phantomRemovedWindow(label));
+    expect(has(tree, 'account-username-cooldown-elsewhere')).toBe(false);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.phantomCleared);
+    expect(rendered(tree)).not.toContain(ACCOUNTS_USERNAME_COPY.cooldownElsewhere(label));
+    // The claim form follows, its submit dark inside the window, with the
+    // date on the control for a screen reader (the proof pass).
+    const submit = tree.root
+      .findAllByProps({ testID: 'account-username-submit' })
+      .find(n => n.props.accessibilityState !== undefined);
+    expect(submit).toBeDefined();
+    tree.unmount();
+  });
+});
+
+describe('the proof pass: the holder’s own row follows the account’s consent bit', () => {
+  function stubHolder(bit: boolean | null): { device: { row: db.UsernameIdentifierRow | null } } {
+    const device = { row: { username: 'alice_7', claimedAt: NOW_MS - DAY_MS, discoverable: true, since: NOW_MS - DAY_MS } as db.UsernameIdentifierRow | null };
+    jest.spyOn(db, 'loadUsernameIdentifier').mockImplementation(async () => device.row);
+    jest.spyOn(db, 'loadUsernameNotice').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameUnlink').mockResolvedValue(null);
+    jest.spyOn(db, 'loadUsernameCooldown').mockResolvedValue(null);
+    jest.spyOn(db, 'saveUsernameIdentifier').mockImplementation(async row => {
+      device.row = { ...row };
+    });
+    jest.spyOn(accountsUsername, 'getIdentifierState').mockResolvedValue(
+      stateOf({ holdsUsername: true, usernameSince: NOW_MS - DAY_MS, usernameFindable: bit }),
+    );
+    return { device };
+  }
+
+  it('a sibling switched findability off: the phone’s switch shows off on its next open, and its row is brought to the server’s bit', async () => {
+    const { device } = stubHolder(false);
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    const sw = tree.root
+      .findAllByProps({ testID: 'username-discoverable-toggle' })
+      .find(n => n.props.onValueChange !== undefined)!;
+    expect(sw.props.value).toBe(false);
+    expect(device.row?.discoverable).toBe(false);
+    expect(has(tree, 'account-username-unfindable')).toBe(true);
+    tree.unmount();
+  });
+
+  it('an unreadable bit (null) changes nothing; a bit that agrees writes nothing', async () => {
+    const { device } = stubHolder(null);
+    const save = db.saveUsernameIdentifier as unknown as jest.Mock;
+    const tree = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(device.row?.discoverable).toBe(true);
+    expect(save).not.toHaveBeenCalled();
+    tree.unmount();
+    jest.restoreAllMocks();
+    jest.spyOn(Date, 'now').mockReturnValue(NOW_MS);
+    const agreed = stubHolder(true);
+    const save2 = db.saveUsernameIdentifier as unknown as jest.Mock;
+    const again = await render(<AccountUsernameScreen onBack={jest.fn()} />);
+    expect(agreed.device.row?.discoverable).toBe(true);
+    expect(save2).not.toHaveBeenCalled();
+    again.unmount();
   });
 });

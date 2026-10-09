@@ -117,6 +117,20 @@ export interface UserRecord {
    */
   groupId?: string;
   /**
+   * The username cool-down stamp CARRIED onto the member by a DISSOLVING
+   * identifier unlink (§4.8; the 2026-10-08 gate pass): a
+   * one-device attach-created group dies with its last identifier, and its
+   * `usernameRenamedAt` would die with it — so the person could claim a
+   * different name at once from the fresh group their next verified attach
+   * mints, the claim→unlink→claim-another hoarding the stamp exists to
+   * price. Unix seconds, the group row's own unit; the LATER of this and
+   * the group's stamp is the window the claim handler and the state read
+   * compute from, and the next lazy-solo attach copies a still-running
+   * value onto the group it mints (the `discoverableAfter` carrier's
+   * shape). Absent = never carried; an elapsed value is inert.
+   */
+  usernameRenamedAt?: number;
+  /**
    * Set by revoke-lost/stolen: the row is dead — auth
    * refuses the tombstoned identity key, sends refuse at enqueue (the
    * read sites landed separately). The ROW tombstone and the idkey-claim tombstone
@@ -622,9 +636,22 @@ export interface IdentifierClaimRecord {
  * former owner keeps a reclaim right for the same window. The row has NO
  * `groupId` (every owner-pinned write — consent toggle, recovery liveness,
  * migration, unlink — refuses it by construction) and NO plaintext, exactly
- * like the live row. `formerGroupId` ABSENT is the nobody-reclaims shape:
- * operator revocation and the dissolve paths (the group is gone, so
- * no reclaim right could ever be exercised) both write it absent.
+ * like the live row. `formerGroupId` AND `formerUserId` both ABSENT is the
+ * nobody-reclaims shape: operator revocation and the deletion /
+ * dissolve sweeps (the account is gone, so no reclaim right could ever be
+ * exercised) write both absent. A rename and a NON-dissolving unlink write
+ * BOTH (the group that held the name, and the member that acted — since the
+ * 2026-10-08 gate pass; before it the group alone), so the take-back
+ * survives a LATER dissolve of that group by its other class's unlink or
+ * by the downgrade. The dissolving UNLINK (a one-device attach-created
+ * group whose last identifier was its name) writes `formerUserId` alone
+ * (2026-10-08, the field report's S3): the group dies in that
+ * transaction and a dangling group id must not outlive its row, but the
+ * PERSON stays, and the take-back the unlink confirmation promises is
+ * theirs from whatever fresh group they verify into next. Retention:
+ * the row, member ULID included, lives
+ * until the first read of the name after `freesAt` reaps it — the users
+ * table has no TTL attribute.
  */
 export interface UsernameTombstoneRecord {
   claimKey: string;
@@ -633,9 +660,15 @@ export interface UsernameTombstoneRecord {
    * reads as absent to the claim condition, and the lookup-facing read reaps
    * it physically). */
   freesAt: number;
-  /** The group that held the name — the ONLY group whose claim passes the
-   * tombstone-aware condition before `freesAt`. Absent: nobody does. */
+  /** The group that held the name — a group whose claim passes the
+   * tombstone-aware condition before `freesAt`. Absent: no group does. */
   formerGroupId?: string;
+  /** The MEMBER that renamed or unlinked the name: the one user whose claim,
+   * from ANY group (the fresh group a re-verified founder mints after the
+   * old one dissolved), passes the condition before `freesAt`. Absent: no
+   * user does. Alone on a dissolving unlink's tombstone, beside
+   * `formerGroupId` on every other rename/unlink tombstone. */
+  formerUserId?: string;
   /** The skeleton row tombstoned beside this one (reaped together). */
   skeletonKey?: string;
 }
@@ -2328,6 +2361,12 @@ export interface DataLayer {
      * newest-version duplicate. Empty outside a rotation window. */
     retiringClaimKeys?: readonly string[];
     nowMs: number;
+    /** The caller's still-running username cool-down stamp (unix seconds;
+     * `UserRecord.usernameRenamedAt`, carried there by a dissolving
+     * unlink), copied onto the group the lazy solo path mints (2026-10-08
+     * gate pass). Ignored on the existing-group branch; undefined when no
+     * window is running. */
+    usernameRenamedAt?: number;
     /** The still-live recovery cool-down carried onto the fresh claim (the re-arm rule: a re-minted claim may not shed a cool-down the
      * recovery armed). The handler takes the max of the group-row carrier
      * and the identifier-keyed shadow (`getIdentifierRecoveryCooldown`). Absent =
@@ -2495,8 +2534,11 @@ export interface DataLayer {
    * claim→unlink→claim and hold a fresh former-owner tombstone per attempt.
    * When the unlink DISSOLVES the group (the lazy-solo reap) the tombstone
    * carries no `formerGroupId` (the group that could reclaim no longer
-   * exists, and a dangling group id must not outlive its row) and there is
-   * no group row left to stamp.
+   * exists, and a dangling group id must not outlive its row) but the
+   * member's `formerUserId`, and the stamp — with no group row left to take
+   * it — is carried onto the member's user row (`UserRecord.
+   * usernameRenamedAt`, the 2026-10-08 gate pass), so the 30-day rule
+   * survives the group.
    */
   unlinkUsername(input: {
     userId: string;
@@ -3209,14 +3251,24 @@ async function sendRosterTransact(
  * otherwise refuse everyone — the former owner's 30-day reclaim included —
  * for the whole ≥90-day key-retirement window. A row with `tombstoned`
  * absent (a LIVE claim, or a live skeleton) fails every arm; a tombstone
- * with `formerGroupId` absent (revocation, dissolve) frees only by clock.
+ * with neither `formerGroupId` nor `formerUserId` (revocation, the
+ * deletion sweep) frees only by clock. The fourth arm (2026-10-08, S3) is
+ * the dissolving unlink's: the former MEMBER, claiming from the fresh group
+ * it verified into, passes before `freesAt` — the group that held the name
+ * no longer exists, and the take-back is the person's.
  */
 const USERNAME_CLAIM_FREE_CONDITION =
-  'attribute_not_exists(userId) OR (tombstoned = :tomb AND (freesAt <= :nowS OR formerGroupId = :owner))';
+  'attribute_not_exists(userId) OR (tombstoned = :tomb AND (freesAt <= :nowS OR formerGroupId = :owner OR formerUserId = :ownerUser))';
 const usernameClaimFreeValues = (
   nowSeconds: number,
   groupId: string,
-): Record<string, unknown> => ({ ':tomb': true, ':nowS': nowSeconds, ':owner': groupId });
+  userId: string,
+): Record<string, unknown> => ({
+  ':tomb': true,
+  ':nowS': nowSeconds,
+  ':owner': groupId,
+  ':ownerUser': userId,
+});
 
 /** `freesAt` for a tombstone written now (unix seconds). */
 const usernameFreesAt = (nowMs: number): number =>
@@ -3234,7 +3286,11 @@ const isUsernameClaimRef = (ref: string): boolean => ref.startsWith(USERNAME_CLA
  * it), pinned to the group that holds it (`kind` + `groupId`: a row that
  * moved to another group since the caller's snapshot is never overwritten
  * by a stale caller). `formerGroupId` present = the 30-day former-owner
- * reclaim right; absent = nobody reclaims early. The claim-row tombstone
+ * reclaim right of the surviving group; `formerUserId` present = the same
+ * right of the MEMBER that acted — beside the group id on a rename or a
+ * surviving unlink (so a later dissolve of that group does not lock the
+ * name against the person), alone when the unlink itself dissolves the
+ * group (S3); both absent = nobody reclaims early. The claim-row tombstone
  * remembers its skeleton key so the reaping read takes both.
  */
 function usernameTombstoneItem(input: {
@@ -3243,6 +3299,7 @@ function usernameTombstoneItem(input: {
   groupId: string;
   nowMs: number;
   formerGroupId?: string;
+  formerUserId?: string;
   skeletonKey?: string;
 }): TransactItem {
   return {
@@ -3255,6 +3312,7 @@ function usernameTombstoneItem(input: {
         tombstonedAt: input.nowMs,
         freesAt: usernameFreesAt(input.nowMs),
         ...(input.formerGroupId !== undefined ? { formerGroupId: input.formerGroupId } : {}),
+        ...(input.formerUserId !== undefined ? { formerUserId: input.formerUserId } : {}),
         ...(input.skeletonKey !== undefined ? { skeletonKey: input.skeletonKey } : {}),
       },
       ConditionExpression: 'kind = :k AND groupId = :g',
@@ -3337,7 +3395,12 @@ async function usernameDissolveTombstones(
  * on whether the group survives. `stampUsernameRenamedAt` (unix seconds)
  * is the username class's addition: the SURVIVING group row takes the
  * rename cool-down stamp in the same Update (an unlink is a name change —
- * the hoarding fix); a dissolving group has no row left to stamp.
+ * the hoarding fix). A DISSOLVING group has no row left to stamp, so the
+ * stamp — this unlink's own, or the one the dying row already carried from
+ * an earlier rename/unlink, whichever is later — is CARRIED onto the
+ * member's user row in the same transaction (the 2026-10-08 gate pass):
+ * the 30-day rule used to die with the row, and the person could claim a
+ * different name at once from the fresh group their next attach minted.
  */
 async function unlinkIdentifierRefs(
   doc: DynamoDBDocumentClient,
@@ -3429,6 +3492,11 @@ async function unlinkIdentifierRefs(
           },
         },
       };
+  // The cool-down stamp a dissolve would otherwise lose: the later of this
+  // unlink's own stamp and the one already on the dying group row.
+  const carriedStamp = [stampUsernameRenamedAt, row.usernameRenamedAt]
+    .filter((stamp): stamp is number => typeof stamp === 'number')
+    .reduce<number | undefined>((latest, stamp) => (latest === undefined || stamp > latest ? stamp : latest), undefined);
   const items: TransactItem[] = [
     groupItem,
     ...(await claimItems(dissolve)),
@@ -3437,13 +3505,20 @@ async function unlinkIdentifierRefs(
           {
             // The founder returns to never-opted-in: groupId cleared
             // under its own pin (a row that re-grouped elsewhere is
-            // never touched).
+            // never touched) — and the username cool-down carried onto
+            // the member, because the group row that held it dies here.
             Update: {
               TableName: TABLES.users,
               Key: { userId },
-              UpdateExpression: 'REMOVE groupId',
+              UpdateExpression:
+                carriedStamp === undefined
+                  ? 'REMOVE groupId'
+                  : 'SET usernameRenamedAt = :carried REMOVE groupId',
               ConditionExpression: 'attribute_exists(userId) AND groupId = :g',
-              ExpressionAttributeValues: { ':g': groupId },
+              ExpressionAttributeValues: {
+                ':g': groupId,
+                ...(carriedStamp === undefined ? {} : { ':carried': carriedStamp }),
+              },
             },
           } satisfies TransactItem,
           {
@@ -7800,12 +7875,28 @@ export function makeTestOnlyDataLayer(
           newClasses.add(acceptorClass);
           const newIds = new Set(members.map((m) => m.userId));
           newIds.add(acceptorUserId);
+          // THE OFFERER'S OWN ENTRY TAKES THIS CEREMONY'S CERTS (2026-10-08,
+          // the field report's S2): the first-link branch certifies BOTH
+          // entries, but the join used to append the acceptor alone, so the
+          // offerer's entry kept whatever it had — nothing for the §3
+          // lazy-solo founder an email attach minted, the PREVIOUS
+          // ceremony's for a re-link after an unlink — and the offerer's
+          // completion probe (app linking.ts `completeOffererLink`), which
+          // verifies THIS ceremony's acceptance off its OWN entry, stalled
+          // forever on "Waiting for the new device to confirm". The whole
+          // list is written under the epoch pin (the snapshot IS the
+          // roster the pin proves unmoved), the offerer's entry re-certified
+          // in place, the acceptor's appended, everyone else untouched.
+          const certifiedMembers: AccountGroupMember[] = [
+            ...members.map((m) => (m.userId === offererUserId ? { ...m, certs } : m)),
+            acceptorMember,
+          ];
           groupItem = {
             Update: {
               TableName: TABLES.users,
               Key: { userId: gkey },
               UpdateExpression:
-                'SET members = list_append(members, :m), memberClasses = :cls, memberIds = :ids, epoch = :next',
+                'SET members = :m, memberClasses = :cls, memberIds = :ids, epoch = :next',
               // THE FOUR CONDITIONS, each its own clause so each fails on its
               // own honest accident: the epoch pin (an acceptance never lands
               // over a roster that moved after signing), the
@@ -7823,7 +7914,7 @@ export function makeTestOnlyDataLayer(
               ConditionExpression:
                 'attribute_exists(userId) AND epoch = :e AND NOT contains(memberClasses, :c) AND size(members) < :cap AND contains(memberIds, :off)',
               ExpressionAttributeValues: {
-                ':m': [acceptorMember],
+                ':m': certifiedMembers,
                 ':cls': newClasses,
                 ':ids': newIds,
                 ':next': rosterEpoch + 1,
@@ -8454,7 +8545,7 @@ export function makeTestOnlyDataLayer(
       }
       return live;
     },
-    async attachIdentifier({ userId, deviceClass, existingGroupId, newGroupId, claimKey, refsSnapshot, retiringClaimKeys, nowMs, discoverableAfter }) {
+    async attachIdentifier({ userId, deviceClass, existingGroupId, newGroupId, claimKey, refsSnapshot, retiringClaimKeys, nowMs, discoverableAfter, usernameRenamedAt }) {
       const groupId = existingGroupId ?? newGroupId;
       // THE PER-CLASS BACKSTOP, MADE STRUCTURAL. Until the third class
       // the size cap below enforced one-per-class by COINCIDENCE on a full
@@ -8595,6 +8686,11 @@ export function makeTestOnlyDataLayer(
                     epoch: 1,
                     createdAt: nowMs,
                     attachCreated: true,
+                    // The username cool-down a dissolving unlink carried
+                    // onto the member (2026-10-08 gate pass): a fresh
+                    // group inherits the running window, so the person
+                    // cannot shed the 30-day rule by re-verifying.
+                    ...(usernameRenamedAt !== undefined ? { usernameRenamedAt } : {}),
                   },
                   ConditionExpression: 'attribute_not_exists(userId)',
                 },
@@ -8763,6 +8859,7 @@ export function makeTestOnlyDataLayer(
           tombstoned: true,
           freesAt,
           ...(typeof item.formerGroupId === 'string' ? { formerGroupId: item.formerGroupId } : {}),
+          ...(typeof item.formerUserId === 'string' ? { formerUserId: item.formerUserId } : {}),
           ...(skeletonKey !== undefined ? { skeletonKey } : {}),
         };
       }
@@ -8850,7 +8947,7 @@ export function makeTestOnlyDataLayer(
               ...(discoverableAfter !== undefined ? { discoverableAfter } : {}),
             },
             ConditionExpression: USERNAME_CLAIM_FREE_CONDITION,
-            ExpressionAttributeValues: usernameClaimFreeValues(nowSeconds, groupId),
+            ExpressionAttributeValues: usernameClaimFreeValues(nowSeconds, groupId, userId),
           },
         },
         {
@@ -8866,7 +8963,7 @@ export function makeTestOnlyDataLayer(
               createdAt: nowMs,
             },
             ConditionExpression: USERNAME_CLAIM_FREE_CONDITION,
-            ExpressionAttributeValues: usernameClaimFreeValues(nowSeconds, groupId),
+            ExpressionAttributeValues: usernameClaimFreeValues(nowSeconds, groupId, userId),
           },
         },
         {
@@ -8910,7 +9007,7 @@ export function makeTestOnlyDataLayer(
               TableName: TABLES.users,
               Key: { userId: key },
               ConditionExpression: USERNAME_CLAIM_FREE_CONDITION,
-              ExpressionAttributeValues: usernameClaimFreeValues(nowSeconds, groupId),
+              ExpressionAttributeValues: usernameClaimFreeValues(nowSeconds, groupId, userId),
             },
           }),
         ),
@@ -8975,8 +9072,10 @@ export function makeTestOnlyDataLayer(
       const newRefs = refsSnapshot.map((ref) => (ref === oldClaimKey ? newClaimKey : ref));
       const items: TransactItem[] = [];
       // (1) The old claim key becomes its tombstone — former owner = this
-      // group, 30-day reclaim right. (It remembers its skeleton tombstone
-      // for the reaping read only when one is written beside it.)
+      // group AND the member that acted (the gate pass: the right must
+      // survive a later dissolve of the group), 30-day reclaim right. (It
+      // remembers its skeleton tombstone for the reaping read only when
+      // one is written beside it.)
       items.push(
         usernameTombstoneItem({
           key: oldClaimKey,
@@ -8984,6 +9083,7 @@ export function makeTestOnlyDataLayer(
           groupId,
           nowMs,
           formerGroupId: groupId,
+          formerUserId: userId,
           ...(sameSkeleton ? {} : { skeletonKey: old.skeletonKey }),
         }),
       );
@@ -9014,6 +9114,7 @@ export function makeTestOnlyDataLayer(
               groupId,
               nowMs,
               formerGroupId: groupId,
+              formerUserId: userId,
             }),
       );
       // (3) The new claim key under the tombstone-aware condition, the
@@ -9036,7 +9137,7 @@ export function makeTestOnlyDataLayer(
               : {}),
           },
           ConditionExpression: USERNAME_CLAIM_FREE_CONDITION,
-          ExpressionAttributeValues: usernameClaimFreeValues(nowSeconds, groupId),
+          ExpressionAttributeValues: usernameClaimFreeValues(nowSeconds, groupId, userId),
         },
       });
       // (4) The new skeleton key, same condition — dropped on the re-point.
@@ -9054,7 +9155,7 @@ export function makeTestOnlyDataLayer(
               createdAt: nowMs,
             },
             ConditionExpression: USERNAME_CLAIM_FREE_CONDITION,
-            ExpressionAttributeValues: usernameClaimFreeValues(nowSeconds, groupId),
+            ExpressionAttributeValues: usernameClaimFreeValues(nowSeconds, groupId, userId),
           },
         });
       }
@@ -9103,7 +9204,7 @@ export function makeTestOnlyDataLayer(
             TableName: TABLES.users,
             Key: { userId: key },
             ConditionExpression: USERNAME_CLAIM_FREE_CONDITION,
-            ExpressionAttributeValues: usernameClaimFreeValues(nowSeconds, groupId),
+            ExpressionAttributeValues: usernameClaimFreeValues(nowSeconds, groupId, userId),
           },
         });
       }
@@ -9161,9 +9262,17 @@ export function makeTestOnlyDataLayer(
         },
         async (dissolve) => {
           if (!old || old.groupId !== groupId) return [];
-          // The former-owner right exists only while the group survives to
-          // exercise it (a dissolved group's id must not dangle in a row).
-          const former = dissolve ? {} : { formerGroupId: groupId };
+          // The former-owner right rides the GROUP while the group survives
+          // to exercise it — and the MEMBER beside it, so the right outlives
+          // a LATER dissolve of that group (the email unlink or the downgrade
+          // after the name left; the 2026-10-08 gate pass) — and the MEMBER
+          // alone when this unlink dissolves it (S3): a dissolved group's id
+          // must not dangle in a row, but the person is still here and the
+          // unlink confirmation promised them the name back for 30 days —
+          // from the fresh group their next verified attach mints.
+          const former = dissolve
+            ? { formerUserId: userId }
+            : { formerGroupId: groupId, formerUserId: userId };
           return [
             usernameTombstoneItem({
               key: claimKey,

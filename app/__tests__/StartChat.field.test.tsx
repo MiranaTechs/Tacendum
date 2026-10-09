@@ -16,9 +16,13 @@
 
 import React from 'react';
 import { Clipboard, StyleSheet, Text } from 'react-native';
-import ReactTestRenderer from 'react-test-renderer';
+import ReactTestRenderer, { type ReactTestInstance } from 'react-test-renderer';
+import * as accounts from '../src/accounts';
+import * as accountsUsername from '../src/accountsUsername';
+import { ACCOUNTS_USERNAME_COPY } from '../src/accountsUsernameCopy';
 import * as db from '../src/db';
 import { StartChatScreen } from '../src/screens/StartChatScreen';
+import { resetLookupPacing } from '../src/screens/startChat/useReachLookup';
 import { themeTokens } from '../src/theme';
 import { PaneWidthProvider } from '../src/windowClass';
 
@@ -66,6 +70,9 @@ beforeEach(async () => {
   sqlite.reset();
   db.setWorkspace('real');
   await db.initDb();
+  // The lookup ledger is the DEVICE's, per process (the gate pass): every
+  // test starts its day and minute empty.
+  resetLookupPacing();
 });
 
 afterEach(async () => {
@@ -141,6 +148,46 @@ function hostStyle(tree: ReactTestRenderer.ReactTestRenderer, id: string) {
     n => n.props.testID === id && typeof n.type === 'string',
   )[0]!;
   return StyleSheet.flatten(host.props.style) as Record<string, unknown>;
+}
+
+/** Host nodes only — a testID on a composite also lands on the host it renders. */
+function hosts(tree: ReactTestRenderer.ReactTestRenderer, id: string): ReactTestInstance[] {
+  return tree.root.findAll(n => n.props.testID === id && typeof n.type === 'string');
+}
+
+function has(tree: ReactTestRenderer.ReactTestRenderer, id: string): boolean {
+  return hosts(tree, id).length > 0;
+}
+
+/** Every string child under the first host node with this testID. */
+function textOf(tree: ReactTestRenderer.ReactTestRenderer, id: string): string | null {
+  const node = hosts(tree, id)[0];
+  if (!node) return null;
+  return node
+    .findAll(n => typeof n.type === 'string')
+    .flatMap(n => React.Children.toArray(n.props.children))
+    .filter((c): c is string => typeof c === 'string')
+    .join(' ');
+}
+
+async function press(tree: ReactTestRenderer.ReactTestRenderer, id: string) {
+  await ReactTestRenderer.act(async () => {
+    control(tree, id).props.onPress();
+  });
+}
+
+/** The go key. */
+async function submit(tree: ReactTestRenderer.ReactTestRenderer) {
+  await ReactTestRenderer.act(async () => {
+    field(tree).props.onSubmitEditing();
+  });
+}
+
+/** Leaving the field ends the settle, so letter-led text is named at once. */
+async function blur(tree: ReactTestRenderer.ReactTestRenderer) {
+  await ReactTestRenderer.act(async () => {
+    field(tree).props.onBlur();
+  });
 }
 
 test('the field does not take focus on entry — the keyboard would cover Scan and My ID', async () => {
@@ -234,4 +281,58 @@ test('at and above layout.narrowWidth no action sits inside the field; its one b
       tree.unmount();
     });
   }
+});
+
+/* ── the typed path’s punctuation (fix/username-discovery, 2026-10-08) ── */
+
+describe('what the field makes of a sentence’s punctuation', () => {
+  // D5: "alice@example.com." passed the shape check, so the row said Email
+  // with no "Finish the address", and Find spent a search on an address
+  // with a period in it. Pasting the same text was already fine.
+  test('a typed address with a period after it: Email, no “Finish the address”, and Find sends the address without the period (D5)', async () => {
+    const search = jest
+      .spyOn(accounts, 'discoverySearch')
+      .mockResolvedValue({ outcome: 'no_match' });
+    const tree = await render();
+    // TYPED: the period arrives as its own keystroke. (One change carrying
+    // the whole text reads as a paste, and the paste reader drops the period
+    // already — the typed path did not.)
+    await type(tree, 'alice@example.com');
+    await type(tree, 'alice@example.com.');
+
+    expect(textOf(tree, 'reach-kind')).toBe('Email');
+    expect(has(tree, 'reach-status')).toBe(false);
+    expect(has(tree, 'discovery-search')).toBe(true);
+    await press(tree, 'discovery-search');
+    expect(search).toHaveBeenCalledTimes(1);
+    expect(search).toHaveBeenCalledWith('alice@example.com');
+    expect(has(tree, 'discovery-no-match')).toBe(true);
+  });
+
+  // D7: "alice-smith" and "alice," were none of the three — the row said
+  // "Not an ID, username or email yet" and the go key "Check what they sent
+  // you", with no hint that only letters, digits and underscores are allowed.
+  test('a hyphenated or comma-tailed name is named a username with the rule under it; no Find; the go key refuses it here with no call (D7)', async () => {
+    const byName = jest.spyOn(accountsUsername, 'discoverySearchByUsername');
+    const tree = await render();
+    for (const raw of ['alice-smith', 'alice,', 'alice.smith']) {
+      await type(tree, '');
+      await type(tree, raw);
+      await blur(tree);
+      expect([raw, textOf(tree, 'reach-kind')]).toEqual([raw, 'Username']);
+      expect([raw, textOf(tree, 'reach-status')]).toEqual([
+        raw,
+        ACCOUNTS_USERNAME_COPY.startChatHandleRule,
+      ]);
+      expect([raw, has(tree, 'discovery-search')]).toEqual([raw, false]);
+
+      await submit(tree);
+      expect([raw, textOf(tree, 'discovery-invalid')]).toEqual([
+        raw,
+        ACCOUNTS_USERNAME_COPY.invalid,
+      ]);
+    }
+    expect(byName).not.toHaveBeenCalled();
+    expect(chatWrites()).toEqual([]);
+  });
 });

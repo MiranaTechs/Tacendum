@@ -336,6 +336,105 @@ describe('the anti-Sybil caller gate (plus-address hoarding priced here)', () =>
   });
 });
 
+describe('the 72 h gate is the ACCOUNT\'s age, not the calling device\'s (field report 2026-10-08, S1)', () => {
+  /** A sibling joined into `holder`'s EXISTING group through the join
+   * branch at the group's current epoch — a device linked today into an
+   * account that verified its email long ago. */
+  async function linkSibling(
+    deps: TestDeps,
+    holder: { userId: string },
+  ): Promise<{ userId: string; token: string }> {
+    const sibling = await mkAcct(deps);
+    const groupId = (await db.getUserById(holder.userId))!.groupId!;
+    const group = (await db.getAccountGroup(groupId))!;
+    const offerNonce = `nonce-s1-${RUN}-${++seq}`;
+    const nowS = Math.floor(deps.now() / 1000);
+    expect(
+      await db.putLinkOffer({
+        offerNonce,
+        groupId,
+        offererUserId: holder.userId,
+        acceptorUserId: sibling.userId,
+        acceptorClass: 'tablet',
+        rosterEpoch: group.epoch,
+        expiresAt: nowS + 600,
+        offerSig: Buffer.from(`o-${offerNonce}`).toString('base64'),
+      }),
+    ).toBe('created');
+    expect(
+      await db.linkDeviceToGroup({
+        offerNonce,
+        acceptSig: Buffer.from(`a-${offerNonce}`).toString('base64'),
+        nowSeconds: nowS,
+        linkedAtMs: deps.now(),
+      }),
+    ).toBe('linked');
+    expect((await db.getUserById(sibling.userId))?.groupId).toBe(groupId);
+    return sibling;
+  }
+
+  gated('a device linked today into a 10-day-old verified group searches by email AT ONCE; a 1 h device in a 1 h group is refused until the GROUP is 72 h old (the device is 71 h then — the older anchor admits); an 80 h device that re-mints a fresh group keeps its own age; the solo young pin stands beside them', async () => {
+    const deps = makeTestDeps(db);
+    const owner = await mkAcct(deps);
+    const email = `s1-target-${RUN}@example.com`;
+    await attachEmail(deps, owner, email);
+    expect(
+      (await setDiscoverableRoute(post(owner.token, { discoverable: true }), deps)).statusCode,
+    ).toBe(204);
+    // Roll the 5/min burst window before every probe so only the gates decide.
+    const lookup = async (who: { token: string }): Promise<HttpResult> => {
+      deps.advanceMs(61_000);
+      return discoveryLookupRoute(post(who.token, { email }), deps);
+    };
+
+    // (a) The reported shape: the phone verified its email 10 days ago, the
+    // iPad was registered and linked just now. The account is 10 days old;
+    // the iPad searches at once — and nothing about the group's age reaches
+    // the wire, only the admission.
+    const phone = await mkAcct(deps);
+    await attachEmail(deps, phone, `s1-phone-${RUN}@example.com`);
+    deps.advanceMs(10 * 86_400_000);
+    const ipad = await linkSibling(deps, phone);
+    expect((await lookup(ipad)).statusCode).toBe(200);
+    expect((await lookup(phone)).statusCode).toBe(200);
+
+    // (b) A young account is still young on every device: the phone
+    // verified 1 h ago, the tablet linked now — refused, the uniform shape.
+    const phone2 = await mkAcct(deps);
+    await attachEmail(deps, phone2, `s1-phone2-${RUN}@example.com`);
+    deps.advanceMs(3_600_000);
+    const tablet2 = await linkSibling(deps, phone2);
+    const young = await lookup(tablet2);
+    expect(young).toBe(discoveryRefusal());
+    expect(young).toEqual(accountsRefusal());
+    // ...until the GROUP turns 72 h exactly: the tablet's own row is then
+    // 71 h old, so this admission is the older anchor's.
+    deps.advanceMs(DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000 - 3_600_000 - 2 * 61_000);
+    expect((await lookup(tablet2)).statusCode).toBe(200);
+    expect(deps.now() - (await db.getUserById(tablet2.userId))!.createdAt).toBeLessThan(
+      DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000,
+    );
+
+    // (c) Churn lends nothing and takes nothing: an 80 h device whose
+    // lazy-solo group was minted just now (unlink, re-attach) keeps its
+    // own 80 h — the device row is the anchor churn cannot shed.
+    const churner = await mkAcct(deps);
+    deps.advanceMs(80 * 3_600_000);
+    await attachEmail(deps, churner, `s1-churner-${RUN}@example.com`);
+    expect(deps.now() - (await db.getAccountGroup((await db.getUserById(churner.userId))!.groupId!))!.createdAt).toBe(0);
+    expect((await lookup(churner)).statusCode).toBe(200);
+
+    // (d) The solo young pin, unchanged: one device, one group, both born
+    // together — refused at 71:59:59, admitted at 72:00:00.
+    const solo = await mkAcct(deps);
+    await attachEmail(deps, solo, `s1-solo-${RUN}@example.com`);
+    deps.advanceMs(DISCOVERY_MIN_ACCOUNT_AGE_SECONDS * 1000 - 1000 - 61_000);
+    expect(await lookup(solo)).toBe(discoveryRefusal());
+    deps.advanceMs(1000);
+    expect((await discoveryLookupRoute(post(solo.token, { email }), deps)).statusCode).toBe(200);
+  });
+});
+
 describe('the per-target aggregate one-time-prekey budget (release pin: 30/day across ALL requesters)', () => {
   gated('thirty fetches by thirty DISTINCT requesters ACROSS TWO CONTAINERS consume one-time prekeys; the thirty-first degrades to signed-prekey-only with the pool untouched — the anti-Sybil drain case, on the real DDB window', async () => {
     const deps = makeTestDeps(db);

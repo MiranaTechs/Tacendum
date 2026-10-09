@@ -7,6 +7,22 @@ import {
 } from '@tacendum/shared';
 import * as apiModule from './api';
 import { ApiRequestError } from './api';
+// The cached account-level read every identifier surface renders from
+// (accountsUsername.getIdentifierState, fix/username-discovery 2026-10-08):
+// every write below that changes the account's facts drops it, so a screen
+// re-reading after the write never shows the state before it. accountsUsername
+// imports pickDiscoveryAnchor from here; both uses are call-time, so the
+// cycle is inert.
+import {
+  clearIdentifierRoutePacing,
+  getIdentifierState,
+  identifierRoutePacing,
+  adoptableRowStamp,
+  invalidateIdentifierState,
+  localRowStale,
+  noteIdentifierRouteCall,
+} from './accountsUsername';
+import type { IdentifierState } from './accountsUsername';
 import * as cryptoModule from 'tacendum-crypto';
 import * as dbModule from './db';
 import { API_BASE } from './config';
@@ -97,7 +113,18 @@ export interface AccountsDeps {
     | 'loadLinkGroup'
     | 'saveLinkGroup'
     | 'upsertLinkedDevice'
-  >;
+  > &
+    /** The username class's local rows the downgrade takes with it (the
+     * gate pass, 2026-10-08): the dissolve's last exit tombstones the name
+     * server-side, so a row left behind read, on the next visit, as
+     * "changed or removed from another device". Optional for the suites
+     * that build deps by hand; the default deps wire the real module. */
+    Partial<
+      Pick<
+        typeof dbModule,
+        'clearUsernameIdentifier' | 'clearUsernameUnlink' | 'clearUsernameCooldown'
+      >
+    >;
   dissolve(): Promise<void>;
   token(): Promise<string | null>;
   selfId(): Promise<string | null>;
@@ -140,9 +167,63 @@ function isRefusal(error: unknown): boolean {
   return error instanceof ApiRequestError;
 }
 
+/** The code request's ONE distinguishable refusal (D2, fix/username-
+ * discovery 2026-10-08): a 429 from the caller's OWN budgets — the
+ * per-device identifier-route burst and the per-group daily attach
+ * allowance (identifiers.ts `rateLimitedResult`) — by STATUS alone. Both
+ * are self-keyed, so the answer discloses nothing about any address; every
+ * address-shaped refusal stays inside the collapsed 403 above. */
+function isRateLimited(error: unknown): boolean {
+  return error instanceof ApiRequestError && error.status === 429;
+}
+
+/* ── the account's own facts (D2) ─────────────────────────────────── */
+
+export type { IdentifierState } from './accountsUsername';
+/** The stale-row rule the email screen applies to its own row against the
+ * account's live email (`emailSince`), and the identifier-route pacing note
+ * the phone module records before each of its legs: by reference, for the
+ * same reason. */
+export { adoptableRowStamp, clearIdentifierRoutePacing, localRowStale, noteIdentifierRouteCall };
+
+/**
+ * The account group's facts the email surface renders beside its local row
+ * (D2, the 2026-10-08 fix train): whether the group holds a verified email
+ * (`emailLinked` — true and false are FACTS from the state route; null is
+ * unknown), from the caller-owned state read. Exposed through THIS module
+ * because the email screen drives it already and the handle class's word
+ * census keeps that class's module out of every other screen and deck;
+ * the read itself is cached by its module and dropped by every write above
+ * and below (`invalidateIdentifierState`).
+ */
+export function loadIdentifierState(): Promise<IdentifierState> {
+  return getIdentifierState();
+}
+
 /* ── email attach ────────────────────────────────────────────── */
 
 export type AttachRequestOutcome = 'sent' | 'refused' | 'failed';
+
+/** The attach code request's answers: the recovery request's three, plus
+ * the self-keyed 429s the request step may tell apart (D2; split by
+ * Retry-After at the gate pass): 'rate_limited' is this device's burst
+ * window (seconds — "wait a minute"), 'rate_limited_today' the account's
+ * daily allowance (hours — "they reset at midnight UTC"). */
+export type AttachCodeOutcome = AttachRequestOutcome | 'rate_limited' | 'rate_limited_today';
+
+/** Retry-After past this is not the minute's burst window but a day's
+ * allowance (the server's burst window is 60 s; the daily window refills
+ * on the UTC day, or at hours of token-bucket refill). */
+const RATE_LIMIT_BURST_MAX_SECONDS = 60;
+
+/** The per-minute identifier-route pacing this device keeps (U3): the
+ * server allows ten identifier-route calls a minute per device and the
+ * email legs draw the same window as the username verbs, so the Email
+ * screen asks this before a tap exactly as the Username screen does.
+ * Seconds to wait, or null when a call may go now. */
+export function identifierRoutePacingNow(nowMs = Date.now()): number | null {
+  return identifierRoutePacing(nowMs);
+}
 
 /** Ask for an attach code. On the uniform 200 the pending address is
  * recorded locally — the only place it can be recorded, and only the fact
@@ -150,14 +231,30 @@ export type AttachRequestOutcome = 'sent' | 'refused' | 'failed';
 export async function requestAttachCode(
   rawEmail: string,
   deps: AccountsDeps = defaultDeps(),
-): Promise<AttachRequestOutcome> {
+): Promise<AttachCodeOutcome> {
   const token = await deps.token();
   if (!token) return 'failed';
   const normalized = normalizeEmailIdentifier(rawEmail);
+  // The server charges this leg to the caller's shared identifier-route
+  // window (the one the Username screen paces): counted here too.
+  noteIdentifierRouteCall(deps.now());
   try {
     await deps.api.emailRequestCode(token, normalized, DEVICE_SLOT_CLASS);
   } catch (error) {
-    return isRefusal(error) ? 'refused' : 'failed';
+    if (isRateLimited(error)) {
+      const retry = (error as ApiRequestError).retryAfterSeconds;
+      return retry !== null && retry > RATE_LIMIT_BURST_MAX_SECONDS
+        ? 'rate_limited_today'
+        : 'rate_limited';
+    }
+    // A refusal here can be a sibling's change the cached state read does
+    // not know yet (the account's one email was linked, or removed, from
+    // another device): the next read goes to the wire.
+    if (isRefusal(error)) {
+      invalidateIdentifierState();
+      return 'refused';
+    }
+    return 'failed';
   }
   const existing = await deps.db.loadAccountIdentifier();
   await deps.db.saveAccountIdentifier({
@@ -167,6 +264,7 @@ export async function requestAttachCode(
     pendingEmail: normalized,
     pendingRequestedAt: deps.now(),
     restoredAt: existing?.restoredAt ?? null,
+    since: existing?.since ?? null,
   });
   return 'sent';
 }
@@ -189,6 +287,7 @@ export async function confirmAttach(
   const token = await deps.token();
   if (!token) return 'failed';
   const normalized = normalizeEmailIdentifier(rawEmail);
+  noteIdentifierRouteCall(deps.now());
   try {
     await deps.api.emailVerify(token, normalized, code);
   } catch (error) {
@@ -205,7 +304,11 @@ export async function confirmAttach(
     // An ordinary attach IS this device's own act — never the restored
     // placeholder state.
     restoredAt: null,
+    // No server stamp yet: the Email screen's next settled read adopts the
+    // live row's stamp as this row's (the proof pass, 2026-10-08).
   });
+  // The account now holds an email: the cached account-level read is stale.
+  invalidateIdentifierState();
   return 'attached';
 }
 
@@ -220,10 +323,17 @@ export async function setDiscoverable(
 ): Promise<SimpleOutcome> {
   const token = await deps.token();
   if (!token) return 'failed';
+  noteIdentifierRouteCall(deps.now());
   try {
     await deps.api.setDiscoverable(token, on);
   } catch (error) {
-    return isRefusal(error) ? 'refused' : 'failed';
+    // Refused: the account may no longer hold this email (a sibling's
+    // change) — the next state read goes to the wire.
+    if (isRefusal(error)) {
+      invalidateIdentifierState();
+      return 'refused';
+    }
+    return 'failed';
   }
   const existing = await deps.db.loadAccountIdentifier();
   if (existing) {
@@ -232,6 +342,7 @@ export async function setDiscoverable(
     // from here on the switch shows what this device set.
     await deps.db.saveAccountIdentifier({ ...existing, discoverable: on, restoredAt: null });
   }
+  invalidateIdentifierState();
   return 'ok';
 }
 
@@ -243,12 +354,23 @@ export async function unlinkIdentifier(
 ): Promise<SimpleOutcome> {
   const token = await deps.token();
   if (!token) return 'failed';
+  noteIdentifierRouteCall(deps.now());
   try {
     await deps.api.emailUnlink(token);
   } catch (error) {
-    return isRefusal(error) ? 'refused' : 'failed';
+    // Refused: the group holds no email any more — a sibling removed it
+    // after this device's last read. The next read goes to the wire, so a
+    // retry is not answered from the same stale memory.
+    if (isRefusal(error)) {
+      invalidateIdentifierState();
+      return 'refused';
+    }
+    return 'failed';
   }
   await deps.db.clearAccountIdentifier();
+  // The account's email is gone — for every device, since the claim is the
+  // GROUP's (a linked sibling may run this with no local row at all).
+  invalidateIdentifierState();
   return 'ok';
 }
 
@@ -266,6 +388,7 @@ export async function downgradeToAnonymous(
 ): Promise<'downgraded' | 'failed'> {
   const token = await deps.token();
   if (!token) return 'failed';
+  noteIdentifierRouteCall(deps.now());
   try {
     await deps.api.emailUnlink(token);
   } catch (error) {
@@ -274,6 +397,17 @@ export async function downgradeToAnonymous(
     // and an identifier-less dissolve is a complete downgrade.
     if (!isRefusal(error)) return 'failed';
   }
+  // Whatever the dissolve below does, the identifier leg has already
+  // changed the account's facts: drop the cached read now, not only on the
+  // complete exit (a partial downgrade must not keep showing the email).
+  invalidateIdentifierState();
+  // Whether a ceremonial group stands to dissolve: its last exit tombstones
+  // the account's username server-side (nobody reclaims), so the local
+  // username row and this device's cool-down memories go with it below —
+  // a row left behind read, on the next visit, as "changed or removed from
+  // another device" (the gate pass, 2026-10-08). A lazily minted solo group
+  // has no local row and keeps its name through the email leg alone.
+  const grouped = (await deps.db.loadLinkGroup()) !== null;
   try {
     await deps.dissolve();
   } catch {
@@ -284,6 +418,11 @@ export async function downgradeToAnonymous(
   // dissolve's last exit takes EVERY claim server-side, and a flag-dark
   // binary simply has no phone row for this to touch.
   await deps.db.clearPhoneIdentifier();
+  if (grouped) {
+    await deps.db.clearUsernameIdentifier?.();
+    await deps.db.clearUsernameUnlink?.();
+    await deps.db.clearUsernameCooldown?.();
+  }
   return 'downgraded';
 }
 
@@ -756,6 +895,8 @@ async function recordCompletedRecoveryLocally(
     // Loudness, never correctness: the epoch catches up from later signals.
   }
   await deps.db.clearLocalRecovery();
+  // This device just joined a group that holds the identifier it proved.
+  invalidateIdentifierState();
 }
 
 /** Give up locally: deletes only this device's own record of the attempt.

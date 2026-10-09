@@ -28,6 +28,7 @@ import * as accounts from '../src/accounts';
 import * as db from '../src/db';
 import { LINKING_COPY } from '../src/linkingCopy';
 import { COPY, StartChatScreen } from '../src/screens/StartChatScreen';
+import { resetLookupPacing } from '../src/screens/startChat/useReachLookup';
 
 jest.mock('react-native-image-picker', () => ({
   launchImageLibrary: jest.fn(),
@@ -82,6 +83,9 @@ beforeEach(async () => {
   sqlite.reset();
   db.setWorkspace('real');
   await db.initDb();
+  // The lookup ledger is the DEVICE's, per process (the gate pass): every
+  // test starts its day and minute empty.
+  resetLookupPacing();
   nativeQr.__qr.reset();
   nativeQr.__qr.state.failScan = null;
   nativeQr.scanWithCamera.mockClear();
